@@ -34,6 +34,7 @@ The M1 spike's raw-epoll server shows this is enough. It held 11k connections at
 | `socket` | L1: `Socket` and every socket option, no policy |
 | `blocking`, `tcp`, `unix` | L2: `TcpStream`, `TcpListener`, `UnixStream`, `UnixListener` and friends |
 | `reader` | `BufReader`: bounded, all-or-nothing frame reads over any `Read` stream (`TcpStream`, `UnixStream`) |
+| `dns` | DNS messages, sans-I/O: A/AAAA queries (optionally EDNS(0)) and defensive response parsing that ignores forged or unrelated packets (RFC 5452) |
 | `buffer`, `codec` | re-exports of `bytes.buffer` and `bytes.codec` |
 
 ## L2 blocking contract (as built in M1)
@@ -76,9 +77,10 @@ The M1 spike's raw-epoll server shows this is enough. It held 11k connections at
      - pipelined leftovers are kept, and `into_parts` hands them back.
      - Every frame read is all or nothing, so a deadline that expires mid-frame loses nothing.
   2. **DNS stub resolver**, blocking and pure Mojo:
+     - the wire codec (`net.dns`): done, fuzzed and ASan-clean;
      - reads `/etc/hosts` and `resolv.conf` (search, ndots, timeout, attempts);
      - UDP A/AAAA queries with random ids, falling back to TCP on truncation;
-     - response validation, and a fuzzed parser.
+     - response validation.
   3. **`connect_host(name, port, timeout)`** with Happy Eyeballs v2 (RFC 8305).
   4. **Client presets for DB drivers:** keepalive + `TCP_USER_TIMEOUT`, and a stale-connection check.
   5. **Nonblocking stream access** (`try_read`/`try_write`) for external readiness loops, plus server helpers (`SO_REUSEPORT` listeners, fd-table pre-growth, `RLIMIT_NOFILE`).
@@ -87,4 +89,7 @@ The M1 spike's raw-epoll server shows this is enough. It held 11k connections at
      - a rattler-build recipe (modular-community);
      - CI on real aarch64;
      - an API review and freeze.
-- **Later:** a UDP API, sendfile, vectored helpers, TLS integration points.
+- **M3: UDP** (after TCP v1 is stable), in two modes like TCP:
+  - sync: blocking `send_to` / `recv_from` with deadlines;
+  - async: nonblocking `try_*` calls for readiness loops (`linux.Epoll`), which a future runtime can build on.
+- **Later:** sendfile, vectored helpers, TLS integration points.
