@@ -1,5 +1,7 @@
 # Spikes: pthreads, runtime threads, `{thin fn, ctx}` callbacks
 
+> **Note (after the refocus).** References below to `rt` and "M2/M3" mean the experimental event-loop runtime. It has since moved to the separate `mojo_rt` repo (git tag `runtime-snapshot`). The measurements stand. The epoll-spike rules (syscall budget, sticky read-closed, fd-table pre-growth, EMFILE handling) apply to any readiness-loop server built on this library; `docs/design.md` lists them.
+
 These are time-boxed M1 spikes that feed the M2/M3 decisions in `design.md`: the threads-vs-processes choice, the `pthread_create` control-plane exception, and the completion-target layout. The code is in `spikes/`. Nothing in `src/` depends on it.
 
 Reproduce everything with one command (it builds into `spikes/out/` and exits non-zero on any failure):

@@ -32,13 +32,14 @@ from .consts import (
     AT_FDCWD,
     AT_NULL,
     AT_PAGESZ,
+    F_DUPFD_CLOEXEC,
     O_CLOEXEC,
     O_RDONLY,
     RLIMIT_NOFILE,
 )
 from .errno import Errno
 from .error import ErrorKind, IoError, check
-from .fd import OwnedFd
+from .fd import AsFd, OwnedFd
 from .nr import (
     SYS_epoll_pwait2,
     SYS_io_uring_setup,
@@ -47,7 +48,7 @@ from .nr import (
     SYS_sched_getaffinity,
     SYS_uname,
 )
-from .sys import close, keep_alive, read
+from .sys import close, fcntl, keep_alive, read
 from .syscall import (
     err_of,
     is_err,
@@ -257,6 +258,37 @@ def raise_nofile_limit(target: UInt64) raises IoError -> UInt64:
         return lim.cur
     set_rlimit(RLIMIT_NOFILE, Rlimit(want, lim.max))
     return want
+
+
+def pregrow_fd_table[F: AsFd](fd: F, max_fds: Int = 65536) -> Int:
+    """Make the kernel allocate a large fd table once, now (best effort).
+
+    The kernel doubles a process's fd table when an fd number reaches its
+    size. In a multi-threaded process, and every Mojo process is one (the
+    runtime starts its worker pool before main), each doubling waits for an
+    RCU grace period. That stalls whatever syscall creates the fd for
+    20-40 ms; under a connection burst it overflows the accept queue
+    (docs/spikes.md). Long-running servers call this once at startup with any
+    open fd (typically the listener).
+
+    It duplicates `fd` to the lowest free number >= min(RLIMIT_NOFILE,
+    `max_fds`) - 1, then closes the copy: the table stays large.
+    F_DUPFD_CLOEXEC never touches an fd that is in use (dup3 would close it).
+    Returns the number that was used, or -1 if nothing was done (limit too
+    small to matter, or the dup failed)."""
+    var limit = 1024
+    try:
+        limit = Int(min(nofile_limit().cur, UInt64(max(max_fds, 0))))
+    except:
+        pass
+    var high = limit - 1
+    if high < 256:
+        return -1
+    var r = fcntl(fd, F_DUPFD_CLOEXEC, high)
+    if r < 0:
+        return -1
+    _ = close(Int32(r))
+    return r
 
 
 # ---- CPUs --------------------------------------------------------------------

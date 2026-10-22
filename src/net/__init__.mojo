@@ -1,11 +1,12 @@
 """Sockets: addresses, socket options (L1), blocking TCP/Unix streams with
 deadlines (L2), and the sans-I/O codec contract. `ByteBuffer` lives in
-`bytes` (re-exported here).
+`bytes` (re-exported here). Coming next: buffered reading, DNS resolution
+and connect-by-name.
 
-Evented connections on the `rt` event loop are in `net.evented`
-(`TcpServer[H]`, `dial[H]`, `ConnHandler`, `Conn`). It is deliberately not
-re-exported here, so blocking users never pull in `rt`; blocking modules and
-codecs must not import `rt`. DNS comes in M3.
+This is a socket library, not an async runtime: a concurrent server drives
+nonblocking sockets from its own readiness loop (`linux.Epoll`). The
+experimental event-loop runtime that used to live here is in the separate
+mojo_rt repository.
 """
 
 from .addr import (

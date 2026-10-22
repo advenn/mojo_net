@@ -6,15 +6,6 @@
 # -D MOJO_TCP_FAULTS=1, which compiles in the syscall fault-injection seam
 # (src/linux/fault.mojo). Every other file runs on the exact production syscalls.
 #
-# Event-loop backends: files named test_*_contract.mojo are built and run
-# twice, once on the real kernel (epoll, the default) and once with
-# -D MOJO_TCP_SIM=1, which selects the in-memory network simulator
-# (src/rt/sim.mojo); each run reports its own line, tagged [epoll] or
-# [-D MOJO_TCP_SIM=1], and counts as one run. Files named test_*_sim.mojo
-# use simulator-only controls (seed, faults, virtual clock) and run only with
-# -D MOJO_TCP_SIM=1. MOJO_TCP_SIM_SEED=<n> reseeds the simulator, to explore
-# or replay a seed.
-#
 # Hangs: each file runs under `timeout` (MOJO_TCP_TEST_TIMEOUT seconds,
 # default 600, then SIGKILL 10 s later), so a test that blocks forever fails
 # with "timed out" instead of hanging the suite. The file name is printed
@@ -73,18 +64,12 @@ run_one() {
   fi
 }
 
-sim=(-D MOJO_TCP_SIM=1)
 while IFS= read -r f; do
   [[ -n "$filter" && "$f" != *"$filter"* ]] && continue
   base="$(basename "$f")"
   if [[ "$base" == test_*_faults.mojo ]]; then
     defines=(-D MOJO_TCP_FAULTS=1)
     run_one "$f" " [${defines[*]}]" mojo run "${defines[@]}" -I src "$f"
-  elif [[ "$base" == test_*_contract.mojo ]]; then
-    run_one "$f [epoll]" "" mojo run -I src "$f"
-    run_one "$f [${sim[*]}]" "" mojo run "${sim[@]}" -I src "$f"
-  elif [[ "$base" == test_*_sim.mojo ]]; then
-    run_one "$f" " [${sim[*]}]" mojo run "${sim[@]}" -I src "$f"
   else
     run_one "$f" "" mojo run -I src "$f"
   fi

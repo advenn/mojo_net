@@ -2,8 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Native Mojo networking for Linux. It is the foundation for a future HTTP library, an HTTP server and database drivers.
-- Architecture, contracts and milestones: `docs/design.md`. Read it before changing `rt` or `net`.
+A native Mojo TCP/socket library for Linux. It is the foundation for a future HTTP library, an HTTP server and database drivers.
+
+**Scope:** this repo is the socket library, not an async runtime. Keep runtime work (event loops, executors, schedulers, io_uring proactors) out of it. The experimental runtime that grew here lives in the separate `mojo_rt` repo; the git tag `runtime-snapshot` marks the last commit that contained it. A concurrent server drives nonblocking sockets from its own readiness loop (`linux.Epoll`, edge-triggered) and runs one process per core with `SO_REUSEPORT` (see `docs/design.md`).
+- Architecture, scope, contracts and milestones: `docs/design.md`. Read it before changing `net`.
 - Measured facts (threads, runtime, callbacks, the 10k-connection epoll spike): `docs/spikes.md`.
 
 ## Commands
@@ -25,24 +27,21 @@ pixi run spikes                    # re-run the M1 spikes
 - Each test file ends with `def main() raises: TestSuite.discover_tests[__functions_in_module()]().run()`; `mojo test` no longer exists.
 - A file fails if it runs 0 tests, because TestSuite exits 0 in that case.
 - Files named `test_*_faults.mojo` (and only those) are built with `-D MOJO_TCP_FAULTS=1`.
-- Files named `test_*_contract.mojo` run twice: on epoll, then on the in-memory simulator (`-D MOJO_TCP_SIM=1`). Files named `test_*_sim.mojo` run on the simulator only. Replay a simulator run with `MOJO_TCP_SIM_SEED=<n>`.
 - Each file has a timeout: `MOJO_TCP_TEST_TIMEOUT`, default 600 s.
 - `MOJO_TCP_REQUIRE_IPV6=1` turns "no IPv6 loopback" skips into failures.
 
 **Test-only Python:** some tests use the pixi env's Python as an oracle (`ipaddress`) or as a peer process. It is never used in `src/`.
 
 ## Layout and rules
-- **Packages:** imports only point downward: `net → rt → bytes → linux`. `linux` imports only `std`. Blocking `net` modules and codecs must not import `rt`.
+- **Packages:** imports only point downward: `net → bytes → linux`. `linux` imports only `std`.
   - `src/linux`: the syscall layer.
-  - `src/rt`: the event-loop runtime (`docs/rt.md`): `core` (Loop + proactor), `driver` (trait), `epoll_driver`, `sim` (simulator), `event_loop`, `timers`, `slab`, `mailbox`.
-  - `src/bytes`: `ByteBuffer`, shared by `rt` and `net`.
+  - `src/bytes`: `ByteBuffer`.
   - `src/net`: sockets.
 - **`net` modules:**
   - `addr`: addresses.
   - `socket`: L1, every socket option, no policy.
   - `blocking`, `tcp`, `unix`: L2 blocking streams. Nonblocking internally: try → EAGAIN → `wait_ready` → retry, with absolute per-direction deadlines.
   - `buffer` / `codec`: `ByteBuffer` (re-exported from `bytes`) and the sans-I/O `Codec` trait.
-  - `evented`: connections on the `rt` loop. `TcpServer[H]`, `dial[H]` and `Dialer[H]` drive a per-connection `ConnHandler` through `Conn`. It provides backpressure, idle timeouts, lingering close and graceful shutdown. It is not re-exported from `net`.
 - **Syscalls:**
   - All of them go through `linux/syscall.mojo` (the only inline asm), via the typed wrappers in `linux/sys.mojo` or module-local wrappers.
   - Never call libc for I/O (`external_call["socket"...]` etc.); `nolibc-check` enforces this.
@@ -79,10 +78,12 @@ pixi run spikes                    # re-run the M1 spikes
 - **Moves:**
   - A move-only element can't be moved out of a `Tuple`, and `var x = s.field^` only works inside a `deinit self` method. So APIs return small structs (`TcpAccepted`, `SocketPair` with `Optional` fields + `take()`) instead of tuples.
   - A list literal of mutable `Span`s over one buffer fails the aliasing check; use `append` or `ImmSpan`.
-- **Function values (critical for `rt`):** a function cannot take its own address, or the address of any function in a reference cycle with it, as a value. `Target(on_recv, ctx)` inside `on_recv` fails with "function instantiation in parameter domain that recursively requires itself". Build every `Target` once, outside the cycle (at registration), store it as data, and re-arm with the stored value. Generic trampolines such as `_dispatch[H]` referenced only from a setup function are fine.
-- **Comptime backend alias:** `comptime Backend: Driver = A if cond else B` has the trait type, so members beyond the trait are invisible through it. Tests reach simulator-only members with `rebind[SimDriver](ev.driver)`.
-- **Loop `ctx` state vs `mut` arguments (critical for `rt`):** if a struct is reached by callbacks through a `ctx` address while a frame that runs the loop also holds it as a `mut` argument, the compiler may cache its fields across `run_once` (`mut` is exclusive) and read stale values. Keep handler state on the heap, or take its address in the function that runs the loop.
-- **Threads: never share a struct through `mut self` (critical).** Mojo treats `mut self` as an exclusive borrow, so the compiler may cache fields or write a stale copy back. A struct mutated through `mut self` on two threads loses updates even when every field access is atomic. An early `rt.mailbox` lost a committed CAS this way under `mojo run`: the producer then spun forever, and the process segfaulted at exit. Put cross-thread state in raw memory (`std.memory.alloc.unsafe_alloc`, `MutUntrackedOrigin` pointers) and touch it only through atomic pointer ops from methods that take `self` immutably, as `rt.mailbox.Sender` does.
+- **Function values:** a function cannot take its own address, or the address of any function in a reference cycle with it, as a value. Storing `on_recv` as a callback inside `on_recv` fails with "function instantiation in parameter domain that recursively requires itself". Build callback values once at setup and store them as data.
+- **`mut` is exclusive:** the compiler may cache a `mut` argument's fields, or write a stale copy back. So:
+  - never mutate a struct through `mut self` from two threads, even with atomic field access. Use raw memory (`std.memory.alloc.unsafe_alloc`, `MutUntrackedOrigin` pointers) and atomic pointer ops from methods that take `self` immutably;
+  - don't hold a struct as a `mut` argument while code reaches it through a raw address.
+  
+  Both bit the experimental runtime (now in `mojo_rt`).
 - **Typed raises:** inside a `try` whose calls raise `IoError`, you can't `raise Error(...)`.
 - **Comptime arrays:** a comptime `Array` of non-`ImplicitlyCopyable` values can't be indexed at runtime; use if-chains.
 - **FFI:** declare each `external_call` C symbol with exactly one signature (spike-only code). A C-callable fn pointer is spelled `def(OpaquePointer[MutAnyOrigin]) thin abi("C") -> OpaquePointer[MutAnyOrigin]`, and function-typed parameters are spelled `def(T) thin -> R`.
@@ -90,6 +91,6 @@ pixi run spikes                    # re-run the M1 spikes
   - `String.splitlines()` also splits on `\t` (verified on 1.2.0rc2); use `split("\n")`. This matters for HTTP parsing.
   - `TestSuite.run()` rejects unknown argv, and its times are in milliseconds.
   - Memory copies are spelled `unsafe_memcpy` / `unsafe_memmove`.
-- **Runtime threads:** every Mojo process starts 1 + (CPUs in its affinity mask) runtime threads before `main`. Because a process is always multi-threaded, each kernel fd-table doubling stalls the fd-creating syscall for 20–40 ms. Long-running servers must pre-grow the fd table (see `docs/spikes.md`).
+- **Runtime threads:** every Mojo process starts 1 + (CPUs in its affinity mask) runtime threads before `main`. Because a process is always multi-threaded, each kernel fd-table doubling stalls the fd-creating syscall for 20–40 ms. Long-running servers must pre-grow the fd table with `linux.probe.pregrow_fd_table(listener)` (see `docs/spikes.md`).
 - **`assert_equal`** needs identical types (`Int(buf[i])` vs `ord("x")`).
 - **Spellings to use:** `def` only (no `fn`), `comptime` (no `alias`), `Self.T` for struct parameters, `std.` import prefix, `@inline(.always)`, and `Layout[T](count=n)` (not the nightly-only `length=`).

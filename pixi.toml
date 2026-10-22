@@ -4,7 +4,7 @@ channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "mojo_tcp"
 platforms = ["linux-64", "linux-aarch64"]
 version = "0.1.0"
-description = "Native Mojo networking for Linux: raw-syscall layer (linux), event-loop runtime (rt), sockets (net)."
+description = "Native Mojo TCP/socket library for Linux: raw-syscall layer (linux), byte buffers (bytes), sockets (net)."
 
 [tasks]
 # Run all tests, or those whose path contains the given filter: `pixi run test net/`.

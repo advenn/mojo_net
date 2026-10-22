@@ -4,10 +4,8 @@
 build/
 spikes/out/
 spikes/epoll_echo/tokio_echo/target/
-# Benchmark/spike outputs: binaries and cargo target dirs are rebuilt by
-# bench/run.sh and spikes/epoll_echo/run.sh; only the saved result JSONs
-# (cited by bench/README.md and docs/spikes.md) are kept.
-bench/out/*
-!bench/out/*.json
+# Spike outputs: binaries and cargo target dirs are rebuilt by
+# spikes/epoll_echo/run.sh; only the saved result JSONs (cited by
+# docs/spikes.md) are kept.
 spikes/epoll_echo/out/*
 !spikes/epoll_echo/out/*.json

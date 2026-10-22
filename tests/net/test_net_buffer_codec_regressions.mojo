@@ -387,10 +387,16 @@ def test_design_contract_1_describes_the_codec_trait() raises:
     """The design doc used to promise `feed(bytes) -> events` and
     `poll_transmit() -> owned buffers`, which is not the trait."""
     var doc = open("docs/design.md", "r").read()
+    # Contract 1 is its numbered line plus the indented lines under it.
     var line = String()
+    var inside = False
     for l in doc.split("\n"):
         if l.startswith("1. **Sans-I/O protocols.**"):
-            line = String(l)
+            inside = True
+        elif inside and not l.startswith(" "):
+            inside = False
+        if inside:
+            line += String(l) + "\n"
     assert_true(line.byte_length() > 0)
     for name in [
         "feed(",
