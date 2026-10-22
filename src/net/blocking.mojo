@@ -64,6 +64,7 @@ from linux.consts import (
     POLLHUP,
     POLLIN,
     POLLOUT,
+    POLLRDHUP,
     SOCK_CLOEXEC,
     SOCK_NONBLOCK,
 )
@@ -100,13 +101,22 @@ struct _Waiter(Movable):
 
     var events: Int16
     var hup_errno: Errno
+    var rdhup_ends: Bool
     var rev: Int16
     var woke: Bool
     var edge: Optional[Epoll]
 
-    def __init__(out self, events: Int, hup_errno: Errno):
-        self.events = Int16(events)
+    def __init__(
+        out self, events: Int, hup_errno: Errno, rdhup_ends: Bool = False
+    ):
+        """`rdhup_ends`: a wakeup with POLLRDHUP that lets nothing progress
+        ends the operation like POLLHUP. Datagram receives need it: after
+        shutdown(SHUT_RD) a UDP socket polls readable forever while a
+        nonblocking recv keeps saying EAGAIN (a blocking one would return
+        0)."""
+        self.events = Int16(events | (POLLRDHUP if rdhup_ends else 0))
         self.hup_errno = hup_errno
+        self.rdhup_ends = rdhup_ends
         self.rev = 0
         self.woke = False
         self.edge = None
@@ -125,7 +135,9 @@ struct _Waiter(Movable):
         if self.woke:
             # The previous wakeup let nothing progress.
             var rev = Int(self.rev)
-            if (rev & POLLHUP) != 0:
+            if (rev & POLLHUP) != 0 or (
+                self.rdhup_ends and (rev & POLLRDHUP) != 0
+            ):
                 raise IoError.from_errno(op, self.hup_errno)
             if deadline.is_expired():
                 raise IoError.of_kind(op, ErrorKind.TimedOut)

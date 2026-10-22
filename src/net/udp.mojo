@@ -31,6 +31,9 @@ Two modes:
   instead of EAGAIN. The socket is always O_NONBLOCK; register it with
   `linux.Epoll` and drain until None after each edge.
 
+`shutdown_read()` wakes receivers: blocking receives then never wait (they
+return what is queued or raise `NotConnected`).
+
 Connected sockets (`connect`): the kernel fixes the destination, drops
 datagrams from any other sender, and reports ICMP errors. After a "port
 unreachable" the next send or receive raises `ConnectionRefused`. An
@@ -54,7 +57,17 @@ from std.sys import size_of
 
 from linux import AsFd, Errno, ErrorKind, IoError, sys
 from linux.abi import Iovec, Mmsghdr, Msghdr, SockaddrStorage
-from linux.consts import IOV_MAX, MSG_NOSIGNAL, MSG_PEEK, MSG_TRUNC, POLLIN, POLLOUT
+from linux.consts import (
+    IOV_MAX,
+    IPPROTO_UDP,
+    IPPROTO_UDPLITE,
+    MSG_NOSIGNAL,
+    MSG_PEEK,
+    MSG_TRUNC,
+    POLLIN,
+    POLLOUT,
+    SHUT_RD,
+)
 from linux.syscall import err_of
 from linux.time import Deadline, Duration
 
@@ -111,7 +124,7 @@ def _recv(
     op: StaticString,
 ) raises IoError -> Datagram:
     """One recvfrom(MSG_TRUNC | `flags`) that waits up to `deadline`."""
-    var w = _Waiter(POLLIN, Errno.ENOTCONN)
+    var w = _Waiter(POLLIN, Errno.ENOTCONN, rdhup_ends=True)
     while True:
         var raw = RawSockaddr()
         var r = sys.recvfrom(sock, buf, flags | MSG_TRUNC, raw.storage, raw.len)
@@ -202,9 +215,10 @@ struct DatagramBatch(Movable, Sized):
     Receiving replaces the contents: datagram `i` is `payload(i)` (what was
     stored), `datagram(i)` (`len`, `size`, `sender`; `size > len` when it
     was truncated). Sending: `push` copies each datagram in (with its
-    destination, or none for a connected socket); a send moves the ones not
-    sent yet, and `sent()` counts the progress, also after an error.
-    `clear` empties it for reuse."""
+    destination, or none for a connected socket); a send moves the pending
+    ones, `sent()` counts the progress, also after an error, and `skip()`
+    gives up on a datagram that keeps failing. `clear` empties it for
+    reuse."""
 
     var _slot: Int
     var _data: List[UInt8]
@@ -215,6 +229,8 @@ struct DatagramBatch(Movable, Sized):
     var _iov: List[Iovec]
     var _hdrs: List[Mmsghdr]
     var _count: Int
+    var _next: Int
+    """Index of the next datagram to send."""
     var _sent: Int
 
     def __init__(out self, capacity: Int, max_datagram: Int = 2048) raises IoError:
@@ -236,6 +252,7 @@ struct DatagramBatch(Movable, Sized):
             self._iov.append(Iovec(0, 0))
             self._hdrs.append(Mmsghdr(Msghdr(0, 0, 0, 0, 0, 0, 0), 0))
         self._count = 0
+        self._next = 0
         self._sent = 0
 
     @inline(.always)
@@ -257,8 +274,23 @@ struct DatagramBatch(Movable, Sized):
         return self._sent
 
     @inline(.always)
+    def pending(self) -> Int:
+        """How many pushed datagrams are still to send (after an error,
+        the failing one comes first)."""
+        return self._count - self._next
+
+    def skip(mut self) raises IoError:
+        """Give up on the next datagram to send (the one a send just failed
+        on), so the next `send_batch` goes on with the rest. `InvalidInput`
+        when nothing is pending."""
+        if self._next >= self._count:
+            raise IoError.of_kind("DatagramBatch.skip", ErrorKind.InvalidInput)
+        self._next += 1
+
+    @inline(.always)
     def clear(mut self):
         self._count = 0
+        self._next = 0
         self._sent = 0
 
     def payload(self, i: Int) raises IoError -> Span[UInt8, origin_of(self._data)]:
@@ -330,6 +362,7 @@ struct DatagramBatch(Movable, Sized):
     def _recv(mut self, sock: Socket) -> Int:
         """One recvmmsg into every slot: datagrams received, or -errno."""
         self._count = 0
+        self._next = 0
         self._sent = 0
         var cap = self.capacity()
         for i in range(cap):
@@ -348,10 +381,10 @@ struct DatagramBatch(Movable, Sized):
     def _send(mut self, sock: Socket) -> Int:
         """One sendmmsg of the datagrams not sent yet: how many it sent, or
         -errno."""
-        for i in range(self._sent, self._count):
+        for i in range(self._next, self._count):
             self._header(i, self._lens[i], self._namelens[i])
         return sys.sendmmsg(
-            sock, Span(self._hdrs)[self._sent : self._count], MSG_NOSIGNAL
+            sock, Span(self._hdrs)[self._next : self._count], MSG_NOSIGNAL
         )
 
 
@@ -404,9 +437,10 @@ struct UdpSocket(AsFd, Movable, Writable):
 
     @staticmethod
     def from_socket(var sock: Socket) raises IoError -> UdpSocket:
-        """Adopt an AF_INET/AF_INET6 SOCK_DGRAM socket (socket activation, a
-        tuned L1 socket), else `InvalidInput` (op "UdpSocket.from_socket";
-        the socket is closed). Sets FD_CLOEXEC and O_NONBLOCK."""
+        """Adopt an AF_INET/AF_INET6 SOCK_DGRAM UDP (or UDP-Lite) socket
+        (socket activation, a tuned L1 socket), else `InvalidInput` (op
+        "UdpSocket.from_socket"; the socket is closed). Sets FD_CLOEXEC and
+        O_NONBLOCK."""
         comptime op = "UdpSocket.from_socket"
         var ok: Bool
         try:
@@ -414,6 +448,10 @@ struct UdpSocket(AsFd, Movable, Writable):
             ok = (d == Domain.IPV4 or d == Domain.IPV6) and (
                 sock.socket_type() == SockType.DGRAM
             )
+            # Other datagram protocols (ICMP "ping" sockets, ...) ignore
+            # MSG_TRUNC, which would make truncation silent.
+            var proto = sock.protocol().value
+            ok = ok and (proto == IPPROTO_UDP or proto == IPPROTO_UDPLITE)
         except e:
             if e.errno == Errno.ENOTSOCK:
                 raise IoError(ErrorKind.InvalidInput, e.errno, op)
@@ -595,6 +633,19 @@ struct UdpSocket(AsFd, Movable, Writable):
         """`peek_from` without waiting."""
         return _try_recv(self._sock, buf, MSG_PEEK, "peek_from")
 
+    def shutdown_read(self) raises IoError:
+        """Stop blocking receives on this socket and every handle of it:
+        once nothing is queued they raise `NotConnected` instead of waiting
+        (datagrams that arrive later are still queued and readable). This
+        is how one thread wakes another that is blocked in `recv_from` on a
+        `try_clone` of the socket. Linux applies it on an unconnected socket
+        too while reporting ENOTCONN, which is therefore not raised."""
+        var r = sys.shutdown(self._sock, SHUT_RD)
+        if r < 0:
+            var e = Errno(err_of(r))
+            if e != Errno.ENOTCONN:
+                raise IoError.from_errno("shutdown", e)
+
     # ---- options and addresses -----------------------------------------------
 
     def set_broadcast(self, on: Bool) raises IoError:
@@ -610,7 +661,7 @@ struct UdpSocket(AsFd, Movable, Writable):
         """Wait (up to the read deadline) for a datagram, then take it and
         every other queued one, up to `batch.capacity()`, in one recvmmsg.
         Returns how many (at least 1); they replace the batch's contents."""
-        var w = _Waiter(POLLIN, Errno.ENOTCONN)
+        var w = _Waiter(POLLIN, Errno.ENOTCONN, rdhup_ends=True)
         while True:
             var r = batch._recv(self._sock)
             if r >= 0:
@@ -636,15 +687,22 @@ struct UdpSocket(AsFd, Movable, Writable):
                 raise IoError.from_errno("recv_batch", e)
 
     def send_batch(self, mut batch: DatagramBatch) raises IoError -> Int:
-        """Send every pushed datagram not sent yet, in as few sendmmsg calls
-        as the kernel allows, waiting (up to the write deadline) for buffer
-        space; returns `len(batch)`. A datagram that fails (EMSGSIZE, a
-        refusal on a connected socket) raises; `batch.sent()` says how many
-        went out before it."""
+        """Send every pending datagram, in as few sendmmsg calls as the
+        kernel allows, waiting (up to the write deadline) for buffer space;
+        returns `batch.sent()`.
+
+        A datagram that fails (EMSGSIZE, an unreachable or wrong-family
+        destination, a broadcast without SO_BROADCAST) raises: `sent()`
+        counts what went out, `pending()` what is left with the failing one
+        first, and `skip()` drops it so that calling again sends the rest.
+        An ICMP refusal on a connected socket is different: sendmmsg
+        reports the datagrams it sent and drops that error, so it usually
+        shows up on the next receive rather than here."""
         var w = _Waiter(POLLOUT, Errno.EPIPE)
-        while batch._sent < batch._count:
+        while batch._next < batch._count:
             var r = batch._send(self._sock)
             if r >= 0:
+                batch._next += r
                 batch._sent += r
                 w.progressed()
                 continue
@@ -657,10 +715,12 @@ struct UdpSocket(AsFd, Movable, Writable):
 
     def try_send_batch(self, mut batch: DatagramBatch) raises IoError -> Int:
         """Send what fits without waiting; returns `batch.sent()` (call
-        again when writable until it equals `len(batch)`)."""
-        while batch._sent < batch._count:
+        again when writable while `batch.pending()` is not 0). Errors as for
+        `send_batch`."""
+        while batch._next < batch._count:
             var r = batch._send(self._sock)
             if r >= 0:
+                batch._next += r
                 batch._sent += r
                 continue
             var e = Errno(err_of(r))

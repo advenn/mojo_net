@@ -24,6 +24,9 @@ comptime IPPROTO_IP: Int = 0
 comptime IPPROTO_IPV6: Int = 41
 comptime IPPROTO_TCP: Int = 6
 comptime IPPROTO_UDP: Int = 17
+comptime IPPROTO_UDPLITE: Int = 136
+comptime IPPROTO_ICMP: Int = 1
+comptime IPPROTO_ICMPV6: Int = 58
 
 # SOL_SOCKET options
 comptime SO_REUSEADDR: Int = 2

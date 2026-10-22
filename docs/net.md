@@ -116,7 +116,7 @@ These names and their documented behavior are stable for v1.
 | Framing | `BufReader[S: Read]` (the `Read` trait): `stream`, `into_parts`, `buffer`, `consume`, `capacity`, `max_size`, `fill`, `fill_until`, `read_until`, `read_line`, `read_exact`, `read` |
 | Resolution | `Resolver` (`system`, `lookup_ip`, `start`), `Lookup`, `net.resolv.ResolvConf` / `Hosts` / `search_names`; the `net.dns` message helpers |
 | Errors | `IoError{kind, errno, op}`: the kinds under "Using the client" |
-| UDP (M3, stable with this release) | `UdpSocket`: `bind`, `bind_reuseport`, `connect_host` / `connect_host_deadline`, `connect`, `from_socket`, `into_socket`, `try_clone`, `close`; `send_to`, `send`, `recv_from`, `recv`, `peek_from` and their `try_*` forms; `recv_batch` / `try_recv_batch` / `send_batch` / `try_send_batch`; deadlines; `set_broadcast`; multicast `join_*` / `leave_*` / `set_multicast_*`; `Datagram`, `DatagramBatch` |
+| UDP (M3, stable with this release) | `UdpSocket`: `bind`, `bind_reuseport`, `connect_host` / `connect_host_deadline`, `connect`, `from_socket`, `into_socket`, `try_clone`, `shutdown_read`, `close`; `send_to`, `send`, `recv_from`, `recv`, `peek_from` and their `try_*` forms; `recv_batch` / `try_recv_batch` / `send_batch` / `try_send_batch`; deadlines; `set_broadcast`; multicast `join_*` / `leave_*` / `set_multicast_*`; `Datagram`, `DatagramBatch` |
 
 ## L2 blocking contract (as built in M1)
 - **Nonblocking internally.** Every op is: try once → on EAGAIN `wait_ready` (ppoll) → retry. EINTR retries.
@@ -207,10 +207,17 @@ These names and their documented behavior are stable for v1.
   3. **Batched I/O.** Done.
      - `DatagramBatch` with `recv_batch` / `send_batch` and their `try_*` forms: one `recvmmsg` / `sendmmsg` for up to 1024 datagrams.
      - The batch owns every buffer and header, so a call allocates nothing.
-     - Truncation is reported per datagram; `sent()` tracks progress, also after an error.
+     - Truncation is reported per datagram; `sent()` tracks progress, also after an error, and `skip()` moves past a datagram that keeps failing.
+     - On a connected socket, `sendmmsg` absorbs ICMP refusals that arrive during a batch; they surface on the next receive.
      - Measured on loopback (a loaded 4-core host, 64-byte datagrams, batches of 64): 13–20% faster end to end. On loopback the kernel's per-datagram work dominates (~2 µs: the send also runs the receive path). Batching saves only the syscall overhead (~120–250 ns per datagram), and its gain is larger on real NICs.
      - **Later:** UDP GSO/GRO (`UDP_SEGMENT`, `UDP_GRO`, one route lookup for many segments) is the next throughput lever.
   4. **Examples, docs, API.** Done.
+     - An independent review found 5 issues, all fixed with regression tests (`tests/net/test_net_udp_regressions.mojo`):
+       - a spin in blocking receives after `shutdown(READ)`, which now raise `NotConnected`; `shutdown_read()` wakes blocked receivers;
+       - `skip()` for a stuck batch;
+       - the batch-refusal docs;
+       - `from_socket` accepting non-UDP datagram sockets;
+       - the ping example's address fail-over.
      - `examples/net/udp_echo.mojo`: blocking, or an epoll loop with batches.
      - `examples/net/udp_ping.mojo`: by name, RTT and loss.
      - `UdpSocket.connect_host`, the guide above, and the UDP rows of the API table.
