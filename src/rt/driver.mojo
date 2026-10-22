@@ -35,7 +35,7 @@ struct ReadyEvent(TrivialRegisterPassable, Writable):
         writer.write("ReadyEvent(", self.token, ", ", self.events, ")")
 
 
-trait Driver(Movable):
+trait Driver(Deinitable, Movable):
     @staticmethod
     def create() raises IoError -> Self:
         ...

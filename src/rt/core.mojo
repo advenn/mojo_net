@@ -23,6 +23,7 @@ See docs/rt.md for the op table; tests/rt/test_loop_contract.mojo checks
 every rule on every backend.
 """
 
+from std.memory.alloc import unsafe_alloc
 from std.sys import size_of
 
 from bytes.buffer import ByteBuffer
@@ -74,6 +75,8 @@ struct OpKind(Equatable, TrivialRegisterPassable, Writable):
     comptime CANCEL = OpKind(9)
     comptime _RESUME_ACCEPT = OpKind(10)
     """Internal: re-enable an accept paused by fd exhaustion."""
+    comptime RECV_MULTI = OpKind(11)
+    """Internal: re-enable an accept paused by fd exhaustion."""
 
     @inline(.always)
     def __eq__(self, other: Self) -> Bool:
@@ -98,6 +101,8 @@ struct OpKind(Equatable, TrivialRegisterPassable, Writable):
             return "close"
         if self.v == 8:
             return "timeout"
+        if self.v == 11:
+            return "recv_multi"
         if self.v == 9:
             return "cancel"
         return "internal"
@@ -127,7 +132,8 @@ struct Completion(Movable, Writable):
     is `-errno` (`-ECANCELED` when canceled). `more` means a multishot op
     (accept) will complete again. `fd` is the connection an accept, listen or
     connect produced (owned by the loop). `buf` is the received data, or the
-    (consumed) buffer a send hands back."""
+    (consumed) buffer a send hands back; an empty `ByteBuffer()` (no storage)
+    otherwise. Move it out with `take_buf()`."""
 
     var op: OpId
     var kind: OpKind
@@ -135,7 +141,8 @@ struct Completion(Movable, Writable):
     var res: Int
     var more: Bool
     var fd: FdId
-    var buf: Optional[ByteBuffer]
+    var buf: ByteBuffer
+    var _has_buf: Bool
     var _target: Target
 
     def __init__(
@@ -146,7 +153,8 @@ struct Completion(Movable, Writable):
         res: Int,
         more: Bool,
         fd: FdId,
-        var buf: Optional[ByteBuffer],
+        var buf: ByteBuffer,
+        has_buf: Bool,
         target: Target,
     ):
         self.op = op
@@ -156,6 +164,7 @@ struct Completion(Movable, Writable):
         self.more = more
         self.fd = fd
         self.buf = buf^
+        self._has_buf = has_buf
         self._target = target
 
     @inline(.always)
@@ -169,6 +178,20 @@ struct Completion(Movable, Writable):
     @inline(.always)
     def canceled(self) -> Bool:
         return self.res == -Int(Errno.ECANCELED.value)
+
+    @inline(.always)
+    def has_buf(self) -> Bool:
+        """True if the completion carries a buffer: recv data, or the buffer
+        a send hands back (even an empty one)."""
+        return self._has_buf
+
+    @inline(.always)
+    def take_buf(mut self) -> ByteBuffer:
+        """Move the buffer out, leaving an empty one (no storage) behind."""
+        var b = ByteBuffer()
+        swap(b, self.buf)
+        self._has_buf = False
+        return b^
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write("Completion(", self.kind, " ", self.op, " res=")
@@ -186,7 +209,8 @@ struct Op(Movable):
     var target: Target
     var tag: UInt64
     var fd: FdId
-    var buf: Optional[ByteBuffer]
+    var buf: ByteBuffer
+    """SEND: the buffer being written (empty, no storage, for other ops)."""
     var addr: List[RawSockaddr]
     """LISTEN/CONNECT target (empty otherwise): out of line, so the 136-byte
     sockaddr does not bloat every op record."""
@@ -199,7 +223,7 @@ struct Op(Movable):
         self.target = target
         self.tag = tag
         self.fd = fd
-        self.buf = None
+        self.buf = ByteBuffer()
         self.addr = []
         self.arg = 0
 
@@ -214,6 +238,10 @@ struct FdEntry(Movable):
     var accept_op: OpId
     var recv_op: OpId
     var connect_op: OpId
+    var recv_multi: Bool
+    """`recv_op` is multishot (completes with `more=True` per chunk)."""
+    var recv_paused: Bool
+    """Reading is paused (`pause_recv`): the multishot recv stays armed."""
     var sends: List[OpId]
     var addr: List[RawSockaddr]
     """Out of line (empty for most fds): the peer of an accepted/connected
@@ -232,6 +260,8 @@ struct FdEntry(Movable):
         self.accept_op = OpId.null()
         self.recv_op = OpId.null()
         self.connect_op = OpId.null()
+        self.recv_multi = False
+        self.recv_paused = False
         self.sends = []
         self.addr = []
         self.addr_is_local = False
@@ -247,6 +277,59 @@ def _is(res: Int, e: Errno) -> Bool:
     return res == -Int(e.value)
 
 
+struct _CompletionRing(Movable, Sized):
+    """FIFO of completions in raw memory: push at the tail, pop at the head,
+    no per-batch swap/reverse and no reallocation once warm. Grows by
+    doubling (moving the queued elements in order)."""
+
+    var _buf: Pointer[Completion, MutUntrackedOrigin]
+    var _cap: Int
+    var _head: Int
+    var _len: Int
+
+    def __init__(out self, capacity: Int = 1024):
+        self._cap = capacity
+        self._buf = unsafe_alloc[Completion](capacity)
+        self._head = 0
+        self._len = 0
+
+    def __deinit__(deinit self):
+        for i in range(self._len):
+            _ = self._buf.unsafe_offset((self._head + i) & (self._cap - 1)).unsafe_take_pointee()
+        self._buf.unsafe_free()
+
+    @inline(.always)
+    def __len__(self) -> Int:
+        return self._len
+
+    def _grow(mut self):
+        var cap = self._cap * 2
+        var nb = unsafe_alloc[Completion](cap)
+        for i in range(self._len):
+            nb.unsafe_offset(i).unsafe_write(
+                self._buf.unsafe_offset((self._head + i) & (self._cap - 1)).unsafe_take_pointee()
+            )
+        self._buf.unsafe_free()
+        self._buf = nb
+        self._cap = cap
+        self._head = 0
+
+    @inline(.always)
+    def push(mut self, var c: Completion):
+        if self._len == self._cap:
+            self._grow()
+        self._buf.unsafe_offset((self._head + self._len) & (self._cap - 1)).unsafe_write(c^)
+        self._len += 1
+
+    @inline(.always)
+    def pop(mut self) -> Completion:
+        debug_assert(self._len > 0, "pop from empty completion queue")
+        var c = self._buf.unsafe_offset(self._head).unsafe_take_pointee()
+        self._head = (self._head + 1) & (self._cap - 1)
+        self._len -= 1
+        return c^
+
+
 struct Loop(Movable):
     """Backend-independent loop state. Submit ops with the methods below;
     every op completes exactly once through its `Target`."""
@@ -254,7 +337,7 @@ struct Loop(Movable):
     var _ops: Slab[Op]
     var _fds: Slab[FdEntry]
     var _submitted: List[OpId]
-    var _ready: List[Completion]
+    var _ready: _CompletionRing
     var _rescan: List[FdId]
     var _paused: List[FdId]
     """Listeners whose accepting is paused by fd exhaustion (so a close
@@ -273,7 +356,7 @@ struct Loop(Movable):
         self._ops = Slab[Op]()
         self._fds = Slab[FdEntry]()
         self._submitted = []
-        self._ready = []
+        self._ready = _CompletionRing()
         self._rescan = []
         self._paused = []
         self._timers = TimerHeap()
@@ -400,6 +483,31 @@ struct Loop(Movable):
         back with `recycle`), or res 0 at EOF. One recv per fd at a time."""
         return self._submit(Op(OpKind.RECV, target, tag, fd))
 
+    def recv_multi(mut self, fd: FdId, target: Target, tag: UInt64 = 0) -> OpId:
+        """Multishot receive: one completion per chunk of data (`more=True`,
+        `c.buf`, at most RECV_CHUNK bytes) for as long as it stays armed,
+        then one final completion: res 0 at EOF, -errno on error, ECANCELED
+        when canceled or the fd closes. Costs no op submission per chunk.
+        Use `pause_recv` / `resume_recv` for backpressure. It occupies the
+        fd's single receive slot (a plain `recv` meanwhile gets EBUSY)."""
+        return self._submit(Op(OpKind.RECV_MULTI, target, tag, fd))
+
+    def pause_recv(mut self, fd: FdId):
+        """Stop reading `fd` (no more recv completions are produced; ones
+        already queued are still delivered). Takes effect at once."""
+        if self._fds.contains(fd):
+            self._fds.unsafe_ptr(fd)[].recv_paused = True
+
+    def resume_recv(mut self, fd: FdId):
+        """Undo `pause_recv`; buffered data is read on the next turn."""
+        if not self._fds.contains(fd):
+            return
+        var e = self._fds.unsafe_ptr(fd)
+        if e[].recv_paused:
+            e[].recv_paused = False
+            if not e[].recv_op.is_null() and (e[].readable or e[].read_closed):
+                self._rescan.append(fd)
+
     def send(
         mut self, fd: FdId, var buf: ByteBuffer, target: Target, tag: UInt64 = 0
     ) -> OpId:
@@ -408,7 +516,7 @@ struct Loop(Movable):
         that fails or is canceled also hands its buffer back; its readable
         bytes are the part that was not sent."""
         var op = Op(OpKind.SEND, target, tag, fd)
-        op.buf = Optional(buf^)
+        op.buf = buf^
         return self._submit(op^)
 
     def shutdown(
@@ -461,32 +569,53 @@ struct Loop(Movable):
     ):
         """Queue the completion of op `id`; a final one removes the op.
         `c.fd` is `fd` when given (accept/listen/connect results), else the
-        fd the op ran on."""
+        fd the op ran on. A final completion carries the op's buffer."""
         if more:
-            ref op = self._ops[id]
-            var cfd = fd if not fd.is_null() else op.fd
-            self._ready.append(
-                Completion(id, op.kind, op.tag, res, True, cfd, None, op.target)
+            var op = self._ops.unsafe_ptr(id)
+            var cfd = fd if not fd.is_null() else op[].fd
+            self._ready.push(
+                Completion(id, op[].kind, op[].tag, res, True, cfd, ByteBuffer(), False, op[].target)
             )
             return
         var op = self._ops.remove(id)
         var cfd = fd if not fd.is_null() else op.fd
-        var buf = op.buf.take() if op.buf else Optional[ByteBuffer](None)
-        self._ready.append(
-            Completion(id, op.kind, op.tag, res, False, cfd, buf^, op.target)
+        var buf = ByteBuffer()
+        swap(buf, op.buf)
+        var has = op.kind == OpKind.SEND
+        self._ready.push(
+            Completion(id, op.kind, op.tag, res, False, cfd, buf^, has, op.target)
         )
 
     def _complete_with_buf(mut self, id: OpId, res: Int, var buf: ByteBuffer):
         var op = self._ops.remove(id)
-        self._ready.append(
-            Completion(id, op.kind, op.tag, res, False, op.fd, Optional(buf^), op.target)
+        self._ready.push(
+            Completion(id, op.kind, op.tag, res, False, op.fd, buf^, True, op.target)
         )
 
+    def _complete_more_with_buf(mut self, id: OpId, res: Int, var buf: ByteBuffer):
+        """A non-final (multishot) completion carrying data; the op stays."""
+        var op = self._ops.unsafe_ptr(id)
+        self._ready.push(
+            Completion(id, op[].kind, op[].tag, res, True, op[].fd, buf^, True, op[].target)
+        )
+
+    @inline(.always)
+    def ready_len(self) -> Int:
+        """Completions queued for dispatch."""
+        return len(self._ready)
+
+    @inline(.always)
+    def pop_ready(mut self) -> Completion:
+        """The oldest queued completion (requires `ready_len() > 0`); for the
+        dispatcher. Completions queued meanwhile go to the tail."""
+        return self._ready.pop()
+
     def take_ready(mut self) -> List[Completion]:
-        """The queued completions, oldest LAST (pop() order); for the
-        dispatcher. New completions queue into a fresh list."""
-        var batch = List[Completion]()
-        swap(batch, self._ready)
+        """Every queued completion, oldest LAST (pop() order). Kept for
+        callers that drain in batches; the dispatcher uses `pop_ready`."""
+        var batch = List[Completion](capacity=len(self._ready))
+        while len(self._ready) > 0:
+            batch.append(self._ready.pop())
         batch.reverse()
         return batch^
 
@@ -505,10 +634,10 @@ struct Loop(Movable):
         var batch = List[OpId]()
         swap(batch, self._submitted)
         for i in range(len(batch)):
-            var id = batch[i]
+            var id = batch.unsafe_get(i)
             if not self._ops.contains(id):
                 continue  # canceled before it started
-            var kind = self._ops[id].kind
+            var kind = self._ops.unsafe_ptr(id)[].kind
             if kind == OpKind.POST:
                 self._complete(id, 0)
             elif kind == OpKind.LISTEN:
@@ -517,7 +646,7 @@ struct Loop(Movable):
                 self._start_connect(d, id)
             elif kind == OpKind.ACCEPT:
                 self._start_accept(d, id)
-            elif kind == OpKind.RECV:
+            elif kind == OpKind.RECV or kind == OpKind.RECV_MULTI:
                 self._start_recv(d, id)
             elif kind == OpKind.SEND:
                 self._start_send(d, id)
@@ -753,61 +882,73 @@ struct Loop(Movable):
     # ---- recv ----------------------------------------------------------------
 
     def _start_recv[D: Driver](mut self, mut d: D, id: OpId):
-        var fd = self._ops[id].fd
+        var fd = self._ops.unsafe_ptr(id)[].fd
         if not self._fds.contains(fd):
             self._complete(id, _neg(Errno.EBADF))
             return
-        if not self._fds[fd].recv_op.is_null():
+        var e = self._fds.unsafe_ptr(fd)
+        if not e[].recv_op.is_null():
             self._complete(id, _neg(Errno.EBUSY))
             return
-        self._fds[fd].recv_op = id
+        e[].recv_op = id
+        e[].recv_multi = self._ops.unsafe_ptr(id)[].kind == OpKind.RECV_MULTI
         self._do_recv(d, fd)
 
     def _do_recv[D: Driver](mut self, mut d: D, fd: FdId):
-        ref e = self._fds[fd]
-        if e.recv_op.is_null() or not (e.readable or e.read_closed):
+        # `e` stays valid for the whole call: nothing here removes the fd.
+        var e = self._fds.unsafe_ptr(fd)
+        if e[].recv_op.is_null() or not (e[].readable or e[].read_closed):
+            return
+        if e[].recv_paused:
             return
         var buf = self.take_buffer()
         while True:
-            try:
-                buf.ensure_writable(RECV_CHUNK)
-            except:
-                pass
+            if buf.writable() < RECV_CHUNK:
+                try:
+                    buf.ensure_writable(RECV_CHUNK)
+                except:
+                    pass
             var room = buf.writable()
             if room == 0:
                 # A zero-length recv returns 0, which would read as EOF.
-                var id0 = self._fds[fd].recv_op
-                self._fds[fd].recv_op = OpId.null()
+                var id0 = e[].recv_op
+                e[].recv_op = OpId.null()
                 self._complete(id0, _neg(Errno.ENOMEM))
                 return
-            var r = d.recv(self._fds[fd].raw, buf)
+            var r = d.recv(e[].raw, buf)
             if r > 0:
-                ref e2 = self._fds[fd]
-                if r < room and not e2.read_closed:
-                    e2.readable = False  # short read: drained (edge rearmed)
-                var id = e2.recv_op
-                e2.recv_op = OpId.null()
+                if r < room and not e[].read_closed:
+                    e[].readable = False  # short read: drained (edge rearmed)
+                var id = e[].recv_op
+                if e[].recv_multi:
+                    # Stays armed. A full chunk may mean more is queued: go on
+                    # next turn (fairness, and no unbounded read-ahead).
+                    self._complete_more_with_buf(id, r, buf^)
+                    if e[].readable:
+                        self._rescan.append(fd)
+                    return
+                e[].recv_op = OpId.null()
                 self._complete_with_buf(id, r, buf^)
                 return
             if r == 0:
-                ref e3 = self._fds[fd]
                 # EOF is permanent: later receives report it at once instead
                 # of waiting for the RDHUP edge.
-                e3.read_closed = True
-                var id = e3.recv_op
-                e3.recv_op = OpId.null()
+                e[].read_closed = True
+                var id = e[].recv_op
+                e[].recv_op = OpId.null()
+                e[].recv_multi = False
                 self.recycle(buf^)
                 self._complete(id, 0)
                 return
             if _is(r, Errno.EINTR):
                 continue
-            ref e4 = self._fds[fd]
             if _is(r, Errno.EAGAIN):
-                e4.readable = False
+                e[].readable = False
                 self.recycle(buf^)
                 return
-            var id = e4.recv_op
-            e4.recv_op = OpId.null()
+            var id = e[].recv_op
+            e[].recv_op = OpId.null()
+            e[].recv_multi = False
             self.recycle(buf^)
             self._complete(id, r)
             return
@@ -815,12 +956,13 @@ struct Loop(Movable):
     # ---- send ----------------------------------------------------------------
 
     def _start_send[D: Driver](mut self, mut d: D, id: OpId):
-        var fd = self._ops[id].fd
+        var fd = self._ops.unsafe_ptr(id)[].fd
         if not self._fds.contains(fd):
             self._complete(id, _neg(Errno.EBADF))
             return
-        self._fds[fd].sends.append(id)
-        if len(self._fds[fd].sends) == 1:
+        var e = self._fds.unsafe_ptr(fd)
+        e[].sends.append(id)
+        if len(e[].sends) == 1:
             self._do_send(d, fd)
 
     def _start_shutdown[D: Driver](mut self, mut d: D, id: OpId):
@@ -840,36 +982,42 @@ struct Loop(Movable):
         """Make the fd's write queue progress: sends in order, each written
         completely (partial writes resume on the next writable edge), and
         queued write shutdowns once everything before them is out."""
-        while self._fds.contains(fd) and len(self._fds[fd].sends) > 0:
-            var id = self._fds[fd].sends[0]
-            if self._ops[id].kind == OpKind.SHUTDOWN:
-                _ = self._fds[fd].sends.pop(0)
-                self._complete(id, d.shutdown(self._fds[fd].raw, self._ops[id].arg))
+        if not self._fds.contains(fd):
+            return
+        # `e` stays valid for the whole call: nothing here removes the fd.
+        var e = self._fds.unsafe_ptr(fd)
+        while len(e[].sends) > 0:
+            var id = e[].sends.unsafe_get(0)
+            var op = self._ops.unsafe_ptr(id)  # valid until _complete(id)
+            if op[].kind == OpKind.SHUTDOWN:
+                _ = e[].sends.pop(0)
+                self._complete(id, d.shutdown(e[].raw, op[].arg))
                 continue
-            if not self._fds[fd].writable:
+            if not e[].writable:
                 return
-            if self._ops[id].buf.value().readable() == 0:
-                _ = self._fds[fd].sends.pop(0)
-                self._complete(id, self._ops[id].arg)
-                continue
-            var r = d.send(self._fds[fd].raw, self._ops[id].buf.value())
-            if r > 0:
-                try:
-                    self._ops[id].buf.value().consume(r)
-                except:
-                    pass
-                self._ops[id].arg += r
-                if self._ops[id].buf.value().readable() > 0:
-                    self._fds[fd].writable = False  # partial write: full
+            var left = op[].buf.readable()
+            if left > 0:
+                var r = d.send(e[].raw, op[].buf)
+                if r > 0:
+                    try:
+                        op[].buf.consume(r)
+                    except:
+                        pass
+                    op[].arg += r
+                    if r < left:
+                        e[].writable = False  # partial write: socket full
+                        return
+                elif r == 0 or _is(r, Errno.EAGAIN):
+                    e[].writable = False
                     return
-                continue  # loop completes it via the empty-buffer branch
-            if r == 0 or _is(r, Errno.EAGAIN):
-                self._fds[fd].writable = False
-                return
-            if _is(r, Errno.EINTR):
-                continue
-            _ = self._fds[fd].sends.pop(0)
-            self._complete(id, r)
+                elif _is(r, Errno.EINTR):
+                    continue
+                else:
+                    _ = e[].sends.pop(0)
+                    self._complete(id, r)
+                    continue
+            _ = e[].sends.pop(0)
+            self._complete(id, op[].arg)
 
     # ---- cancel --------------------------------------------------------------
 
@@ -889,8 +1037,9 @@ struct Loop(Movable):
             self._note_stale_timer()
         elif self._fds.contains(fd):
             ref e = self._fds[fd]
-            if kind == OpKind.RECV and e.recv_op == target:
+            if (kind == OpKind.RECV or kind == OpKind.RECV_MULTI) and e.recv_op == target:
                 e.recv_op = OpId.null()
+                e.recv_multi = False
             elif kind == OpKind.ACCEPT and e.accept_op == target:
                 e.accept_op = OpId.null()
             elif kind == OpKind.SEND or kind == OpKind.SHUTDOWN:
@@ -927,31 +1076,34 @@ struct Loop(Movable):
         var fd = FdId(ev.token)
         if not self._fds.contains(fd):
             return  # the fd was closed (and maybe reused) since it fired
-        ref e = self._fds[fd]
+        var e = self._fds.unsafe_ptr(fd)
         var bits = ev.events
         if (bits & READ_READY) != 0:
-            e.readable = True
+            e[].readable = True
         if (bits & WRITE_READY) != 0:
-            e.writable = True
+            e[].writable = True
         if (bits & (READ_CLOSED | HANGUP | ERROR)) != 0:
-            e.read_closed = True  # sticky: read on to EOF/EAGAIN from now on
-            e.readable = True
+            e[].read_closed = True  # sticky: read on to EOF/EAGAIN from now on
+            e[].readable = True
         if (bits & (HANGUP | ERROR)) != 0:
-            e.writable = True  # let pending sends observe the error
+            e[].writable = True  # let pending sends observe the error
         self._progress(d, fd)
 
     def _progress[D: Driver](mut self, mut d: D, fd: FdId):
         if not self._fds.contains(fd):
             return
-        if not self._fds[fd].connect_op.is_null():
-            if self._fds[fd].writable:
-                self._finish_connect(d, fd)
+        var e = self._fds.unsafe_ptr(fd)
+        if not e[].connect_op.is_null():
+            if e[].writable:
+                self._finish_connect(d, fd)  # may drop the fd
             return
-        if not self._fds[fd].accept_op.is_null():
+        if not e[].accept_op.is_null():
             self._do_accept(d, fd)
-        if self._fds.contains(fd) and not self._fds[fd].recv_op.is_null():
+        # Neither recv nor send removes the fd, but accept never runs on a
+        # connection, so `e` is still the same entry here.
+        if not e[].recv_op.is_null():
             self._do_recv(d, fd)
-        if self._fds.contains(fd) and len(self._fds[fd].sends) > 0:
+        if len(e[].sends) > 0:
             self._do_send(d, fd)
 
     # ---- timers --------------------------------------------------------------

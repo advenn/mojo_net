@@ -238,13 +238,13 @@ def on_recv(ctx: Int, mut lp: Loop, var c: Completion):
     ref s = _st(ctx)
     if c.res > 0:
         s.msgs += 1
-        _ = lp.send(c.fd, c.buf.take(), s.t_sent)
+        _ = lp.send(c.fd, c.take_buf(), s.t_sent)
         _ = lp.recv(c.fd, s.t_recv)
 
 
 def on_sent(ctx: Int, mut lp: Loop, var c: Completion):
-    if c.buf:
-        lp.recycle(c.buf.take())
+    if c.has_buf():
+        lp.recycle(c.take_buf())
 
 
 # ---- net.evented echo ----------------------------------------------------------

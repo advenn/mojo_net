@@ -81,13 +81,13 @@ def on_recv(ctx: Int, mut lp: Loop, var c: Completion):
     ref s = _st(ctx)
     if c.res > 0:
         s.app[].bytes_in += c.res
-        _ = lp.send(c.fd, c.buf.take(), s.t_sent)
+        _ = lp.send(c.fd, c.take_buf(), s.t_sent)
         _ = lp.recv(c.fd, s.t_recv)
         return
     if c.res < 0 and not c.canceled():
         s.app[].resets += 1
-    if c.buf:
-        lp.recycle(c.buf.take())
+    if c.has_buf():
+        lp.recycle(c.take_buf())
     if not c.canceled():
         _ = lp.close(c.fd, s.t_closed)
 
@@ -96,8 +96,8 @@ def on_sent(ctx: Int, mut lp: Loop, var c: Completion):
     ref s = _st(ctx)
     if c.res > 0:
         s.app[].bytes_out += c.res
-    if c.buf:
-        lp.recycle(c.buf.take())
+    if c.has_buf():
+        lp.recycle(c.take_buf())
 
 
 def on_closed(ctx: Int, mut lp: Loop, var c: Completion):
@@ -155,7 +155,7 @@ def main() raises:
         var local = SocketAddr.from_raw(ev.loop.local_addr(raw.listener).value())
         emit(String("LISTEN ", local, " pid=", getpid(), " nofile_soft=", soft, " server=rt-raw stock_loop=False"))
         ticker.counts = Pointer(to=ev.driver.n).unsafe_origin_cast[MutUntrackedOrigin]()
-        ticker.clock = Pointer(to=ev.clock_reads).unsafe_origin_cast[MutUntrackedOrigin]()
+        ticker.clock = ev.driver.clock_cell()
         ticker.start(ev.loop)
         ev.run()
     sys.keep_alive(ticker)

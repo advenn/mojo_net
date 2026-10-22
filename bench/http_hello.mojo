@@ -142,7 +142,7 @@ def main() raises:
     emit(String("LISTEN ", srv.local_addr().value(), " pid=", getpid(), " server=mojo-http"))
     var ticker = Ticker(stats_ms * 1_000_000, ap, quiet)
     ticker.counts = Pointer(to=ev.driver.n).unsafe_origin_cast[MutUntrackedOrigin]()
-    ticker.clock = Pointer(to=ev.clock_reads).unsafe_origin_cast[MutUntrackedOrigin]()
+    ticker.clock = ev.driver.clock_cell()
     ticker.start(ev.loop)
     ev.run()
     sys.keep_alive(srv)

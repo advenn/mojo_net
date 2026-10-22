@@ -129,7 +129,7 @@ def main() raises:
             ev.run_once(0)
         emit(_listen_line(srv, soft, lim.max, swap_buffers))
         ticker.counts = Pointer(to=ev.driver.n).unsafe_origin_cast[MutUntrackedOrigin]()
-        ticker.clock = Pointer(to=ev.clock_reads).unsafe_origin_cast[MutUntrackedOrigin]()
+        ticker.clock = ev.driver.clock_cell()
         ticker.start(ev.loop)
         ev.run()
         sys.keep_alive(srv)

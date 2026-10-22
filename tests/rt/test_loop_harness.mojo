@@ -129,9 +129,9 @@ def mismatch(data: Span[UInt8, _], seed: Int, start: Int) -> Int:
 
 
 def text_of(c: Completion) -> String:
-    if not c.buf:
+    if not c.has_buf():
         return ""
-    return String(from_utf8_lossy=c.buf.value().readable_span())
+    return String(from_utf8_lossy=c.buf.readable_span())
 
 
 # ---- records -----------------------------------------------------------------
@@ -340,6 +340,13 @@ struct Harness(Movable):
         self._track(id, OpKind.RECV, tag, fd.raw, 0)
         return id
 
+    def recv_multi(mut self, mut lp: Loop, fd: FdId, tag: UInt64 = 0) -> OpId:
+        self.in_submit = True
+        var id = lp.recv_multi(fd, self.t, tag)
+        self.in_submit = False
+        self._track(id, OpKind.RECV_MULTI, tag, fd.raw, 0)
+        return id
+
     def send(mut self, mut lp: Loop, fd: FdId, var buf: ByteBuffer, tag: UInt64 = 0) -> OpId:
         var n = buf.readable()
         self.in_submit = True
@@ -444,7 +451,7 @@ struct Harness(Movable):
         """Check one completion against the contract and record it."""
         self.seq += 1
         var s = self.seq
-        var blen = c.buf.value().readable() if c.buf else -1
+        var blen = c.buf.readable() if c.has_buf() else -1
         if self.keep_recs:
             self.recs.append(
                 Rec(s, c.op.raw, c.kind, c.tag, c.res, c.more, c.fd.raw, blen, lp.now().as_nanos())
@@ -467,9 +474,14 @@ struct Harness(Movable):
         if o.finals > 0:
             self.fail("completion after the final one: " + what)
         if c.more:
-            if o.kind != OpKind.ACCEPT:
+            if o.kind == OpKind.RECV_MULTI:
+                if c.res <= 0 or blen != c.res or c.res > RECV_CHUNK:
+                    self.fail(String("recv_multi chunk res ", c.res, " with ", blen, " buffered bytes: ", what))
+                if c.fd.raw != o.fd:
+                    self.fail("recv_multi chunk fd differs from the op's fd: " + what)
+            elif o.kind != OpKind.ACCEPT:
                 self.fail("more=True on a single-shot op: " + what)
-            if c.res < 0 or c.fd.is_null() or c.fd.raw == o.fd:
+            elif c.res < 0 or c.fd.is_null() or c.fd.raw == o.fd:
                 self.fail("accept more=True without a new connection: " + what)
             self.ops[i].mores += 1
             return
@@ -477,7 +489,7 @@ struct Harness(Movable):
         self.ops[i].final_seq = s
         self.ops[i].final_res = c.res
         var k = o.kind
-        if k == OpKind.RECV or k == OpKind.SEND or k == OpKind.SHUTDOWN or k == OpKind.CLOSE:
+        if k == OpKind.RECV or k == OpKind.RECV_MULTI or k == OpKind.SEND or k == OpKind.SHUTDOWN or k == OpKind.CLOSE:
             if c.fd.raw != o.fd:
                 self.fail("completion fd differs from the op's fd: " + what)
         if o.must_ebadf and c.res != EBADF:
@@ -490,6 +502,10 @@ struct Harness(Movable):
                 self.fail(
                     String("send of ", o.arg, " bytes completed with ", c.res, ", ", blen, " left: ", what)
                 )
+        elif k == OpKind.RECV_MULTI:
+            # Data only ever arrives in more=True chunks; the final one ends it.
+            if c.res > 0 or blen >= 0:
+                self.fail("recv_multi final completion carries data: " + what)
         elif k == OpKind.RECV:
             if c.res > 0 and (blen != c.res or c.res > RECV_CHUNK):
                 self.fail(String("recv res ", c.res, " with ", blen, " buffered bytes: ", what))
@@ -674,7 +690,9 @@ struct _Nothing(Script):
 
 
 def _fake(op: OpId, kind: OpKind, tag: UInt64, res: Int, more: Bool, fd: FdId, var buf: Optional[ByteBuffer]) -> Completion:
-    return Completion(op, kind, tag, res, more, fd, buf^, Target(_nop_target, 0))
+    var has = Bool(buf)
+    var b = buf.take() if buf else ByteBuffer()
+    return Completion(op, kind, tag, res, more, fd, b^, has, Target(_nop_target, 0))
 
 
 def test_harness_flags_double_completion_and_reentrancy() raises:

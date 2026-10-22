@@ -141,6 +141,14 @@ struct Slab[T: Movable & Deinitable](Movable, Sized):
         )
 
     @inline(.always)
+    def unsafe_ptr(self, id: SlabId) -> Pointer[Self.T, MutUntrackedOrigin]:
+        """Raw pointer to a live id's value, for hot paths that would
+        otherwise repeat `self[id]` lookups. Valid until `id` is removed
+        (growth never moves values); the caller guarantees `contains(id)`."""
+        debug_assert(self.contains(id), "stale or null SlabId ", id)
+        return self._ptr(id.slot())
+
+    @inline(.always)
     def remove(mut self, id: SlabId) -> Self.T:
         debug_assert(self.contains(id), "stale or null SlabId ", id)
         var slot = id.slot()

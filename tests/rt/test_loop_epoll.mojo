@@ -314,21 +314,21 @@ struct Idle(Script):
             self._progress(h, lp)
         elif tag == SR:
             if c.res > 0:
-                _ = h.send(lp, c.fd, c.buf.take(), SS)
+                _ = h.send(lp, c.fd, c.take_buf(), SS)
                 _ = h.recv(lp, c.fd, SR)
             elif not self.closing:
                 h.fail("server recv " + rs(c.res))
         elif tag == SS:
-            if c.buf:
-                lp.recycle(c.buf.take())
+            if c.has_buf():
+                lp.recycle(c.take_buf())
         elif tag == CR:
             if c.res <= 0:
                 if not self.closing:
                     h.fail("client recv " + rs(c.res))
                 return
-            if c.res != 64 or mismatch(c.buf.value().readable_span(), i, 0) >= 0:
+            if c.res != 64 or mismatch(c.buf.readable_span(), i, 0) >= 0:
                 self.bad += 1
-            lp.recycle(c.buf.take())
+            lp.recycle(c.take_buf())
             self.msgs += 1
             self.round_of[i] += 1
             if self.round_of[i] < self.rounds:
@@ -444,16 +444,16 @@ struct Churn(Script):
             _ = h.recv(lp, c.fd, CR)
         elif c.tag == SR:
             if c.res > 0:
-                _ = h.send(lp, c.fd, c.buf.take(), SS)
+                _ = h.send(lp, c.fd, c.take_buf(), SS)
                 _ = h.recv(lp, c.fd, SR)
             else:
                 _ = h.close(lp, c.fd, END)
         elif c.tag == SS:
-            if c.buf:
-                lp.recycle(c.buf.take())
+            if c.has_buf():
+                lp.recycle(c.take_buf())
         elif c.tag == CR:
             if c.res > 0:
-                lp.recycle(c.buf.take())
+                lp.recycle(c.take_buf())
                 _ = h.recv(lp, c.fd, CR)
             else:
                 _ = h.close(lp, c.fd, END)

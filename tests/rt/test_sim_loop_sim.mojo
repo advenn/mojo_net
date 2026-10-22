@@ -156,7 +156,7 @@ def echo_srecv(ctx: Int, mut lp: Loop, var c: Completion):
     if c.res <= 0:
         _ = lp.close(c.fd, s.t[E_CLOSED])
         return
-    _ = lp.send(c.fd, c.buf.take(), s.t[E_SSENT])
+    _ = lp.send(c.fd, c.take_buf(), s.t[E_SSENT])
     _ = lp.recv(c.fd, s.t[E_SRECV])
 
 
@@ -183,13 +183,13 @@ def echo_crecv(ctx: Int, mut lp: Loop, var c: Completion):
     ref s = _st(ctx)
     s.log.append("crecv " + String(c.res) + " @" + String(ms(lp, s)))
     if c.res == 4:
-        var sp = c.buf.value().readable_span()
+        var sp = c.buf.readable_span()
         s.bad = not (
             Int(sp[0]) == ord("p")
             and Int(sp[1]) == ord("i")
             and Int(sp[3]) == ord("g")
         )
-        lp.recycle(c.buf.take())
+        lp.recycle(c.take_buf())
     _ = lp.close(c.fd, s.t[E_CLOSED])
 
 
@@ -466,12 +466,12 @@ def fc_accept(ctx: Int, mut lp: Loop, var c: Completion):
 def fc_srecv(ctx: Int, mut lp: Loop, var c: Completion):
     ref s = _st(ctx)
     if c.res > 0:
-        var sp = c.buf.value().readable_span()
+        var sp = c.buf.readable_span()
         for i in range(len(sp)):
             if sp[i] != UInt8(((s.bytes + i) * 7 + 3) & 0xFF):
                 s.bad = True
         s.bytes += c.res
-        lp.recycle(c.buf.take())
+        lp.recycle(c.take_buf())
         _ = lp.recv(c.fd, s.t[F_SRECV])
         return
     s.log.append("srecv " + String(c.res) + " after " + String(s.bytes))

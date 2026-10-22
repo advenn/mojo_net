@@ -258,8 +258,8 @@ struct CancelRecv(Script):
             _ = h.recv(lp, self.client, CR2)
         elif c.tag == CR2:
             self.got = text_of(c)
-            if c.buf:
-                lp.recycle(c.buf.take())
+            if c.has_buf():
+                lp.recycle(c.take_buf())
             _ = h.close(lp, self.client, END)
             _ = h.close(lp, self.server, END)
         elif c.tag == END:
@@ -433,8 +433,8 @@ struct CancelSameBatch(Script):
             _ = h.close(lp, c.fd, END)
         elif c.tag == CR2:
             self.got = text_of(c)
-            if c.buf:
-                lp.recycle(c.buf.take())
+            if c.has_buf():
+                lp.recycle(c.take_buf())
             _ = h.close(lp, self.client, END)
             _ = h.close(lp, self.server, END)
         elif c.tag == END:
@@ -516,10 +516,10 @@ struct CloseCancels(Script):
             h.expect(c.res == 0, "close " + rs(c.res))
         elif c.tag == SR:
             if c.res > 0:
-                if mismatch(c.buf.value().readable_span(), 1, self.got) >= 0:
+                if mismatch(c.buf.readable_span(), 1, self.got) >= 0:
                     self.bad_data = True
                 self.got += c.res
-                lp.recycle(c.buf.take())
+                lp.recycle(c.take_buf())
                 _ = h.recv(lp, self.server, SR)
             else:
                 h.expect(c.res == 0, "server recv after peer close: " + rs(c.res))
@@ -618,7 +618,7 @@ struct StaleFd(Script):
         elif c.tag == SR:
             if c.res > 0:
                 self.fresh += text_of(c)
-                lp.recycle(c.buf.take())
+                lp.recycle(c.take_buf())
                 _ = h.recv(lp, c.fd, SR)
             else:
                 _ = h.close(lp, c.fd, END)
@@ -684,8 +684,8 @@ struct DoubleRecv(Script):
             _ = h.send_text(lp, self.server, "hi", SS)
         elif c.tag == CR:
             self.got = text_of(c)
-            if c.buf:
-                lp.recycle(c.buf.take())
+            if c.has_buf():
+                lp.recycle(c.take_buf())
             _ = h.close(lp, self.client, END)
             _ = h.close(lp, self.server, END)
         elif c.tag == LIS:
@@ -760,15 +760,15 @@ struct EchoSizes(Script):
     def on(mut self, mut h: Harness, mut lp: Loop, var c: Completion):
         if c.tag == SR:
             if c.res > 0:
-                _ = h.send(lp, self.server, c.buf.take(), SS)  # echo the buffer itself
+                _ = h.send(lp, self.server, c.take_buf(), SS)  # echo the buffer itself
                 _ = h.recv(lp, self.server, SR)
             else:
                 h.expect(c.res == 0, "server recv " + rs(c.res))
                 _ = h.close(lp, self.server, END)
         elif c.tag == SS:
             h.expect(c.res > 0, "echo send " + rs(c.res))
-            if c.buf:
-                lp.recycle(c.buf.take())
+            if c.has_buf():
+                lp.recycle(c.take_buf())
         elif c.tag == CS0:
             h.expect(c.res == 0, "0-byte send " + rs(c.res))
             self.zero_sends += 1
@@ -779,10 +779,10 @@ struct EchoSizes(Script):
                 if self.i >= len(self.sizes):
                     h.fail("data after the last message")
                     return
-                if mismatch(c.buf.value().readable_span(), self.i, self.got) >= 0:
+                if mismatch(c.buf.readable_span(), self.i, self.got) >= 0:
                     self.bad += 1
                 self.got += c.res
-                lp.recycle(c.buf.take())
+                lp.recycle(c.take_buf())
                 if self.got > self.sizes[self.i]:
                     h.fail("echo returned more than was sent")
                 elif self.got == self.sizes[self.i]:
@@ -860,10 +860,10 @@ struct BigTransfer(Script):
                 _ = h.recv(lp, self.client, CR)
         elif c.tag == SR:
             if c.res > 0:
-                if mismatch(c.buf.value().readable_span(), 5, self.got) >= 0:
+                if mismatch(c.buf.readable_span(), 5, self.got) >= 0:
                     self.bad += 1
                 self.got += c.res
-                lp.recycle(c.buf.take())
+                lp.recycle(c.take_buf())
                 _ = h.recv(lp, self.server, SR)
             else:
                 h.expect(c.res == 0, "server recv " + rs(c.res))
@@ -932,10 +932,10 @@ struct ShutdownAfterSends(Script):
             h.expect(c.res == 0, "shutdown " + rs(c.res))
         elif c.tag == SR:
             if c.res > 0:
-                if mismatch(c.buf.value().readable_span(), 9, self.got) >= 0:
+                if mismatch(c.buf.readable_span(), 9, self.got) >= 0:
                     self.bad += 1
                 self.got += c.res
-                lp.recycle(c.buf.take())
+                lp.recycle(c.take_buf())
                 _ = h.recv(lp, self.server, SR)
             else:
                 self.eof_at = self.got
@@ -992,7 +992,7 @@ struct HalfClose(Script):
         if c.tag == SR:
             if c.res > 0:
                 self.s_got += text_of(c)
-                lp.recycle(c.buf.take())
+                lp.recycle(c.take_buf())
                 _ = h.recv(lp, self.server, SR)
             else:
                 h.expect(c.res == 0, "server recv " + rs(c.res))
@@ -1007,7 +1007,7 @@ struct HalfClose(Script):
         elif c.tag == CR:
             if c.res > 0:
                 self.c_got += text_of(c)
-                lp.recycle(c.buf.take())
+                lp.recycle(c.take_buf())
                 _ = h.recv(lp, self.client, CR)
             else:
                 h.expect(c.res == 0, "client recv " + rs(c.res))
@@ -1107,10 +1107,10 @@ struct FinWithData(Script):
             _ = h.recv(lp, self.server, SR)
         elif c.tag == SR:
             if c.res > 0:
-                if mismatch(c.buf.value().readable_span(), self.round, self.s_got) >= 0:
+                if mismatch(c.buf.readable_span(), self.round, self.s_got) >= 0:
                     self.bad += 1
                 self.s_got += c.res
-                lp.recycle(c.buf.take())
+                lp.recycle(c.take_buf())
                 _ = h.recv(lp, self.server, SR)
             else:
                 h.expect(c.res == 0, "server recv " + rs(c.res))
@@ -1173,8 +1173,8 @@ struct ResetOnUnread(Script):
             h.expect(c.res == 200_000 or c.res < 0, "send " + rs(c.res))
         elif c.tag == SR:
             h.expect(c.res > 0, "server recv " + rs(c.res))
-            if c.buf:
-                lp.recycle(c.buf.take())
+            if c.has_buf():
+                lp.recycle(c.take_buf())
             _ = h.timeout(lp, 20 * MS, TMO)  # let the rest arrive, unread
         elif c.tag == TMO:
             _ = h.close(lp, self.server, END)  # unread data: the kernel sends RST
@@ -1362,20 +1362,20 @@ struct ConcurrentEcho(Script):
         var tag = c.tag & 0xFF
         if tag == SR:
             if c.res > 0:
-                _ = h.send(lp, c.fd, c.buf.take(), SS | (UInt64(i) << 8))
+                _ = h.send(lp, c.fd, c.take_buf(), SS | (UInt64(i) << 8))
                 _ = h.recv(lp, c.fd, c.tag)
             else:
                 h.expect(c.res == 0, "server recv " + rs(c.res))
                 _ = h.close(lp, c.fd, END)
         elif tag == SS:
-            if c.buf:
-                lp.recycle(c.buf.take())
+            if c.has_buf():
+                lp.recycle(c.take_buf())
         elif tag == CR:
             if c.res > 0:
-                if mismatch(c.buf.value().readable_span(), i, self.got[i]) >= 0:
+                if mismatch(c.buf.readable_span(), i, self.got[i]) >= 0:
                     self.bad += 1
                 self.got[i] += c.res
-                lp.recycle(c.buf.take())
+                lp.recycle(c.take_buf())
                 _ = h.recv(lp, c.fd, c.tag)
             else:
                 h.expect(c.res == 0, "client recv " + rs(c.res))
@@ -1502,7 +1502,7 @@ struct RecycledBigBuffer(Script):
             if c.res > 0:
                 self.biggest = max(self.biggest, c.res)
                 self.got += c.res
-                lp.recycle(c.buf.take())
+                lp.recycle(c.take_buf())
                 _ = h.recv(lp, self.server, SR)
             else:
                 _ = h.close(lp, self.server, END)
@@ -1562,17 +1562,17 @@ struct CancelHeadSend(Script):
             _ = h.cancel(lp, self.send_id, CAN)
         elif c.tag == CS:
             h.expect(c.res == ECANCELED, "send " + rs(c.res))
-            if c.buf:
-                self.left = c.buf.value().readable()  # the unsent rest
+            if c.has_buf():
+                self.left = c.buf.readable()  # the unsent rest
         elif c.tag == SH:
             self.sh_res = c.res
             _ = h.recv(lp, self.server, SR)  # only now start reading
         elif c.tag == SR:
             if c.res > 0:
-                if mismatch(c.buf.value().readable_span(), 4, self.got) >= 0:
+                if mismatch(c.buf.readable_span(), 4, self.got) >= 0:
                     h.fail("corrupted data")
                 self.got += c.res
-                lp.recycle(c.buf.take())
+                lp.recycle(c.take_buf())
                 _ = h.recv(lp, self.server, SR)
             else:
                 h.expect(c.res == 0, "server recv " + rs(c.res))
@@ -1690,8 +1690,8 @@ struct DropWithPending(Script):
             _ = h.accept(lp, c.fd, ACC)
             lp.stop()
         elif c.tag == CR:
-            if c.buf:
-                lp.recycle(c.buf.take())
+            if c.has_buf():
+                lp.recycle(c.take_buf())
             _ = h.recv(lp, c.fd, CR)
 
 

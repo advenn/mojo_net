@@ -73,14 +73,14 @@ def on_server_recv(ctx: Int, mut lp: Loop, var c: Completion):
         _ = lp.close(c.fd, s.t[T_CLOSED])
         return
     # Echo the received buffer straight back.
-    _ = lp.send(c.fd, c.buf.take(), s.t[T_SSENT])
+    _ = lp.send(c.fd, c.take_buf(), s.t[T_SSENT])
     _ = lp.recv(c.fd, s.t[T_SRECV])
 
 
 def on_server_sent(ctx: Int, mut lp: Loop, var c: Completion):
     _st(ctx).log.append("ssent " + String(c.res))
-    if c.buf:
-        lp.recycle(c.buf.take())
+    if c.has_buf():
+        lp.recycle(c.take_buf())
 
 
 def on_connect(ctx: Int, mut lp: Loop, var c: Completion):
@@ -107,8 +107,8 @@ def on_client_recv(ctx: Int, mut lp: Loop, var c: Completion):
     ref s = _st(ctx)
     s.log.append("crecv " + String(c.res))
     if c.res > 0:
-        s.got = String(StringSlice(unsafe_from_utf8=c.buf.value().readable_span()))
-        lp.recycle(c.buf.take())
+        s.got = String(StringSlice(unsafe_from_utf8=c.buf.readable_span()))
+        lp.recycle(c.take_buf())
     # Close the client; the server sees EOF and closes its side.
     _ = lp.close(c.fd, s.t[T_CLOSED])
 

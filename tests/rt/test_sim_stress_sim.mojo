@@ -301,7 +301,7 @@ def on_srecv(ctx: Int, mut lp: Loop, var c: Completion):
     note(w, lp, c)
     if c.res > 0:
         w.server_bytes += c.res
-        _ = lp.send(c.fd, c.buf.take(), w.t[T_SSENT], c.tag)
+        _ = lp.send(c.fd, c.take_buf(), w.t[T_SSENT], c.tag)
         return
     if c.res != ECANCELED:
         _ = lp.close(c.fd, w.t[T_SCLOSED], c.tag)  # EOF or reset
@@ -310,8 +310,8 @@ def on_srecv(ctx: Int, mut lp: Loop, var c: Completion):
 def on_ssent(ctx: Int, mut lp: Loop, var c: Completion):
     ref w = _w(ctx)
     note(w, lp, c)
-    if c.buf:
-        lp.recycle(c.buf.take())
+    if c.has_buf():
+        lp.recycle(c.take_buf())
     if c.res >= 0:
         _ = lp.recv(c.fd, w.t[T_SRECV], c.tag)
     elif c.res != ECANCELED:
@@ -364,7 +364,7 @@ def on_csent(ctx: Int, mut lp: Loop, var c: Completion):
             + " != "
             + String(expect)
         )
-    if c.res >= 0 and (not c.buf or c.buf.value().readable() != 0):
+    if c.res >= 0 and (not c.has_buf() or c.buf.readable() != 0):
         w.unexpected.append(
             "send " + String(i) + ": buffer not handed back consumed"
         )
@@ -388,7 +388,7 @@ def on_crecv(ctx: Int, mut lp: Loop, var c: Completion):
     note(w, lp, c)
     var i = Int(c.tag)
     if c.res > 0:
-        var sp = c.buf.value().readable_span()
+        var sp = c.buf.readable_span()
         var off = w.clients[i].got
         if off + len(sp) > w.clients[i].sent:
             w.clients[i].bad = True  # echoed more than was ever sent
@@ -397,7 +397,7 @@ def on_crecv(ctx: Int, mut lp: Loop, var c: Completion):
                 w.clients[i].bad = True
                 break
         w.clients[i].got += c.res
-        lp.recycle(c.buf.take())
+        lp.recycle(c.take_buf())
         if w.clients[i].phase == P_RUNNING:
             _ = lp.recv(c.fd, w.t[T_CRECV], c.tag)
         return

@@ -5,10 +5,10 @@
   has no strace or perf). A counter increment is ~1 ns next to a ~5 us
   message; `-D BENCH_STOCK_LOOP=1` builds the servers on rt's own
   `EventLoop` instead, to check that the counting costs nothing.
-- `BenchLoop[D]`: `rt.event_loop.EventLoop`'s run loop, generic over the
-  driver so it can run on `CountingDriver`. It mirrors event_loop.mojo
-  line for line (dispatch rounds, wait computation, one clock read per
-  iteration); keep the two in sync.
+- `BenchLoop[D]`: rt's own run loop (`rt.event_loop.EventLoopOf[D]`) over
+  driver `D`, so the benchmarks measure exactly the code that ships.
+  `CountingDriver` counts clock reads in a heap cell (`clock_cell()`),
+  because `Driver.now` takes `self` immutably.
 - `Ticker`: prints the `STATS` line `spikes/epoll_echo/bench.py` parses,
   from a loop timer every `--stats-ms`.
 
@@ -16,6 +16,7 @@ Benchmark code, not library code: it touches `Completion._target`, which
 only a run loop may use.
 """
 
+from std.memory.alloc import unsafe_alloc
 from std.sys import is_defined
 
 from bytes.buffer import ByteBuffer
@@ -25,7 +26,7 @@ from linux.errno import Errno
 from rt.core import Completion, Loop, Target
 from rt.driver import Driver, ReadyEvent
 from rt.epoll_driver import EpollDriver
-from rt.event_loop import DISPATCH_ROUNDS, NEAR_TIMER_NS, EventLoop
+from rt.event_loop import EventLoop, EventLoopOf
 
 from echo_util import emit
 
@@ -63,10 +64,21 @@ struct SysCounts(TrivialRegisterPassable):
 struct CountingDriver(Driver):
     var inner: EpollDriver
     var n: SysCounts
+    var _clock: Pointer[Int, MutUntrackedOrigin]
+    """Clock reads, in its own heap cell: `now(self)` is immutable."""
 
     def __init__(out self, var inner: EpollDriver):
         self.inner = inner^
         self.n = SysCounts.zero()
+        self._clock = unsafe_alloc[Int](1)
+        self._clock[] = 0
+
+    def __deinit__(deinit self):
+        self._clock.unsafe_free()
+
+    @inline(.always)
+    def clock_cell(self) -> Pointer[Int, MutUntrackedOrigin]:
+        return self._clock
 
     @staticmethod
     def create() raises IoError -> Self:
@@ -74,7 +86,8 @@ struct CountingDriver(Driver):
 
     @inline(.always)
     def now(self) -> Instant:
-        return self.inner.now()  # counted by BenchLoop (self is immutable here)
+        self._clock[] += 1
+        return self.inner.now()
 
     def socket(mut self, family: Int, type_: Int) -> Int:
         self.n.other += 1
@@ -154,69 +167,8 @@ struct CountingDriver(Driver):
         self.n.events += len(out) - before
 
 
-struct BenchLoop[D: Driver & Deinitable](Movable):
-    """`rt.event_loop.EventLoop` over an explicit driver (see module doc)."""
-
-    var loop: Loop
-    var driver: Self.D
-    var _events: List[ReadyEvent]
-    var clock_reads: Int
-
-    def __init__(out self) raises IoError:
-        self.driver = Self.D.create()
-        self.loop = Loop(self.driver.now())
-        self._events = List[ReadyEvent](capacity=1024)
-        self.clock_reads = 1
-
-    def __deinit__(deinit self):
-        self.loop.close_all(self.driver)
-
-    def _dispatch(mut self):
-        for _ in range(DISPATCH_ROUNDS):
-            self.loop.flush(self.driver)
-            if not self.loop.has_ready():
-                return
-            var batch = self.loop.take_ready()
-            while len(batch) > 0:
-                var c = batch.pop()
-                var t = c._target
-                t.call(t.ctx, self.loop, c^)
-
-    def run_once(mut self, timeout_ns: Int = -1) raises IoError:
-        self._dispatch()
-        var wait = timeout_ns
-        if (
-            self.loop.has_ready()
-            or self.loop.has_submitted()
-            or self.loop.stopped()
-            or self.loop.pending_ops() == 0
-        ):
-            wait = 0
-        else:
-            self.loop._prune_timers()
-            var next = self.loop.next_timer_ns()
-            if next:
-                var until = next.value() - self.loop.now().as_nanos()
-                if until < NEAR_TIMER_NS:
-                    self.clock_reads += 1
-                    until = next.value() - self.driver.now().as_nanos()
-                until = max(0, until)
-                wait = until if wait < 0 else min(wait, until)
-        self._events.clear()
-        self.driver.wait(wait, self._events)
-        self.clock_reads += 1
-        self.loop.set_now(self.driver.now())
-        for i in range(len(self._events)):
-            self.loop.on_ready(self.driver, self._events[i])
-        self.loop.expire_timers()
-        self._dispatch()
-
-    def run(mut self) raises IoError:
-        while not self.loop.stopped() and (
-            self.loop.pending_ops() > 0 or self.loop.has_ready()
-        ):
-            self.run_once()
-        self.loop._clear_stop()
+comptime BenchLoop[D: Driver] = EventLoopOf[D]
+"""rt's own run loop over driver `D` (no copy to keep in sync)."""
 
 
 @fieldwise_init

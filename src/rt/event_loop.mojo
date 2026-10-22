@@ -23,13 +23,22 @@ comptime DISPATCH_ROUNDS = 4
 callbacks that keep producing immediate completions cannot starve I/O."""
 
 
-struct EventLoop(Movable):
+comptime EventLoop = EventLoopOf[Backend]
+"""The event loop on this build's driver (epoll, or the simulator under
+-D MOJO_TCP_SIM=1). What applications use."""
+
+
+struct EventLoopOf[D: Driver & Deinitable](Movable):
+    """The run loop over driver `D`. `EventLoop` is `EventLoopOf[Backend]`;
+    the parameter lets benchmarks and tools wrap the driver (counting
+    syscalls, a kernel-free driver) while running exactly this loop."""
+
     var loop: Loop
-    var driver: Backend
+    var driver: Self.D
     var _events: List[ReadyEvent]
 
     def __init__(out self) raises IoError:
-        self.driver = Backend.create()
+        self.driver = Self.D.create()
         self.loop = Loop(self.driver.now())
         self._events = List[ReadyEvent](capacity=1024)
 
@@ -41,11 +50,13 @@ struct EventLoop(Movable):
         submitted; repeat while that produced immediate completions."""
         for _ in range(DISPATCH_ROUNDS):
             self.loop.flush(self.driver)
-            if not self.loop.has_ready():
+            var n = self.loop.ready_len()
+            if n == 0:
                 return
-            var batch = self.loop.take_ready()
-            while len(batch) > 0:
-                var c = batch.pop()
+            # Exactly the completions queued before this round; the ones the
+            # callbacks produce wait for the next round (after a flush).
+            for _ in range(n):
+                var c = self.loop.pop_ready()
                 var t = c._target
                 t.call(t.ctx, self.loop, c^)
 
@@ -80,7 +91,7 @@ struct EventLoop(Movable):
         self.driver.wait(wait, self._events)
         self.loop.set_now(self.driver.now())
         for i in range(len(self._events)):
-            self.loop.on_ready(self.driver, self._events[i])
+            self.loop.on_ready(self.driver, self._events.unsafe_get(i))
         self.loop.expire_timers()
         self._dispatch()
 

@@ -324,8 +324,8 @@ trait ConnHandler(Deinitable, Movable):
 
 def _ignore(ctx: Int, mut lp: Loop, var c: Completion):
     """Target of fire-and-forget ops (cancels, closes of rejected fds)."""
-    if c.buf:
-        lp.recycle(c.buf.take())
+    if c.has_buf():
+        lp.recycle(c.take_buf())
 
 
 @inline(.always)
@@ -918,7 +918,7 @@ def _on_recv[H: ConnHandler](mut st: _ConnState[H], mut lp: Loop, var c: Complet
     ref core = st.core
     core.recv_inflight = False
     if c.res > 0:
-        var buf = c.buf.take()
+        var buf = c.take_buf()
         if core.closing or core.abort_req or core.close_submitted:
             _recycle(lp, buf^)
             return
@@ -971,8 +971,8 @@ def _on_send[H: ConnHandler](mut st: _ConnState[H], mut lp: Loop, var c: Complet
         core.bytes_out += c.res
     if core.sends == 0:
         core.queued = 0
-    if c.buf:
-        _recycle(lp, c.buf.take())
+    if c.has_buf():
+        _recycle(lp, c.take_buf())
     if c.res < 0:
         if not c.canceled():
             _fail(core, IoError.from_errno("send", c.errno()))

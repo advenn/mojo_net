@@ -117,20 +117,20 @@ struct PingPong(Script):
     def on(mut self, mut h: Harness, mut lp: Loop, var c: Completion):
         if c.tag == SR:
             if c.res > 0:
-                _ = h.send(lp, self.server, c.buf.take(), SS)  # echo
+                _ = h.send(lp, self.server, c.take_buf(), SS)  # echo
                 _ = h.recv(lp, self.server, SR)
             else:
                 _ = h.close(lp, self.server, END)
         elif c.tag == SS:
-            if c.buf:
-                lp.recycle(c.buf.take())
+            if c.has_buf():
+                lp.recycle(c.take_buf())
         elif c.tag == CR:
             if c.res <= 0:
                 h.fail("client recv " + rs(c.res))
                 return
-            if c.res != 64 or mismatch(c.buf.value().readable_span(), self.i, 0) >= 0:
+            if c.res != 64 or mismatch(c.buf.readable_span(), self.i, 0) >= 0:
                 self.bad += 1
-            lp.recycle(c.buf.take())
+            lp.recycle(c.take_buf())
             self.i += 1
             if self.i == self.warm:
                 fault.clear()  # steady state from here
@@ -228,21 +228,21 @@ struct EintrEcho(Script):
             h.expect(c.res >= 0, "send/shutdown " + rs(c.res))
         elif c.tag == SR:
             if c.res > 0:
-                _ = h.send(lp, c.fd, c.buf.take(), SS)
+                _ = h.send(lp, c.fd, c.take_buf(), SS)
                 _ = h.recv(lp, c.fd, SR)
             else:
                 h.expect(c.res == 0, "server recv " + rs(c.res))
                 _ = h.close(lp, c.fd, END)
         elif c.tag == SS:
             h.expect(c.res > 0, "echo " + rs(c.res))
-            if c.buf:
-                lp.recycle(c.buf.take())
+            if c.has_buf():
+                lp.recycle(c.take_buf())
         elif c.tag == CR:
             if c.res > 0:
-                if mismatch(c.buf.value().readable_span(), 7, self.got) >= 0:
+                if mismatch(c.buf.readable_span(), 7, self.got) >= 0:
                     self.bad += 1
                 self.got += c.res
-                lp.recycle(c.buf.take())
+                lp.recycle(c.take_buf())
                 if self.got == (self.k + 1) * 1000:
                     self.k += 1
                     if self.k == self.msgs:
@@ -452,8 +452,8 @@ struct RegisterFails(Script):
             # The connection whose accepted end could not be registered was
             # closed by the loop: its client sees EOF (or a reset).
             self.done += 1
-            if c.buf:
-                lp.recycle(c.buf.take())
+            if c.has_buf():
+                lp.recycle(c.take_buf())
         if self.done == 1 and self.accepted == self.n - 1:
             self.done = 2
             for i in range(len(self.conns)):
