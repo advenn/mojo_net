@@ -1,4 +1,5 @@
-"""Sockets: addresses, socket options (L1) and blocking TCP/Unix streams with
+"""Sockets: addresses, socket options (L1), blocking TCP/Unix streams and UDP
+sockets with
 deadlines (L2), and `BufReader` for bounded, frame-at-a-time reads over
 them. `ByteBuffer` and the sans-I/O `Codec` contract live in `bytes` and are
 re-exported here. Coming next: DNS resolution and connect-by-name
@@ -39,4 +40,5 @@ from .dial import HostPort
 from .reader import BufReader, BufReaderParts, Read
 from .resolver import Lookup, Resolver
 from .tcp import TcpAccepted, TcpListener, TcpStream
+from .udp import Datagram, UdpSocket
 from .unix import UnixAccepted, UnixListener, UnixStream, UnixStreamPair

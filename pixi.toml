@@ -15,7 +15,7 @@ gen = "python3 tools/gen_syscall_nr.py && python3 tools/gen_abi.py --write"
 # Verify committed constants and struct layouts against this host's C headers.
 abi-check = "python3 tools/gen_abi.py --check && mojo run -I src build/test_abi_layout.mojo"
 # Verify the I/O path imports no libc socket/poll/epoll symbols.
-nolibc-check = "bash tools/check_nolibc.sh tests/linux/test_sys.mojo tests/linux/test_epoll.mojo tests/linux/test_poll.mojo tests/net/test_socket.mojo tests/net/test_tcp.mojo tests/net/test_unix.mojo"
+nolibc-check = "bash tools/check_nolibc.sh tests/linux/test_sys.mojo tests/linux/test_epoll.mojo tests/linux/test_poll.mojo tests/net/test_socket.mojo tests/net/test_tcp.mojo tests/net/test_unix.mojo tests/net/test_udp.mojo"
 # Verify the package import rules (docs/design.md, "Packages").
 import-check = "python3 tools/check_imports.py"
 # Build every example, so none can rot unnoticed.

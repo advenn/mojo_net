@@ -47,6 +47,7 @@ comptime SO_MARK: Int = 36
 comptime SO_ZEROCOPY: Int = 60
 comptime SO_BINDTODEVICE: Int = 25
 comptime SO_BUSY_POLL: Int = 46
+comptime SO_BROADCAST: Int = 6
 comptime SO_ATTACH_REUSEPORT_CBPF: Int = 51
 
 # IPPROTO_TCP options

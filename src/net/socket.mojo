@@ -59,6 +59,7 @@ from linux.consts import (
     SHUT_WR,
     SO_ACCEPTCONN,
     SO_BINDTODEVICE,
+    SO_BROADCAST,
     SO_DOMAIN,
     SO_ERROR,
     SO_INCOMING_CPU,
@@ -1261,6 +1262,17 @@ struct Socket(AsFd, Movable, Writable):
     def reuse_port(self) raises IoError -> Bool:
         return self._get_bool(
             SOL_SOCKET, SO_REUSEPORT, "getsockopt(SO_REUSEPORT)"
+        )
+
+    def set_broadcast(self, on: Bool) raises IoError:
+        """SO_BROADCAST: allow sending datagrams to a broadcast address
+        (255.255.255.255 or a subnet's); without it such sends fail with
+        EACCES (`PermissionDenied`)."""
+        self._set_bool(SOL_SOCKET, SO_BROADCAST, on, "setsockopt(SO_BROADCAST)")
+
+    def broadcast(self) raises IoError -> Bool:
+        return self._get_bool(
+            SOL_SOCKET, SO_BROADCAST, "getsockopt(SO_BROADCAST)"
         )
 
     def set_keepalive(self, on: Bool) raises IoError:

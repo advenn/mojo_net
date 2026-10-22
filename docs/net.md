@@ -33,6 +33,7 @@ The M1 spike's raw-epoll server shows this is enough. It held 11k connections at
 | `addr` | `Ipv4Addr`, `Ipv6Addr`, `IpAddr`, `SocketAddr`/`V4`/`V6`, `UnixAddr`, `if_nametoindex` |
 | `socket` | L1: `Socket` and every socket option, no policy |
 | `blocking`, `tcp`, `unix` | L2: `TcpStream`, `TcpListener`, `UnixStream`, `UnixListener` and friends |
+| `udp` | `UdpSocket`: datagrams, blocking with per-direction deadlines or nonblocking (`try_*`); truncation reported (`Datagram`), connected sockets with ICMP errors |
 | `reader` | `BufReader`: bounded, all-or-nothing frame reads over any `Read` stream (`TcpStream`, `UnixStream`) |
 | `dial` | `dial_tcp` / `TcpStream.connect_host`: connect by host name with Happy Eyeballs v2 (RFC 8305); `HostPort` parses `host:port` |
 | `resolver` | `Resolver`: host names to addresses (literals, /etc/hosts, `localhost`, DNS over UDP with TCP fallback); `Lookup`, the same as an incremental state machine |
@@ -160,7 +161,14 @@ These names and their documented behavior are stable for v1.
      - **Left:**
        - a rattler-build recipe (modular-community);
        - running the suite on a real aarch64 host.
-- **M3: UDP** (after TCP v1 is stable), in two modes like TCP:
+- **M3: UDP**, in two modes like TCP:
   - sync: blocking `send_to` / `recv_from` with deadlines;
   - async: nonblocking `try_*` calls for readiness loops (`linux.Epoll`), which a future runtime can build on.
+  1. **`UdpSocket`.** Done.
+     - Both modes; truncation is never silent (`Datagram.size`); empty datagrams; peeking a datagram's size.
+     - Connected sockets filter senders and report ICMP refusals.
+     - `bind_reuseport`, `from_socket`, `SO_BROADCAST`.
+  2. Multicast (IPv4 and IPv6 groups, TTL/hops, loop, interface).
+  3. Batched I/O (`sendmmsg` / `recvmmsg`) for throughput.
+  4. Examples, docs, API review.
 - **Later:** sendfile, vectored helpers, TLS integration points.
