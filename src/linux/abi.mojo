@@ -356,3 +356,12 @@ struct Ipv6Mreq(Copyable, Movable):
     var multiaddr: Array[UInt8, 16]
     var interface: UInt32
     """The interface index, or 0 for the kernel's choice."""
+
+
+@fieldwise_init
+struct Mmsghdr(Copyable, Movable):
+    """`struct mmsghdr` (64 bytes): one message of sendmmsg/recvmmsg."""
+
+    var hdr: Msghdr
+    var len: UInt32
+    """Bytes sent or received for this message (set by the kernel)."""

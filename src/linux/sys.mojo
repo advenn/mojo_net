@@ -37,7 +37,7 @@ Therefore:
 `tests/linux/test_linux_core_regressions.mojo` pins this policy.
 """
 
-from .abi import Msghdr, SockaddrStorage
+from .abi import Mmsghdr, Msghdr, SockaddrStorage
 from .fd import AsFd
 from .nr import (
     SYS_accept4,
@@ -54,7 +54,9 @@ from .nr import (
     SYS_pipe2,
     SYS_read,
     SYS_recvfrom,
+    SYS_recvmmsg,
     SYS_recvmsg,
+    SYS_sendmmsg,
     SYS_sendmsg,
     SYS_sendto,
     SYS_setsockopt,
@@ -261,3 +263,28 @@ def sendmsg[F: AsFd](fd: F, ref msg: Msghdr, flags: Int) -> Int:
 @inline(.always)
 def recvmsg[F: AsFd](fd: F, mut msg: Msghdr, flags: Int) -> Int:
     return syscall3(SYS_recvmsg, Int(fd.raw_fd()), _addr(msg), flags)
+
+
+@inline(.always)
+def sendmmsg[F: AsFd](fd: F, msgs: MutSpan[Mmsghdr, _], flags: Int) -> Int:
+    """Messages sent (at least 1), or -errno if the first one failed. The
+    headers point at buffers and addresses by raw address: keep their
+    owners alive across the call."""
+    return syscall4(
+        SYS_sendmmsg, Int(fd.raw_fd()), Int(msgs.unsafe_ptr()), len(msgs), flags
+    )
+
+
+@inline(.always)
+def recvmmsg[F: AsFd](fd: F, msgs: MutSpan[Mmsghdr, _], flags: Int) -> Int:
+    """Messages received, or -errno if none was; no timeout (the socket's
+    blocking mode decides). Keep the buffers' owners alive across the
+    call."""
+    return syscall5(
+        SYS_recvmmsg,
+        Int(fd.raw_fd()),
+        Int(msgs.unsafe_ptr()),
+        len(msgs),
+        flags,
+        0,
+    )

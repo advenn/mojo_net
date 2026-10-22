@@ -6,10 +6,10 @@ None, and nothing is lost or duplicated."""
 from std.testing import TestSuite, assert_equal, assert_false, assert_true
 
 from linux import Errno, fault
-from linux.nr import SYS_ppoll, SYS_recvfrom, SYS_sendto
+from linux.nr import SYS_ppoll, SYS_recvfrom, SYS_recvmmsg, SYS_sendmmsg, SYS_sendto
 from linux.time import Deadline, Duration, Instant
 from net.addr import SocketAddr
-from net.udp import Datagram, UdpSocket
+from net.udp import Datagram, DatagramBatch, UdpSocket
 
 
 def _bound() raises -> UdpSocket:
@@ -82,6 +82,30 @@ def test_send_eagain_waits_for_space() raises:
     var buf = List[UInt8](length=8, fill=0)
     assert_equal(b.recv_from(Span(buf)).len, 2)  # only the one that was sent
     assert_false(b.try_recv_from(Span(buf)))
+
+
+def test_batches_retry_eintr_and_wait_through_eagain() raises:
+    fault.clear()
+    var a = _bound()
+    var b = _bound()
+    var out = DatagramBatch(4, 32)
+    for i in range(4):
+        out.push(String("d", i).as_bytes(), b.local_addr())
+    fault.clear()
+    fault.inject(SYS_sendmmsg, Errno.EINTR, times=1)
+    fault.inject(SYS_sendmmsg, Errno.EAGAIN, times=1)
+    assert_equal(a.send_batch(out), 4)
+    var sends = fault.calls(SYS_sendmmsg)
+    fault.clear()
+    assert_true(sends >= 3)  # EINTR, EAGAIN (then a wait), the real one
+    var inb = DatagramBatch(8, 32)
+    fault.inject(SYS_recvmmsg, Errno.EINTR, times=2)
+    var got = 0
+    while got < 4:
+        got += b.recv_batch(inb)
+    fault.clear()
+    assert_equal(got, 4)
+    assert_equal(b.try_recv_batch(inb), 0)  # nothing duplicated
 
 
 def main() raises:

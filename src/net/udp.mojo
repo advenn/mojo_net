@@ -49,8 +49,12 @@ options (TTL, TOS, buffer sizes, ...) are on `socket()`.
 This module does not import `rt` (blocking layer).
 """
 
+from std.memory import unsafe_memcpy
+from std.sys import size_of
+
 from linux import AsFd, Errno, ErrorKind, IoError, sys
-from linux.consts import MSG_NOSIGNAL, MSG_PEEK, MSG_TRUNC, POLLIN, POLLOUT
+from linux.abi import Iovec, Mmsghdr, Msghdr, SockaddrStorage
+from linux.consts import IOV_MAX, MSG_NOSIGNAL, MSG_PEEK, MSG_TRUNC, POLLIN, POLLOUT
 from linux.syscall import err_of
 from linux.time import Deadline, Duration
 
@@ -178,6 +182,175 @@ def _try_send(
             return None
         if e != Errno.EINTR:
             raise IoError.from_errno(op, e)
+
+
+# ---- batches -----------------------------------------------------------------
+
+
+comptime MAX_BATCH = IOV_MAX
+"""The most datagrams one batch call moves (the kernel's UIO_MAXIOV)."""
+
+
+struct DatagramBatch(Movable, Sized):
+    """Up to `capacity()` datagrams of up to `max_datagram()` bytes each,
+    for `UdpSocket.recv_batch` / `send_batch` (recvmmsg / sendmmsg: one
+    syscall for many datagrams). The batch owns every buffer, address and
+    kernel header and reuses them, so a batch call allocates nothing.
+
+    Receiving replaces the contents: datagram `i` is `payload(i)` (what was
+    stored), `datagram(i)` (`len`, `size`, `sender`; `size > len` when it
+    was truncated). Sending: `push` copies each datagram in (with its
+    destination, or none for a connected socket); a send moves the ones not
+    sent yet, and `sent()` counts the progress, also after an error.
+    `clear` empties it for reuse."""
+
+    var _slot: Int
+    var _data: List[UInt8]
+    var _lens: List[Int]
+    var _sizes: List[Int]
+    var _names: List[SockaddrStorage]
+    var _namelens: List[UInt32]
+    var _iov: List[Iovec]
+    var _hdrs: List[Mmsghdr]
+    var _count: Int
+    var _sent: Int
+
+    def __init__(out self, capacity: Int, max_datagram: Int = 2048) raises IoError:
+        """`InvalidInput` unless `1 <= capacity <= MAX_BATCH` and
+        `1 <= max_datagram <= 65535`. Allocates `capacity * max_datagram`
+        bytes once."""
+        if capacity < 1 or capacity > MAX_BATCH or max_datagram < 1 or max_datagram > 65535:
+            raise IoError.of_kind("DatagramBatch.__init__", ErrorKind.InvalidInput)
+        self._slot = max_datagram
+        self._data = List[UInt8](length=capacity * max_datagram, fill=0)
+        self._lens = List[Int](length=capacity, fill=0)
+        self._sizes = List[Int](length=capacity, fill=0)
+        self._names = List[SockaddrStorage](capacity=capacity)
+        self._namelens = List[UInt32](length=capacity, fill=0)
+        self._iov = List[Iovec](capacity=capacity)
+        self._hdrs = List[Mmsghdr](capacity=capacity)
+        for _ in range(capacity):
+            self._names.append(SockaddrStorage.zeroed())
+            self._iov.append(Iovec(0, 0))
+            self._hdrs.append(Mmsghdr(Msghdr(0, 0, 0, 0, 0, 0, 0), 0))
+        self._count = 0
+        self._sent = 0
+
+    @inline(.always)
+    def __len__(self) -> Int:
+        """Datagrams held (received, or pushed for sending)."""
+        return self._count
+
+    @inline(.always)
+    def capacity(self) -> Int:
+        return len(self._lens)
+
+    @inline(.always)
+    def max_datagram(self) -> Int:
+        return self._slot
+
+    @inline(.always)
+    def sent(self) -> Int:
+        """How many of the pushed datagrams have been sent."""
+        return self._sent
+
+    @inline(.always)
+    def clear(mut self):
+        self._count = 0
+        self._sent = 0
+
+    def payload(self, i: Int) raises IoError -> Span[UInt8, origin_of(self._data)]:
+        """Datagram `i`'s bytes (as stored: at most `max_datagram()`).
+        Valid until the next call that changes the batch."""
+        self._check(i, "DatagramBatch.payload")
+        return Span(self._data)[i * self._slot : i * self._slot + self._lens[i]]
+
+    def datagram(self, i: Int) raises IoError -> Datagram:
+        """Datagram `i`'s length, full size and sender (for a pushed one,
+        its destination; unspecified for a connected socket's)."""
+        self._check(i, "DatagramBatch.datagram")
+        var raw = RawSockaddr(storage=self._names[i].copy(), len=self._namelens[i])
+        return _datagram(self._sizes[i], self._slot, raw)
+
+    def push(mut self, data: Span[UInt8, _], dest: SocketAddr) raises IoError:
+        """Queue `data` as one datagram to `dest`. `InvalidInput` when the
+        batch is full or `data` is longer than `max_datagram()`."""
+        var raw = dest.to_raw()
+        self._push(data, raw.storage.copy(), UInt32(raw.socklen()))
+
+    def push(mut self, data: Span[UInt8, _]) raises IoError:
+        """Queue `data` as one datagram to a connected socket's peer."""
+        self._push(data, SockaddrStorage.zeroed(), 0)
+
+    def _push(
+        mut self, data: Span[UInt8, _], var name: SockaddrStorage, namelen: UInt32
+    ) raises IoError:
+        if self._count == self.capacity() or len(data) > self._slot:
+            raise IoError.of_kind("DatagramBatch.push", ErrorKind.InvalidInput)
+        var i = self._count
+        if len(data) > 0:
+            unsafe_memcpy(
+                dest=self._data.unsafe_ptr().unsafe_offset(i * self._slot),
+                src=data.unsafe_ptr(),
+                count=len(data),
+            )
+        self._lens[i] = len(data)
+        self._sizes[i] = len(data)
+        self._names[i] = name^
+        self._namelens[i] = namelen
+        self._count += 1
+
+    @inline(.always)
+    def _check(self, i: Int, op: StaticString) raises IoError:
+        if i < 0 or i >= self._count:
+            raise IoError.of_kind(op, ErrorKind.InvalidInput)
+
+    def _header(mut self, i: Int, length: Int, namelen: UInt32):
+        """Point header `i` at slot `i` (`length` bytes) and name `i`."""
+        var base = Int(self._data.unsafe_ptr()) + i * self._slot
+        self._iov[i] = Iovec(base, UInt(length))
+        var name = 0
+        if namelen > 0:
+            name = Int(self._names.unsafe_ptr().unsafe_offset(i))
+        self._hdrs[i] = Mmsghdr(
+            Msghdr(
+                name,
+                namelen,
+                Int(self._iov.unsafe_ptr().unsafe_offset(i)),
+                1,
+                0,
+                0,
+                0,
+            ),
+            0,
+        )
+
+    def _recv(mut self, sock: Socket) -> Int:
+        """One recvmmsg into every slot: datagrams received, or -errno."""
+        self._count = 0
+        self._sent = 0
+        var cap = self.capacity()
+        for i in range(cap):
+            self._header(i, self._slot, UInt32(size_of[SockaddrStorage]()))
+        var r = sys.recvmmsg(sock, Span(self._hdrs), MSG_TRUNC)
+        if r <= 0:
+            return r
+        for i in range(r):
+            var size = Int(self._hdrs[i].len)
+            self._sizes[i] = size
+            self._lens[i] = min(size, self._slot)
+            self._namelens[i] = self._hdrs[i].hdr.namelen
+        self._count = r
+        return r
+
+    def _send(mut self, sock: Socket) -> Int:
+        """One sendmmsg of the datagrams not sent yet: how many it sent, or
+        -errno."""
+        for i in range(self._sent, self._count):
+            self._header(i, self._lens[i], self._namelens[i])
+        return sys.sendmmsg(
+            sock, Span(self._hdrs)[self._sent : self._count], MSG_NOSIGNAL
+        )
 
 
 # ---- UdpSocket ---------------------------------------------------------------
@@ -376,6 +549,72 @@ struct UdpSocket(AsFd, Movable, Writable):
 
     def broadcast(self) raises IoError -> Bool:
         return self._sock.broadcast()
+
+    # ---- batches -----------------------------------------------------------
+
+    def recv_batch(self, mut batch: DatagramBatch) raises IoError -> Int:
+        """Wait (up to the read deadline) for a datagram, then take it and
+        every other queued one, up to `batch.capacity()`, in one recvmmsg.
+        Returns how many (at least 1); they replace the batch's contents."""
+        var w = _Waiter(POLLIN, Errno.ENOTCONN)
+        while True:
+            var r = batch._recv(self._sock)
+            if r >= 0:
+                w.progressed()
+                return r
+            var e = Errno(err_of(r))
+            if e == Errno.EAGAIN:
+                w.wait(self._sock, self._rd, "recv_batch")
+            elif e != Errno.EINTR:
+                raise IoError.from_errno("recv_batch", e)
+
+    def try_recv_batch(self, mut batch: DatagramBatch) raises IoError -> Int:
+        """`recv_batch` without waiting: 0 (and an empty batch) when nothing
+        is queued."""
+        while True:
+            var r = batch._recv(self._sock)
+            if r >= 0:
+                return r
+            var e = Errno(err_of(r))
+            if e == Errno.EAGAIN:
+                return 0
+            if e != Errno.EINTR:
+                raise IoError.from_errno("recv_batch", e)
+
+    def send_batch(self, mut batch: DatagramBatch) raises IoError -> Int:
+        """Send every pushed datagram not sent yet, in as few sendmmsg calls
+        as the kernel allows, waiting (up to the write deadline) for buffer
+        space; returns `len(batch)`. A datagram that fails (EMSGSIZE, a
+        refusal on a connected socket) raises; `batch.sent()` says how many
+        went out before it."""
+        var w = _Waiter(POLLOUT, Errno.EPIPE)
+        while batch._sent < batch._count:
+            var r = batch._send(self._sock)
+            if r >= 0:
+                batch._sent += r
+                w.progressed()
+                continue
+            var e = Errno(err_of(r))
+            if e == Errno.EAGAIN:
+                w.wait(self._sock, self._wr, "send_batch")
+            elif e != Errno.EINTR:
+                raise IoError.from_errno("send_batch", e)
+        return batch._sent
+
+    def try_send_batch(self, mut batch: DatagramBatch) raises IoError -> Int:
+        """Send what fits without waiting; returns `batch.sent()` (call
+        again when writable until it equals `len(batch)`)."""
+        while batch._sent < batch._count:
+            var r = batch._send(self._sock)
+            if r >= 0:
+                batch._sent += r
+                continue
+            var e = Errno(err_of(r))
+            if e == Errno.EAGAIN:
+                break
+            if e != Errno.EINTR:
+                raise IoError.from_errno("send_batch", e)
+        return batch._sent
 
     # ---- multicast ---------------------------------------------------------
 

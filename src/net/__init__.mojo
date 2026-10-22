@@ -40,5 +40,5 @@ from .dial import HostPort
 from .reader import BufReader, BufReaderParts, Read
 from .resolver import Lookup, Resolver
 from .tcp import TcpAccepted, TcpListener, TcpStream
-from .udp import Datagram, UdpSocket
+from .udp import Datagram, DatagramBatch, UdpSocket
 from .unix import UnixAccepted, UnixListener, UnixStream, UnixStreamPair

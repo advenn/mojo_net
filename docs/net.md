@@ -173,6 +173,11 @@ These names and their documented behavior are stable for v1.
      - Linux's `IP_MULTICAST_ALL` default (a wildcard-bound socket hears every group joined on its port) is documented and can be switched off.
      - L1 has every option, including IPv6 unicast hops.
      - IPv4 delivery is tested over loopback. IPv6 is tested for membership and options, and for delivery where the host routes IPv6 multicast.
-  3. Batched I/O (`sendmmsg` / `recvmmsg`) for throughput.
+  3. **Batched I/O.** Done.
+     - `DatagramBatch` with `recv_batch` / `send_batch` and their `try_*` forms: one `recvmmsg` / `sendmmsg` for up to 1024 datagrams.
+     - The batch owns every buffer and header, so a call allocates nothing.
+     - Truncation is reported per datagram; `sent()` tracks progress, also after an error.
+     - Measured on loopback (a loaded 4-core host, 64-byte datagrams, batches of 64): 13–20% faster end to end. On loopback the kernel's per-datagram work dominates (~2 µs: the send also runs the receive path). Batching saves only the syscall overhead (~120–250 ns per datagram), and its gain is larger on real NICs.
+     - **Later:** UDP GSO/GRO (`UDP_SEGMENT`, `UDP_GRO`, one route lookup for many segments) is the next throughput lever.
   4. Examples, docs, API review.
 - **Later:** sendfile, vectored helpers, TLS integration points.

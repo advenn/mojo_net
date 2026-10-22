@@ -226,6 +226,7 @@ STRUCTS = [
       ("imr_ifindex", "ifindex")]),
     ("struct ipv6_mreq", "Ipv6Mreq",
      [("ipv6mr_multiaddr", "multiaddr"), ("ipv6mr_interface", "interface")]),
+    ("struct mmsghdr", "Mmsghdr", [("msg_hdr", "hdr"), ("msg_len", "len")]),
 ]
 
 # Mirrors kept outside linux.abi ({Mojo type: module}); currently none.
