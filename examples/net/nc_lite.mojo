@@ -2,7 +2,7 @@
 
     pixi run mojo run -I src examples/net/nc_lite.mojo ADDR [TEXT...]
 
-Connects to ADDR (`127.0.0.1:7878`, `[::1]:6379`, ...) with a 3 s connect
+Connects to ADDR (`localhost:7878`, `[::1]:6379`, ...) with a 3 s connect
 timeout, sends TEXT (the remaining arguments joined by spaces, plus "\\n"),
 half-closes, and prints whatever comes back until the server closes or 2 s
 pass without the reply finishing (a read deadline, not an error: servers
@@ -13,7 +13,7 @@ from std.sys import argv, exit, stderr
 
 from linux import ErrorKind, IoError
 from linux.time import Deadline, Duration
-from net.addr import SocketAddr
+from net.dial import HostPort
 from net.socket import Shutdown
 from net.tcp import TcpStream
 
@@ -21,14 +21,14 @@ from net.tcp import TcpStream
 comptime USAGE = "usage: nc_lite ADDR [TEXT...]"
 
 
-def parse_addr(text: String) -> Optional[SocketAddr]:
-    """ADDR from the command line: a numeric IP:PORT. A bad one is a usage
-    error, explained on stderr (None: the caller exits 2)."""
+def parse_target(text: String) -> Optional[HostPort]:
+    """ADDR from the command line: HOST:PORT, where HOST is a name or an IP
+    address. A bad one is a usage error, explained on stderr (None: the
+    caller exits 2)."""
     try:
-        return SocketAddr.parse(text)
+        return HostPort.parse(text)
     except:
-        print("bad address '", text, "': expected IP:PORT, for example 127.0.0.1:7878 or [::1]:7878", sep="", file=stderr)
-        print("(numeric addresses only: host names such as localhost are not resolved yet, so use 127.0.0.1)", file=stderr)
+        print("bad address '", text, "': expected HOST:PORT, for example localhost:7878, 127.0.0.1:7878 or [::1]:7878", sep="", file=stderr)
         print(USAGE, file=stderr)
         return None
 
@@ -38,10 +38,10 @@ def main() raises:
     if len(args) < 2:
         print(USAGE, file=stderr)
         exit(2)
-    var parsed = parse_addr(String(args[1]))
+    var parsed = parse_target(String(args[1]))
     if not parsed:
         exit(2)
-    var addr = parsed.take()
+    var target = parsed.take()
     var text = String()
     for i in range(2, len(args)):
         if i > 2:
@@ -51,9 +51,9 @@ def main() raises:
 
     var conn: TcpStream
     try:
-        conn = TcpStream.connect_timeout(addr, Duration.from_secs(3))
+        conn = TcpStream.connect_host(target.host, target.port, Duration.from_secs(3))
     except e:
-        print("nc_lite: cannot connect to", addr, "-", e)
+        print("nc_lite: cannot connect to", target, "-", e)
         exit(1)
         return
     conn.set_write_deadline(Deadline.after(Duration.from_secs(3)))

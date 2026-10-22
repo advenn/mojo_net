@@ -75,7 +75,9 @@ from .blocking import (
     send_vectored_with_deadline,
     send_with_deadline,
 )
+from .dial import dial_tcp
 from .reader import Read
+from .resolver import Resolver
 from .socket import Domain, Shutdown, SockType, Socket
 
 
@@ -138,6 +140,34 @@ struct TcpStream(AsFd, Movable, Read, Writable):
             Domain.for_address(addr), SockType.STREAM, nonblocking=True
         )
         connect_with_deadline(sock, addr.to_raw(), deadline)
+        sock.set_nodelay(True)
+        return TcpStream(nonblocking_socket=sock^)
+
+    @staticmethod
+    def connect_host(
+        host: StringSlice, port: UInt16, timeout: Duration
+    ) raises IoError -> TcpStream:
+        """Connect to a host name (or IP literal) and port, giving up with
+        `TimedOut` after `timeout`, name resolution included. The system
+        configuration (/etc/resolv.conf, /etc/hosts) is read for each call
+        that needs it; to reuse it, pass a `Resolver` to
+        `connect_host_deadline`. Addresses race with Happy Eyeballs v2
+        (`net.dial`). A zero timeout raises `InvalidInput`."""
+        _check_timeout(timeout, "connect")
+        var sock = dial_tcp(host, port, Deadline.after(timeout))
+        sock.set_nodelay(True)
+        return TcpStream(nonblocking_socket=sock^)
+
+    @staticmethod
+    def connect_host_deadline(
+        host: StringSlice,
+        port: UInt16,
+        deadline: Deadline,
+        resolver: Resolver,
+    ) raises IoError -> TcpStream:
+        """`connect_host` with an absolute deadline and a `Resolver` kept by
+        the caller (a connection pool, for example)."""
+        var sock = dial_tcp(resolver, host, port, deadline)
         sock.set_nodelay(True)
         return TcpStream(nonblocking_socket=sock^)
 

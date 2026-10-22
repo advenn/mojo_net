@@ -2,7 +2,7 @@
 
     pixi run mojo run -I src examples/net/redis_ping.mojo [ADDR] [MESSAGE]
 
-Sends `PING` (or `PING MESSAGE`) to ADDR (default 127.0.0.1:6379) and prints
+Sends `PING` (or `PING MESSAGE`) to ADDR, HOST:PORT (default 127.0.0.1:6379), and prints
 the reply: `PONG`, or MESSAGE echoed back as a bulk string.
 
 The protocol side is sans-I/O (docs/design.md, contract 1): `encode_command`
@@ -15,7 +15,7 @@ the event loop later.
 from std.sys import argv, exit, stderr
 
 from linux.time import Deadline, Duration
-from net.addr import SocketAddr
+from net.dial import HostPort
 from net.tcp import TcpStream
 
 
@@ -73,28 +73,28 @@ struct RespReply(Copyable, Movable):
 comptime USAGE = "usage: redis_ping [ADDR] [MESSAGE]"
 
 
-def parse_addr(text: String) -> Optional[SocketAddr]:
-    """ADDR from the command line: a numeric IP:PORT. A bad one is a usage
-    error, explained on stderr (None: the caller exits 2)."""
+def parse_target(text: String) -> Optional[HostPort]:
+    """ADDR from the command line: HOST:PORT, where HOST is a name or an IP
+    address. A bad one is a usage error, explained on stderr (None: the
+    caller exits 2)."""
     try:
-        return SocketAddr.parse(text)
+        return HostPort.parse(text)
     except:
-        print("bad address '", text, "': expected IP:PORT, for example 127.0.0.1:7878 or [::1]:7878", sep="", file=stderr)
-        print("(numeric addresses only: host names such as localhost are not resolved yet, so use 127.0.0.1)", file=stderr)
+        print("bad address '", text, "': expected HOST:PORT, for example localhost:7878, 127.0.0.1:7878 or [::1]:7878", sep="", file=stderr)
         print(USAGE, file=stderr)
         return None
 
 
 def main() raises:
     var args = argv()
-    var parsed = parse_addr(String(args[1]) if len(args) > 1 else String("127.0.0.1:6379"))
+    var parsed = parse_target(String(args[1]) if len(args) > 1 else String("127.0.0.1:6379"))
     if not parsed:
         exit(2)
-    var addr = parsed.take()
+    var target = parsed.take()
     var cmd: List[String] = ["PING"]
     if len(args) > 2:
         cmd.append(String(args[2]))
-    var conn = TcpStream.connect_timeout(addr, Duration.from_secs(2))
+    var conn = TcpStream.connect_host(target.host, target.port, Duration.from_secs(2))
     conn.set_deadline(Deadline.after(Duration.from_secs(5)))
     conn.write_all(Span(encode_command(cmd)))
     var buf = List[UInt8]()

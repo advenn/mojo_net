@@ -19,14 +19,12 @@ There is no published package yet. Pin the same Mojo as `pixi.toml`, and put `sr
 
 ```mojo
 from linux.time import Deadline, Duration
-from net.addr import SocketAddr
 from net.tcp import TcpStream
 
 
 def main() raises:
-    var conn = TcpStream.connect_timeout(
-        SocketAddr.parse("127.0.0.1:7878"), Duration.from_secs(3)
-    )
+    # Host names resolve without libc; IPv6 and IPv4 race (Happy Eyeballs).
+    var conn = TcpStream.connect_host("localhost", 7878, Duration.from_secs(3))
     conn.set_deadline(Deadline.after(Duration.from_secs(5)))
     conn.write_all("ping\n".as_bytes())
     var reply = List[UInt8](length=5, fill=0)

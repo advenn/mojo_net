@@ -104,6 +104,16 @@ def answer(server, tcp, data):
         return ok(v4(name, '192.0.2.9')) if qtype == A else ok()
     if name == 'drop.test':
         return []
+    if name == 'loop.test':
+        return ok(v4(name, '127.0.0.1')) if qtype == A else ok(v6(name, '::1'))
+    if name == 'slowaaaa.test':
+        if qtype == A:
+            return ok(v4(name, '127.0.0.1'))
+        return [(2.0, reply(qid, q, 0, (v6(name, '::1'),)))]
+    if name == 'slowa.test':
+        if qtype == A:
+            return [(0.3, reply(qid, q, 0, (v4(name, '127.0.0.1'),)))]
+        return ok(v6(name, '::1'))
     if name == 'slow.test':
         if qtype == A:
             return [(0.3, reply(qid, q, 0, (v4(name, '192.0.2.13'),)))]

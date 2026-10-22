@@ -2,7 +2,8 @@
 
     pixi run mojo run -I src examples/net/echo_client.mojo [ADDR] [MESSAGES]
 
-Connects (3 s connect timeout) to ADDR (default 127.0.0.1:7878), sends
+Connects to ADDR, HOST:PORT with a name or an IP address (default
+127.0.0.1:7878), within 3 s with name resolution included, sends
 MESSAGES (default 3) lines one at a time and checks that each comes back
 byte for byte (`read_exact` under a 5 s read deadline), then half-closes
 and confirms the server ends the stream (EOF).
@@ -11,7 +12,7 @@ and confirms the server ends the stream (EOF).
 from std.sys import argv, exit, stderr
 
 from linux.time import Deadline, Duration, Instant
-from net.addr import SocketAddr
+from net.dial import HostPort
 from net.socket import Shutdown
 from net.tcp import TcpStream
 
@@ -19,26 +20,26 @@ from net.tcp import TcpStream
 comptime USAGE = "usage: echo_client [ADDR] [MESSAGES]"
 
 
-def parse_addr(text: String) -> Optional[SocketAddr]:
-    """ADDR from the command line: a numeric IP:PORT. A bad one is a usage
-    error, explained on stderr (None: the caller exits 2)."""
+def parse_target(text: String) -> Optional[HostPort]:
+    """ADDR from the command line: HOST:PORT, where HOST is a name or an IP
+    address. A bad one is a usage error, explained on stderr (None: the
+    caller exits 2)."""
     try:
-        return SocketAddr.parse(text)
+        return HostPort.parse(text)
     except:
-        print("bad address '", text, "': expected IP:PORT, for example 127.0.0.1:7878 or [::1]:7878", sep="", file=stderr)
-        print("(numeric addresses only: host names such as localhost are not resolved yet, so use 127.0.0.1)", file=stderr)
+        print("bad address '", text, "': expected HOST:PORT, for example localhost:7878, 127.0.0.1:7878 or [::1]:7878", sep="", file=stderr)
         print(USAGE, file=stderr)
         return None
 
 
 def main() raises:
     var args = argv()
-    var parsed = parse_addr(String(args[1]) if len(args) > 1 else String("127.0.0.1:7878"))
+    var parsed = parse_target(String(args[1]) if len(args) > 1 else String("127.0.0.1:7878"))
     if not parsed:
         exit(2)
-    var addr = parsed.take()
+    var target = parsed.take()
     var count = atol(args[2]) if len(args) > 2 else 3
-    var conn = TcpStream.connect_timeout(addr, Duration.from_secs(3))
+    var conn = TcpStream.connect_host(target.host, target.port, Duration.from_secs(3))
     print("connected", conn.local_addr(), "->", conn.peer_addr())
     for i in range(count):
         var msg = String("message ", i, " from echo_client\n")

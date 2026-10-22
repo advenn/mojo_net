@@ -59,7 +59,7 @@ def parse_addr(text: String) -> Optional[SocketAddr]:
         return SocketAddr.parse(text)
     except:
         print("bad address '", text, "': expected IP:PORT, for example 127.0.0.1:7878 or [::1]:7878", sep="", file=stderr)
-        print("(numeric addresses only: host names such as localhost are not resolved yet, so use 127.0.0.1)", file=stderr)
+        print("(a server binds an IP address: for localhost use 127.0.0.1 or [::1])", file=stderr)
         print(USAGE, file=stderr)
         return None
 

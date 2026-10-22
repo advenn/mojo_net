@@ -34,6 +34,7 @@ The M1 spike's raw-epoll server shows this is enough. It held 11k connections at
 | `socket` | L1: `Socket` and every socket option, no policy |
 | `blocking`, `tcp`, `unix` | L2: `TcpStream`, `TcpListener`, `UnixStream`, `UnixListener` and friends |
 | `reader` | `BufReader`: bounded, all-or-nothing frame reads over any `Read` stream (`TcpStream`, `UnixStream`) |
+| `dial` | `dial_tcp` / `TcpStream.connect_host`: connect by host name with Happy Eyeballs v2 (RFC 8305); `HostPort` parses `host:port` |
 | `resolver` | `Resolver`: host names to addresses (literals, /etc/hosts, `localhost`, DNS over UDP with TCP fallback); `Lookup`, the same as an incremental state machine |
 | `resolv` | `/etc/resolv.conf` (`ResolvConf`), `/etc/hosts` (`Hosts`) and the search list (`search_names`), parsed as glibc does |
 | `dns` | DNS messages, sans-I/O: A/AAAA queries (optionally EDNS(0)) and defensive response parsing that ignores forged or unrelated packets (RFC 5452) |
@@ -86,7 +87,10 @@ The M1 spike's raw-epoll server shows this is enough. It held 11k connections at
        - TCP after truncation; EDNS(0) and `use-vc` on request.
        - Failover on SERVFAIL/REFUSED/FORMERR/malformed answers/ICMP refusals at once, and on timeouts.
        - Tested against a scripted DNS server.
-  3. **`connect_host(name, port, timeout)`** with Happy Eyeballs v2 (RFC 8305).
+  3. **`connect_host(name, port, timeout)`** with Happy Eyeballs v2 (RFC 8305). Done (`net.dial`).
+     - Connections start while DNS still runs; IPv4 waits at most 50 ms for a pending AAAA.
+     - Families alternate, IPv6 first; a new attempt every 250 ms, or at once when one fails; the first to connect wins.
+     - One deadline covers resolution and connecting.
   4. **Client presets for DB drivers:** keepalive + `TCP_USER_TIMEOUT`, and a stale-connection check.
   5. **Nonblocking stream access** (`try_read`/`try_write`) for external readiness loops, plus server helpers (`SO_REUSEPORT` listeners, fd-table pre-growth, `RLIMIT_NOFILE`).
   6. **v1 polish:**
