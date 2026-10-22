@@ -23,7 +23,7 @@ Deadlines bound every step, so one stuck client cannot wedge the server:
   the write deadline after each partial write.
 """
 
-from std.sys import argv
+from std.sys import argv, exit, stderr
 
 from linux import ErrorKind, IoError
 from linux.time import Deadline, Duration, sleep
@@ -49,9 +49,27 @@ def serve(mut conn: TcpStream) raises IoError -> Int:
         total += n
 
 
+comptime USAGE = "usage: echo_server [ADDR] [MAX_CONNS]"
+
+
+def parse_addr(text: String) -> Optional[SocketAddr]:
+    """ADDR from the command line: a numeric IP:PORT. A bad one is a usage
+    error, explained on stderr (None: the caller exits 2)."""
+    try:
+        return SocketAddr.parse(text)
+    except:
+        print("bad address '", text, "': expected IP:PORT, for example 127.0.0.1:7878 or [::1]:7878", sep="", file=stderr)
+        print("(numeric addresses only: host names such as localhost are not resolved yet, so use 127.0.0.1)", file=stderr)
+        print(USAGE, file=stderr)
+        return None
+
+
 def main() raises:
     var args = argv()
-    var addr = SocketAddr.parse(args[1] if len(args) > 1 else "127.0.0.1:7878")
+    var parsed = parse_addr(String(args[1]) if len(args) > 1 else String("127.0.0.1:7878"))
+    if not parsed:
+        exit(2)
+    var addr = parsed.take()
     var max_conns = atol(args[2]) if len(args) > 2 else 0
     var listener = TcpListener.bind(addr)
     print("echo_server listening on", listener.local_addr())

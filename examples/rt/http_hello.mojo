@@ -19,7 +19,7 @@ Request bodies are not supported: this shows the connection layer, it is
 not an HTTP implementation. Idle keep-alive connections close after 60 s.
 """
 
-from std.sys import argv
+from std.sys import argv, exit, stderr
 
 from bytes.buffer import ByteBuffer
 from linux import IoError
@@ -108,9 +108,27 @@ struct Hello(ConnHandler, Copyable):
             conn.write(RESPONSE)
 
 
+comptime USAGE = "usage: http_hello [ADDR]"
+
+
+def parse_addr(text: String) -> Optional[SocketAddr]:
+    """ADDR from the command line: a numeric IP:PORT. A bad one is a usage
+    error, explained on stderr (None: the caller exits 2)."""
+    try:
+        return SocketAddr.parse(text)
+    except:
+        print("bad address '", text, "': expected IP:PORT, for example 127.0.0.1:7878 or [::1]:7878", sep="", file=stderr)
+        print("(numeric addresses only: host names such as localhost are not resolved yet, so use 127.0.0.1)", file=stderr)
+        print(USAGE, file=stderr)
+        return None
+
+
 def main() raises:
     var args = argv()
-    var addr = SocketAddr.parse(args[1] if len(args) > 1 else "127.0.0.1:8080")
+    var parsed = parse_addr(String(args[1]) if len(args) > 1 else String("127.0.0.1:8080"))
+    if not parsed:
+        exit(2)
+    var addr = parsed.take()
     var ev = EventLoop()
     var srv = TcpServer[Hello].listen(
         ev.loop, addr, Hello(), ServerConfig(conn=ConnConfig(idle_timeout_ns=IDLE_NS), backlog=4096)

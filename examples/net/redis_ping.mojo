@@ -12,7 +12,7 @@ arrived simply means "read more", which is how the same codec will run on
 the event loop later.
 """
 
-from std.sys import argv
+from std.sys import argv, exit, stderr
 
 from linux.time import Deadline, Duration
 from net.addr import SocketAddr
@@ -70,9 +70,27 @@ struct RespReply(Copyable, Movable):
         raise Error("unsupported RESP type: ", kind)
 
 
+comptime USAGE = "usage: redis_ping [ADDR] [MESSAGE]"
+
+
+def parse_addr(text: String) -> Optional[SocketAddr]:
+    """ADDR from the command line: a numeric IP:PORT. A bad one is a usage
+    error, explained on stderr (None: the caller exits 2)."""
+    try:
+        return SocketAddr.parse(text)
+    except:
+        print("bad address '", text, "': expected IP:PORT, for example 127.0.0.1:7878 or [::1]:7878", sep="", file=stderr)
+        print("(numeric addresses only: host names such as localhost are not resolved yet, so use 127.0.0.1)", file=stderr)
+        print(USAGE, file=stderr)
+        return None
+
+
 def main() raises:
     var args = argv()
-    var addr = SocketAddr.parse(args[1] if len(args) > 1 else "127.0.0.1:6379")
+    var parsed = parse_addr(String(args[1]) if len(args) > 1 else String("127.0.0.1:6379"))
+    if not parsed:
+        exit(2)
+    var addr = parsed.take()
     var cmd: List[String] = ["PING"]
     if len(args) > 2:
         cmd.append(String(args[2]))

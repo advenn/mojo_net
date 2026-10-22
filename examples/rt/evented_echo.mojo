@@ -25,7 +25,7 @@ Try it: `nc 127.0.0.1 7878`, or many at once with
 `spikes/epoll_echo/out/client --port 7878 --active 100 --duration 5`.
 """
 
-from std.sys import argv
+from std.sys import argv, exit, stderr
 
 from bytes.buffer import ByteBuffer
 from linux import IoError
@@ -68,9 +68,27 @@ struct Echo(ConnHandler, Copyable):
         print("close", reason)
 
 
+comptime USAGE = "usage: evented_echo [ADDR] [MAX_CONNS]"
+
+
+def parse_addr(text: String) -> Optional[SocketAddr]:
+    """ADDR from the command line: a numeric IP:PORT. A bad one is a usage
+    error, explained on stderr (None: the caller exits 2)."""
+    try:
+        return SocketAddr.parse(text)
+    except:
+        print("bad address '", text, "': expected IP:PORT, for example 127.0.0.1:7878 or [::1]:7878", sep="", file=stderr)
+        print("(numeric addresses only: host names such as localhost are not resolved yet, so use 127.0.0.1)", file=stderr)
+        print(USAGE, file=stderr)
+        return None
+
+
 def main() raises:
     var args = argv()
-    var addr = SocketAddr.parse(args[1] if len(args) > 1 else "127.0.0.1:7878")
+    var parsed = parse_addr(String(args[1]) if len(args) > 1 else String("127.0.0.1:7878"))
+    if not parsed:
+        exit(2)
+    var addr = parsed.take()
     var max_conns = atol(args[2]) if len(args) > 2 else 0
 
     var closed = Closed()
