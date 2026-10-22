@@ -63,6 +63,7 @@ pixi run bench build               # rt benchmarks (bench/rt/README.md)
   - `socket`: L1, every socket option, no policy.
   - `blocking`, `tcp`, `unix`: L2 blocking streams. Nonblocking internally: try → EAGAIN → `wait_ready` → retry, with absolute per-direction deadlines.
   - `reader`: the `Read` trait and `BufReader`. Frame reads are bounded (`max_bytes`, `max_size`) and all or nothing: on any error nothing is consumed.
+  - `dns` (sans-I/O DNS messages), `resolv` (resolv.conf, hosts, search list), `resolver` (`Resolver.lookup_ip`, `Lookup`): name resolution without libc.
   - `buffer` / `codec`: re-exports of `bytes.buffer` / `bytes.codec`.
 - **Syscalls:**
   - All of them go through `linux/syscall.mojo` (the only inline asm), via the typed wrappers in `linux/sys.mojo` or module-local wrappers.
@@ -84,6 +85,7 @@ pixi run bench build               # rt benchmarks (bench/rt/README.md)
   - Use port 0, pid-unique abstract socket names, and scratch subdirectories, so files can run in parallel.
   - Every fault test starts with `fault.clear()`.
   - Regression tests for review findings live in `tests/*/test_<group>_regressions*.mojo`.
+  - Shared test helpers are modules not named `test_*` (`tests/net/reader_script.mojo`, `tests/net/fake_dns.mojo`). A helper that owns a peer process must be stopped explicitly at the end of the test (`dns^.stop()`): Mojo destroys values right after their last use, which would kill the peer early.
 
 ## Mojo 1.2 pitfalls found in this codebase
 - **Lifetimes (critical).** Mojo destroys a value right after its last use. In `sys.fcntl(owner.raw_fd(), ...)` the `OwnedFd` is destroyed, and the fd closed, *before* the syscall runs. So:

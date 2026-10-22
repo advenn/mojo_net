@@ -34,6 +34,7 @@ The M1 spike's raw-epoll server shows this is enough. It held 11k connections at
 | `socket` | L1: `Socket` and every socket option, no policy |
 | `blocking`, `tcp`, `unix` | L2: `TcpStream`, `TcpListener`, `UnixStream`, `UnixListener` and friends |
 | `reader` | `BufReader`: bounded, all-or-nothing frame reads over any `Read` stream (`TcpStream`, `UnixStream`) |
+| `resolver` | `Resolver`: host names to addresses (literals, /etc/hosts, `localhost`, DNS over UDP with TCP fallback); `Lookup`, the same as an incremental state machine |
 | `resolv` | `/etc/resolv.conf` (`ResolvConf`), `/etc/hosts` (`Hosts`) and the search list (`search_names`), parsed as glibc does |
 | `dns` | DNS messages, sans-I/O: A/AAAA queries (optionally EDNS(0)) and defensive response parsing that ignores forged or unrelated packets (RFC 5452) |
 | `buffer`, `codec` | re-exports of `bytes.buffer` and `bytes.codec` |
@@ -80,8 +81,11 @@ The M1 spike's raw-epoll server shows this is enough. It held 11k connections at
   2. **DNS stub resolver**, blocking and pure Mojo:
      - the wire codec (`net.dns`): done, fuzzed and ASan-clean;
      - `/etc/hosts` and `resolv.conf` (search, ndots, timeout, attempts, rotate, edns0, use-vc) and the search list (`net.resolv`): done, checked against glibc's getaddrinfo;
-     - UDP A/AAAA queries with random ids, falling back to TCP on truncation;
-     - response validation.
+     - the resolver (`net.resolver`): done.
+       - A and AAAA in parallel on separate connected UDP sockets, with random IDs; forged packets are ignored.
+       - TCP after truncation; EDNS(0) and `use-vc` on request.
+       - Failover on SERVFAIL/REFUSED/FORMERR/malformed answers/ICMP refusals at once, and on timeouts.
+       - Tested against a scripted DNS server.
   3. **`connect_host(name, port, timeout)`** with Happy Eyeballs v2 (RFC 8305).
   4. **Client presets for DB drivers:** keepalive + `TCP_USER_TIMEOUT`, and a stale-connection check.
   5. **Nonblocking stream access** (`try_read`/`try_write`) for external readiness loops, plus server helpers (`SO_REUSEPORT` listeners, fd-table pre-growth, `RLIMIT_NOFILE`).
