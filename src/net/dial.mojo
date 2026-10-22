@@ -37,7 +37,7 @@ from linux.poll import poll_until
 from linux.syscall import err_of, is_err
 from linux.time import Deadline, Duration, Instant
 
-from .addr import IpAddr, SocketAddr, SocketAddrV6
+from .addr import IpAddr, RawSockaddr, SocketAddr, SocketAddrV6
 from .blocking import connect_with_deadline
 from .dns import TYPE_AAAA
 from .resolver import Lookup, Resolver, precedence
@@ -342,20 +342,34 @@ def _settle(
     """Look at the attempts that finished (`revents[i]` is attempt `i`'s
     poll entry). Return the index of the earliest-started one that
     connected (attempts are in start order, so a tie goes to the first),
-    else record and drop the failed ones and return None."""
+    else record and drop the failed ones and return None.
+
+    As in `net.blocking.connect_with_deadline`: SO_ERROR first, then
+    getpeername decides. Writability alone proves nothing, since a socket
+    whose connect never started also polls POLLOUT|POLLHUP with no error;
+    ENOTCONN with HUP/ERR means the attempt is over, without them the
+    wakeup was spurious and the attempt keeps waiting."""
     var failed = List[Int]()
     for i in range(len(attempts)):
         var ev = revents[i].revents
         if (ev & Int16(POLLOUT | POLLERR | POLLHUP)) == 0:
             continue
         var err = attempts[i].sock.take_error()
-        if not err and (ev & Int16(POLLOUT)) != 0:
-            return i
         if err:
             errors.add(IoError.from_errno("connect", err.value().errno))
-        else:
-            errors.add(IoError.of_kind("connect", ErrorKind.ConnectionRefused))
-        failed.append(i)
+            failed.append(i)
+            continue
+        var peer = RawSockaddr()
+        var g = sys.getpeername(attempts[i].sock, peer.storage, peer.len)
+        if g == 0:
+            return i
+        var ge = Errno(err_of(g))
+        if ge != Errno.ENOTCONN:
+            errors.add(IoError.from_errno("connect", ge))
+            failed.append(i)
+        elif (ev & Int16(POLLERR | POLLHUP)) != 0:
+            errors.add(IoError.from_errno("connect", Errno.ENOTCONN))
+            failed.append(i)
     for k in range(len(failed) - 1, -1, -1):  # from the end: indices stay valid
         _ = attempts.pop(failed[k])
     return None

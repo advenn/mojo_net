@@ -377,11 +377,16 @@ struct Lookup(Movable):
                 Domain.for_address(server), SockType.DGRAM, nonblocking=True
             )
             sock.connect(server)
-            _ = sock.send(Span(self._queries[i].msg))
         except e:
             if _is_local_resource_error(e):
                 raise e
             return False
+        while True:
+            var r = sys.send(sock, Span(self._queries[i].msg), MSG_NOSIGNAL)
+            if r >= 0:
+                break
+            if Errno(err_of(r)) != Errno.EINTR:
+                return False  # unreachable, refused, ...: the next server
         self._queries[i].udp = sock^
         return True
 

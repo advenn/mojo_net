@@ -50,16 +50,6 @@ def _set(ips: List[IpAddr]) -> String:
     return out
 
 
-def _count(dns: FakeDns, server: Int, name: StringSlice) raises -> Int:
-    """Queries server `server` has seen for `name` (its `count.` answer)."""
-    var c = ResolvConf()
-    c.nameservers.append(dns.server(server))
-    var r = Resolver(c^, Hosts())
-    var ips = r.lookup_ip(String("count.", name), _secs(5), want_v6=False)
-    var o = ips[0].v4().octets()
-    return Int(o[2]) * 256 + Int(o[3])
-
-
 # ---- R1 ----------------------------------------------------------------------
 
 
@@ -140,9 +130,9 @@ def test_r4_no_query_after_the_deadline() raises:
     except e:
         kind = String(e.kind)
     assert_equal(kind, "TimedOut")
-    assert_equal(_count(dns, 0, "drop.test"), 2)  # A and AAAA, once
-    assert_equal(_count(dns, 1, "drop.test"), 0)
-    assert_equal(_count(dns, 0, "drop.test.d0.test"), 0)
+    assert_equal(dns.count(0, "drop.test"), 2)  # A and AAAA, once
+    assert_equal(dns.count(1, "drop.test"), 0)
+    assert_equal(dns.count(0, "drop.test.d0.test"), 0)
     dns^.stop()
 
 

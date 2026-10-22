@@ -7,6 +7,7 @@ lookup failures.
 A black hole is a loopback listener whose accept queue is full: Linux drops
 the SYNs of further connections, so their connect hangs."""
 
+from std.os import listdir
 from std.testing import TestSuite, assert_equal, assert_false, assert_true
 
 from linux import ErrorKind, IoError, sys
@@ -274,6 +275,53 @@ def test_lookup_failures_are_resolve_errors() raises:
         op = String(e.op)
     assert_equal(kind, "NotFound")
     assert_equal(op, "resolve")
+    dns^.stop()
+
+
+def _fd_count() raises -> Int:
+    return len(listdir("/proc/self/fd"))
+
+
+def _attempt_kind(
+    host: StringSlice, port: UInt16, deadline: Deadline, r: Resolver
+) -> String:
+    try:
+        _ = TcpStream.connect_host_deadline(host, port, deadline, r)
+        return "ok"
+    except e:
+        return String(e.kind)
+
+
+def test_no_descriptor_leaks() raises:
+    # Every path closes what it opened: success through DNS, a refused
+    # address before a live one, NXDOMAIN, TC then TCP, a silent server
+    # hitting the deadline, and a black hole hitting it.
+    var dns = FakeDns()
+    var l = TcpListener.bind(SocketAddr.parse("127.0.0.1:0"))
+    var port = l.local_addr().port()
+    var hole = _BlackHole(SocketAddr.parse("127.0.0.2:0"))
+    var hole_port = hole.port()
+    var r = dns.resolver()
+    var hosts = _resolver_with(
+        "127.0.0.2 re.test\n127.0.0.1 re.test\n127.0.0.2 hole.test\n"
+    )
+    var before = -1
+    for round in range(31):
+        if round == 1:
+            before = _fd_count()  # after one warm-up round
+        assert_equal(_attempt_kind("loop.test", port, _secs(5), r), "ok")
+        _ = l.accept()
+        assert_equal(_attempt_kind("re.test", port, _secs(5), hosts), "ok")
+        _ = l.accept()
+        assert_equal(_attempt_kind("nx.test", port, _secs(5), r), "NotFound")
+        _ = r.lookup_ip("big.test", _secs(5))
+        var quick = Deadline.after(Duration.from_millis(30))
+        assert_equal(_attempt_kind("drop.test", port, quick, r), "TimedOut")
+        var short = Deadline.after(Duration.from_millis(30))
+        assert_equal(_attempt_kind("hole.test", hole_port, short, hosts), "TimedOut")
+    assert_equal(_fd_count(), before)
+    sys.keep_alive(l)
+    hole^.stop()
     dns^.stop()
 
 

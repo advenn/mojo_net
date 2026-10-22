@@ -8,7 +8,7 @@ destroyed. The wire format here is written independently of `net.dns`."""
 
 from std.python import Python, PythonObject
 
-from linux.time import Duration
+from linux.time import Deadline, Duration
 from net.addr import IpAddr, SocketAddr
 from net.resolv import Hosts, ResolvConf
 from net.resolver import Resolver
@@ -259,6 +259,20 @@ struct FakeDns(Movable):
 
     def resolver(self, timeout_secs: Int = 1, attempts: Int = 1) raises -> Resolver:
         return Resolver(self.conf(timeout_secs, attempts), Hosts())
+
+    def count(self, server: Int, name: StringSlice) raises -> Int:
+        """How many queries server `server` has seen for `name` (its
+        `count.<name>` answer encodes the number in an IPv4 address)."""
+        var c = ResolvConf()
+        c.nameservers.append(self.server(server))
+        var r = Resolver(c^, Hosts())
+        var ips = r.lookup_ip(
+            String("count.", name),
+            Deadline.after(Duration.from_secs(5)),
+            want_v6=False,
+        )
+        var o = ips[0].v4().octets()
+        return Int(o[2]) * 256 + Int(o[3])
 
 
 def _kill(proc: PythonObject):
