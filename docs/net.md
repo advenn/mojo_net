@@ -8,7 +8,7 @@ Sockets for Mojo on Linux. It provides:
 
 It is the transport under the planned HTTP library, HTTP server and database drivers. Package rules and the shared contracts (sans-I/O codecs, errors, fds, determinism seams) are in `docs/design.md`.
 
-**Status: active.** M1 is done; M2 (TCP v1) is next.
+**Status: active.** M1 is done; M2 (TCP v1) is in progress (item 1 done).
 
 ## Scope
 **In scope:**
@@ -33,6 +33,7 @@ The M1 spike's raw-epoll server shows this is enough. It held 11k connections at
 | `addr` | `Ipv4Addr`, `Ipv6Addr`, `IpAddr`, `SocketAddr`/`V4`/`V6`, `UnixAddr`, `if_nametoindex` |
 | `socket` | L1: `Socket` and every socket option, no policy |
 | `blocking`, `tcp`, `unix` | L2: `TcpStream`, `TcpListener`, `UnixStream`, `UnixListener` and friends |
+| `reader` | `BufReader`: bounded, all-or-nothing frame reads over any `Read` stream (`TcpStream`, `UnixStream`) |
 | `buffer`, `codec` | re-exports of `bytes.buffer` and `bytes.codec` |
 
 ## L2 blocking contract (as built in M1)
@@ -69,7 +70,11 @@ The M1 spike's raw-epoll server shows this is enough. It held 11k connections at
   - **Review:** a 5-lens adversarial review confirmed and fixed 49 issues.
   - **Spike:** 11k connections at C/tokio speed.
 - **M2: TCP v1.**
-  1. **Buffered reader** over blocking streams: `read_until(delim, max)`, `read_exact`, `peek`, keeping pipelined leftovers.
+  1. **Buffered reader.** Done: `net.reader.BufReader`.
+     - `read_until(delim, max)`, `read_line`, `read_exact`;
+     - zero-copy `fill`/`fill_until` + `buffer()` + `consume`;
+     - pipelined leftovers are kept, and `into_parts` hands them back.
+     - Every frame read is all or nothing, so a deadline that expires mid-frame loses nothing.
   2. **DNS stub resolver**, blocking and pure Mojo:
      - reads `/etc/hosts` and `resolv.conf` (search, ndots, timeout, attempts);
      - UDP A/AAAA queries with random ids, falling back to TCP on truncation;

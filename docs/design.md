@@ -21,7 +21,7 @@ So a Mojo upgrade, or a change in a shared layer, lands in every package in one 
 |---|---|---|---|
 | `linux` | raw syscalls, ABI mirrors, errno, `IoError`, fds, clock, poll/epoll/eventfd wrappers, probing (including fd-table pre-growth) | stable (M1) | `std` only |
 | `bytes` | `ByteBuffer`, and the sans-I/O `Codec` contract (contract 1) with the reference `LineCodec` | stable (M1) | `linux` |
-| `net` | the TCP/socket library (`docs/net.md`): addresses, socket options (L1), blocking TCP/Unix with deadlines (L2); next: buffered reader, DNS, connect-by-name | **active**: M2, TCP v1 | `linux`, `bytes` |
+| `net` | the TCP/socket library (`docs/net.md`): addresses, socket options (L1), blocking TCP/Unix with deadlines (L2), buffered frame reads (`BufReader`); next: DNS, connect-by-name | **active**: M2, TCP v1 | `linux`, `bytes` |
 | `rt` | experimental completion-based event loop (`docs/rt.md`): epoll and simulator backends, timers, slab, mailbox, `rt.evented` connections | **frozen** until Mojo's async/await stabilizes | `linux`, `bytes`, `net` |
 
 - **Nothing outside `rt` imports `rt`.** `rt` builds on `net`, never the reverse.

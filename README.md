@@ -9,7 +9,7 @@ Native Mojo networking libraries for Linux (x86_64 and aarch64, kernel 5.15+):
 |---|---|---|
 | `linux` | raw syscalls (inline asm), ABI mirrors, errno and `IoError`, fds, clocks, poll/epoll/eventfd, probing | stable |
 | `bytes` | `ByteBuffer` and the sans-I/O `Codec` contract that protocol codecs implement | stable |
-| `net` | the TCP library: addresses, every socket option, blocking TCP/Unix streams with deadlines ([docs/net.md](docs/net.md)) | active: TCP v1 |
+| `net` | the TCP library: addresses, every socket option, blocking TCP/Unix streams with deadlines, buffered frame reads ([docs/net.md](docs/net.md)) | active: TCP v1 |
 | `rt` | an experimental completion-based event loop ([docs/rt.md](docs/rt.md)) | frozen |
 
 Imports point downward only (`linux` ← `bytes` ← `net` ← `rt`), and only `rt` may import `rt`. CI checks both rules. Design, package rules and shared contracts: [docs/design.md](docs/design.md).

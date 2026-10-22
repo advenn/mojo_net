@@ -46,6 +46,7 @@ from .blocking import (
     send_vectored_with_deadline,
     send_with_deadline,
 )
+from .reader import Read
 from .socket import Domain, Shutdown, SockType, Socket
 
 
@@ -103,7 +104,7 @@ def _unix_addr(raw: RawSockaddr) raises IoError -> UnixAddr:
 # ---- UnixStream --------------------------------------------------------------
 
 
-struct UnixStream(AsFd, Movable, Writable):
+struct UnixStream(AsFd, Movable, Read, Writable):
     """A connected AF_UNIX stream with blocking reads and writes bounded by
     per-direction deadlines (semantics as `net.tcp.TcpStream`)."""
 

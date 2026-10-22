@@ -75,6 +75,7 @@ from .blocking import (
     send_vectored_with_deadline,
     send_with_deadline,
 )
+from .reader import Read
 from .socket import Domain, Shutdown, SockType, Socket
 
 
@@ -89,7 +90,7 @@ def _check_timeout(timeout: Duration, op: StaticString) raises IoError:
 # ---- TcpStream ---------------------------------------------------------------
 
 
-struct TcpStream(AsFd, Movable, Writable):
+struct TcpStream(AsFd, Movable, Read, Writable):
     """A connected TCP stream with blocking reads and writes bounded by
     per-direction deadlines (see the module docs).
 
