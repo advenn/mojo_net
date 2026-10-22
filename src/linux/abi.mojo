@@ -333,3 +333,26 @@ struct RawSockaddr(Copyable, Movable):
         buffer (the kernel shrinks `len`)."""
         self.storage = SockaddrStorage.zeroed()
         self.len = UInt32(size_of[SockaddrStorage]())
+
+
+@fieldwise_init
+struct IpMreqn(Copyable, Movable):
+    """`struct ip_mreqn` (12 bytes): an IPv4 multicast membership request
+    (IP_ADD_MEMBERSHIP / IP_DROP_MEMBERSHIP)."""
+
+    var multiaddr: UInt32
+    """The group, network order."""
+    var address: UInt32
+    """The local interface's address (network order), or 0 for any."""
+    var ifindex: Int32
+    """The interface index, or 0 to pick by `address`."""
+
+
+@fieldwise_init
+struct Ipv6Mreq(Copyable, Movable):
+    """`struct ipv6_mreq` (20 bytes): an IPv6 multicast membership request
+    (IPV6_ADD_MEMBERSHIP / IPV6_DROP_MEMBERSHIP)."""
+
+    var multiaddr: Array[UInt8, 16]
+    var interface: UInt32
+    """The interface index, or 0 for the kernel's choice."""

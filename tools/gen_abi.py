@@ -75,7 +75,13 @@ CONSTS = [
     ("TCP congestion-avoidance states (tcp_info ca_state)",
      ["TCP_CA_Open", "TCP_CA_Disorder", "TCP_CA_CWR", "TCP_CA_Recovery",
       "TCP_CA_Loss"]),
-    ("IP / IPv6 options", ["IP_TOS", "IP_TTL", "IPV6_V6ONLY", "IPV6_TCLASS"]),
+    ("IP / IPv6 options", ["IP_TOS", "IP_TTL", "IPV6_V6ONLY", "IPV6_TCLASS",
+      "IPV6_UNICAST_HOPS"]),
+    ("Multicast",
+     ["IP_MULTICAST_IF", "IP_MULTICAST_TTL", "IP_MULTICAST_LOOP",
+      "IP_ADD_MEMBERSHIP", "IP_DROP_MEMBERSHIP", "IP_MULTICAST_ALL",
+      "IPV6_MULTICAST_IF", "IPV6_MULTICAST_HOPS", "IPV6_MULTICAST_LOOP",
+      "IPV6_ADD_MEMBERSHIP", "IPV6_DROP_MEMBERSHIP", "IPV6_MULTICAST_ALL"]),
     ("send/recv flags",
      ["MSG_OOB", "MSG_PEEK", "MSG_DONTWAIT", "MSG_NOSIGNAL", "MSG_MORE",
       "MSG_WAITALL", "MSG_TRUNC", "MSG_CTRUNC", "MSG_ERRQUEUE", "MSG_ZEROCOPY",
@@ -215,6 +221,11 @@ STRUCTS = [
     ("struct rlimit64", "Rlimit", [("rlim_cur", "cur"), ("rlim_max", "max")]),
     ("struct ifreq", "Ifreq",
      [("ifr_name", "name"), ("ifr_ifindex", "ifindex")]),
+    ("struct ip_mreqn", "IpMreqn",
+     [("imr_multiaddr", "multiaddr"), ("imr_address", "address"),
+      ("imr_ifindex", "ifindex")]),
+    ("struct ipv6_mreq", "Ipv6Mreq",
+     [("ipv6mr_multiaddr", "multiaddr"), ("ipv6mr_interface", "interface")]),
 ]
 
 # Mirrors kept outside linux.abi ({Mojo type: module}); currently none.

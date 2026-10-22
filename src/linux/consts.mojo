@@ -94,6 +94,21 @@ comptime IP_TOS: Int = 1
 comptime IP_TTL: Int = 2
 comptime IPV6_V6ONLY: Int = 26
 comptime IPV6_TCLASS: Int = 67
+comptime IPV6_UNICAST_HOPS: Int = 16
+
+# Multicast
+comptime IP_MULTICAST_IF: Int = 32
+comptime IP_MULTICAST_TTL: Int = 33
+comptime IP_MULTICAST_LOOP: Int = 34
+comptime IP_ADD_MEMBERSHIP: Int = 35
+comptime IP_DROP_MEMBERSHIP: Int = 36
+comptime IP_MULTICAST_ALL: Int = 49
+comptime IPV6_MULTICAST_IF: Int = 17
+comptime IPV6_MULTICAST_HOPS: Int = 18
+comptime IPV6_MULTICAST_LOOP: Int = 19
+comptime IPV6_ADD_MEMBERSHIP: Int = 20
+comptime IPV6_DROP_MEMBERSHIP: Int = 21
+comptime IPV6_MULTICAST_ALL: Int = 29
 
 # send/recv flags
 comptime MSG_OOB: Int = 1

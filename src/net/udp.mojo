@@ -36,6 +36,14 @@ datagrams from any other sender, and reports ICMP errors. After a "port
 unreachable" the next send or receive raises `ConnectionRefused`. An
 unconnected socket never sees ICMP errors.
 
+Multicast: bind the group's port (usually on the wildcard address), then
+`join_multicast_v4` / `join_multicast_v6`; senders choose the interface,
+TTL / hops and loopback with the `set_multicast_*` calls. Linux delivers
+to a wildcard-bound socket the datagrams of every group that any socket on
+the host joined on that port (IP_MULTICAST_ALL, on by default): turn it
+off with `socket().set_multicast_all_v4(False)` to hear only this
+socket's groups.
+
 Every socket is CLOEXEC and O_NONBLOCK, and sends pass MSG_NOSIGNAL. L1
 options (TTL, TOS, buffer sizes, ...) are on `socket()`.
 This module does not import `rt` (blocking layer).
@@ -46,7 +54,7 @@ from linux.consts import MSG_NOSIGNAL, MSG_PEEK, MSG_TRUNC, POLLIN, POLLOUT
 from linux.syscall import err_of
 from linux.time import Deadline, Duration
 
-from .addr import IpAddr, Ipv4Addr, RawSockaddr, SocketAddr
+from .addr import IpAddr, Ipv4Addr, Ipv6Addr, RawSockaddr, SocketAddr
 from .blocking import _Waiter, _set_cloexec
 from .socket import Domain, SockType, Socket
 
@@ -368,6 +376,53 @@ struct UdpSocket(AsFd, Movable, Writable):
 
     def broadcast(self) raises IoError -> Bool:
         return self._sock.broadcast()
+
+    # ---- multicast ---------------------------------------------------------
+
+    def join_multicast_v4(
+        self, group: Ipv4Addr, interface: Ipv4Addr = Ipv4Addr(0, 0, 0, 0)
+    ) raises IoError:
+        """Receive `group`'s datagrams on the interface with address
+        `interface` (0.0.0.0: chosen by route). Bind the group's port
+        first; see `Socket.join_multicast_v4` and `set_multicast_all_v4`."""
+        self._sock.join_multicast_v4(group, interface)
+
+    def leave_multicast_v4(
+        self, group: Ipv4Addr, interface: Ipv4Addr = Ipv4Addr(0, 0, 0, 0)
+    ) raises IoError:
+        self._sock.leave_multicast_v4(group, interface)
+
+    def join_multicast_v6(self, group: Ipv6Addr, interface: UInt32 = 0) raises IoError:
+        """Receive `group`'s datagrams on the interface with index
+        `interface` (`net.addr.if_nametoindex`)."""
+        self._sock.join_multicast_v6(group, interface)
+
+    def leave_multicast_v6(self, group: Ipv6Addr, interface: UInt32 = 0) raises IoError:
+        self._sock.leave_multicast_v6(group, interface)
+
+    def set_multicast_ttl_v4(self, ttl: Int) raises IoError:
+        """How many hops IPv4 multicast sent from here may travel (default
+        1: the local network)."""
+        self._sock.set_multicast_ttl_v4(ttl)
+
+    def set_multicast_loop_v4(self, on: Bool) raises IoError:
+        """Whether this host's own listeners get the IPv4 multicast sent
+        from here (default on)."""
+        self._sock.set_multicast_loop_v4(on)
+
+    def set_multicast_if_v4(self, interface: Ipv4Addr) raises IoError:
+        """Send IPv4 multicast from the interface with this address."""
+        self._sock.set_multicast_if_v4(interface)
+
+    def set_multicast_hops_v6(self, hops: Int) raises IoError:
+        self._sock.set_multicast_hops_v6(hops)
+
+    def set_multicast_loop_v6(self, on: Bool) raises IoError:
+        self._sock.set_multicast_loop_v6(on)
+
+    def set_multicast_if_v6(self, interface: UInt32) raises IoError:
+        """Send IPv6 multicast from the interface with this index."""
+        self._sock.set_multicast_if_v6(interface)
 
     def local_addr(self) raises IoError -> SocketAddr:
         return self._sock.local_addr()

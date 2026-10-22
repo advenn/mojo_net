@@ -36,9 +36,31 @@ from std.sys import size_of
 
 from linux import AsFd, Errno, ErrorKind, IoError, OwnedFd, check
 from linux import sys
-from linux.abi import Iovec, Linger, Msghdr, Ucred
+from linux.abi import (
+    IpMreqn,
+    Ipv6Mreq,
+    Iovec,
+    Linger,
+    Msghdr,
+    Ucred,
+    hton32,
+    ntoh32,
+)
 from linux.time import NANOS_PER_SEC, Duration
 from linux.consts import (
+    IP_ADD_MEMBERSHIP,
+    IP_DROP_MEMBERSHIP,
+    IP_MULTICAST_ALL,
+    IP_MULTICAST_IF,
+    IP_MULTICAST_LOOP,
+    IP_MULTICAST_TTL,
+    IPV6_ADD_MEMBERSHIP,
+    IPV6_DROP_MEMBERSHIP,
+    IPV6_MULTICAST_ALL,
+    IPV6_MULTICAST_HOPS,
+    IPV6_MULTICAST_IF,
+    IPV6_MULTICAST_LOOP,
+    IPV6_UNICAST_HOPS,
     AF_INET,
     AF_INET6,
     AF_UNIX,
@@ -163,7 +185,7 @@ from linux.consts import (
 from linux.nr import SYS_getsockopt, SYS_setsockopt
 from linux.syscall import syscall5
 
-from .addr import RawSockaddr, SocketAddr, UnixAddr
+from .addr import Ipv4Addr, Ipv6Addr, RawSockaddr, SocketAddr, UnixAddr
 
 # Kernel limits (include/net/tcp.h). Checked up front so `set_tcp_keepalive`
 # never leaves a socket half-configured when the second or third option
@@ -1789,6 +1811,207 @@ struct Socket(AsFd, Movable, Writable):
 
     def ttl(self) raises IoError -> Int:
         return self._get_int(IPPROTO_IP, IP_TTL, "getsockopt(IP_TTL)")
+
+    def set_unicast_hops_v6(self, hops: Int) raises IoError:
+        """IPV6_UNICAST_HOPS, the IPv6 TTL (1..255; -1 restores the route
+        default)."""
+        self._set_int(
+            IPPROTO_IPV6,
+            IPV6_UNICAST_HOPS,
+            _c_int(hops, "setsockopt(IPV6_UNICAST_HOPS)"),
+            "setsockopt(IPV6_UNICAST_HOPS)",
+        )
+
+    def unicast_hops_v6(self) raises IoError -> Int:
+        return self._get_int(
+            IPPROTO_IPV6, IPV6_UNICAST_HOPS, "getsockopt(IPV6_UNICAST_HOPS)"
+        )
+
+    # ---- multicast -----------------------------------------------------------
+
+    def join_multicast_v4(
+        self, group: Ipv4Addr, interface: Ipv4Addr = Ipv4Addr(0, 0, 0, 0)
+    ) raises IoError:
+        """IP_ADD_MEMBERSHIP: receive datagrams sent to `group` on the
+        interface whose address is `interface` (0.0.0.0: the one the
+        routing table picks for the group). The socket must be bound to the
+        group's port. `InvalidInput` for a non-multicast group; a second
+        join of the same group and interface is `AddrInUse`."""
+        self._mreq_v4(
+            IP_ADD_MEMBERSHIP, group, interface, "setsockopt(IP_ADD_MEMBERSHIP)"
+        )
+
+    def leave_multicast_v4(
+        self, group: Ipv4Addr, interface: Ipv4Addr = Ipv4Addr(0, 0, 0, 0)
+    ) raises IoError:
+        """IP_DROP_MEMBERSHIP: undo `join_multicast_v4` (closing the socket
+        also does)."""
+        self._mreq_v4(
+            IP_DROP_MEMBERSHIP,
+            group,
+            interface,
+            "setsockopt(IP_DROP_MEMBERSHIP)",
+        )
+
+    def _mreq_v4(
+        self, name: Int, group: Ipv4Addr, interface: Ipv4Addr, op: StaticString
+    ) raises IoError:
+        var m = IpMreqn(hton32(group.to_bits()), hton32(interface.to_bits()), 0)
+        _ = check(
+            op,
+            sys.setsockopt(self._fd, IPPROTO_IP, name, m, size_of[IpMreqn]()),
+        )
+
+    def join_multicast_v6(
+        self, group: Ipv6Addr, interface: UInt32 = 0
+    ) raises IoError:
+        """IPV6_ADD_MEMBERSHIP: receive datagrams sent to `group` on the
+        interface with index `interface` (`if_nametoindex`; 0: the kernel's
+        choice, which a link-local group such as ff02::/16 needs spelled
+        out). The socket must be bound to the group's port."""
+        self._mreq_v6(
+            IPV6_ADD_MEMBERSHIP,
+            group,
+            interface,
+            "setsockopt(IPV6_ADD_MEMBERSHIP)",
+        )
+
+    def leave_multicast_v6(
+        self, group: Ipv6Addr, interface: UInt32 = 0
+    ) raises IoError:
+        """IPV6_DROP_MEMBERSHIP: undo `join_multicast_v6`."""
+        self._mreq_v6(
+            IPV6_DROP_MEMBERSHIP,
+            group,
+            interface,
+            "setsockopt(IPV6_DROP_MEMBERSHIP)",
+        )
+
+    def _mreq_v6(
+        self, name: Int, group: Ipv6Addr, interface: UInt32, op: StaticString
+    ) raises IoError:
+        var m = Ipv6Mreq(group.octets(), interface)
+        _ = check(
+            op,
+            sys.setsockopt(
+                self._fd, IPPROTO_IPV6, name, m, size_of[Ipv6Mreq]()
+            ),
+        )
+
+    def set_multicast_ttl_v4(self, ttl: Int) raises IoError:
+        """IP_MULTICAST_TTL: how far IPv4 multicast travels (0..255; the
+        default 1 stays on the local network)."""
+        self._set_int(
+            IPPROTO_IP,
+            IP_MULTICAST_TTL,
+            _c_int(ttl, "setsockopt(IP_MULTICAST_TTL)"),
+            "setsockopt(IP_MULTICAST_TTL)",
+        )
+
+    def multicast_ttl_v4(self) raises IoError -> Int:
+        return self._get_int(
+            IPPROTO_IP, IP_MULTICAST_TTL, "getsockopt(IP_MULTICAST_TTL)"
+        )
+
+    def set_multicast_loop_v4(self, on: Bool) raises IoError:
+        """IP_MULTICAST_LOOP: deliver this socket's IPv4 multicast to
+        listeners on this host too (on by default). It governs the local
+        copy of what goes out a real interface; multicast sent on the
+        loopback interface reaches local listeners through the interface
+        itself, whatever this says."""
+        self._set_bool(
+            IPPROTO_IP, IP_MULTICAST_LOOP, on, "setsockopt(IP_MULTICAST_LOOP)"
+        )
+
+    def multicast_loop_v4(self) raises IoError -> Bool:
+        return self._get_bool(
+            IPPROTO_IP, IP_MULTICAST_LOOP, "getsockopt(IP_MULTICAST_LOOP)"
+        )
+
+    def set_multicast_if_v4(self, interface: Ipv4Addr) raises IoError:
+        """IP_MULTICAST_IF: send IPv4 multicast from the interface with this
+        address (0.0.0.0: by the routing table)."""
+        var m = IpMreqn(0, hton32(interface.to_bits()), 0)
+        _ = check(
+            "setsockopt(IP_MULTICAST_IF)",
+            sys.setsockopt(
+                self._fd, IPPROTO_IP, IP_MULTICAST_IF, m, size_of[IpMreqn]()
+            ),
+        )
+
+    def set_multicast_all_v4(self, on: Bool) raises IoError:
+        """IP_MULTICAST_ALL. Linux's default (on) delivers to a socket bound
+        to a wildcard address the datagrams of every group joined by any
+        socket on this host for that port, not only its own memberships;
+        off restricts it to the groups this socket joined."""
+        self._set_bool(
+            IPPROTO_IP, IP_MULTICAST_ALL, on, "setsockopt(IP_MULTICAST_ALL)"
+        )
+
+    def multicast_all_v4(self) raises IoError -> Bool:
+        return self._get_bool(
+            IPPROTO_IP, IP_MULTICAST_ALL, "getsockopt(IP_MULTICAST_ALL)"
+        )
+
+    def set_multicast_hops_v6(self, hops: Int) raises IoError:
+        """IPV6_MULTICAST_HOPS (0..255; -1 restores the default, 1)."""
+        self._set_int(
+            IPPROTO_IPV6,
+            IPV6_MULTICAST_HOPS,
+            _c_int(hops, "setsockopt(IPV6_MULTICAST_HOPS)"),
+            "setsockopt(IPV6_MULTICAST_HOPS)",
+        )
+
+    def multicast_hops_v6(self) raises IoError -> Int:
+        return self._get_int(
+            IPPROTO_IPV6, IPV6_MULTICAST_HOPS, "getsockopt(IPV6_MULTICAST_HOPS)"
+        )
+
+    def set_multicast_loop_v6(self, on: Bool) raises IoError:
+        """IPV6_MULTICAST_LOOP: deliver this socket's IPv6 multicast locally
+        too (on by default)."""
+        self._set_bool(
+            IPPROTO_IPV6,
+            IPV6_MULTICAST_LOOP,
+            on,
+            "setsockopt(IPV6_MULTICAST_LOOP)",
+        )
+
+    def multicast_loop_v6(self) raises IoError -> Bool:
+        return self._get_bool(
+            IPPROTO_IPV6, IPV6_MULTICAST_LOOP, "getsockopt(IPV6_MULTICAST_LOOP)"
+        )
+
+    def set_multicast_if_v6(self, interface: UInt32) raises IoError:
+        """IPV6_MULTICAST_IF: send IPv6 multicast from the interface with
+        this index (0: the kernel's choice)."""
+        self._set_int(
+            IPPROTO_IPV6,
+            IPV6_MULTICAST_IF,
+            Int32(interface),
+            "setsockopt(IPV6_MULTICAST_IF)",
+        )
+
+    def multicast_if_v6(self) raises IoError -> UInt32:
+        return UInt32(
+            self._get_int(
+                IPPROTO_IPV6, IPV6_MULTICAST_IF, "getsockopt(IPV6_MULTICAST_IF)"
+            )
+        )
+
+    def set_multicast_all_v6(self, on: Bool) raises IoError:
+        """IPV6_MULTICAST_ALL: as `set_multicast_all_v4`, for IPv6 groups."""
+        self._set_bool(
+            IPPROTO_IPV6,
+            IPV6_MULTICAST_ALL,
+            on,
+            "setsockopt(IPV6_MULTICAST_ALL)",
+        )
+
+    def multicast_all_v6(self) raises IoError -> Bool:
+        return self._get_bool(
+            IPPROTO_IPV6, IPV6_MULTICAST_ALL, "getsockopt(IPV6_MULTICAST_ALL)"
+        )
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write("Socket(fd=", self._fd.raw_fd(), ")")

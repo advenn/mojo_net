@@ -168,7 +168,11 @@ These names and their documented behavior are stable for v1.
      - Both modes; truncation is never silent (`Datagram.size`); empty datagrams; peeking a datagram's size.
      - Connected sockets filter senders and report ICMP refusals.
      - `bind_reuseport`, `from_socket`, `SO_BROADCAST`.
-  2. Multicast (IPv4 and IPv6 groups, TTL/hops, loop, interface).
+  2. **Multicast.** Done.
+     - `join_multicast_v4` / `v6` and `leave_*`; TTL / hops, loop and interface on the sender.
+     - Linux's `IP_MULTICAST_ALL` default (a wildcard-bound socket hears every group joined on its port) is documented and can be switched off.
+     - L1 has every option, including IPv6 unicast hops.
+     - IPv4 delivery is tested over loopback. IPv6 is tested for membership and options, and for delivery where the host routes IPv6 multicast.
   3. Batched I/O (`sendmmsg` / `recvmmsg`) for throughput.
   4. Examples, docs, API review.
 - **Later:** sendfile, vectored helpers, TLS integration points.
