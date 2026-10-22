@@ -161,7 +161,17 @@ struct TcpStream(AsFd, Movable, Read, Writable):
         `connect_host_deadline`. Addresses race with Happy Eyeballs v2
         (`net.dial`). A zero timeout raises `InvalidInput`."""
         _check_timeout(timeout, "connect")
-        var sock = dial_tcp(host, port, Deadline.after(timeout))
+        return TcpStream.connect_host_deadline(
+            host, port, Deadline.after(timeout)
+        )
+
+    @staticmethod
+    def connect_host_deadline(
+        host: StringSlice, port: UInt16, deadline: Deadline
+    ) raises IoError -> TcpStream:
+        """`connect_host` with an absolute deadline; the system configuration
+        is read only when `host` is not an IP literal."""
+        var sock = dial_tcp(host, port, deadline)
         sock.set_nodelay(True)
         return TcpStream(nonblocking_socket=sock^)
 

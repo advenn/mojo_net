@@ -118,7 +118,7 @@ pixi run bench build               # rt benchmarks (bench/rt/README.md)
 - **Comptime arrays:** a comptime `Array` of non-`ImplicitlyCopyable` values can't be indexed at runtime; use if-chains.
 - **FFI:** declare each `external_call` C symbol with exactly one signature (spike-only code). A C-callable fn pointer is spelled `def(OpaquePointer[MutAnyOrigin]) thin abi("C") -> OpaquePointer[MutAnyOrigin]`, and function-typed parameters are spelled `def(T) thin -> R`.
 - **Stdlib traps:**
-  - `String.splitlines()` also splits on `\t` (verified on 1.2.0rc2); use `split("\n")`. This matters for HTTP parsing.
+  - `String.splitlines()` also splits on `\t` (verified on 1.2.0rc2 and 1.2.0); use `split("\n")`. This matters for HTTP parsing.
   - `TestSuite.run()` rejects unknown argv, and its times are in milliseconds.
   - Memory copies are spelled `unsafe_memcpy` / `unsafe_memmove`.
 - **Runtime threads:** every Mojo process starts 1 + (CPUs in its affinity mask) runtime threads before `main`. Because a process is always multi-threaded, each kernel fd-table doubling stalls the fd-creating syscall for 20–40 ms. Long-running servers must pre-grow the fd table with `linux.probe.pregrow_fd_table(listener)` (see `docs/spikes.md`).

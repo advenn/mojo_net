@@ -8,7 +8,7 @@ Sockets for Mojo on Linux. It provides:
 
 It is the transport under the planned HTTP library, HTTP server and database drivers. Package rules and the shared contracts (sans-I/O codecs, errors, fds, determinism seams) are in `docs/design.md`.
 
-**Status: active.** M1 is done; M2 (TCP v1) is in progress (item 1 done).
+**Status: active.** M1 is done; M2 (TCP v1) is done for clients (items 1–5, and item 6 except packaging and a real aarch64 run). The client API is stable (see "v1 client API").
 
 ## Scope
 **In scope:**
@@ -67,10 +67,24 @@ var reply = r.read_until("\r\n".as_bytes(), max_bytes=64 * 1024)
   - `InvalidData` (a limit or the protocol);
   - `InvalidInput` (a bad argument).
 - **Readiness loops** use `try_read` / `try_write` / `try_accept`, which return None instead of waiting (see the rules below).
-- **Cost** (x86_64, Mojo 1.2.0rc2):
-  - `connect_host("127.0.0.1")` takes 20 µs, the same as connecting to a `SocketAddr`; `"localhost"` takes 34 µs, including the refused `::1` attempt.
-  - Resolution: hosts-file names in 8 µs (glibc `getaddrinfo`: 35 µs, since it re-reads the files every call). A DNS lookup costs one round trip, the same as glibc (A and AAAA in parallel).
-  - `BufReader` framing has ~25 ns of overhead per frame plus a SIMD scan (6.9 GB/s on 1 KiB lines, zero-copy). `read_line` adds one allocation per line (~45 ns).
+- **Cost** (x86_64, Mojo 1.2.0):
+  - `connect_host("127.0.0.1")` takes 16 µs, the same as connecting to a `SocketAddr`; `"localhost"` takes 29 µs, including the refused `::1` attempt.
+  - Resolution: hosts-file names in 8 µs (glibc `getaddrinfo`: 36 µs, since it re-reads the files every call). A DNS lookup costs one round trip, like glibc (4.1 ms against 4.3 ms here; A and AAAA in parallel).
+  - `BufReader` framing has ~25 ns of overhead per frame plus a SIMD scan (6.4 GB/s on 1 KiB lines, zero-copy). `read_line` adds one allocation per line (~40 ns).
+
+## v1 client API
+These names and their documented behavior are stable for v1.
+- **Changes are additive.** A replacement first ships beside the old name, which stays working with a deprecation warning (as `Epoll.wait(timeout_ns)` and `set_linger(Int)` did).
+- **Internal names** (with a leading `_`) are not part of it.
+
+| Area | API |
+|---|---|
+| Connecting | `TcpStream.connect` / `connect_timeout` / `connect_deadline` (an address); `connect_host` / `connect_host_deadline` (a name or literal, Happy Eyeballs; optionally with a `Resolver`); `net.dial.HostPort` |
+| Streams | `TcpStream` and `UnixStream`: `read`, `read_exact`, `read_to_end`, `read_vectored`, `peek`, `write`, `write_all`, `write_vectored`, `shutdown`; `set_read_deadline` / `set_write_deadline` / `set_deadline` and their getters; `try_read`, `try_write`, `idle_state`; `local_addr`, `peer_addr`, `socket`, `try_clone`, `from_socket`, `into_socket`, `close`. TCP only: `detect_dead_peers` |
+| Listeners | `TcpListener` / `UnixListener`: `bind` (TCP also `bind_reuseport`), `accept`, `try_accept`, `set_deadline` / `deadline`, `local_addr`, `socket`, `try_clone`, `from_socket`, `into_socket`, `close` |
+| Framing | `BufReader[S: Read]` (the `Read` trait): `stream`, `into_parts`, `buffer`, `consume`, `capacity`, `max_size`, `fill`, `fill_until`, `read_until`, `read_line`, `read_exact`, `read` |
+| Resolution | `Resolver` (`system`, `lookup_ip`, `start`), `Lookup`, `net.resolv.ResolvConf` / `Hosts` / `search_names`; the `net.dns` message helpers |
+| Errors | `IoError{kind, errno, op}`: the kinds under "Using the client" |
 
 ## L2 blocking contract (as built in M1)
 - **Nonblocking internally.** Every op is: try once → on EAGAIN `wait_ready` (ppoll) → retry. EINTR retries.
@@ -137,10 +151,15 @@ var reply = r.read_until("\r\n".as_bytes(), max_bytes=64 * 1024)
      - `TcpListener.bind_reuseport`, `linux.probe.raise_nofile_limit`, fd-table pre-growth.
      - `examples/net/epoll_echo.mojo` puts them together. Under load it ran 200 concurrent connections, 10k verified echoes in 0.21 s, and held a client that does not read to bounded memory.
   6. **v1 polish:**
-     - API docs and examples;
-     - a rattler-build recipe (modular-community);
-     - CI on real aarch64;
-     - an API review and freeze.
+     - **Done:**
+       - the client guide and the v1 client API above;
+       - an independent review of the client code, with all findings fixed under regression tests;
+       - fault-seam and descriptor-leak tests;
+       - every test and example cross-compiles for aarch64 (`pixi run aarch64-check`);
+       - Mojo 1.2.0 GA.
+     - **Left:**
+       - a rattler-build recipe (modular-community);
+       - running the suite on a real aarch64 host.
 - **M3: UDP** (after TCP v1 is stable), in two modes like TCP:
   - sync: blocking `send_to` / `recv_from` with deadlines;
   - async: nonblocking `try_*` calls for readiness loops (`linux.Epoll`), which a future runtime can build on.

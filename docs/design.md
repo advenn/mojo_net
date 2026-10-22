@@ -38,7 +38,7 @@ So a Mojo upgrade, or a change in a shared layer, lands in every package in one 
   - Control-plane exceptions (for example `pthread_create`) need an explicit, documented decision.
   - `pixi run nolibc-check` enforces it.
 - **Toolchain:**
-  - Mojo is pinned exactly (currently `1.2.0rc2`, moving to `1.2.0` GA).
+  - Mojo is pinned exactly: `1.2.0`, from Modular's stable channel (`https://conda.modular.com/max`).
   - Packages ship as source, with the constraint `>=1.2,<1.3`.
   - No private or underscore stdlib APIs (the test-only `linux.fault` is the one exception), and no nightly-only spellings.
 - **No async/await yet.** Mojo marks it unstable.

@@ -102,6 +102,10 @@ def test_literals_connect_directly() raises:
         _ = TcpStream.connect_host("::1", p6, Duration.from_secs(5))
         _ = TcpStream.connect_host("[::1]", p6, Duration.from_secs(5))
         sys.keep_alive(l6)
+    var d = TcpStream.connect_host_deadline("127.0.0.1", port, _secs(5))
+    assert_equal(String(d.peer_addr()), String("127.0.0.1:", port))
+    var h = TcpStream.connect_host_deadline("localhost", port, _secs(5))
+    assert_equal(String(h.peer_addr()), String("127.0.0.1:", port))
     var kind = String()
     try:
         _ = TcpStream.connect_host("127.0.0.1", port, Duration.ZERO)
