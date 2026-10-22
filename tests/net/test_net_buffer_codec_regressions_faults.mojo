@@ -3,7 +3,7 @@
 A span kept across a mutating call is stale, and Mojo 1.2 does not reject
 it. In a normal build such a span usually still shows the right bytes (the
 storage only moves when the buffer grows), so codec tests cannot see the
-bug. Fault builds (this file is built with `-D MOJO_TCP_FAULTS=1`) turn on
+bug. Fault builds (this file is built with `-D MOJO_NET_FAULTS=1`) turn on
 check mode: calls that may move bytes relocate the storage and poison the
 old block, and calls that drop bytes poison them. This file checks that
 the mode is on and does that, using only reads that stay inside live

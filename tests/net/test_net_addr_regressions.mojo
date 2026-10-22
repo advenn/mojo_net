@@ -20,7 +20,7 @@
 
 The abort tests re-run this file as a child process (built once with
 `mojo build`, or argv[0] itself when this is already a binary) with
-MOJO_TCP_ADDR_DEATH naming the case: an abort cannot be caught in-process.
+MOJO_NET_ADDR_DEATH naming the case: an abort cannot be caught in-process.
 """
 
 from std.os import getenv, listdir, remove, rmdir
@@ -57,7 +57,7 @@ from net.addr import (
 from net.socket import Domain, SockType, Socket
 from net.unix import UnixListener, UnixStream
 
-comptime _DEATH_ENV = "MOJO_TCP_ADDR_DEATH"
+comptime _DEATH_ENV = "MOJO_NET_ADDR_DEATH"
 
 
 # ---- helpers ---------------------------------------------------------------
@@ -124,7 +124,7 @@ def _is_path(a: UnixAddr, path: String) -> Bool:
 
 def _abstract(tag: StaticString) raises IoError -> UnixAddr:
     return UnixAddr.from_abstract_name(
-        String("mojo_tcp.addr_regr.", tag, ".", _pid())
+        String("mojo_net.addr_regr.", tag, ".", _pid())
     )
 
 
@@ -440,15 +440,15 @@ def test_f23_ipaddr_predicates_unmap_ipv4_mapped() raises:
 def _have_ipv6_sockets(test: StaticString) raises -> Bool:
     """Whether socket(AF_INET6) works, decided with a raw syscall. Without
     it this prints a skip line and the test returns early, unless
-    MOJO_TCP_REQUIRE_IPV6=1 makes that a failure."""
+    MOJO_NET_REQUIRE_IPV6=1 makes that a failure."""
     var r = sys.socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0)
     if not is_err(r):
         _ = OwnedFd(unsafe_from_raw=Int32(r))
         return True
     if Errno(err_of(r)) != Errno.EAFNOSUPPORT:
         _ = check("socket(AF_INET6)", r)
-    if getenv("MOJO_TCP_REQUIRE_IPV6") == "1":
-        raise Error(test, ": no IPv6 but MOJO_TCP_REQUIRE_IPV6=1")
+    if getenv("MOJO_NET_REQUIRE_IPV6") == "1":
+        raise Error(test, ": no IPv6 but MOJO_NET_REQUIRE_IPV6=1")
     print(String("    (skipped: ", test, ": no IPv6, EAFNOSUPPORT)"))
     return False
 

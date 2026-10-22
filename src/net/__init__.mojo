@@ -1,12 +1,12 @@
-"""Sockets: addresses, socket options (L1), blocking TCP/Unix streams with
-deadlines (L2), and the sans-I/O codec contract. `ByteBuffer` lives in
-`bytes` (re-exported here). Coming next: buffered reading, DNS resolution
-and connect-by-name.
+"""Sockets: addresses, socket options (L1) and blocking TCP/Unix streams with
+deadlines (L2). `ByteBuffer` and the sans-I/O `Codec` contract live in
+`bytes` and are re-exported here. Coming next: buffered reading, DNS
+resolution and connect-by-name (docs/net.md).
 
 This is a socket library, not an async runtime: a concurrent server drives
 nonblocking sockets from its own readiness loop (`linux.Epoll`). The
-experimental event-loop runtime that used to live here is in the separate
-mojo_rt repository.
+experimental event loop is the separate, frozen `rt` package, which builds
+on `net`; `net` never imports it.
 """
 
 from .addr import (
@@ -21,7 +21,7 @@ from .addr import (
     if_nametoindex,
 )
 from bytes.buffer import ByteBuffer
-from .codec import Codec, LineCodec
+from bytes.codec import Codec, LineCodec
 from .socket import (
     Accepted,
     Domain,

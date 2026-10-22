@@ -1,6 +1,6 @@
 """Unix-domain echo with `net.unix`, in a single process.
 
-    pixi run mojo run -I src examples/unix_echo.mojo [PATH]
+    pixi run mojo run -I src examples/net/unix_echo.mojo [PATH]
 
 Without PATH the listener uses a Linux abstract name (no file, gone when
 the socket closes); with PATH it binds that filesystem path and removes the
@@ -37,7 +37,7 @@ def main() raises:
     var args = argv()
     var pathname = len(args) > 1
     var addr = UnixAddr.from_pathname(args[1]) if pathname else (
-        UnixAddr.from_abstract_name("mojo_tcp_unix_echo_example")
+        UnixAddr.from_abstract_name("mojo_net_unix_echo_example")
     )
     var listener = UnixListener.bind(addr)
     print("listening on", listener.local_addr())

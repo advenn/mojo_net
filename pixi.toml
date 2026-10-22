@@ -1,10 +1,10 @@
 [workspace]
 authors = ["beck <qurbonovasadbek@gmail.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
-name = "mojo_tcp"
+name = "mojo_net"
 platforms = ["linux-64", "linux-aarch64"]
 version = "0.1.0"
-description = "Native Mojo TCP/socket library for Linux: raw-syscall layer (linux), byte buffers (bytes), sockets (net)."
+description = "Native Mojo networking libraries for Linux: shared layers (linux syscalls, bytes), the TCP/socket library (net), and an experimental, frozen event-loop runtime (rt)."
 
 [tasks]
 # Run all tests, or those whose path contains the given filter: `pixi run test net/`.
@@ -16,11 +16,19 @@ gen = "python3 tools/gen_syscall_nr.py && python3 tools/gen_abi.py --write"
 abi-check = "python3 tools/gen_abi.py --check && mojo run -I src build/test_abi_layout.mojo"
 # Verify the I/O path imports no libc socket/poll/epoll symbols.
 nolibc-check = "bash tools/check_nolibc.sh tests/linux/test_sys.mojo tests/linux/test_epoll.mojo tests/linux/test_poll.mojo tests/net/test_socket.mojo tests/net/test_tcp.mojo tests/net/test_unix.mojo"
-# Everything CI must run: every test file (which includes the ABI layout check)
-# plus the no-libc check. Set MOJO_TCP_REQUIRE_IPV6=1 on runners with IPv6.
-ci = { depends-on = ["test", "nolibc-check"] }
+# Verify the package import rules (docs/design.md, "Packages").
+import-check = "python3 tools/check_imports.py"
+# Build every example, so none can rot unnoticed.
+examples-check = "bash tools/check_examples.sh"
+# Everything CI must run: the import rules, every test file (which includes the
+# ABI layout check), the no-libc check and the example builds.
+# Set MOJO_NET_REQUIRE_IPV6=1 on runners with IPv6.
+ci = { depends-on = ["import-check", "test", "nolibc-check", "examples-check"] }
 # Re-run the M1 threading/runtime/callback spikes (see docs/spikes.md).
 spikes = "bash spikes/run_spikes.sh"
+# rt benchmarks against tokio (rt is frozen; see bench/rt/README.md):
+# `pixi run bench build`, then `pixi run bench gate`.
+bench = "bash bench/rt/run.sh"
 format = "mojo format src tests"
 
 [dependencies]

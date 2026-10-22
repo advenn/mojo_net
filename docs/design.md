@@ -1,93 +1,99 @@
 # Design
 
-A native Mojo TCP/socket library for Linux. It is the foundation for an HTTP library, an HTTP server and database drivers. Requirements: correct socket semantics, reliability, speed.
+`mojo_net` is a set of native Mojo networking libraries for Linux, kept in one repository. The roadmap is what lightbug gave up: 1. TCP, 2. an HTTP library, 3. an HTTP server. Database drivers build on the same layers. Requirements: correct socket semantics, reliability, speed.
 
-## Scope
-**In scope:**
-- raw syscalls;
-- addresses;
-- every socket option;
-- blocking TCP/Unix streams with deadlines;
-- nonblocking access for callers that run their own readiness loop (`linux.Epoll`);
-- buffered reading;
-- DNS resolution and connect-by-name;
-- the sans-I/O codec contract that protocol libraries build on.
+## One repo, separate libraries
+**Why one repo.** The packages share:
+- one toolchain pin;
+- one CI;
+- the same low-level layers.
 
-**Out of scope: an async runtime** (event loop, executor, timers, scheduling, io_uring proactor, simulation). That is a separate, heavy project. An experimental one grew here during M2 and was moved to its own repository, `mojo_rt` (git tag `runtime-snapshot` marks the last commit that contained it). It is frozen until Mojo's async/await stabilizes, because Mojo's async design ("the compiler generates coroutines, the library schedules them") will shape any runtime API. Sockets and syscalls don't depend on it.
+So a Mojo upgrade, or a change in a shared layer, lands in every package in one commit. There is no package manager to wire separate repos together yet, and precompiled Mojo packages only load on the compiler that built them, so everything builds from source together.
 
-**How a concurrent server uses this library without a runtime:**
-- Make sockets nonblocking and drive them from a readiness loop (epoll, edge-triggered).
-- For multi-core, run N processes on one port with `SO_REUSEPORT`, as nginx does.
-
-The M1 spike's raw-epoll server shows this is enough. It held 11k connections at C/tokio throughput, using 123–159 B of user memory per connection. The rules it found are listed below.
-
-## Fixed decisions
-- **Platform:** Linux only, x86_64 and aarch64; kernel 5.15 LTS or newer.
-- **No libc on the I/O path:** every syscall is inline asm in `src/linux/syscall.mojo`. Any control-plane exception needs an explicit, documented decision.
-- **Toolchain:**
-  - Mojo is pinned exactly (currently `1.2.0rc2`, moving to `1.2.0` GA).
-  - The library ships as source, with the constraint `>=1.2,<1.3`.
-  - No private or underscore stdlib APIs, and no nightly-only spellings.
+**What stays separate.** Sharing a repo does not merge scopes:
+- Each library has its own document, scope, status and milestones (`docs/<pkg>.md`).
+- Each depends only on the layers below it.
+- One library's goals never gate another's. The TCP library is not blocked on runtime performance.
+- The import rules below are checked in CI (`pixi run import-check`).
 
 ## Packages (dependencies point downward only)
-| Package | Role | May import |
-|---|---|---|
-| `linux` | raw syscalls, ABI mirrors, errno, `IoError`, fds, clock, poll/epoll/eventfd wrappers, probing | std only |
-| `bytes` | `ByteBuffer`: owned buffers that codecs read from and append to | `linux` |
-| `net` | addresses, socket options (L1), blocking TCP/Unix (L2), codec contract; next: buffered reader, DNS, connect-by-name | `linux`, `bytes` |
+| Package | Role | Status | May import |
+|---|---|---|---|
+| `linux` | raw syscalls, ABI mirrors, errno, `IoError`, fds, clock, poll/epoll/eventfd wrappers, probing (including fd-table pre-growth) | stable (M1) | `std` only |
+| `bytes` | `ByteBuffer`, and the sans-I/O `Codec` contract (contract 1) with the reference `LineCodec` | stable (M1) | `linux` |
+| `net` | the TCP/socket library (`docs/net.md`): addresses, socket options (L1), blocking TCP/Unix with deadlines (L2); next: buffered reader, DNS, connect-by-name | **active**: M2, TCP v1 | `linux`, `bytes` |
+| `rt` | experimental completion-based event loop (`docs/rt.md`): epoll and simulator backends, timers, slab, mailbox, `rt.evented` connections | **frozen** until Mojo's async/await stabilizes | `linux`, `bytes`, `net` |
+
+- **Nothing outside `rt` imports `rt`.** `rt` builds on `net`, never the reverse.
+- **The same rules cover all code.** They apply to `tests/<pkg>`, `examples/<pkg>` and `bench/<pkg>`. `spikes/` (M1 evidence) follows `net`'s rules.
+- **Planned libraries** (an HTTP library, database drivers) each get `src/<pkg>`, `tests/<pkg>`, `examples/<pkg>`, `docs/<pkg>.md`, and an entry in `ALLOWED` in `tools/check_imports.py`.
+  - Their protocol logic is a sans-I/O codec built on `bytes` (contract 1).
+  - Their transport uses `net`.
+
+## Fixed decisions
+- **Platform:** Linux only, x86_64 and aarch64.
+- **Kernel:** 5.15 LTS or newer. epoll is the guaranteed readiness backend. io_uring (6.1-level features) is only a probed option (`linux.probe`), because Docker/containerd's default seccomp profile blocks it and RHEL disables it.
+- **No libc on the I/O path:**
+  - Every syscall is inline asm in `src/linux/syscall.mojo`.
+  - Control-plane exceptions (for example `pthread_create`) need an explicit, documented decision.
+  - `pixi run nolibc-check` enforces it.
+- **Toolchain:**
+  - Mojo is pinned exactly (currently `1.2.0rc2`, moving to `1.2.0` GA).
+  - Packages ship as source, with the constraint `>=1.2,<1.3`.
+  - No private or underscore stdlib APIs (the test-only `linux.fault` is the one exception), and no nightly-only spellings.
+- **No async/await yet.** Mojo marks it unstable.
+  - The libraries expose blocking APIs, plus nonblocking building blocks for callers that run their own readiness loop.
+  - An async runtime waits for Mojo's async design ("the compiler generates coroutines, the library schedules them"), which will shape its API. That is why `rt` is frozen.
 
 ## Contracts
-1. **Sans-I/O protocols.** Codecs (HTTP, Postgres, RESP, DNS, TLS) never call read or write, so the same codec runs over blocking streams or any event loop.
-   - The interface is the `net.codec.Codec` trait; its docstring has the full rules:
-     - `feed(bytes)`, at most `feed_capacity()` bytes per call;
+Code comments cite these by number, so keep the numbering stable. Contracts 2, 3 and 6 concern event loops (`rt`, or any loop built on `linux.Epoll`).
+
+1. **Sans-I/O protocols.** Codecs (HTTP, Postgres, RESP, DNS, TLS) never call read or write, so the same codec runs over blocking streams, a readiness loop, the event loop or a future executor.
+   - The interface is the `bytes.codec.Codec` trait (re-exported as `net.codec`); its docstring has the full rules:
+     - `feed(bytes)`, at most `feed_capacity()` bytes per call (a larger receive is fed in pieces, draining in between);
      - `feed_eof()`;
-     - `next_event()` until it returns None;
-     - `poll_transmit(out)`, which appends to a `ByteBuffer` the driver owns;
+     - `next_event()` until it returns None, which yields owned events;
+     - `poll_transmit(out)`, which appends pending output to a `ByteBuffer` the driver owns;
      - `next_deadline()` and `handle_timeout(now)`.
-   - `feed` copies what it keeps.
-2. **Errors.** One `IoError{kind, errno, op}` everywhere. Public APIs `raise IoError`; internals pass `-errno`.
-3. **Determinism seam.** Syscall results can be injected through `linux.fault`. It is compiled only with `-D MOJO_TCP_FAULTS=1` and costs nothing otherwise. The clock seam is `linux.time.Clock`.
-4. **Fds.** Every fd is created with CLOEXEC, and owned by exactly one `OwnedFd`. Wrappers borrow the owner (`AsFd`) so it outlives the syscall (see `CLAUDE.md`).
+   - `feed` copies what it keeps, because receive buffers are only lent (contract 4).
+2. **Completions.** Every `rt` backend honors these:
+   - Every op completes exactly once; multishot completions carry `more`.
+   - Cancel is two-phase: the target still completes, with its real result or `Canceled`.
+   - Completions are FIFO per fd and per direction.
+   - Results are `-errno` integers internally.
+   - Completions are never re-entrant from submit.
+3. **Op ids.**
+   - **Layout.** 64 bits: a 32-bit slab index plus a 32-bit generation. They fit io_uring `user_data`, and stale ids are rejected.
+   - **Targets.** Completion targets are `{thin fn, ctx}`.
+   - **No raw pointers in kernel user data**, because Mojo moves values.
+4. **Buffers.**
+   - Blocking code may borrow `Span`s.
+   - Evented code never borrows:
+     - receive buffers are loop-owned and lent to the callback;
+     - send buffers are moved in and returned at completion.
+   - An evented driver moves a codec's filled `out` buffer into its send op, so no staging buffer is needed.
+5. **fd lifetime.**
+   - Every fd is created with CLOEXEC and owned by exactly one `OwnedFd`. Wrappers borrow the owner (`AsFd`) so it outlives the syscall (see `CLAUDE.md`).
+   - A loop-registered fd is closed only after its ops complete.
+   - Always `EPOLL_CTL_DEL` before close.
+6. **Threading.**
+   - A loop is confined to its thread.
+   - No global mutable state in `linux`/`rt`, and no work stealing.
+   - Cross-loop traffic goes only through a mailbox plus a waker.
+7. **Determinism seams.** Clock, randomness, readiness order and syscall results are injectable, so failures replay.
+   - **Syscall results** go through `linux.fault`:
+     - compiled only with `-D MOJO_NET_FAULTS=1`, and zero-cost otherwise;
+     - it holds process-global, test-only state, an explicit exception to contract 6.
+   - **The clock seam** is `linux.time.Clock`. L2 blocking waits (ppoll) always use the real monotonic clock.
+   - **The event loop's clock, randomness and readiness order** come from the simulator `rt.sim.SimDriver`:
+     - virtual time, one seeded generator, shuffled readiness;
+     - a run replays from `MOJO_NET_SIM_SEED`.
+8. **Errors.**
+   - One `IoError{kind, errno, op}` everywhere.
+   - Public APIs `raise IoError`; internals pass `-errno`.
+   - `InvalidData` means the peer broke the protocol; `InvalidInput` means the caller passed a bad argument.
 
-## L2 blocking contract (as built in M1)
-- **Nonblocking internally.** Every op is: try once → on EAGAIN `wait_ready` (ppoll) → retry. EINTR retries.
-- **Deadlines.** They are absolute and per direction (`set_read_deadline` / `set_write_deadline` / `set_deadline`), and apply to every later op. Expiry raises `TimedOut` and leaves the stream usable.
-  - A deadline limits *waiting*, not work.
-- **POLLERR.** POLLERR caused only by the error queue is not progress; review finding F01 was a busy-spin from exactly that.
-- **Connect.** TCP connect is never re-issued after EINTR. AF_UNIX connect timeouts use `SO_SNDTIMEO`.
-- **Return types.** `accept` returns a struct (`TcpAccepted`), not a tuple.
-
-## Rules for readiness-loop servers (from the 10k spike, `docs/spikes.md`)
-- **Syscall budget.** Register once, edge-triggered; read and write to EAGAIN; drain accept until EAGAIN; batch ~1024 events per wait. That is 2 syscalls per message, with no `EPOLL_CTL_MOD` per operation.
-- **Sticky read-closed.** Once RDHUP/HUP/ERR has been seen, read to EOF or EAGAIN. Otherwise a FIN that arrives with data is lost.
-- **Pre-grow the fd table at startup** with `linux.probe.pregrow_fd_table(listener)`. Every Mojo process is multi-threaded, so each fd-table doubling otherwise stalls 20–40 ms under load.
-- **EMFILE.** Pause accepting rather than spin on a readable listener. Log with raw `write(2)`.
-
-## Milestones
-- **M1: foundation and blocking transport. Done.**
-  - **Scope:**
-    - syscalls, ABI, errors, fds;
-    - addresses;
-    - a socket2-style `Socket`;
-    - L2 TCP/Unix with deadlines;
-    - time, poll, probe, epoll, eventfd;
-    - the fault seam;
-    - `Codec` + `ByteBuffer`;
-    - examples.
-  - **Review:** a 5-lens adversarial review confirmed and fixed 49 issues.
-  - **Spike:** 11k connections at C/tokio speed.
-- **M2: TCP v1.**
-  1. **Buffered reader** over blocking streams: `read_until(delim, max)`, `read_exact`, `peek`, keeping pipelined leftovers.
-  2. **DNS stub resolver**, blocking and pure Mojo:
-     - reads `/etc/hosts` and `resolv.conf` (search, ndots, timeout, attempts);
-     - UDP A/AAAA queries with random ids, TCP fallback on truncation;
-     - response validation, and a fuzzed parser.
-  3. **`connect_host(name, port, timeout)`** with Happy Eyeballs v2 (RFC 8305).
-  4. **Client presets for DB drivers:** keepalive + `TCP_USER_TIMEOUT`, and a stale-connection check.
-  5. **Nonblocking stream access** (`try_read`/`try_write`) for external readiness loops, plus server helpers (`SO_REUSEPORT` listeners, fd-table pre-growth, `RLIMIT_NOFILE`).
-  6. **v1 polish:**
-     - a README with examples;
-     - a rattler-build recipe (modular-community);
-     - CI on real aarch64;
-     - an API review and freeze.
-- **Later:** UDP API, sendfile, vectored helpers, TLS integration points.
+## Documents
+- `docs/net.md`: the TCP library. Covers its scope, the L2 blocking contract, the rules for readiness-loop servers, and milestones.
+- `docs/rt.md`: the frozen runtime. Covers how contracts 2–7 are realised, the simulator, and the M2 gate.
+- `docs/spikes.md`: measured facts. Covers threads, the Mojo runtime, callbacks, and the 10k-connection epoll spike.

@@ -1,7 +1,7 @@
 """Deterministic fault injection for real syscalls (docs/design.md contract 7).
 
 Test builds only. The seam exists only when compiled with
-`-D MOJO_TCP_FAULTS=1` (`tools/run_tests.sh` passes it to files named
+`-D MOJO_NET_FAULTS=1` (`tools/run_tests.sh` passes it to files named
 `test_*_faults.mojo`, and only to those). Without the define,
 `linux.syscall` never imports this module and every `syscallN` compiles to
 the bare inline asm; calling anything here is a compile error, so a test
@@ -55,18 +55,18 @@ from .error import ErrorKind, IoError
 from .nr import SYS_read, SYS_recvfrom, SYS_sendto, SYS_write
 from .syscall import MAX_ERRNO
 
-comptime ENABLED = get_defined_bool["MOJO_TCP_FAULTS"]()
-"""True when compiled with `-D MOJO_TCP_FAULTS=1`. Use it to guard optional
+comptime ENABLED = get_defined_bool["MOJO_NET_FAULTS"]()
+"""True when compiled with `-D MOJO_NET_FAULTS=1`. Use it to guard optional
 fault scenarios: `comptime if fault.ENABLED: ...`."""
 
 comptime _NEED_DEFINE = (
-    "linux.fault is test-only: build with -D MOJO_TCP_FAULTS=1"
+    "linux.fault is test-only: build with -D MOJO_NET_FAULTS=1"
     " (tools/run_tests.sh does this for files named test_*_faults.mojo)"
 )
 
 # Name of the process-global. Versioned: two copies of the library with
 # different `_Plan` layouts in one process must not share the storage.
-comptime _GLOBAL_NAME = "mojo_tcp.linux.fault.plan.v1"
+comptime _GLOBAL_NAME = "mojo_net.linux.fault.plan.v1"
 
 # Counters cover syscall numbers below this (the highest today is ~470).
 comptime _NR_SLOTS = 1024

@@ -1,6 +1,6 @@
 """Regression tests (review group "tooling-docs") for linux-layer branches
 that the live host never takes, driven through the syscall fault seam
-(built with -D MOJO_TCP_FAULTS=1 because of the `_faults.mojo` suffix).
+(built with -D MOJO_NET_FAULTS=1 because of the `_faults.mojo` suffix).
 
 - Epoll.wait's epoll_pwait2 -> epoll_pwait fallback (ENOSYS/EPERM, the
   seccomp/Docker path): it switches permanently, serves the same call, and

@@ -85,7 +85,7 @@ def _ipv6(test: StaticString, need_loopback: Bool = True) raises -> Bool:
     mean "no IPv6"; any other failure raises, so a regression is never
     reported as a skip. Without IPv6 this prints a visible skip line (which
     tools/run_tests.sh shows and counts) and the test returns early, unless
-    MOJO_TCP_REQUIRE_IPV6=1 turns it into a failure."""
+    MOJO_NET_REQUIRE_IPV6=1 turns it into a failure."""
     var why: StaticString
     var r = sys.socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0)
     if is_err(r) and Errno(err_of(r)) == Errno.EAFNOSUPPORT:
@@ -106,8 +106,8 @@ def _ipv6(test: StaticString, need_loopback: Bool = True) raises -> Bool:
         if Errno(err_of(b)) != Errno.EADDRNOTAVAIL:
             _ = check("bind([::1]:0)", b)
         why = "bind([::1]:0): EADDRNOTAVAIL"
-    if getenv("MOJO_TCP_REQUIRE_IPV6") == "1":
-        raise Error(test, ": no IPv6 (", why, ") but MOJO_TCP_REQUIRE_IPV6=1")
+    if getenv("MOJO_NET_REQUIRE_IPV6") == "1":
+        raise Error(test, ": no IPv6 (", why, ") but MOJO_NET_REQUIRE_IPV6=1")
     print(String("    (skipped: ", test, ": no IPv6, ", why, ")"))
     return False
 
@@ -561,7 +561,7 @@ def test_take_error_none_on_fresh_socket() raises:
 
 
 def test_unix_pathname_in_temp_dir() raises:
-    var dir = _socket_dir("mojo_tcp_sock_", "nope.sock")
+    var dir = _socket_dir("mojo_net_sock_", "nope.sock")
     var path = dir + "/s.sock"
     try:
         _unix_pathname_body(dir, path)
@@ -613,7 +613,7 @@ def _unix_pathname_body(dir: String, path: String) raises:
 
 
 def test_unix_abstract_and_refused() raises:
-    var name = String("mojo_tcp.test_socket.", _pid())
+    var name = String("mojo_net.test_socket.", _pid())
     var want = UnixAddr.from_abstract_name(name)
     var l = Socket.new(Domain.UNIX, SockType.STREAM)
     l.bind_unix(want)
@@ -642,7 +642,7 @@ def test_unix_abstract_and_refused() raises:
 
 
 def test_unix_dgram_recv_from_named_and_unnamed() raises:
-    var name = String("mojo_tcp.test_socket.dgram.", _pid())
+    var name = String("mojo_net.test_socket.dgram.", _pid())
     var rx_addr = UnixAddr.from_abstract_name(name)
     var rx = Socket.new(Domain.UNIX, SockType.DGRAM)
     rx.bind_unix(rx_addr)

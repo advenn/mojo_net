@@ -1,6 +1,6 @@
-"""A minimal HTTP/1.1 keep-alive "Hello, World!" server on `net.evented`.
+"""A minimal HTTP/1.1 keep-alive "Hello, World!" server on `rt.evented`.
 
-    pixi run mojo run -I src examples/http_hello.mojo [ADDR]
+    pixi run mojo run -I src examples/rt/http_hello.mojo [ADDR]
     curl -v http://127.0.0.1:8080/
 
 ADDR defaults to 127.0.0.1:8080. bench/http_hello.mojo is the same handler
@@ -24,7 +24,7 @@ from std.sys import argv
 from bytes.buffer import ByteBuffer
 from linux import IoError
 from net.addr import SocketAddr
-from net.evented import Conn, ConnConfig, ConnHandler, ServerConfig, TcpServer
+from rt.evented import Conn, ConnConfig, ConnHandler, ServerConfig, TcpServer
 from rt.event_loop import EventLoop
 
 comptime RESPONSE: StaticString = (

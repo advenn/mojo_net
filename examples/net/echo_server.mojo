@@ -5,7 +5,7 @@ It serves ONE connection at a time: each client is echoed until it closes
 listen backlog meanwhile. That is the honest limit of blocking I/O on one
 thread; the many-connections server is the M2 event loop (`rt`).
 
-    pixi run mojo run -I src examples/echo_server.mojo [ADDR] [MAX_CONNS]
+    pixi run mojo run -I src examples/net/echo_server.mojo [ADDR] [MAX_CONNS]
 
 ADDR defaults to 127.0.0.1:7878 (port 0 picks a free one; the bound address
 is printed). MAX_CONNS > 0 exits after that many connections (handy for

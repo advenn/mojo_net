@@ -3,7 +3,7 @@ readiness waits, epoll/eventfd and kernel probing.
 
 This package knows nothing about TCP or async. It must not import `rt` or
 `net`. Only `syscall.mojo` contains inline assembly. `linux.fault` is
-deliberately not re-exported: it exists only in `-D MOJO_TCP_FAULTS=1` test
+deliberately not re-exported: it exists only in `-D MOJO_NET_FAULTS=1` test
 builds.
 """
 

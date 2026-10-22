@@ -40,8 +40,8 @@ span taken before it. A stale span reads freed memory after growth.
   relative to the read index, as returned by `find`/`read_until` and read
   back with `byte_at` (or copied with `read_bytes`). Offsets stay valid
   across growth and compaction (not across `consume`).
-- Check mode (test builds): with `-D MOJO_TCP_CHECK_SPANS=1`, and in every
-  fault build (`-D MOJO_TCP_FAULTS=1`, the test-only define), every call
+- Check mode (test builds): with `-D MOJO_NET_CHECK_SPANS=1`, and in every
+  fault build (`-D MOJO_NET_FAULTS=1`, the test-only define), every call
   that may move bytes (`ensure_writable`, `write_*`, `commit`, `compact`,
   `discard_read_bytes`, `shrink_to`) moves the storage to a fresh
   allocation and fills the old one with `POISON` before freeing it, and
@@ -70,8 +70,8 @@ from std.sys import get_defined_bool
 from linux import ErrorKind, IoError
 
 comptime CHECK_SPANS = get_defined_bool[
-    "MOJO_TCP_CHECK_SPANS"
-]() or get_defined_bool["MOJO_TCP_FAULTS"]()
+    "MOJO_NET_CHECK_SPANS"
+]() or get_defined_bool["MOJO_NET_FAULTS"]()
 """Span-invalidation check mode (see the module docstring). Test builds
 only: it reallocates on every write, so it is far slower."""
 

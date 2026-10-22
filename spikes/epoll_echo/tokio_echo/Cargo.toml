@@ -1,4 +1,4 @@
-# tokio current_thread echo server: the reference for design.md's M2 gate
+# tokio current_thread echo server: the reference for the M2 gate (docs/rt.md)
 # (">= 80% of tokio current_thread throughput"), measured with the same
 # client and harness as server.mojo (spikes/epoll_echo/bench.py).
 [package]

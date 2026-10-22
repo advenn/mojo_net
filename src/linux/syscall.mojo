@@ -11,7 +11,7 @@ Register conventions:
   the instruction clobbers rcx and r11.
 - aarch64: `svc #0`, nr in x8, args x0..x5, result in x0.
 
-Fault injection: built with `-D MOJO_TCP_FAULTS=1` (test builds only), each
+Fault injection: built with `-D MOJO_NET_FAULTS=1` (test builds only), each
 `syscallN` first asks `linux.fault` whether to fail the call or shorten its
 length argument (arg 3). Without the define the hook and its import do not
 exist: `syscallN` is exactly `_asmN`.
@@ -44,13 +44,13 @@ comptime SUPPORTED_TARGET = (
 def assert_supported_target():
     """Compile-time check of `SUPPORTED_TARGET`; no code is generated."""
     comptime assert SUPPORTED_TARGET, (
-        "mojo_tcp supports only little-endian 64-bit Linux on x86_64 or"
+        "mojo_net supports only little-endian 64-bit Linux on x86_64 or"
         " aarch64; this target would get wrong syscall registers or byte order"
     )
 
 # Same switch as `linux.fault.ENABLED`; kept here so that normal builds never
 # import `linux.fault`.
-comptime _FAULTS = get_defined_bool["MOJO_TCP_FAULTS"]()
+comptime _FAULTS = get_defined_bool["MOJO_NET_FAULTS"]()
 
 # Largest errno the kernel returns through a syscall result.
 comptime MAX_ERRNO = 4095

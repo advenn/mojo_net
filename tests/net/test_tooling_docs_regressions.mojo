@@ -359,7 +359,7 @@ comptime _UNIX_ACCEPTER = (
 
 def test_unix_connect_timeout_succeeds_when_backlog_frees() raises:
     var addr = UnixAddr.from_abstract_name(
-        String("mojo_tcp_tooling_", syscall0(SYS_getpid), "_backlog")
+        String("mojo_net_tooling_", syscall0(SYS_getpid), "_backlog")
     )
     var l = UnixListener.bind(addr, backlog=0)
     var first = UnixStream.connect(addr)  # takes the only slot

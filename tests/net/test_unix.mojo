@@ -75,7 +75,7 @@ def _socket_dir(prefix: String, longest_name: StaticString) raises -> String:
 
 def _abstract(tag: StaticString) raises IoError -> UnixAddr:
     return UnixAddr.from_abstract_name(
-        String("mojo_tcp_unix_", _pid(), "_", tag)
+        String("mojo_net_unix_", _pid(), "_", tag)
     )
 
 
@@ -184,7 +184,7 @@ def _echo_check(mut c: UnixStream, mut s: UnixStream) raises:
 
 
 def test_pathname_listener_echo() raises:
-    var dir = _socket_dir("mojo_tcp_l2unix_", "missing.sock")
+    var dir = _socket_dir("mojo_net_l2unix_", "missing.sock")
     var path = dir + "/echo.sock"
     try:
         _pathname_body(dir, path)

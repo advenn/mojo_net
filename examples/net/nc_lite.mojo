@@ -1,6 +1,6 @@
 """A tiny netcat: connect, send the command-line text, print the reply.
 
-    pixi run mojo run -I src examples/nc_lite.mojo ADDR [TEXT...]
+    pixi run mojo run -I src examples/net/nc_lite.mojo ADDR [TEXT...]
 
 Connects to ADDR (`127.0.0.1:7878`, `[::1]:6379`, ...) with a 3 s connect
 timeout, sends TEXT (the remaining arguments joined by spaces, plus "\\n"),

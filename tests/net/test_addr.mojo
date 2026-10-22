@@ -946,7 +946,7 @@ def _ipv6(test: StaticString, need_loopback: Bool = True) raises -> Bool:
     mean "no IPv6"; any other failure raises, so a regression is never
     reported as a skip. Without IPv6 this prints a visible skip line (which
     tools/run_tests.sh shows and counts) and the test returns early, unless
-    MOJO_TCP_REQUIRE_IPV6=1 turns it into a failure."""
+    MOJO_NET_REQUIRE_IPV6=1 turns it into a failure."""
     var why: StaticString
     var r = sys.socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0)
     if is_err(r) and Errno(err_of(r)) == Errno.EAFNOSUPPORT:
@@ -967,8 +967,8 @@ def _ipv6(test: StaticString, need_loopback: Bool = True) raises -> Bool:
         if Errno(err_of(b)) != Errno.EADDRNOTAVAIL:
             _ = check("bind([::1]:0)", b)
         why = "bind([::1]:0): EADDRNOTAVAIL"
-    if getenv("MOJO_TCP_REQUIRE_IPV6") == "1":
-        raise Error(test, ": no IPv6 (", why, ") but MOJO_TCP_REQUIRE_IPV6=1")
+    if getenv("MOJO_NET_REQUIRE_IPV6") == "1":
+        raise Error(test, ": no IPv6 (", why, ") but MOJO_NET_REQUIRE_IPV6=1")
     print(String("    (skipped: ", test, ": no IPv6, ", why, ")"))
     return False
 
@@ -1079,7 +1079,7 @@ def test_kernel_dual_stack_peer_is_ipv4_mapped() raises:
 
 def test_kernel_unix_abstract_and_unnamed() raises:
     var pid = syscall0(SYS_getpid)
-    var name = String("mojo_tcp.test_addr.", pid)
+    var name = String("mojo_net.test_addr.", pid)
     var fd = _sock(AF_UNIX, SOCK_STREAM)
     var want = UnixAddr.from_abstract_name(name)
     var raw = want.to_raw()
@@ -1112,9 +1112,9 @@ def test_kernel_unix_abstract_and_unnamed() raises:
 def test_kernel_unix_pathname() raises:
     var pid = syscall0(SYS_getpid)
     var paths: List[String] = [
-        String("/tmp/mojo_tcp_addr_", pid, ".sock"),
+        String("/tmp/mojo_net_addr_", pid, ".sock"),
         # Longest allowed: 107 bytes + NUL fills sun_path.
-        String("/tmp/mojo_tcp_addr_", pid, "_"),
+        String("/tmp/mojo_net_addr_", pid, "_"),
     ]
     paths[1] = paths[1] + String("L") * (107 - paths[1].byte_length())
     assert_equal(paths[1].byte_length(), 107)

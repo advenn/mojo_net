@@ -1,6 +1,6 @@
 """RESP PING against a local Redis, over `net.tcp`.
 
-    pixi run mojo run -I src examples/redis_ping.mojo [ADDR] [MESSAGE]
+    pixi run mojo run -I src examples/net/redis_ping.mojo [ADDR] [MESSAGE]
 
 Sends `PING` (or `PING MESSAGE`) to ADDR (default 127.0.0.1:6379) and prints
 the reply: `PONG`, or MESSAGE echoed back as a bulk string.

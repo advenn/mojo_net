@@ -9,3 +9,7 @@ spikes/epoll_echo/tokio_echo/target/
 # docs/spikes.md) are kept.
 spikes/epoll_echo/out/*
 !spikes/epoll_echo/out/*.json
+# rt benchmark outputs: rebuilt by bench/rt/run.sh; only result JSONs are kept.
+bench/rt/out/*
+!bench/rt/out/*.json
+__pycache__/

@@ -1,8 +1,8 @@
-"""Evented TCP echo server on `net.evented`: any number of concurrent
-connections on one thread (compare examples/echo_server.mojo, the blocking
+"""Evented TCP echo server on `rt.evented`: any number of concurrent
+connections on one thread (compare examples/net/echo_server.mojo, the blocking
 one-at-a-time version).
 
-    pixi run mojo run -I src examples/evented_echo.mojo [ADDR] [MAX_CONNS]
+    pixi run mojo run -I src examples/rt/evented_echo.mojo [ADDR] [MAX_CONNS]
 
 ADDR defaults to 127.0.0.1:7878 (port 0 picks a free one; the bound address
 is printed). MAX_CONNS > 0 starts a graceful shutdown once that many
@@ -30,7 +30,7 @@ from std.sys import argv
 from bytes.buffer import ByteBuffer
 from linux import IoError
 from net.addr import SocketAddr
-from net.evented import CloseReason, Conn, ConnConfig, ConnHandler, ServerConfig, TcpServer
+from rt.evented import CloseReason, Conn, ConnConfig, ConnHandler, ServerConfig, TcpServer
 from rt.core import Loop
 from rt.event_loop import EventLoop
 

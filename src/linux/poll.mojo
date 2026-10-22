@@ -4,7 +4,7 @@ is ready or the deadline passes" primitive.
 ppoll (not poll: aarch64 has no `poll` syscall) takes a relative timespec
 with nanosecond resolution and a NULL sigmask here, so the library never
 touches the signal mask. Blocking I/O follows the pattern from
-docs/design.md: try the syscall, on EAGAIN `wait_ready`, retry. Because the
+docs/net.md: try the syscall, on EAGAIN `wait_ready`, retry. Because the
 deadline is absolute, every EINTR or early wakeup recomputes what is left
 instead of restarting the full timeout.
 

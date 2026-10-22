@@ -1,5 +1,5 @@
 """Deterministic error paths of net.tcp and net.unix via the syscall fault
-seam (built with -D MOJO_TCP_FAULTS=1 because of the `_faults.mojo` suffix).
+seam (built with -D MOJO_NET_FAULTS=1 because of the `_faults.mojo` suffix).
 
 An injected error is returned *without* issuing the syscall, so nothing
 happens in the kernel: an injected EAGAIN on recv consumes nothing, an
@@ -78,7 +78,7 @@ def _fd_count() raises -> Int:
 def _abstract(tag: StaticString) raises IoError -> UnixAddr:
     """An abstract name unique to this process (tests may run in parallel)."""
     return UnixAddr.from_abstract_name(
-        String("mojo_tcp_faults_", syscall0(SYS_getpid), "_", tag)
+        String("mojo_net_faults_", syscall0(SYS_getpid), "_", tag)
     )
 
 

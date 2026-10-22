@@ -271,7 +271,7 @@ def test_unix_connect_resumes_with_remaining_time_under_signal_storm() raises:
     # AF_UNIX) with the *remaining* time: re-arming the full timeout after
     # every 20 ms signal would never time out.
     var addr = UnixAddr.from_abstract_name(
-        String("mojo_tcp_eintr_", syscall0(SYS_getpid))
+        String("mojo_net_eintr_", syscall0(SYS_getpid))
     )
     var l = UnixListener.bind(addr, backlog=0)
     var first = UnixStream.connect(addr)  # takes the only slot

@@ -112,7 +112,7 @@ def _fill_until_would_block(s: Socket) raises -> Int:
 
 def _unique_abstract(tag: StaticString) raises -> UnixAddr:
     var name = String(
-        "mojo_tcp_net_socket_regress_", tag, "_", syscall0(SYS_getpid)
+        "mojo_net_net_socket_regress_", tag, "_", syscall0(SYS_getpid)
     )
     return UnixAddr.from_abstract_name(name)
 

@@ -1,0 +1,85 @@
+# net: the TCP/socket library
+
+Sockets for Mojo on Linux. It provides:
+- addresses;
+- every socket option;
+- blocking TCP and Unix streams with deadlines;
+- building blocks for servers that run their own readiness loop.
+
+It is the transport under the planned HTTP library, HTTP server and database drivers. Package rules and the shared contracts (sans-I/O codecs, errors, fds, determinism seams) are in `docs/design.md`.
+
+**Status: active.** M1 is done; M2 (TCP v1) is next.
+
+## Scope
+**In scope:**
+- addresses;
+- every socket option;
+- blocking TCP/Unix streams with deadlines;
+- nonblocking access for callers that run their own readiness loop (`linux.Epoll`);
+- buffered reading;
+- DNS resolution and connect-by-name.
+
+**Out of scope: an async runtime** (event loop, executor, timers, scheduling, io_uring proactor, simulation). That is the separate, frozen `rt` package (`docs/rt.md`). `net` never imports it, and `tools/check_imports.py` enforces that.
+
+**How a concurrent server uses this library without a runtime:**
+- Make sockets nonblocking and drive them from a readiness loop (epoll, edge-triggered).
+- For multi-core, run N processes on one port with `SO_REUSEPORT`, as nginx does.
+
+The M1 spike's raw-epoll server shows this is enough. It held 11k connections at C/tokio throughput, using 123–159 B of user memory per connection. The rules it found are listed below.
+
+## Modules
+| Module | What |
+|---|---|
+| `addr` | `Ipv4Addr`, `Ipv6Addr`, `IpAddr`, `SocketAddr`/`V4`/`V6`, `UnixAddr`, `if_nametoindex` |
+| `socket` | L1: `Socket` and every socket option, no policy |
+| `blocking`, `tcp`, `unix` | L2: `TcpStream`, `TcpListener`, `UnixStream`, `UnixListener` and friends |
+| `buffer`, `codec` | re-exports of `bytes.buffer` and `bytes.codec` |
+
+## L2 blocking contract (as built in M1)
+- **Nonblocking internally.** Every op is: try once → on EAGAIN `wait_ready` (ppoll) → retry. EINTR retries.
+- **Deadlines.** They are absolute and per direction (`set_read_deadline` / `set_write_deadline` / `set_deadline`), and apply to every later op. Expiry raises `TimedOut` and leaves the stream usable.
+  - A deadline limits *waiting*, not work: data that is already available wins over an expired deadline.
+- **POLLERR.** POLLERR caused only by the error queue is not progress; review finding F01 was a busy-spin from exactly that.
+- **Connect.**
+  - TCP connect is never re-issued after EINTR: wait for writable, then read `SO_ERROR`.
+  - AF_UNIX connect timeouts use `SO_SNDTIMEO`.
+- **Return types.** `accept` returns a struct (`TcpAccepted`), not a tuple (see the Mojo move rules in `CLAUDE.md`).
+
+## Rules for readiness-loop servers (from the 10k spike, `docs/spikes.md`)
+- **Syscall budget: 2 syscalls per message.**
+  - Register once, edge-triggered, with no `EPOLL_CTL_MOD` per operation.
+  - Read and write until EAGAIN.
+  - Drain accept until EAGAIN.
+  - Batch ~1024 events per wait.
+- **Sticky read-closed.** Once RDHUP/HUP/ERR has been seen, read to EOF or EAGAIN. Otherwise a FIN that arrives with data is lost.
+- **Pre-grow the fd table at startup** with `linux.probe.pregrow_fd_table(listener)`. Every Mojo process is multi-threaded, so otherwise each fd-table doubling stalls 20–40 ms under load.
+- **EMFILE.** Pause accepting rather than spin on a readable listener. Log with raw `write(2)`.
+
+## Milestones
+- **M1: foundation and blocking transport (with `linux` and `bytes`). Done.**
+  - **Scope:**
+    - syscalls, ABI, errors, fds;
+    - addresses;
+    - a socket2-style `Socket`;
+    - L2 TCP/Unix with deadlines;
+    - time, poll, probe, epoll, eventfd;
+    - the fault seam;
+    - `Codec` + `ByteBuffer`;
+    - examples.
+  - **Review:** a 5-lens adversarial review confirmed and fixed 49 issues.
+  - **Spike:** 11k connections at C/tokio speed.
+- **M2: TCP v1.**
+  1. **Buffered reader** over blocking streams: `read_until(delim, max)`, `read_exact`, `peek`, keeping pipelined leftovers.
+  2. **DNS stub resolver**, blocking and pure Mojo:
+     - reads `/etc/hosts` and `resolv.conf` (search, ndots, timeout, attempts);
+     - UDP A/AAAA queries with random ids, falling back to TCP on truncation;
+     - response validation, and a fuzzed parser.
+  3. **`connect_host(name, port, timeout)`** with Happy Eyeballs v2 (RFC 8305).
+  4. **Client presets for DB drivers:** keepalive + `TCP_USER_TIMEOUT`, and a stale-connection check.
+  5. **Nonblocking stream access** (`try_read`/`try_write`) for external readiness loops, plus server helpers (`SO_REUSEPORT` listeners, fd-table pre-growth, `RLIMIT_NOFILE`).
+  6. **v1 polish:**
+     - API docs and examples;
+     - a rattler-build recipe (modular-community);
+     - CI on real aarch64;
+     - an API review and freeze.
+- **Later:** a UDP API, sendfile, vectored helpers, TLS integration points.

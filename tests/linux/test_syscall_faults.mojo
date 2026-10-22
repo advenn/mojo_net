@@ -1,4 +1,4 @@
-# Fault-injection seam tests. Needs `-D MOJO_TCP_FAULTS=1`; tools/run_tests.sh
+# Fault-injection seam tests. Needs `-D MOJO_NET_FAULTS=1`; tools/run_tests.sh
 # passes it because the file name ends in `_faults.mojo`. Without it the
 # `linux.fault` calls below fail to compile, so the faults can't be silently
 # missing.

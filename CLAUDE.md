@@ -2,11 +2,20 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-A native Mojo TCP/socket library for Linux. It is the foundation for a future HTTP library, an HTTP server and database drivers.
+`mojo_net` is a monorepo of native Mojo networking libraries for Linux. The roadmap is: 1. TCP, 2. an HTTP library, 3. an HTTP server, plus database drivers on the same layers.
 
-**Scope:** this repo is the socket library, not an async runtime. Keep runtime work (event loops, executors, schedulers, io_uring proactors) out of it. The experimental runtime that grew here lives in the separate `mojo_rt` repo; the git tag `runtime-snapshot` marks the last commit that contained it. A concurrent server drives nonblocking sockets from its own readiness loop (`linux.Epoll`, edge-triggered) and runs one process per core with `SO_REUSEPORT` (see `docs/design.md`).
-- Architecture, scope, contracts and milestones: `docs/design.md`. Read it before changing `net`.
-- Measured facts (threads, runtime, callbacks, the 10k-connection epoll spike): `docs/spikes.md`.
+**Scope.** One repo does not mean one project:
+- Each library has its own doc, status and milestones.
+- Work on one library must not gate or leak into another.
+- Package status:
+  - `linux`, `bytes`: shared base layers;
+  - `net`: the TCP library, the active work;
+  - `rt`: an experimental event-loop runtime, **frozen** until Mojo's async/await stabilizes. Keep it compiling and green; add no features unless the user unfreezes it.
+
+**Docs:**
+- `docs/design.md`: packages, import rules and the numbered contracts that code comments cite. Read it before changing any package.
+- Per-library docs: `docs/net.md` (scope, L2 contract, readiness-loop rules, milestones) and `docs/rt.md`.
+- `docs/spikes.md`: measured facts (threads, the Mojo runtime, callbacks, the 10k-connection epoll spike).
 
 ## Commands
 Run everything through pixi (`~/.pixi/bin/pixi`). The Mojo toolchain is pinned in `pixi.toml`.
@@ -14,38 +23,50 @@ Run everything through pixi (`~/.pixi/bin/pixi`). The Mojo toolchain is pinned i
 ```bash
 pixi run test                      # every tests/**/test_*.mojo, plus the ABI layout check
 pixi run test net/                 # only files whose path contains "net/" (no ABI check)
-pixi run ci                        # test + nolibc-check: what CI must run
+pixi run ci                        # import-check + test + nolibc-check + examples-check: what CI must run
 pixi run mojo run -I src tests/linux/test_sys.mojo                      # one file
-pixi run mojo run -D MOJO_TCP_FAULTS=1 -I src tests/net/test_tcp_faults.mojo   # one fault-seam file
+pixi run mojo run -D MOJO_NET_FAULTS=1 -I src tests/net/test_tcp_faults.mojo   # one fault-seam file
+pixi run mojo run -D MOJO_NET_SIM=1 -I src tests/rt/test_loop_contract.mojo     # one file on the rt simulator
+pixi run import-check              # package import rules (tools/check_imports.py)
+pixi run examples-check            # build every examples/<pkg>/*.mojo
 pixi run abi-check                 # constants + struct layouts vs this host's C headers
 pixi run nolibc-check              # no libc socket/poll/epoll symbols on the I/O path
 pixi run gen                       # regenerate src/linux/{nr,consts,errno}.mojo from headers
 pixi run spikes                    # re-run the M1 spikes
+pixi run bench build               # rt benchmarks (bench/rt/README.md)
 ```
 
 **Test runner (`tools/run_tests.sh`):**
 - Each test file ends with `def main() raises: TestSuite.discover_tests[__functions_in_module()]().run()`; `mojo test` no longer exists.
 - A file fails if it runs 0 tests, because TestSuite exits 0 in that case.
-- Files named `test_*_faults.mojo` (and only those) are built with `-D MOJO_TCP_FAULTS=1`.
-- Each file has a timeout: `MOJO_TCP_TEST_TIMEOUT`, default 600 s.
-- `MOJO_TCP_REQUIRE_IPV6=1` turns "no IPv6 loopback" skips into failures.
+- Files named `test_*_faults.mojo` (and only those) are built with `-D MOJO_NET_FAULTS=1`.
+- Files named `test_*_contract.mojo` run twice: on epoll, then on the `rt` in-memory simulator (`-D MOJO_NET_SIM=1`). Files named `test_*_sim.mojo` run on the simulator only. Replay a simulator run with `MOJO_NET_SIM_SEED=<n>`.
+- Each file has a timeout: `MOJO_NET_TEST_TIMEOUT`, default 600 s.
+- `MOJO_NET_REQUIRE_IPV6=1` turns "no IPv6 loopback" skips into failures.
 
 **Test-only Python:** some tests use the pixi env's Python as an oracle (`ipaddress`) or as a peer process. It is never used in `src/`.
 
 ## Layout and rules
-- **Packages:** imports only point downward: `net → bytes → linux`. `linux` imports only `std`.
+- **Packages:** imports only point downward: `rt → net → bytes → linux`. `linux` imports only `std`.
+  - Nothing outside `rt` imports `rt`.
+  - `pixi run import-check` enforces these rules for `src/`, `tests/`, `examples/`, `bench/` and `spikes/`.
+  - A new library gets an entry in `ALLOWED` in `tools/check_imports.py`.
+  - Per-package directories:
+    - `src/<pkg>`, `tests/<pkg>`, `examples/<pkg>`, `bench/<pkg>`;
+    - `docs/<pkg>.md`.
   - `src/linux`: the syscall layer.
-  - `src/bytes`: `ByteBuffer`.
+  - `src/bytes`: `ByteBuffer`, and the sans-I/O `Codec` trait (`bytes.codec`, contract 1).
   - `src/net`: sockets.
+  - `src/rt` (frozen): `core` (Loop + proactor), `driver` (trait), `epoll_driver`, `sim` (simulator), `event_loop`, `timers`, `slab`, `mailbox`, `evented` (`TcpServer[H]`/`dial[H]` connections driving a `ConnHandler`).
 - **`net` modules:**
   - `addr`: addresses.
   - `socket`: L1, every socket option, no policy.
   - `blocking`, `tcp`, `unix`: L2 blocking streams. Nonblocking internally: try → EAGAIN → `wait_ready` → retry, with absolute per-direction deadlines.
-  - `buffer` / `codec`: `ByteBuffer` (re-exported from `bytes`) and the sans-I/O `Codec` trait.
+  - `buffer` / `codec`: re-exports of `bytes.buffer` / `bytes.codec`.
 - **Syscalls:**
   - All of them go through `linux/syscall.mojo` (the only inline asm), via the typed wrappers in `linux/sys.mojo` or module-local wrappers.
   - Never call libc for I/O (`external_call["socket"...]` etc.); `nolibc-check` enforces this.
-  - The one private-stdlib use is `linux/fault.mojo` (`std.ffi._Global`). It is compiled only under `-D MOJO_TCP_FAULTS=1` and is deliberately not re-exported from `linux`.
+  - The one private-stdlib use is `linux/fault.mojo` (`std.ffi._Global`). It is compiled only under `-D MOJO_NET_FAULTS=1` and is deliberately not re-exported from `linux`.
 - **Generated files:**
   - `src/linux/nr.mojo`, `consts.mojo` and `errno.mojo` are generated from kernel/C headers. Don't edit them; add names to `tools/gen_syscall_nr.py` / `tools/gen_abi.py` and run `pixi run gen`.
   - A syscall must exist on both x86_64 and aarch64; the generator rejects it otherwise (aarch64 has no `poll`, `epoll_wait`, `accept`, `open`, `pipe`).
@@ -78,12 +99,14 @@ pixi run spikes                    # re-run the M1 spikes
 - **Moves:**
   - A move-only element can't be moved out of a `Tuple`, and `var x = s.field^` only works inside a `deinit self` method. So APIs return small structs (`TcpAccepted`, `SocketPair` with `Optional` fields + `take()`) instead of tuples.
   - A list literal of mutable `Span`s over one buffer fails the aliasing check; use `append` or `ImmSpan`.
-- **Function values:** a function cannot take its own address, or the address of any function in a reference cycle with it, as a value. Storing `on_recv` as a callback inside `on_recv` fails with "function instantiation in parameter domain that recursively requires itself". Build callback values once at setup and store them as data.
-- **`mut` is exclusive:** the compiler may cache a `mut` argument's fields, or write a stale copy back. So:
-  - never mutate a struct through `mut self` from two threads, even with atomic field access. Use raw memory (`std.memory.alloc.unsafe_alloc`, `MutUntrackedOrigin` pointers) and atomic pointer ops from methods that take `self` immutably;
-  - don't hold a struct as a `mut` argument while code reaches it through a raw address.
-  
-  Both bit the experimental runtime (now in `mojo_rt`).
+- **Function values (critical for callbacks).** A function cannot take its own address, or the address of any function in a reference cycle with it, as a value.
+  - `Target(on_recv, ctx)` inside `on_recv` fails with "function instantiation in parameter domain that recursively requires itself".
+  - Build every callback value (`rt`'s `Target`) once, outside the cycle (at registration), store it as data, and re-arm with the stored value.
+  - Generic trampolines such as `_dispatch[H]`, referenced only from a setup function, are fine.
+- **`mut` is exclusive (critical).** The compiler may cache a `mut` argument's fields, or write a stale copy back. So:
+  - **Threads.** Never mutate a struct through `mut self` from two threads, even with atomic field access. An early `rt.mailbox` lost a committed CAS this way. Put cross-thread state in raw memory (`std.memory.alloc.unsafe_alloc`, `MutUntrackedOrigin` pointers) and touch it only through atomic pointer ops from methods that take `self` immutably, as `rt.mailbox.Sender` does.
+  - **Loop state.** Don't hold a struct as a `mut` argument in a frame that runs a loop while callbacks reach it through a raw address (`ctx`). The compiler may read stale fields across `run_once`. Keep handler state on the heap, or take its address in the function that runs the loop.
+- **Comptime backend alias:** `comptime Backend: Driver = A if cond else B` has the trait type, so members beyond the trait are invisible through it. Tests reach simulator-only members with `rebind[SimDriver](ev.driver)`.
 - **Typed raises:** inside a `try` whose calls raise `IoError`, you can't `raise Error(...)`.
 - **Comptime arrays:** a comptime `Array` of non-`ImplicitlyCopyable` values can't be indexed at runtime; use if-chains.
 - **FFI:** declare each `external_call` C symbol with exactly one signature (spike-only code). A C-callable fn pointer is spelled `def(OpaquePointer[MutAnyOrigin]) thin abi("C") -> OpaquePointer[MutAnyOrigin]`, and function-typed parameters are spelled `def(T) thin -> R`.

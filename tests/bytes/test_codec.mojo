@@ -15,8 +15,8 @@ from std.testing import (
 from linux import ErrorKind, IoError, OwnedFd, check, sys
 from linux.consts import AF_UNIX, MSG_NOSIGNAL, SOCK_CLOEXEC, SOCK_STREAM
 from linux.time import Instant
-from net.buffer import ByteBuffer
-from net.codec import Codec, LineCodec, drive_chunked, escape_bytes
+from bytes.buffer import ByteBuffer
+from bytes.codec import Codec, LineCodec, drive_chunked, escape_bytes
 
 
 # ---- helpers -----------------------------------------------------------------

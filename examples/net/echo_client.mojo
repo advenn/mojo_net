@@ -1,6 +1,6 @@
-"""Blocking TCP echo client for examples/echo_server.mojo.
+"""Blocking TCP echo client for examples/net/echo_server.mojo.
 
-    pixi run mojo run -I src examples/echo_client.mojo [ADDR] [MESSAGES]
+    pixi run mojo run -I src examples/net/echo_client.mojo [ADDR] [MESSAGES]
 
 Connects (3 s connect timeout) to ADDR (default 127.0.0.1:7878), sends
 MESSAGES (default 3) lines one at a time and checks that each comes back

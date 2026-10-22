@@ -1,5 +1,5 @@
 """Deterministic regression tests for F01 (net-blocking review) through the
-syscall fault seam (built with -D MOJO_TCP_FAULTS=1 because of the
+syscall fault seam (built with -D MOJO_NET_FAULTS=1 because of the
 `_faults.mojo` suffix).
 
 F01: every net.blocking retry loop was `syscall -> EAGAIN -> wait -> retry`

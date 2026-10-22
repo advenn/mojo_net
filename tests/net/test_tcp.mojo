@@ -165,7 +165,7 @@ def _ipv6(test: StaticString, need_loopback: Bool = True) raises -> Bool:
     mean "no IPv6"; any other failure raises, so a regression is never
     reported as a skip. Without IPv6 this prints a visible skip line (which
     tools/run_tests.sh shows and counts) and the test returns early, unless
-    MOJO_TCP_REQUIRE_IPV6=1 turns it into a failure."""
+    MOJO_NET_REQUIRE_IPV6=1 turns it into a failure."""
     var why: StaticString
     var r = sys.socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0)
     if is_err(r) and Errno(err_of(r)) == Errno.EAFNOSUPPORT:
@@ -186,8 +186,8 @@ def _ipv6(test: StaticString, need_loopback: Bool = True) raises -> Bool:
         if Errno(err_of(b)) != Errno.EADDRNOTAVAIL:
             _ = check("bind([::1]:0)", b)
         why = "bind([::1]:0): EADDRNOTAVAIL"
-    if getenv("MOJO_TCP_REQUIRE_IPV6") == "1":
-        raise Error(test, ": no IPv6 (", why, ") but MOJO_TCP_REQUIRE_IPV6=1")
+    if getenv("MOJO_NET_REQUIRE_IPV6") == "1":
+        raise Error(test, ": no IPv6 (", why, ") but MOJO_NET_REQUIRE_IPV6=1")
     print(String("    (skipped: ", test, ": no IPv6, ", why, ")"))
     return False
 
