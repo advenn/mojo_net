@@ -1,0 +1,29 @@
+[workspace]
+authors = ["beck <qurbonovasadbek@gmail.com>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "mojo_tcp"
+platforms = ["linux-64", "linux-aarch64"]
+version = "0.1.0"
+description = "Native Mojo networking for Linux: raw-syscall layer (linux), event-loop runtime (rt), sockets (net)."
+
+[tasks]
+# Run all tests, or those whose path contains the given filter: `pixi run test net/`.
+# Without a filter it also runs the abi-check layout test (see tools/run_tests.sh).
+test = "bash tools/run_tests.sh"
+# Regenerate syscall numbers, constants and errno from the kernel/C headers.
+gen = "python3 tools/gen_syscall_nr.py && python3 tools/gen_abi.py --write"
+# Verify committed constants and struct layouts against this host's C headers.
+abi-check = "python3 tools/gen_abi.py --check && mojo run -I src build/test_abi_layout.mojo"
+# Verify the I/O path imports no libc socket/poll/epoll symbols.
+nolibc-check = "bash tools/check_nolibc.sh tests/linux/test_sys.mojo tests/linux/test_epoll.mojo tests/linux/test_poll.mojo tests/net/test_socket.mojo tests/net/test_tcp.mojo tests/net/test_unix.mojo"
+# Everything CI must run: every test file (which includes the ABI layout check)
+# plus the no-libc check. Set MOJO_TCP_REQUIRE_IPV6=1 on runners with IPv6.
+ci = { depends-on = ["test", "nolibc-check"] }
+# Re-run the M1 threading/runtime/callback spikes (see docs/spikes.md).
+spikes = "bash spikes/run_spikes.sh"
+format = "mojo format src tests"
+
+[dependencies]
+mojo = "==1.2.0rc2"
+# Test-only: differential oracles (ipaddress) and peer processes.
+python = ">=3.12"

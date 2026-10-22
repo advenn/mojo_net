@@ -1,0 +1,16 @@
+# Minimal HTTP/1.1 keep-alive "Hello, World!" server on tokio current_thread:
+# the Rust counterpart of bench/http_hello.mojo (same parsing, same replies).
+[package]
+name = "rust_http"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "net", "io-util"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

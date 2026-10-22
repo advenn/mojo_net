@@ -1,0 +1,17 @@
+# tokio current_thread echo server: the reference for design.md's M2 gate
+# (">= 80% of tokio current_thread throughput"), measured with the same
+# client and harness as server.mojo (spikes/epoll_echo/bench.py).
+[package]
+name = "tokio_echo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
