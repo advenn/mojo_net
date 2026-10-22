@@ -9,7 +9,7 @@ Native Mojo networking libraries for Linux (x86_64 and aarch64, kernel 5.15+):
 |---|---|---|
 | `linux` | raw syscalls (inline asm), ABI mirrors, errno and `IoError`, fds, clocks, poll/epoll/eventfd, probing | stable |
 | `bytes` | `ByteBuffer` and the sans-I/O `Codec` contract that protocol codecs implement | stable |
-| `net` | the TCP/UDP library: addresses, every socket option, TCP/Unix streams with deadlines, connect by name, buffered frame reads, UDP sockets ([docs/net.md](docs/net.md)) | TCP client stable; UDP in progress |
+| `net` | the TCP/UDP library: addresses, every socket option, TCP/Unix streams with deadlines, connect by name, buffered frame reads, UDP sockets (blocking, nonblocking, batched, multicast) ([docs/net.md](docs/net.md)) | TCP client and UDP stable |
 | `rt` | an experimental completion-based event loop ([docs/rt.md](docs/rt.md)) | frozen |
 
 Imports point downward only (`linux` ← `bytes` ← `net` ← `rt`), and only `rt` may import `rt`. CI checks both rules. Design, package rules and shared contracts: [docs/design.md](docs/design.md).
@@ -37,7 +37,8 @@ More in `examples/net/`:
 - a Unix-socket echo;
 - a tiny netcat;
 - a Redis `PING`, with sans-I/O RESP encoding and parsing;
-- a readiness-loop echo server: edge-triggered epoll and `try_read` / `try_write`, with no runtime.
+- a readiness-loop echo server: edge-triggered epoll and `try_read` / `try_write`, with no runtime;
+- a UDP echo server (blocking, or an epoll loop with batched `recvmmsg` / `sendmmsg`) and a UDP ping client.
 
 ## Develop
 Everything runs through [pixi](https://pixi.sh):

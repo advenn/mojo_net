@@ -11,6 +11,8 @@ from linux.abi import EpollEvent
 from linux.consts import EPOLLET, EPOLLIN
 from linux.time import Deadline, Duration, Instant
 from net.addr import SocketAddr
+from net.resolv import Hosts, ResolvConf
+from net.resolver import Resolver
 from net.socket import Domain, SockType, Socket
 from net.udp import Datagram, UdpSocket
 
@@ -300,6 +302,35 @@ def test_options() raises:
     assert_equal(c.local_addr(), a.local_addr())
     sys.keep_alive(x)  # both must still be bound for the AddrInUse check
     sys.keep_alive(y)
+
+
+def test_connect_host_by_literal_and_name() raises:
+    var srv = _bound()
+    var port = srv.local_addr().port()
+    var lit = UdpSocket.connect_host("127.0.0.1", port, Duration.from_secs(2))
+    assert_equal(lit.peer_addr(), srv.local_addr())
+    var c = ResolvConf()
+    c.nameservers.append(SocketAddr.parse("127.0.0.1:9"))  # never asked
+    var r = Resolver(c^, Hosts.parse("127.0.0.1 echo.test\n"))
+    var named = UdpSocket.connect_host_deadline("echo.test", port, _guard(), r)
+    named.set_deadline(_guard())
+    assert_equal(named.peer_addr(), srv.local_addr())
+    _ = named.send(String("hi").as_bytes())
+    var buf = _bytes(8, 0)
+    var d = srv.recv_from(Span(buf))
+    assert_equal(d.sender, named.local_addr())
+    var kind = String()
+    try:
+        _ = UdpSocket.connect_host_deadline("missing.test", port, _guard(), r)
+    except e:
+        kind = String(e.kind)
+    assert_true(kind == "NotFound" or kind == "TimedOut" or kind == "Other")
+    var zero = String()
+    try:
+        _ = UdpSocket.connect_host("127.0.0.1", port, Duration.ZERO)
+    except e:
+        zero = String(e.kind)
+    assert_equal(zero, "InvalidInput")
 
 
 def main() raises:

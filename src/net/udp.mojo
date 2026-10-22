@@ -60,6 +60,8 @@ from linux.time import Deadline, Duration
 
 from .addr import IpAddr, Ipv4Addr, Ipv6Addr, RawSockaddr, SocketAddr
 from .blocking import _Waiter, _set_cloexec
+from .dial import _literal
+from .resolver import Resolver
 from .socket import Domain, SockType, Socket
 
 
@@ -420,6 +422,58 @@ struct UdpSocket(AsFd, Movable, Writable):
             raise IoError.of_kind(op, ErrorKind.InvalidInput)
         _set_cloexec(sock)
         sock.set_nonblocking(True)
+        return UdpSocket(nonblocking_socket=sock^)
+
+    @staticmethod
+    def connect_host(
+        host: StringSlice, port: UInt16, timeout: Duration
+    ) raises IoError -> UdpSocket:
+        """A socket connected to `host:port` (a name or an IP literal),
+        resolving within `timeout`; see `connect_host_deadline`."""
+        if timeout.is_zero():
+            raise IoError.of_kind("connect", ErrorKind.InvalidInput)
+        return UdpSocket.connect_host_deadline(
+            host, port, Deadline.after(timeout)
+        )
+
+    @staticmethod
+    def connect_host_deadline(
+        host: StringSlice, port: UInt16, deadline: Deadline
+    ) raises IoError -> UdpSocket:
+        """`connect_host_deadline` with the system configuration (read only
+        when `host` is not an IP literal)."""
+        var literal = _literal(host, port)
+        if literal:
+            return UdpSocket._connected_to(literal.value())
+        return UdpSocket.connect_host_deadline(
+            host, port, deadline, Resolver.system()
+        )
+
+    @staticmethod
+    def connect_host_deadline(
+        host: StringSlice, port: UInt16, deadline: Deadline, resolver: Resolver
+    ) raises IoError -> UdpSocket:
+        """A socket connected to `host:port`: the name is resolved with
+        `resolver` by `deadline`, and the first address in RFC 6724 order
+        (usable ones first) is used, from an ephemeral local port of its
+        family. UDP has no handshake to race, so unlike
+        `TcpStream.connect_host` there is no Happy Eyeballs: to fail over,
+        a caller tries the next address of `Resolver.lookup_ip` itself.
+        `localhost` gives ::1 first (RFC 6724 ranks it highest), so a server
+        that listens on 127.0.0.1 only shows up as `ConnectionRefused` on
+        the first receive."""
+        var literal = _literal(host, port)
+        if literal:
+            return UdpSocket._connected_to(literal.value())
+        var ips = resolver.lookup_ip(host, deadline)
+        return UdpSocket._connected_to(SocketAddr(ips[0], port))
+
+    @staticmethod
+    def _connected_to(addr: SocketAddr) raises IoError -> UdpSocket:
+        var sock = Socket.new(
+            Domain.for_address(addr), SockType.DGRAM, nonblocking=True
+        )
+        sock.connect(addr)
         return UdpSocket(nonblocking_socket=sock^)
 
     def connect(self, addr: SocketAddr) raises IoError:

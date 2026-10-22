@@ -73,6 +73,36 @@ var reply = r.read_until("\r\n".as_bytes(), max_bytes=64 * 1024)
   - Resolution: hosts-file names in 8 µs (glibc `getaddrinfo`: 36 µs, since it re-reads the files every call). A DNS lookup costs one round trip, like glibc (4.1 ms against 4.3 ms here; A and AAAA in parallel).
   - `BufReader` framing has ~25 ns of overhead per frame plus a SIMD scan (6.4 GB/s on 1 KiB lines, zero-copy). `read_line` adds one allocation per line (~40 ns).
 
+## Using UDP
+```mojo
+from linux.time import Deadline, Duration
+from net import UdpSocket
+
+# A client: connected, so only the server's replies arrive and ICMP errors
+# surface (ConnectionRefused).
+var sock = UdpSocket.connect_host("ntp.internal", 123, Duration.from_secs(2))
+sock.set_read_deadline(Deadline.after(Duration.from_secs(1)))
+_ = sock.send(request)
+var buf = List[UInt8](length=1500, fill=0)
+var d = sock.recv(Span(buf))        # d.len bytes in buf; d.truncated()?
+```
+- **Two modes, as for TCP.**
+  - Blocking: `send_to` / `recv_from` (`send` / `recv` once connected) wait up to the per-direction deadlines.
+  - Nonblocking: `try_*` returns None instead of waiting, for readiness loops.
+  - Batched: `DatagramBatch` with `recv_batch` / `send_batch` moves up to 1024 datagrams per syscall, in both modes.
+- **Datagrams are whole.** A receive returns one datagram. One longer than the buffer is cut, and `Datagram.size > len` says so, so it is never silent. Empty datagrams are valid; there is no EOF. A peek into an empty buffer tells the next datagram's size.
+- **Servers.**
+  - `UdpSocket.bind(addr)`, plus `bind_reuseport` for one socket per core.
+  - Reply with `send_to(payload, d.sender)`.
+  - `examples/net/udp_echo.mojo` shows a blocking loop and an edge-triggered batched loop.
+- **Multicast:** `join_multicast_v4` / `v6` on a socket bound to the group's port. Mind `IP_MULTICAST_ALL`.
+- **Names:** `UdpSocket.connect_host` resolves without libc and uses the first address in RFC 6724 order. There is no Happy Eyeballs for UDP: try the next `Resolver.lookup_ip` address to fail over.
+- **Errors:**
+  - `TimedOut` (`is_deadline()`);
+  - `ConnectionRefused` on a connected socket after ICMP "port unreachable";
+  - EMSGSIZE for a datagram too large to send;
+  - `PermissionDenied` for a broadcast without `set_broadcast(True)`.
+
 ## v1 client API
 These names and their documented behavior are stable for v1.
 - **Changes are additive.** A replacement first ships beside the old name, which stays working with a deprecation warning (as `Epoll.wait(timeout_ns)` and `set_linger(Int)` did).
@@ -86,6 +116,7 @@ These names and their documented behavior are stable for v1.
 | Framing | `BufReader[S: Read]` (the `Read` trait): `stream`, `into_parts`, `buffer`, `consume`, `capacity`, `max_size`, `fill`, `fill_until`, `read_until`, `read_line`, `read_exact`, `read` |
 | Resolution | `Resolver` (`system`, `lookup_ip`, `start`), `Lookup`, `net.resolv.ResolvConf` / `Hosts` / `search_names`; the `net.dns` message helpers |
 | Errors | `IoError{kind, errno, op}`: the kinds under "Using the client" |
+| UDP (M3, stable with this release) | `UdpSocket`: `bind`, `bind_reuseport`, `connect_host` / `connect_host_deadline`, `connect`, `from_socket`, `into_socket`, `try_clone`, `close`; `send_to`, `send`, `recv_from`, `recv`, `peek_from` and their `try_*` forms; `recv_batch` / `try_recv_batch` / `send_batch` / `try_send_batch`; deadlines; `set_broadcast`; multicast `join_*` / `leave_*` / `set_multicast_*`; `Datagram`, `DatagramBatch` |
 
 ## L2 blocking contract (as built in M1)
 - **Nonblocking internally.** Every op is: try once → on EAGAIN `wait_ready` (ppoll) → retry. EINTR retries.
@@ -179,5 +210,8 @@ These names and their documented behavior are stable for v1.
      - Truncation is reported per datagram; `sent()` tracks progress, also after an error.
      - Measured on loopback (a loaded 4-core host, 64-byte datagrams, batches of 64): 13–20% faster end to end. On loopback the kernel's per-datagram work dominates (~2 µs: the send also runs the receive path). Batching saves only the syscall overhead (~120–250 ns per datagram), and its gain is larger on real NICs.
      - **Later:** UDP GSO/GRO (`UDP_SEGMENT`, `UDP_GRO`, one route lookup for many segments) is the next throughput lever.
-  4. Examples, docs, API review.
+  4. **Examples, docs, API.** Done.
+     - `examples/net/udp_echo.mojo`: blocking, or an epoll loop with batches.
+     - `examples/net/udp_ping.mojo`: by name, RTT and loss.
+     - `UdpSocket.connect_host`, the guide above, and the UDP rows of the API table.
 - **Later:** sendfile, vectored helpers, TLS integration points.
