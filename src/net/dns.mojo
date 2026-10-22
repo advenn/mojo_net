@@ -19,7 +19,8 @@ Accepting a response (RFC 5452's rules against forged answers):
 
 Parsing is defensive. Every length and offset is bounds-checked, labels are
 at most 63 bytes, names at most 255 bytes, and a compression pointer must
-point strictly before itself, so following pointers always terminates.
+point strictly before itself, so following pointers always terminates; at
+most `MAX_POINTERS` are followed per name, which bounds the work.
 Whatever does not fit raises `InvalidData` (op "dns"). Names are compared
 in wire form (length-prefixed labels, ASCII lowercase), never as dotted
 text, so a label that contains a `.` cannot alias two labels.
@@ -51,13 +52,19 @@ comptime MAX_NAME_LEN = 255
 """Longest name in wire form, terminating root label included."""
 comptime MAX_LABEL_LEN = 63
 comptime MAX_CNAME_HOPS = 16
+comptime MAX_POINTERS = 16
+"""Compression pointers followed per name: real names need one or two;
+without a cap a hostile 64 KB answer can chain thousands per name."""
+comptime TYPE_SOA: UInt16 = 6
 comptime EDNS_PAYLOAD = 1232
 """The UDP payload size to advertise with EDNS(0): DNS Flag Day 2020's
 value, small enough to avoid IP fragmentation on common paths."""
 
 comptime _FLAG_QR: UInt16 = 0x8000
+comptime _FLAG_AA: UInt16 = 0x0400
 comptime _FLAG_TC: UInt16 = 0x0200
 comptime _FLAG_RD: UInt16 = 0x0100
+comptime _FLAG_RA: UInt16 = 0x0080
 comptime _OPCODE_MASK: UInt16 = 0x7800
 
 
@@ -160,10 +167,12 @@ def read_name(
     first) in lowercase wire form; returns the offset just after it in the
     message. `InvalidData` for anything out of bounds, a label over 63
     bytes, a name over 255 bytes, a pointer that does not point strictly
-    before itself, or a reserved label type."""
+    before itself, more than `MAX_POINTERS` pointers, or a reserved label
+    type."""
     name.clear()
     var pos = at
     var after = -1  # where the name ends in the message, once known
+    var pointers = 0
     while True:
         if pos < 0 or pos >= len(msg):
             raise IoError.of_kind("dns", ErrorKind.InvalidData)
@@ -176,7 +185,9 @@ def read_name(
         var kind = len_byte & 0xC0
         if kind == 0xC0:
             var target = Int(_u16(msg, pos) & 0x3FFF)
-            if target >= pos:  # forward or self pointers could loop
+            pointers += 1
+            if target >= pos or pointers > MAX_POINTERS:
+                # Forward or self pointers could loop; long chains burn CPU.
                 raise IoError.of_kind("dns", ErrorKind.InvalidData)
             if after < 0:
                 after = pos + 2
@@ -252,6 +263,11 @@ struct DnsAnswer(Movable):
     records (NODATA)."""
     var truncated: Bool
     """TC was set: nothing else was parsed; ask again over TCP."""
+    var lame: Bool
+    """A lame referral: NOERROR with no answers from a server that is
+    neither authoritative nor recursive (AA and RA clear) and gave no SOA,
+    so it says nothing about the name. Resolvers ask the next server (as
+    glibc and Go do)."""
     var addrs: List[IpAddr]
     """The question type's addresses for its name, in answer order."""
     var ttl: UInt32
@@ -260,6 +276,7 @@ struct DnsAnswer(Movable):
     def __init__(out self, rcode: Int, truncated: Bool):
         self.rcode = rcode
         self.truncated = truncated
+        self.lame = False
         self.addrs = List[IpAddr]()
         self.ttl = 0
 
@@ -390,7 +407,31 @@ def parse_response(
             min_ttl = min(min_ttl, r.ttl)
     if len(result.addrs) > 0:
         result.ttl = min_ttl
+    if (
+        ancount == 0
+        and (flags & _FLAG_AA) == 0
+        and (flags & _FLAG_RA) == 0
+        and not _has_soa(msg, pos, Int(_u16(msg, 8)))
+    ):
+        result.lame = True
     return result^
+
+
+def _has_soa(msg: Span[UInt8, _], at: Int, nscount: Int) raises IoError -> Bool:
+    """Whether the authority section (`nscount` records from `at`) holds
+    an SOA record."""
+    var pos = at
+    var name = List[UInt8]()
+    for _ in range(nscount):
+        pos = read_name(msg, pos, name)
+        var rtype = _u16(msg, pos)
+        var rdlen = Int(_u16(msg, pos + 8))
+        if pos + 10 + rdlen > len(msg):
+            raise IoError.of_kind("dns", ErrorKind.InvalidData)
+        if rtype == TYPE_SOA:
+            return True
+        pos += 10 + rdlen
+    return False
 
 
 def tcp_frame(msg: Span[UInt8, _]) raises IoError -> List[UInt8]:

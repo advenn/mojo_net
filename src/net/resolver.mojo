@@ -23,13 +23,21 @@ DNS queries:
   ephemeral ones, and a packet that is not an answer to the query (wrong ID
   or question) is ignored, not counted as a failure (`net.dns`).
 - **TCP.** A truncated answer is asked again over TCP of the same server;
-  `options use-vc` uses TCP for everything; `options edns0` advertises
-  1232-byte UDP answers instead.
+  `options use-vc` uses TCP for everything. The TCP exchange is
+  nonblocking like the UDP one: it never holds up the other query or a
+  caller racing connections.
+- **EDNS(0).** `options edns0` advertises 1232-byte UDP answers; a server
+  that answers that with FORMERR or NOTIMP is asked again without it.
 - **Servers.** In order (from a random one with `options rotate`), for
   `attempts` rounds; each try waits `timeout`. SERVFAIL, REFUSED, FORMERR,
-  NOTIMP, a malformed answer, an ICMP port unreachable (ECONNREFUSED) and a
-  failed send move to the next server at once. NXDOMAIN and NOERROR (with
-  or without addresses) end the query for that name.
+  NOTIMP, a lame referral (no answer from a server that is neither
+  authoritative nor recursive), a malformed answer, an ICMP port
+  unreachable (ECONNREFUSED) and a failed send move to the next server at
+  once. NXDOMAIN and NOERROR (with or without addresses) end the query for
+  that name.
+- **Deadline.** No try starts after the caller's deadline, and every try
+  ends by it, so a lookup finishes by its deadline with whatever it has:
+  an A answer is returned even if AAAA never came.
 
 `lookup_ip` orders its result by a subset of RFC 6724's destination rules:
 usable addresses first (the kernel has a route: probed with a UDP connect,
@@ -40,7 +48,7 @@ ULA, ...), keeping answer order otherwise. Callers that connect should use
 
 Errors carry op "resolve": `NotFound` when no candidate name has
 addresses (NXDOMAIN or NODATA everywhere), `TimedOut` when the deadline
-passes or a server never answered, `Other` when servers failed (SERVFAIL,
+passed or a server never answered (and nothing was found), `Other` when servers failed (SERVFAIL,
 REFUSED, malformed answers), `InvalidInput` for a name that cannot be
 asked (empty, a label over 63 bytes, a byte outside letters, digits, `-`
 and `_`).
@@ -52,7 +60,7 @@ calls `advance`; addresses come out of `take` as each answer arrives.
 
 from linux import ErrorKind, IoError, sys
 from linux.abi import Pollfd
-from linux.consts import POLLIN
+from linux.consts import MSG_NOSIGNAL, POLLIN, POLLOUT
 from linux.errno import Errno
 from linux.poll import poll_until
 from linux.random import fill_random
@@ -60,13 +68,10 @@ from linux.syscall import err_of, is_err
 from linux.time import Deadline, Duration
 
 from .addr import IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr
-from .blocking import (
-    connect_with_deadline,
-    recv_exact_with_deadline,
-    send_all_with_deadline,
-)
 from .dns import (
+    RCODE_FORMERR,
     RCODE_NOERROR,
+    RCODE_NOTIMP,
     RCODE_NXDOMAIN,
     TYPE_A,
     TYPE_AAAA,
@@ -96,12 +101,25 @@ comptime _RECV_BUF = 65535
 
 
 struct _Query(Movable):
-    """One question (`qtype` for the current name) over the server list."""
+    """One question (`qtype` for the current name) over the server list. A
+    try is a connected UDP socket (`udp`) or a TCP exchange in progress
+    (`tcp`: after a truncated answer, or always with `use-vc`); both are
+    nonblocking and driven by `Lookup.advance`."""
 
     var qtype: UInt16
     var state: Int
-    var sock: Optional[Socket]
+    var udp: Optional[Socket]
+    var tcp: Optional[Socket]
+    var tcp_out: List[UInt8]
+    """The length-prefixed query; `tcp_sent` bytes of it are sent."""
+    var tcp_sent: Int
+    var tcp_in: List[UInt8]
+    """The length prefix and answer received so far."""
     var msg: List[UInt8]
+    var server: Int
+    """Index of the current try's server."""
+    var edns: Bool
+    """Whether `msg` carries an OPT record."""
     var tries: Int
     var try_deadline: Deadline
     var outcome: Int
@@ -110,12 +128,22 @@ struct _Query(Movable):
     def __init__(out self, qtype: UInt16):
         self.qtype = qtype
         self.state = _DONE
-        self.sock = None
+        self.udp = None
+        self.tcp = None
+        self.tcp_out = List[UInt8]()
+        self.tcp_sent = 0
+        self.tcp_in = List[UInt8]()
         self.msg = List[UInt8]()
+        self.server = 0
+        self.edns = False
         self.tries = 0
         self.try_deadline = Deadline.none()
         self.outcome = 0
         self.saw_timeout = False
+
+    def close(mut self):
+        self.udp = None
+        self.tcp = None
 
 
 # ---- the lookup state machine ------------------------------------------------
@@ -124,7 +152,8 @@ struct _Query(Movable):
 struct Lookup(Movable):
     """One host lookup in progress (see the module docs). Not copyable: it
     owns its sockets. Drive it with `poll_fds` / `next_deadline` /
-    `advance` until `is_done()`, collecting addresses with `take`."""
+    `advance` until `is_done()`, collecting addresses with `take`. Nothing
+    in it waits: every socket is nonblocking."""
 
     var _servers: List[SocketAddr]
     var _timeout: Duration
@@ -171,7 +200,7 @@ struct Lookup(Movable):
         want_v6: Bool,
         deadline: Deadline,
     ) raises IoError:
-        """Start asking DNS for `names` in turn (the first query is sent
+        """Start asking DNS for `names` in turn (the first queries are sent
         before this returns)."""
         self._servers = List[SocketAddr]()
         var n = len(conf.nameservers)
@@ -237,12 +266,19 @@ struct Lookup(Movable):
         return False
 
     def poll_fds(self, mut fds: List[Pollfd]):
-        """Append a POLLIN entry for each socket awaiting an answer. The
-        entries hold raw descriptors: keep the lookup alive while polling."""
+        """Append an entry for each socket a query waits on (POLLIN for UDP
+        and TCP answers, POLLOUT while a TCP query is connecting or
+        sending). The entries hold raw descriptors: keep the lookup alive
+        while polling."""
         for i in range(len(self._queries)):
             ref q = self._queries[i]
-            if q.state == _WAITING and q.sock:
-                fds.append(Pollfd(q.sock.value().raw_fd(), Int16(POLLIN), 0))
+            if q.state != _WAITING:
+                continue
+            if q.tcp:
+                var ev = POLLOUT if q.tcp_sent < len(q.tcp_out) else POLLIN
+                fds.append(Pollfd(q.tcp.value().raw_fd(), Int16(ev), 0))
+            elif q.udp:
+                fds.append(Pollfd(q.udp.value().raw_fd(), Int16(POLLIN), 0))
 
     def next_deadline(self) -> Deadline:
         """When `advance` must run again even without readiness."""
@@ -254,25 +290,30 @@ struct Lookup(Movable):
         return d
 
     def advance(mut self, deadline: Deadline) raises IoError:
-        """Read whatever answers have arrived (without waiting for UDP),
-        move expired tries on, and start the next name when this one is
-        finished. A TCP retry of a truncated answer is a blocking exchange
-        bounded by its try timeout and `deadline`. Never raises for server
-        behaviour, only for local failures (no descriptors, ...)."""
+        """Make progress without waiting: read the answers that arrived,
+        push TCP exchanges along, move expired tries on, and start the next
+        name when this one is finished. Once `deadline` has passed no new
+        try starts, so the lookup finishes (with whatever it found). Raises
+        only for local failures (no descriptors, ...), never for server
+        behaviour."""
         if self._done:
             return
         for i in range(len(self._queries)):
-            if self._queries[i].state == _WAITING:
+            if self._queries[i].state != _WAITING:
+                continue
+            if self._queries[i].tcp:
+                self._step_tcp(i, deadline)
+            else:
                 self._drain(i, deadline)
         for i in range(len(self._queries)):
             ref q = self._queries[i]
             if q.state == _WAITING and q.try_deadline.is_expired():
                 q.saw_timeout = True
-                q.sock = None
+                q.close()
                 self._next_try(i, deadline)
         self._settle(deadline)
 
-    # ---- internals -------------------------------------------------------
+    # ---- tries -----------------------------------------------------------
 
     def _start_name(mut self, deadline: Deadline) raises IoError:
         for i in range(len(self._queries)):
@@ -281,72 +322,167 @@ struct Lookup(Movable):
             q.tries = 0
             q.outcome = 0
             q.saw_timeout = False
-            q.sock = None
+            q.close()
             self._next_try(i, deadline)
         self._settle(deadline)
 
     def _next_try(mut self, i: Int, deadline: Deadline) raises IoError:
-        """Send query `i` to its next server, or finish it if none is
-        left. Local resource errors (EMFILE, ENOMEM) raise."""
+        """Send query `i` to its next server, or finish it when no try is
+        left or `deadline` has passed."""
         while self._queries[i].tries < self._max_tries:
-            var server = self._servers[
-                self._queries[i].tries % len(self._servers)
-            ]
-            self._queries[i].tries += 1
-            var id = List[UInt8](length=2, fill=0)
-            fill_random(Span(id))
-            self._queries[i].msg = build_query(
-                (UInt16(id[0]) << 8) | UInt16(id[1]),
-                self._names[self._name_i],
-                self._queries[i].qtype,
-                self._edns,
+            if deadline.is_expired():
+                self._queries[i].saw_timeout = True
+                break
+            self._queries[i].server = self._queries[i].tries % len(
+                self._servers
             )
-            var try_deadline = deadline.earliest(Deadline.after(self._timeout))
-            self._queries[i].try_deadline = try_deadline
-            if self._tcp:
-                if self._ask_tcp(i, server, try_deadline):
-                    return
-                continue
-            var sock: Socket
-            try:
-                sock = Socket.new(
-                    Domain.for_address(server), SockType.DGRAM, nonblocking=True
-                )
-            except e:
-                if _is_local_resource_error(e):
-                    raise e
-                continue  # e.g. IPv6 disabled: next server
-            try:
-                sock.connect(server)
-                _ = sock.send(Span(self._queries[i].msg))
-            except e:
-                if _is_local_resource_error(e):
-                    raise e
-                continue  # unreachable server: next one
-            self._queries[i].sock = sock^
-            self._queries[i].state = _WAITING
-            return
+            self._queries[i].tries += 1
+            if self._send(i, self._edns, deadline):
+                return
         ref q = self._queries[i]
         q.state = _DONE
-        q.sock = None
+        q.close()
         q.outcome = _OUT_TIMEOUT if q.saw_timeout else _OUT_FAILED
+
+    def _fail_try(mut self, i: Int, deadline: Deadline) raises IoError:
+        self._queries[i].close()
+        self._next_try(i, deadline)
+
+    def _send(
+        mut self, i: Int, edns: Bool, deadline: Deadline
+    ) raises IoError -> Bool:
+        """Send query `i` with a fresh ID to its current server, over UDP
+        (or TCP with `use-vc`). False if that failed at once (no route,
+        refused, IPv6 off, ...); local resource errors raise."""
+        var server = self._servers[self._queries[i].server]
+        var id = List[UInt8](length=2, fill=0)
+        fill_random(Span(id))
+        self._queries[i].msg = build_query(
+            (UInt16(id[0]) << 8) | UInt16(id[1]),
+            self._names[self._name_i],
+            self._queries[i].qtype,
+            edns,
+        )
+        self._queries[i].edns = edns
+        self._queries[i].try_deadline = deadline.earliest(
+            Deadline.after(self._timeout)
+        )
+        self._queries[i].close()
+        self._queries[i].state = _WAITING
+        if self._tcp:
+            return self._start_tcp(i)
+        var sock: Socket
+        try:
+            sock = Socket.new(
+                Domain.for_address(server), SockType.DGRAM, nonblocking=True
+            )
+            sock.connect(server)
+            _ = sock.send(Span(self._queries[i].msg))
+        except e:
+            if _is_local_resource_error(e):
+                raise e
+            return False
+        self._queries[i].udp = sock^
+        return True
+
+    def _start_tcp(mut self, i: Int) raises IoError -> Bool:
+        """Begin query `i` over TCP to its current server: a nonblocking
+        connect; `_step_tcp` sends and reads once the socket is ready."""
+        var server = self._servers[self._queries[i].server]
+        var sock: Socket
+        try:
+            sock = Socket.new(
+                Domain.for_address(server), SockType.STREAM, nonblocking=True
+            )
+        except e:
+            if _is_local_resource_error(e):
+                raise e
+            return False
+        var raw = server.to_raw()
+        var r = sys.connect(sock, raw.storage, raw.socklen())
+        if r < 0:
+            var e = Errno(err_of(r))
+            # EINTR: the connect goes on in the background, never reissued.
+            if e != Errno.EINPROGRESS and e != Errno.EINTR:
+                return False
+        self._queries[i].tcp_out = tcp_frame(Span(self._queries[i].msg))
+        self._queries[i].tcp_sent = 0
+        self._queries[i].tcp_in.clear()
+        self._queries[i].tcp = sock^
+        return True
+
+    def _step_tcp(mut self, i: Int, deadline: Deadline) raises IoError:
+        """Push query `i`'s TCP exchange as far as it goes without waiting.
+        A send on a socket still connecting says EAGAIN, so one loop covers
+        connecting and sending."""
+        while self._queries[i].tcp_sent < len(self._queries[i].tcp_out):
+            var r = sys.send(
+                self._queries[i].tcp.value(),
+                Span(self._queries[i].tcp_out)[self._queries[i].tcp_sent :],
+                MSG_NOSIGNAL,
+            )
+            if r >= 0:
+                self._queries[i].tcp_sent += r
+                continue
+            var e = Errno(err_of(r))
+            if e == Errno.EINTR:
+                continue
+            if e == Errno.EAGAIN:
+                return
+            self._fail_try(i, deadline)  # refused, reset, unreachable
+            return
+        while True:
+            var r = sys.recv(
+                self._queries[i].tcp.value(), Span(self._rbuf), 0
+            )
+            if r == 0:
+                self._fail_try(i, deadline)  # closed before the answer
+                return
+            if r < 0:
+                var e = Errno(err_of(r))
+                if e == Errno.EINTR:
+                    continue
+                if e == Errno.EAGAIN:
+                    return
+                self._fail_try(i, deadline)
+                return
+            self._queries[i].tcp_in.extend(Span(self._rbuf)[0:r])
+            var have = len(self._queries[i].tcp_in)
+            if have < 2:
+                continue
+            var need = 2 + (
+                (Int(self._queries[i].tcp_in[0]) << 8)
+                | Int(self._queries[i].tcp_in[1])
+            )
+            if have < need:
+                continue
+            var answer: Optional[DnsAnswer]
+            try:
+                answer = parse_response(
+                    Span(self._queries[i].tcp_in)[2:need],
+                    Span(self._queries[i].msg),
+                )
+            except:
+                answer = None
+            if not answer:  # TCP has no strays: an unrelated answer fails
+                self._fail_try(i, deadline)
+                return
+            self._answer(i, answer.take(), deadline, from_tcp=True)
+            return
 
     def _drain(mut self, i: Int, deadline: Deadline) raises IoError:
         """Receive every queued datagram of query `i` until EAGAIN or an
         accepted answer."""
-        while self._queries[i].state == _WAITING and self._queries[i].sock:
-            var r = sys.recv(
-                self._queries[i].sock.value(), Span(self._rbuf), 0
-            )
+        while self._queries[i].state == _WAITING and self._queries[i].udp:
+            var r = sys.recv(self._queries[i].udp.value(), Span(self._rbuf), 0)
             if is_err(r):
                 var e = Errno(err_of(r))
-                if e == Errno.EAGAIN or e == Errno.EINTR:
-                    if e == Errno.EAGAIN:
-                        return
+                if e == Errno.EINTR:
                     continue
+                if e == Errno.EAGAIN:
+                    return
                 # ECONNREFUSED (ICMP port unreachable) and the like.
-                self._queries[i].sock = None
-                self._next_try(i, deadline)
+                self._fail_try(i, deadline)
                 return
             var answer: Optional[DnsAnswer]
             try:
@@ -355,78 +491,57 @@ struct Lookup(Movable):
                 )
             except:
                 # Our ID and question but malformed: a broken server.
-                self._queries[i].sock = None
-                self._next_try(i, deadline)
+                self._fail_try(i, deadline)
                 return
             if not answer:
                 continue  # not an answer to this query: ignore it
-            var ans = answer.take()
-            if ans.truncated:
-                var server = self._server_of(i)
-                self._queries[i].sock = None
-                var tcp_deadline = deadline.earliest(
-                    Deadline.after(self._timeout)
-                )
-                if not self._ask_tcp(i, server, tcp_deadline):
-                    self._next_try(i, deadline)
-                return
-            if not self._accept(i, ans^):
-                self._queries[i].sock = None
-                self._next_try(i, deadline)
+            self._answer(i, answer.take(), deadline, from_tcp=False)
             return
 
-    def _server_of(self, i: Int) -> SocketAddr:
-        """The server of query `i`'s current try."""
-        return self._servers[(self._queries[i].tries - 1) % len(self._servers)]
-
-    def _ask_tcp(
-        mut self, i: Int, server: SocketAddr, deadline: Deadline
-    ) raises IoError -> Bool:
-        """The current query over TCP to `server`. True if that decided the
-        query; False to move on to the next server."""
-        var resp: List[UInt8]
-        try:
-            resp = _exchange_tcp(server, Span(self._queries[i].msg), deadline)
-        except e:
-            if _is_local_resource_error(e):
-                raise e
-            if e.kind == ErrorKind.TimedOut:
-                self._queries[i].saw_timeout = True
-            return False
-        var answer: Optional[DnsAnswer]
-        try:
-            answer = parse_response(Span(resp), Span(self._queries[i].msg))
-        except:
-            return False
-        if not answer:
-            return False
-        var ans = answer.take()
+    def _answer(
+        mut self, i: Int, var ans: DnsAnswer, deadline: Deadline, from_tcp: Bool
+    ) raises IoError:
+        """Act on an answer to query `i`'s current try."""
         if ans.truncated:
-            return False
-        return self._accept(i, ans^)
-
-    def _accept(mut self, i: Int, var ans: DnsAnswer) -> Bool:
-        """Apply an answer to query `i`: True if it ends the query."""
+            if from_tcp:
+                self._fail_try(i, deadline)
+                return
+            # The same server again over TCP, with a fresh try timeout.
+            self._queries[i].close()
+            self._queries[i].try_deadline = deadline.earliest(
+                Deadline.after(self._timeout)
+            )
+            if not self._start_tcp(i):
+                self._fail_try(i, deadline)
+            return
+        if (
+            ans.rcode == RCODE_FORMERR or ans.rcode == RCODE_NOTIMP
+        ) and self._queries[i].edns:
+            # Perhaps no EDNS(0) support: the same server, without OPT.
+            if not self._send(i, False, deadline):
+                self._fail_try(i, deadline)
+            return
         ref q = self._queries[i]
-        if ans.rcode == RCODE_NOERROR:
+        if ans.rcode == RCODE_NOERROR and not ans.lame:
             q.state = _DONE
-            q.sock = None
+            q.close()
             q.outcome = _OUT_ADDRS
             if len(ans.addrs) > 0:
                 self._found = True
                 for ip in ans.addrs:
                     self._ready.append(ip)
-            return True
+            return
         if ans.rcode == RCODE_NXDOMAIN:
             q.state = _DONE
-            q.sock = None
+            q.close()
             q.outcome = _OUT_NXDOMAIN
-            return True
-        return False  # SERVFAIL, REFUSED, FORMERR, ...: next server
+            return
+        self._fail_try(i, deadline)  # SERVFAIL, REFUSED, lame, ...
 
     def _settle(mut self, deadline: Deadline) raises IoError:
         """After progress: finish the lookup, or start the next name once
-        every query for this one has ended without addresses."""
+        every query for this one has ended without addresses (not after
+        `deadline`)."""
         while not self._done:
             for i in range(len(self._queries)):
                 if self._queries[i].state != _DONE:
@@ -441,9 +556,10 @@ struct Lookup(Movable):
                 elif outcome == _OUT_TIMEOUT:
                     self._timed_out = True
             self._name_i += 1
-            if self._name_i >= len(self._names):
+            var expired = deadline.is_expired()
+            if self._name_i >= len(self._names) or expired:
                 self._done = True
-                if self._timed_out:
+                if self._timed_out or expired:
                     self._error = IoError.of_kind("resolve", ErrorKind.TimedOut)
                 elif self._failed:
                     self._error = IoError.of_kind("resolve", ErrorKind.Other)
@@ -456,32 +572,13 @@ struct Lookup(Movable):
                 q.tries = 0
                 q.outcome = 0
                 q.saw_timeout = False
-                q.sock = None
+                q.close()
                 self._next_try(i, deadline)
 
 
 def _is_local_resource_error(e: IoError) -> Bool:
     """Failures of this process, not of the network or a server: raised."""
     return e.kind == ErrorKind.TooManyFiles or e.kind == ErrorKind.OutOfMemory
-
-
-def _exchange_tcp(
-    server: SocketAddr, msg: Span[UInt8, _], deadline: Deadline
-) raises IoError -> List[UInt8]:
-    """One query and its answer over a fresh TCP connection (RFC 7766's
-    framing: a 2-byte length before each message)."""
-    var sock = Socket.new(
-        Domain.for_address(server), SockType.STREAM, nonblocking=True
-    )
-    connect_with_deadline(sock, server.to_raw(), deadline)
-    var frame = tcp_frame(msg)
-    send_all_with_deadline(sock, Span(frame), deadline, "resolve")
-    var head = List[UInt8](length=2, fill=0)
-    recv_exact_with_deadline(sock, Span(head), deadline, "resolve")
-    var n = (Int(head[0]) << 8) | Int(head[1])
-    var resp = List[UInt8](length=n, fill=0)
-    recv_exact_with_deadline(sock, Span(resp), deadline, "resolve")
-    return resp^
 
 
 # ---- the resolver ------------------------------------------------------------
@@ -519,8 +616,9 @@ struct Resolver(Copyable, Movable):
         self.hosts = hosts^
 
     @staticmethod
-    def system() raises IoError -> Resolver:
-        """/etc/resolv.conf and /etc/hosts (missing files mean defaults)."""
+    def system() -> Resolver:
+        """/etc/resolv.conf and /etc/hosts (files that are missing or
+        unreadable mean the defaults)."""
         return Resolver(ResolvConf.load(), Hosts.load())
 
     def start(
@@ -571,6 +669,9 @@ struct Resolver(Copyable, Movable):
         docs). Raises `TimedOut` once `deadline` passes."""
         var lk = self.start(host, deadline, want_v4=want_v4, want_v6=want_v6)
         var out = List[IpAddr]()
+        # Each try waits until `deadline` at the latest and no try starts
+        # after it, so this loop ends by then; addresses found before it
+        # (A answered, AAAA still pending) are returned, not dropped.
         while not lk.is_done():
             var fds = List[Pollfd]()
             lk.poll_fds(fds)
@@ -579,10 +680,6 @@ struct Resolver(Copyable, Movable):
                 raise IoError.of_kind("resolve", ErrorKind.Other)
             var wake = deadline.earliest(lk.next_deadline())
             _ = poll_until(Span(fds), wake, "resolve")
-            if deadline.is_expired() and not lk.is_done():
-                lk.advance(deadline)  # one last look at what has arrived
-                if not lk.is_done():
-                    raise IoError.of_kind("resolve", ErrorKind.TimedOut)
             lk.advance(deadline)
         lk.take(out)
         if len(out) == 0:

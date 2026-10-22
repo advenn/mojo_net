@@ -29,6 +29,7 @@ pixi run mojo run -D MOJO_NET_FAULTS=1 -I src tests/net/test_tcp_faults.mojo   #
 pixi run mojo run -D MOJO_NET_SIM=1 -I src tests/rt/test_loop_contract.mojo     # one file on the rt simulator
 pixi run import-check              # package import rules (tools/check_imports.py)
 pixi run examples-check            # build every examples/<pkg>/*.mojo
+pixi run aarch64-check             # cross-compile every test and example for aarch64 (~12 min; not in ci)
 pixi run abi-check                 # constants + struct layouts vs this host's C headers
 pixi run nolibc-check              # no libc socket/poll/epoll symbols on the I/O path
 pixi run gen                       # regenerate src/linux/{nr,consts,errno}.mojo from headers

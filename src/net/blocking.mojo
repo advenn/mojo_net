@@ -597,9 +597,9 @@ def detect_dead_peers(sock: Socket, keepalive: TcpKeepalive) raises IoError:
     `InvalidInput` (see `TcpKeepalive`)."""
     sock.set_tcp_keepalive(keepalive)
     sock.set_keepalive(True)
-    sock.set_tcp_user_timeout(
-        keepalive.idle + keepalive.interval * keepalive.count
-    )
+    # The kernel rounds the times up to whole seconds: use what it stored.
+    var ka = sock.tcp_keepalive()
+    sock.set_tcp_user_timeout(ka.idle + ka.interval * ka.count)
 
 
 @fieldwise_init

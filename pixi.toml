@@ -20,6 +20,9 @@ nolibc-check = "bash tools/check_nolibc.sh tests/linux/test_sys.mojo tests/linux
 import-check = "python3 tools/check_imports.py"
 # Build every example, so none can rot unnoticed.
 examples-check = "bash tools/check_examples.sh"
+# Cross-compile every test file and example for aarch64 (objects only:
+# no aarch64 host here). Slow (~10 s a file), so not part of `ci`.
+aarch64-check = "bash tools/check_aarch64.sh"
 # Everything CI must run: the import rules, every test file (which includes the
 # ABI layout check), the no-libc check and the example builds.
 # Set MOJO_NET_REQUIRE_IPV6=1 on runners with IPv6.

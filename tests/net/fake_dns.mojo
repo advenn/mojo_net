@@ -33,10 +33,12 @@ def a(ip):
 def rr_data(family, ip):
     return socket.inet_pton(family, ip)
 
-def reply(qid, question, rcode=0, answers=(), tc=False, qd=True):
-    flags = 0x8180 | rcode | (0x0200 if tc else 0)
-    head = qid + struct.pack('!HHHHH', flags, 1 if qd else 0, len(answers), 0, 0)
-    return head + (question if qd else b'') + b''.join(answers)
+def reply(qid, question, rcode=0, answers=(), tc=False, qd=True, flags=0x8180, auth=()):
+    flags = flags | rcode | (0x0200 if tc else 0)
+    head = qid + struct.pack('!HHHHH', flags, 1 if qd else 0, len(answers), len(auth), 0)
+    return head + (question if qd else b'') + b''.join(answers) + b''.join(auth)
+
+SEEN = {}  # (server, name) -> queries seen, UDP and TCP
 
 def parse(data):
     qid = data[0:2]
@@ -56,10 +58,36 @@ def v4(name, ip):
 def v6(name, ip):
     return rr(name, AAAA, socket.inet_pton(socket.AF_INET6, ip))
 
+BLACK_HOLE = [(3600, b'')]  # TCP: accept, then never answer
+
 def answer(server, tcp, data):
     # A list of (delay seconds, bytes); [] sends nothing; None closes (TCP).
     qid, name, qtype, q, edns = parse(data)
     ok = lambda *rrs: [(0, reply(qid, q, 0, rrs))]
+    if name.startswith('count.'):
+        n = SEEN.get((server, name[6:]), 0)
+        return ok(v4(name, '10.0.%d.%d' % (n >> 8, n & 255))) if qtype == A else ok()
+    SEEN[(server, name)] = SEEN.get((server, name), 0) + 1
+    if name == 'tcblack.test':
+        if qtype == AAAA:  # arrives while A's TCP retry is under way
+            return [(0.05, reply(qid, q, 0, (v6(name, '2001:db8::5'),)))]
+        return BLACK_HOLE if tcp else [(0, reply(qid, q, 0, (), tc=True))]
+    if name == 'tcstall.test':
+        if qtype == A:
+            return ok(v4(name, '127.0.0.1'))
+        return BLACK_HOLE if tcp else [(0, reply(qid, q, 0, (), tc=True))]
+    if name in ('lame.test', 'authnodata.test'):
+        if server == 0:
+            if name == 'lame.test':  # QR RD only: not authoritative, not recursive
+                ns = rr('test', 2, wire('ns.elsewhere'))
+                return [(0, reply(qid, q, 0, (), flags=0x8100, auth=(ns,)))]
+            soa = rr('test', 6, wire('ns.test') + wire('host.test') + struct.pack('!IIIII', 1, 2, 3, 4, 5))
+            return [(0, reply(qid, q, 0, (), flags=0x8500, auth=(soa,)))]  # QR AA RD
+        return ok(v4(name, '192.0.2.30')) if qtype == A else ok()
+    if name == 'noedns.test':
+        if edns:
+            return [(0, reply(qid, q, 1))]  # FORMERR
+        return ok(v4(name, '192.0.2.78')) if qtype == A else ok()
     if name == 'ok.test':
         return ok(v4(name, '192.0.2.1')) if qtype == A else ok(v6(name, '2001:db8::1'))
     if name == 'v4only.test':

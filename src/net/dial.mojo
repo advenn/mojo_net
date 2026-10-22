@@ -8,8 +8,10 @@ How `dial_tcp` connects:
   connections start. An AAAA answer starts IPv6 attempts at once; an A
   answer that arrives first waits at most `RESOLUTION_DELAY` (50 ms) for
   AAAA (section 3). Answers that arrive later join the queue.
-- **Order.** Addresses alternate between the families, IPv6 first, each
-  family in answer order (section 4).
+- **Order.** Each family is sorted by RFC 6724's policy table (answer
+  order among equals), the first attempt goes to the family that ranks
+  first (IPv6, unless its best address is ULA, 6to4, Teredo, ...), and
+  then the families alternate (section 4).
 - **Racing.** A new attempt starts every `ATTEMPT_DELAY` (250 ms) while no
   attempt has connected, and at once when one fails (section 5). Attempts
   run in parallel; the first to connect wins and the others are closed.
@@ -38,7 +40,7 @@ from linux.time import Deadline, Duration, Instant
 from .addr import IpAddr, SocketAddr, SocketAddrV6
 from .blocking import connect_with_deadline
 from .dns import TYPE_AAAA
-from .resolver import Lookup, Resolver
+from .resolver import Lookup, Resolver, precedence
 from .socket import Domain, SockType, Socket
 
 comptime ATTEMPT_DELAY = Duration.from_millis(250)
@@ -67,7 +69,8 @@ struct HostPort(Copyable, Movable, Writable):
         """Split `host:port`. An IPv6 literal must be bracketed (`[::1]:80`).
         `InvalidInput` (op "HostPort.parse") for a missing host or port, a
         port that is not a decimal 0..65535, a colon in an unbracketed
-        host, or anything after the closing bracket but `:port`."""
+        host, a bracket inside the host, or anything after the closing
+        bracket but `:port`."""
         var b = text.as_bytes()
         var n = len(b)
         var colon: Int
@@ -99,6 +102,9 @@ struct HostPort(Copyable, Movable, Writable):
             host_end = colon
         if host_end <= host_start or colon + 1 >= n or n - colon - 1 > 5:
             raise IoError.of_kind("HostPort.parse", ErrorKind.InvalidInput)
+        for i in range(host_start, host_end):
+            if b[i] == 91 or b[i] == 93:  # a bracket inside the host
+                raise IoError.of_kind("HostPort.parse", ErrorKind.InvalidInput)
         var port = 0
         for i in range(colon + 1, n):
             var c = b[i]
@@ -240,14 +246,15 @@ def dial_tcp(
         if deadline.is_expired(now):
             raise IoError.of_kind("connect", ErrorKind.TimedOut)
 
-        # New answers join the queues.
+        # New answers join the queues, each kept in RFC 6724 precedence
+        # order (stable: answer order among equals).
         var got = List[IpAddr]()
         lk.take(got)
         for ip in got:
             if ip.is_ipv6():
-                v6.append(SocketAddr(ip, port))
+                _insert_by_precedence(v6, SocketAddr(ip, port))
             else:
-                v4.append(SocketAddr(ip, port))
+                _insert_by_precedence(v4, SocketAddr(ip, port))
 
         # Resolution delay: IPv4 waits briefly for a pending AAAA answer
         # before the very first attempt.
@@ -272,6 +279,10 @@ def dial_tcp(
             or now - last_start.value() >= ATTEMPT_DELAY
         )
         if queued > 0 and due and not hold:
+            if not last_start and len(v6) > 0 and len(v4) > 0:
+                # The first family is the one RFC 6724 ranks first (IPv6
+                # unless its best address is ULA, 6to4, Teredo, ...).
+                next_v6 = precedence(v6[0].ip()) >= precedence(v4[0].ip())
             var addr: SocketAddr
             if (next_v6 and len(v6) > 0) or len(v4) == 0:
                 addr = v6.pop(0)
@@ -317,25 +328,49 @@ def dial_tcp(
             )
         _ = poll_until(Span(fds), wake, "connect")
 
-        # Settle the attempts that finished (from the end: pops keep the
-        # lower indices valid).
-        var i = len(attempts) - 1
-        while i >= 0:
-            var ev = fds[first_attempt + i].revents
-            if (ev & Int16(POLLOUT | POLLERR | POLLHUP)) != 0:
-                var err = attempts[i].sock.take_error()
-                if not err and (ev & Int16(POLLOUT)) != 0:
-                    return attempts.pop(i).into_sock()
-                if err:
-                    errors.add(IoError.from_errno("connect", err.value().errno))
-                else:
-                    errors.add(
-                        IoError.of_kind("connect", ErrorKind.ConnectionRefused)
-                    )
-                _ = attempts.pop(i)
-                kick = True
-            i -= 1
+        var winner = _settle(attempts, Span(fds)[first_attempt:], errors)
+        if winner:
+            return attempts.pop(winner.value()).into_sock()
+        if len(attempts) < len(fds) - first_attempt:
+            kick = True  # some failed: the next attempt starts now
         lk.advance(deadline)
+
+
+def _settle(
+    mut attempts: List[_Attempt], revents: Span[Pollfd, _], mut errors: _Errors
+) raises IoError -> Optional[Int]:
+    """Look at the attempts that finished (`revents[i]` is attempt `i`'s
+    poll entry). Return the index of the earliest-started one that
+    connected (attempts are in start order, so a tie goes to the first),
+    else record and drop the failed ones and return None."""
+    var failed = List[Int]()
+    for i in range(len(attempts)):
+        var ev = revents[i].revents
+        if (ev & Int16(POLLOUT | POLLERR | POLLHUP)) == 0:
+            continue
+        var err = attempts[i].sock.take_error()
+        if not err and (ev & Int16(POLLOUT)) != 0:
+            return i
+        if err:
+            errors.add(IoError.from_errno("connect", err.value().errno))
+        else:
+            errors.add(IoError.of_kind("connect", ErrorKind.ConnectionRefused))
+        failed.append(i)
+    for k in range(len(failed) - 1, -1, -1):  # from the end: indices stay valid
+        _ = attempts.pop(failed[k])
+    return None
+
+
+def _insert_by_precedence(mut q: List[SocketAddr], addr: SocketAddr):
+    """Insert `addr` after every queued address of at least its precedence
+    (RFC 6724's policy table), so equal ones keep answer order."""
+    var p = precedence(addr.ip())
+    var at = len(q)
+    for j in range(len(q)):
+        if precedence(q[j].ip()) < p:
+            at = j
+            break
+    q.insert(at, addr)
 
 
 def _start(

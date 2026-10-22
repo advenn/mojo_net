@@ -40,6 +40,38 @@ The M1 spike's raw-epoll server shows this is enough. It held 11k connections at
 | `dns` | DNS messages, sans-I/O: A/AAAA queries (optionally EDNS(0)) and defensive response parsing that ignores forged or unrelated packets (RFC 5452) |
 | `buffer`, `codec` | re-exports of `bytes.buffer` and `bytes.codec` |
 
+## Using the client
+```mojo
+from linux.time import Deadline, Duration
+from net import BufReader, TcpStream
+
+var conn = TcpStream.connect_host("db.internal", 5432, Duration.from_secs(5))
+conn.detect_dead_peers()            # long-lived (pooled) connections
+var r = BufReader(conn^)
+r.stream().set_deadline(Deadline.after(Duration.from_secs(10)))
+r.stream().write_all(request)
+var reply = r.read_until("\r\n".as_bytes(), max_bytes=64 * 1024)
+```
+- **Connecting.**
+  - `connect_host(host, port, timeout)`: a name or an IP literal. It resolves without libc and races IPv6 and IPv4 (Happy Eyeballs v2); the timeout covers both resolution and connecting.
+  - `connect_timeout(SocketAddr, timeout)` when you already have an address.
+  - Pools keep one `Resolver` (`Resolver.system()`) and call `connect_host_deadline(..., resolver)`, so the config files are read once.
+- **Deadlines** are absolute and per direction, and bound waiting only. A `BufReader` frame read that times out loses nothing: call it again with a new deadline.
+- **Framing.** `BufReader` gives bounded frame reads: `read_until`, `read_line`, `read_exact`, and the zero-copy `fill_until` + `buffer()` + `consume`. A `max_bytes` overflow is `InvalidData`; EOF inside a frame is `UnexpectedEof`; a clean EOF returns None.
+- **Pools.** Call `detect_dead_peers()` once per connection. Before reusing one, check that `idle_state()` is EMPTY and, with a `BufReader`, that `buffer()` is empty. Otherwise discard it, or read the pending data if the protocol pushes (Postgres LISTEN).
+- **Errors** (`IoError.kind`):
+  - `TimedOut`: `is_deadline()` is true when our own deadline passed, false for the kernel's ETIMEDOUT (keepalive or user timeout);
+  - `ConnectionRefused`; `ConnectionReset` / `BrokenPipe` (the peer went away);
+  - `NotFound` with op "resolve" (no such host);
+  - `UnexpectedEof`;
+  - `InvalidData` (a limit or the protocol);
+  - `InvalidInput` (a bad argument).
+- **Readiness loops** use `try_read` / `try_write` / `try_accept`, which return None instead of waiting (see the rules below).
+- **Cost** (x86_64, Mojo 1.2.0rc2):
+  - `connect_host("127.0.0.1")` takes 20 µs, the same as connecting to a `SocketAddr`; `"localhost"` takes 34 µs, including the refused `::1` attempt.
+  - Resolution: hosts-file names in 8 µs (glibc `getaddrinfo`: 35 µs, since it re-reads the files every call). A DNS lookup costs one round trip, the same as glibc (A and AAAA in parallel).
+  - `BufReader` framing has ~25 ns of overhead per frame plus a SIMD scan (6.9 GB/s on 1 KiB lines, zero-copy). `read_line` adds one allocation per line (~45 ns).
+
 ## L2 blocking contract (as built in M1)
 - **Nonblocking internally.** Every op is: try once → on EAGAIN `wait_ready` (ppoll) → retry. EINTR retries.
 - **Deadlines.** They are absolute and per direction (`set_read_deadline` / `set_write_deadline` / `set_deadline`), and apply to every later op. Expiry raises `TimedOut` and leaves the stream usable.

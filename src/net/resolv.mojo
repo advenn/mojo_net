@@ -195,22 +195,20 @@ struct ResolvConf(Copyable, Movable):
         return conf^
 
     @staticmethod
-    def load(path: StringSlice = RESOLV_CONF) raises IoError -> ResolvConf:
-        """Read and parse `path`; a missing file gives the defaults (local
-        nameservers). The host name comes from uname(2)."""
+    def load(path: StringSlice = RESOLV_CONF) -> ResolvConf:
+        """Read and parse `path`. A file that is missing or cannot be read
+        (permissions, a directory, ...) gives the defaults (local
+        nameservers), as glibc does. The host name comes from uname(2)."""
         var host = String()
         try:
             host = uts_string(uname().nodename)
         except:
             pass
-        var text: List[UInt8]
         try:
-            text = read_file(path, "read(resolv.conf)")
-        except e:
-            if e.kind != ErrorKind.NotFound:
-                raise e
+            var text = read_file(path, "read(resolv.conf)")
+            return ResolvConf.parse(String(from_utf8_lossy=Span(text)), host)
+        except:
             return ResolvConf.parse("", host)
-        return ResolvConf.parse(String(from_utf8_lossy=Span(text)), host)
 
     def _option(mut self, opt: StringSlice):
         var b = opt.as_bytes()
@@ -296,14 +294,13 @@ struct Hosts(Copyable, Movable, Sized):
         return hosts^
 
     @staticmethod
-    def load(path: StringSlice = HOSTS) raises IoError -> Hosts:
-        """Read and parse `path`; a missing file is an empty table."""
+    def load(path: StringSlice = HOSTS) -> Hosts:
+        """Read and parse `path`; a file that is missing or cannot be read
+        is an empty table."""
         try:
             var text = read_file(path, "read(hosts)")
             return Hosts.parse(String(from_utf8_lossy=Span(text)))
-        except e:
-            if e.kind != ErrorKind.NotFound:
-                raise e
+        except:
             return Hosts()
 
     def lookup(self, name: StringSlice) -> List[IpAddr]:
