@@ -45,6 +45,7 @@ struct Completion(Movable):
 - **Targets are data.** Mojo cannot use a function as a value from inside itself, or from any function in a reference cycle with it. Build Targets once at setup and store them; `net.evented` keeps one `Target(_dispatch[H], ctx)` per connection and routes on `c.kind`.
 - **State behind `ctx` must not also be a `mut` argument of the frame that runs the loop.** The compiler treats `mut` as exclusive and may cache its fields across `run_once`, so it misses what callbacks wrote through `ctx`. Keep handler state on the heap, or take its address in the function that runs the loop.
 - **Receive buffers.** A recv moves a pooled buffer (at most `RECV_CHUNK` bytes) to the handler, which returns it with `loop.recycle(buf^)`. Only buffers of exactly `RECV_CHUNK` capacity are pooled; others are freed.
+- **Buffers on the completion.** `c.buf` is a plain `ByteBuffer` (empty when the op has none). Move it out with `c.take_buf()`; `c.has_buf()` is true for every send and for recv data.
 - **Send buffers.** `send` writes *all* readable bytes, finishing partial writes itself, and hands the buffer back in the completion. A failed or canceled send hands back the bytes it did not send.
 
 ## Ops
@@ -54,6 +55,7 @@ struct Completion(Movable):
 | `connect(addr)` | handshake done (`c.fd`) or failed (socket already closed) | 0 / -errno |
 | `accept(listener)` multishot | each connection, registered, TCP_NODELAY on (`c.fd`) | 0, or a fatal -errno |
 | `recv(fd)` single-shot | data (`c.buf`), EOF (res 0) or error | bytes / 0 / -errno |
+| `recv_multi(fd)` multishot | each chunk (`more=True`, `c.buf`), then one final completion: EOF (res 0), error, or ECANCELED. `pause_recv(fd)` / `resume_recv(fd)` take effect at once; there is no op per chunk | bytes per chunk; final 0 / -errno |
 | `send(fd, buf)` | all bytes written, or error | bytes / -errno |
 | `shutdown(fd, how)` | SHUT_WR / SHUT_RDWR: after the earlier sends have gone out | 0 / -errno |
 | `close(fd)` | every pending op on fd has completed (ECANCELED); deregistered and closed | 0 / -errno |
@@ -100,5 +102,5 @@ A bounded lock-free MPSC queue with an eventfd wakeup that is coalesced through 
 
 ## Not yet
 - io_uring (M3).
-- multishot recv, vectored send, sendfile.
+- vectored send, sendfile.
 - A "readable(fd)" op for foreign fds (eventfd, signalfd), needed to wire the mailbox into the loop.

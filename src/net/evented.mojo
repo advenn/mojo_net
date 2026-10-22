@@ -341,6 +341,9 @@ struct ConnCore(Movable):
     # ---- hot: read or written for every message --------------------------
     var opened: Bool
     var recv_inflight: Bool
+    """A multishot receive (`Loop.recv_multi`) is armed on the fd."""
+    var recv_paused: Bool
+    """...and paused in the loop (`pause_recv`), for backpressure."""
     var user_paused: Bool
     var bp_paused: Bool
     var above_hwm: Bool
@@ -410,6 +413,7 @@ struct ConnCore(Movable):
         self.bytes_out = 0
         self.opened = False
         self.recv_inflight = False
+        self.recv_paused = False
         self.user_paused = False
         self.bp_paused = False
         self.above_hwm = False
@@ -615,15 +619,30 @@ def _pump(mut c: ConnCore, mut lp: Loop):
                 c.wshut_submitted = True
                 c.ops += 1
                 _ = lp.shutdown(c.fd, SHUT_WR, c.target)
-            if not c.recv_inflight:
-                c.recv_inflight = True
-                c.ops += 1
-                _ = lp.recv(c.fd, c.target)
-    elif _wants_read(c) and not c.recv_inflight:
-        c.recv_inflight = True
-        c.ops += 1
-        _ = lp.recv(c.fd, c.target)
+            _sync_recv(c, lp, True)
+        else:
+            _sync_recv(c, lp, False)
+    else:
+        _sync_recv(c, lp, _wants_read(c))
     _arm_timer(c, lp)
+
+
+@inline(.always)
+def _sync_recv(mut c: ConnCore, mut lp: Loop, want: Bool):
+    """Make the loop read iff `want`: one multishot receive per connection,
+    armed once and then paused/resumed (no op per chunk)."""
+    if want:
+        if not c.recv_inflight:
+            c.recv_inflight = True
+            c.recv_paused = False
+            c.ops += 1
+            _ = lp.recv_multi(c.fd, c.target)
+        elif c.recv_paused:
+            c.recv_paused = False
+            lp.resume_recv(c.fd)
+    elif c.recv_inflight and not c.recv_paused:
+        c.recv_paused = True
+        lp.pause_recv(c.fd)
 
 
 # ---- Conn: the handler's view ------------------------------------------------
@@ -833,7 +852,7 @@ def _dispatch[H: ConnHandler](ctx: Int, mut lp: Loop, var c: Completion):
     if not c.more:
         st.core.ops -= 1
     var kind = c.kind
-    if kind == OpKind.RECV:
+    if kind == OpKind.RECV_MULTI or kind == OpKind.RECV:
         _on_recv[H](st, lp, c^)
     elif kind == OpKind.SEND:
         _on_send[H](st, lp, c^)
@@ -916,7 +935,9 @@ def _after_input(mut c: ConnCore, mut lp: Loop):
 
 def _on_recv[H: ConnHandler](mut st: _ConnState[H], mut lp: Loop, var c: Completion):
     ref core = st.core
-    core.recv_inflight = False
+    if not c.more:  # the multishot ended (EOF, error, or canceled by close)
+        core.recv_inflight = False
+        core.recv_paused = False
     if c.res > 0:
         var buf = c.take_buf()
         if core.closing or core.abort_req or core.close_submitted:
