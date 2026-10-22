@@ -241,6 +241,18 @@ def nofile_limit() raises IoError -> Rlimit:
     return get_rlimit(RLIMIT_NOFILE)
 
 
+def raise_nofile_limit() raises IoError -> Int:
+    """Raise the soft RLIMIT_NOFILE to the hard limit, as servers with many
+    connections do at startup (no privilege is needed for that); returns
+    the soft limit now in force. A soft limit already at the hard one is
+    left alone."""
+    var lim = nofile_limit()
+    if lim.cur < lim.max:
+        set_rlimit(RLIMIT_NOFILE, Rlimit(lim.max, lim.max))
+        lim = nofile_limit()
+    return Int(min(lim.cur, UInt64(Int.MAX)))
+
+
 def raise_nofile_limit(target: UInt64) raises IoError -> UInt64:
     """Raise the soft RLIMIT_NOFILE toward `target`, capped at the hard
     limit (an unprivileged process can do that much); never lowers it.

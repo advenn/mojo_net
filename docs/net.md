@@ -51,6 +51,12 @@ The M1 spike's raw-epoll server shows this is enough. It held 11k connections at
 - **Return types.** `accept` returns a struct (`TcpAccepted`), not a tuple (see the Mojo move rules in `CLAUDE.md`).
 
 ## Rules for readiness-loop servers (from the 10k spike, `docs/spikes.md`)
+- **API:**
+  - streams: `try_read` / `try_write`;
+  - listeners: `try_accept`;
+  - `TcpListener.bind_reuseport` for one process per core;
+  - `linux.probe.raise_nofile_limit` and `pregrow_fd_table` at startup.
+  - `examples/net/epoll_echo.mojo` follows every rule below.
 - **Syscall budget: 2 syscalls per message.**
   - Register once, edge-triggered, with no `EPOLL_CTL_MOD` per operation.
   - Read and write until EAGAIN.
@@ -94,7 +100,10 @@ The M1 spike's raw-epoll server shows this is enough. It held 11k connections at
   4. **Client presets for DB drivers.** Done.
      - `TcpStream.detect_dead_peers()`: keepalive (30 s idle, 10 s interval, 3 probes) and a `TCP_USER_TIMEOUT` of the same total, so a vanished peer fails the next I/O within about a minute.
      - `idle_state()`: EMPTY / DATA / CLOSED, without waiting or consuming, for pools checking a connection before reuse.
-  5. **Nonblocking stream access** (`try_read`/`try_write`) for external readiness loops, plus server helpers (`SO_REUSEPORT` listeners, fd-table pre-growth, `RLIMIT_NOFILE`).
+  5. **Nonblocking access for readiness loops.** Done.
+     - `try_read`/`try_write` on both streams, `try_accept` on both listeners: `None` instead of waiting.
+     - `TcpListener.bind_reuseport`, `linux.probe.raise_nofile_limit`, fd-table pre-growth.
+     - `examples/net/epoll_echo.mojo` puts them together. Under load it ran 200 concurrent connections, 10k verified echoes in 0.21 s, and held a client that does not read to bounded memory.
   6. **v1 polish:**
      - API docs and examples;
      - a rattler-build recipe (modular-community);

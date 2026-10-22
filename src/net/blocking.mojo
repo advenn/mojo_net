@@ -427,6 +427,66 @@ def accept_with_deadline(
             raise IoError.from_errno("accept", e)
 
 
+def try_accept(
+    listener: Socket, mut peer: RawSockaddr
+) raises IoError -> Optional[Socket]:
+    """`accept4(SOCK_CLOEXEC | SOCK_NONBLOCK)` that never waits: the
+    connection, or None when none is queued (EAGAIN). EINTR and
+    ECONNABORTED retry; EMFILE/ENFILE raise `TooManyFiles` with the
+    connection left queued (see `accept_with_deadline`)."""
+    while True:
+        peer.reset()
+        var r = sys.accept4(
+            listener, peer.storage, peer.len, SOCK_CLOEXEC | SOCK_NONBLOCK
+        )
+        if r >= 0:
+            return Socket(OwnedFd(unsafe_from_raw=Int32(r)))
+        var e = Errno(err_of(r))
+        if e == Errno.EAGAIN:
+            return None
+        if e != Errno.EINTR and e != Errno.ECONNABORTED:
+            raise IoError.from_errno("accept", e)
+
+
+def try_recv(
+    sock: Socket, buf: MutSpan[UInt8, _], op: StaticString
+) raises IoError -> Optional[Int]:
+    """One recv that never waits (the socket is O_NONBLOCK): the bytes read,
+    0 at EOF (and for an empty `buf`), or None when nothing is queued
+    (EAGAIN). EINTR retries; anything else raises, tagged with `op`."""
+    if len(buf) == 0:
+        return 0
+    while True:
+        var r = sys.recv(sock, buf, 0)
+        if r >= 0:
+            return r
+        var e = Errno(err_of(r))
+        if e == Errno.EAGAIN:
+            return None
+        if e != Errno.EINTR:
+            raise IoError.from_errno(op, e)
+
+
+def try_send(
+    sock: Socket, buf: Span[UInt8, _], op: StaticString
+) raises IoError -> Optional[Int]:
+    """One send(MSG_NOSIGNAL) that never waits: the bytes queued (possibly
+    fewer than `len(buf)`; 0 for an empty `buf`), or None when the send
+    buffer is full (EAGAIN). EINTR retries; a vanished peer raises
+    `BrokenPipe` / `ConnectionReset`."""
+    if len(buf) == 0:
+        return 0
+    while True:
+        var r = sys.send(sock, buf, MSG_NOSIGNAL)
+        if r >= 0:
+            return r
+        var e = Errno(err_of(r))
+        if e == Errno.EAGAIN:
+            return None
+        if e != Errno.EINTR:
+            raise IoError.from_errno(op, e)
+
+
 def connect_with_deadline(
     sock: Socket, addr: RawSockaddr, deadline: Deadline
 ) raises IoError:

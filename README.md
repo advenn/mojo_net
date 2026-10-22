@@ -36,7 +36,8 @@ More in `examples/net/`:
 - a blocking echo server and client;
 - a Unix-socket echo;
 - a tiny netcat;
-- a Redis `PING`, with sans-I/O RESP encoding and parsing.
+- a Redis `PING`, with sans-I/O RESP encoding and parsing;
+- a readiness-loop echo server: edge-triggered epoll and `try_read` / `try_write`, with no runtime.
 
 ## Develop
 Everything runs through [pixi](https://pixi.sh):

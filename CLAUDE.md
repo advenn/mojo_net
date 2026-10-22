@@ -66,6 +66,7 @@ pixi run bench build               # rt benchmarks (bench/rt/README.md)
   - `dns` (sans-I/O DNS messages), `resolv` (resolv.conf, hosts, search list), `resolver` (`Resolver.lookup_ip`, `Lookup`): name resolution without libc.
   - `dial`: `TcpStream.connect_host` (Happy Eyeballs v2 over `Lookup`) and `HostPort`.
   - Long-lived connections: `TcpStream.detect_dead_peers()` (keepalive + `TCP_USER_TIMEOUT`) and `idle_state()` (in `blocking`, on both streams).
+  - Readiness loops: `try_read` / `try_write` / `try_accept` never wait (None instead); `TcpListener.bind_reuseport`; see `examples/net/epoll_echo.mojo`.
   - `buffer` / `codec`: re-exports of `bytes.buffer` / `bytes.codec`.
 - **Syscalls:**
   - All of them go through `linux/syscall.mojo` (the only inline asm), via the typed wrappers in `linux/sys.mojo` or module-local wrappers.

@@ -62,6 +62,9 @@ from linux.time import Deadline, Duration
 
 from .addr import RawSockaddr, SocketAddr
 from .blocking import (
+    try_accept,
+    try_recv,
+    try_send,
     DEAD_PEER_KEEPALIVE,
     detect_dead_peers,
     IdleState,
@@ -291,6 +294,20 @@ struct TcpStream(AsFd, Movable, Read, Writable):
         """Scatter-read into `bufs` in order (one recvmsg); 0 at EOF."""
         return recv_vectored_with_deadline(self._sock, bufs, self._rd, "read")
 
+    def try_read(self, buf: MutSpan[UInt8, _]) raises IoError -> Optional[Int]:
+        """For readiness loops (`linux.Epoll`): one read that never waits and
+        ignores the read deadline. The bytes read, 0 at EOF (or for an empty
+        `buf`), or None when nothing is available; with edge-triggered epoll,
+        read until None before waiting again."""
+        return try_recv(self._sock, buf, "read")
+
+    def try_write(self, buf: Span[UInt8, _]) raises IoError -> Optional[Int]:
+        """For readiness loops: one write that never waits and ignores the
+        write deadline. The bytes queued (possibly fewer than `len(buf)`),
+        or None when the send buffer is full: keep the rest and write it
+        when the socket is writable again."""
+        return try_send(self._sock, buf, "write")
+
     def peek(self, buf: MutSpan[UInt8, _]) raises IoError -> Int:
         """Like `read`, but the data stays queued (MSG_PEEK); waits for at
         least one byte under the read deadline. 0 means EOF."""
@@ -405,6 +422,24 @@ struct TcpListener(AsFd, Movable, Writable):
         return TcpListener(nonblocking_socket=sock^)
 
     @staticmethod
+    def bind_reuseport(
+        addr: SocketAddr, backlog: Int = DEFAULT_BACKLOG
+    ) raises IoError -> TcpListener:
+        """`bind` with SO_REUSEPORT too, for one listener per process (or per
+        thread) on the same address: the kernel spreads new connections
+        across them by a hash of the connection's addresses. Every socket
+        bound to the port must set it, and all must belong to the same user
+        (otherwise `AddrInUse`)."""
+        var sock = Socket.new(
+            Domain.for_address(addr), SockType.STREAM, nonblocking=True
+        )
+        sock.set_reuse_address(True)
+        sock.set_reuse_port(True)
+        sock.bind(addr)
+        sock.listen(backlog)
+        return TcpListener(nonblocking_socket=sock^)
+
+    @staticmethod
     def from_socket(var sock: Socket) raises IoError -> TcpListener:
         """Adopt a bound, listening IP stream socket (for example one set up
         with SO_REUSEPORT, or inherited through socket activation).
@@ -433,6 +468,23 @@ struct TcpListener(AsFd, Movable, Writable):
         sock.set_nodelay(True)
         return TcpAccepted(
             TcpStream(nonblocking_socket=sock^), SocketAddr.from_raw(peer)
+        )
+
+    def try_accept(self) raises IoError -> Optional[TcpAccepted]:
+        """For readiness loops: accept without waiting (ignores the accept
+        deadline). None when no connection is queued; with edge-triggered
+        epoll, accept until None. The stream is set up as by `accept`.
+        EMFILE/ENFILE raise `TooManyFiles` and leave the connection queued:
+        stop accepting for a while instead of retrying at once (see
+        docs/net.md)."""
+        var peer = RawSockaddr()
+        var sock = try_accept(self._sock, peer)
+        if not sock:
+            return None
+        var s = sock.take()
+        s.set_nodelay(True)
+        return TcpAccepted(
+            TcpStream(nonblocking_socket=s^), SocketAddr.from_raw(peer)
         )
 
     @inline(.always)

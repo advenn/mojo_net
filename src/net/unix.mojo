@@ -34,6 +34,9 @@ from linux.time import Deadline, Duration
 
 from .addr import RawSockaddr, UnixAddr
 from .blocking import (
+    try_accept,
+    try_recv,
+    try_send,
     IdleState,
     idle_state,
     DEFAULT_BACKLOG,
@@ -246,6 +249,20 @@ struct UnixStream(AsFd, Movable, Read, Writable):
     ](self, bufs: Span[MutSpan[UInt8, o], _]) raises IoError -> Int:
         return recv_vectored_with_deadline(self._sock, bufs, self._rd, "read")
 
+    def try_read(self, buf: MutSpan[UInt8, _]) raises IoError -> Optional[Int]:
+        """For readiness loops (`linux.Epoll`): one read that never waits and
+        ignores the read deadline. The bytes read, 0 at EOF (or for an empty
+        `buf`), or None when nothing is available; with edge-triggered epoll,
+        read until None before waiting again."""
+        return try_recv(self._sock, buf, "read")
+
+    def try_write(self, buf: Span[UInt8, _]) raises IoError -> Optional[Int]:
+        """For readiness loops: one write that never waits and ignores the
+        write deadline. The bytes queued (possibly fewer than `len(buf)`),
+        or None when the send buffer is full: keep the rest and write it
+        when the socket is writable again."""
+        return try_send(self._sock, buf, "write")
+
     def peek(self, buf: MutSpan[UInt8, _]) raises IoError -> Int:
         """Like `read`, leaving the data queued (MSG_PEEK)."""
         return recv_with_deadline(self._sock, buf, MSG_PEEK, self._rd, "peek")
@@ -364,6 +381,18 @@ struct UnixListener(AsFd, Movable, Writable):
         var sock = accept_with_deadline(self._sock, peer, self._deadline)
         return UnixAccepted(
             UnixStream(nonblocking_socket=sock^), _unix_addr(peer)
+        )
+
+    def try_accept(self) raises IoError -> Optional[UnixAccepted]:
+        """For readiness loops: accept without waiting (ignores the accept
+        deadline); None when no connection is queued. EMFILE/ENFILE raise
+        `TooManyFiles` with the connection left queued."""
+        var peer = RawSockaddr()
+        var sock = try_accept(self._sock, peer)
+        if not sock:
+            return None
+        return UnixAccepted(
+            UnixStream(nonblocking_socket=sock.take()), _unix_addr(peer)
         )
 
     @inline(.always)
