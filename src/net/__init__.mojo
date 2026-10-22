@@ -34,6 +34,7 @@ from .socket import (
     TcpInfo,
     TcpKeepalive,
 )
+from .blocking import IdleState
 from .dial import HostPort
 from .reader import BufReader, BufReaderParts, Read
 from .resolver import Lookup, Resolver

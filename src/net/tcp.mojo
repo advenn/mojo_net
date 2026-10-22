@@ -62,6 +62,10 @@ from linux.time import Deadline, Duration
 
 from .addr import RawSockaddr, SocketAddr
 from .blocking import (
+    DEAD_PEER_KEEPALIVE,
+    detect_dead_peers,
+    IdleState,
+    idle_state,
     DEFAULT_BACKLOG,
     DEFAULT_READ_TO_END_MAX,
     accept_with_deadline,
@@ -78,7 +82,7 @@ from .blocking import (
 from .dial import dial_tcp
 from .reader import Read
 from .resolver import Resolver
-from .socket import Domain, Shutdown, SockType, Socket
+from .socket import Domain, Shutdown, SockType, Socket, TcpKeepalive
 
 
 @inline(.always)
@@ -308,6 +312,25 @@ struct TcpStream(AsFd, Movable, Read, Writable):
         (only the first IOV_MAX buffers are used). Build `bufs` from spans
         sharing one origin, as for `Socket.send_vectored`."""
         return send_vectored_with_deadline(self._sock, bufs, self._wr, "write")
+
+    def detect_dead_peers(
+        self, keepalive: TcpKeepalive = DEAD_PEER_KEEPALIVE
+    ) raises IoError:
+        """Tune a connection that may sit idle for long (a database pool) to
+        notice a vanished peer: keepalive probes (by default after 30 s of
+        silence, every 10 s, giving up after 3) and TCP_USER_TIMEOUT of the
+        same total for unacknowledged writes (see
+        `net.blocking.detect_dead_peers`). A dead peer then fails the next
+        read or write with `TimedOut` (ETIMEDOUT) within about a minute."""
+        detect_dead_peers(self._sock, keepalive)
+
+    def idle_state(self) -> IdleState:
+        """Whether this idle stream can be reused, told without waiting or
+        consuming anything (`net.blocking.IdleState`): EMPTY (reusable as
+        far as can be told), DATA (bytes waiting) or CLOSED (FIN, reset or a
+        pending error). A pool calls it before handing a connection out;
+        with a `BufReader`, also check that nothing is buffered."""
+        return idle_state(self._sock)
 
     def shutdown(self, how: Shutdown) raises IoError:
         """Shut down one direction or both (`NotConnected` if the stream is

@@ -34,6 +34,8 @@ from linux.time import Deadline, Duration
 
 from .addr import RawSockaddr, UnixAddr
 from .blocking import (
+    IdleState,
+    idle_state,
     DEFAULT_BACKLOG,
     DEFAULT_READ_TO_END_MAX,
     accept_with_deadline,
@@ -258,6 +260,14 @@ struct UnixStream(AsFd, Movable, Read, Writable):
         mut: Bool, //, o: Origin[mut=mut]
     ](self, bufs: Span[Span[UInt8, o], _]) raises IoError -> Int:
         return send_vectored_with_deadline(self._sock, bufs, self._wr, "write")
+
+    def idle_state(self) -> IdleState:
+        """Whether this idle stream can be reused, told without waiting or
+        consuming anything (`net.blocking.IdleState`): EMPTY (reusable as
+        far as can be told), DATA (bytes waiting) or CLOSED (FIN, reset or a
+        pending error). A pool calls it before handing a connection out;
+        with a `BufReader`, also check that nothing is buffered."""
+        return idle_state(self._sock)
 
     def shutdown(self, how: Shutdown) raises IoError:
         """As `TcpStream.shutdown`: `WRITE` makes the peer read EOF after the

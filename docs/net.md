@@ -91,7 +91,9 @@ The M1 spike's raw-epoll server shows this is enough. It held 11k connections at
      - Connections start while DNS still runs; IPv4 waits at most 50 ms for a pending AAAA.
      - Families alternate, IPv6 first; a new attempt every 250 ms, or at once when one fails; the first to connect wins.
      - One deadline covers resolution and connecting.
-  4. **Client presets for DB drivers:** keepalive + `TCP_USER_TIMEOUT`, and a stale-connection check.
+  4. **Client presets for DB drivers.** Done.
+     - `TcpStream.detect_dead_peers()`: keepalive (30 s idle, 10 s interval, 3 probes) and a `TCP_USER_TIMEOUT` of the same total, so a vanished peer fails the next I/O within about a minute.
+     - `idle_state()`: EMPTY / DATA / CLOSED, without waiting or consuming, for pools checking a connection before reuse.
   5. **Nonblocking stream access** (`try_read`/`try_write`) for external readiness loops, plus server helpers (`SO_REUSEPORT` listeners, fd-table pre-growth, `RLIMIT_NOFILE`).
   6. **v1 polish:**
      - API docs and examples;

@@ -57,6 +57,7 @@ from linux.consts import (
     F_GETFD,
     F_SETFD,
     FD_CLOEXEC,
+    MSG_DONTWAIT,
     MSG_NOSIGNAL,
     MSG_PEEK,
     POLLERR,
@@ -68,10 +69,10 @@ from linux.consts import (
 )
 from linux.poll import wait_ready
 from linux.syscall import err_of, is_err
-from linux.time import Deadline
+from linux.time import Deadline, Duration
 
 from .addr import RawSockaddr
-from .socket import Domain, SockType, Socket
+from .socket import Domain, SockType, Socket, TcpKeepalive
 
 comptime DEFAULT_BACKLOG = 1024
 """Listen backlog for `bind`; the kernel caps it at net.core.somaxconn
@@ -513,3 +514,78 @@ def adopt_stream_socket(
     _set_cloexec(sock)
     sock.set_nonblocking(True)
     return sock^
+
+
+# ---- long-lived connections --------------------------------------------------
+
+
+comptime DEAD_PEER_KEEPALIVE = TcpKeepalive(
+    Duration.from_secs(30), Duration.from_secs(10), 3
+)
+"""Keepalive for connections that sit idle (database pools): the first
+probe after 30 s of silence, then one every 10 s, and the connection is
+reset after 3 unanswered probes, so a vanished peer is noticed within about
+a minute instead of the system default of over two hours."""
+
+
+def detect_dead_peers(sock: Socket, keepalive: TcpKeepalive) raises IoError:
+    """SO_KEEPALIVE with `keepalive`'s timing, and TCP_USER_TIMEOUT set to
+    the same total (idle + interval x count): while sent data is
+    unacknowledged, keepalive probes do not run, and without a user
+    timeout the kernel retransmits for about 15 minutes (tcp_retries2)
+    before giving up. Values outside the kernel's ranges raise
+    `InvalidInput` (see `TcpKeepalive`)."""
+    sock.set_tcp_keepalive(keepalive)
+    sock.set_keepalive(True)
+    sock.set_tcp_user_timeout(
+        keepalive.idle + keepalive.interval * keepalive.count
+    )
+
+
+@fieldwise_init
+struct IdleState(Equatable, TrivialRegisterPassable, Writable):
+    """What an idle stream looks like, from `idle_state`."""
+
+    var value: Int
+
+    comptime EMPTY = IdleState(0)
+    """Nothing to read, no FIN or error: as reusable as can be told without
+    sending. A peer that vanished silently still looks like this; keepalive
+    (`detect_dead_peers`) or the next request finds out."""
+    comptime DATA = IdleState(1)
+    """Bytes are waiting. For a request/response protocol the stream is out
+    of sync (often an error the server sent before closing): discard it.
+    Protocols with server push (Postgres LISTEN) read them."""
+    comptime CLOSED = IdleState(2)
+    """The peer closed (FIN) or reset the stream, or the socket has a
+    pending error: discard it."""
+
+    @inline(.always)
+    def __eq__(self, other: Self) -> Bool:
+        return self.value == other.value
+
+    def write_to(self, mut writer: Some[Writer]):
+        if self.value == 0:
+            writer.write("EMPTY")
+        elif self.value == 1:
+            writer.write("DATA")
+        else:
+            writer.write("CLOSED")
+
+
+def idle_state(sock: Socket) -> IdleState:
+    """One recv(MSG_PEEK | MSG_DONTWAIT) of a byte: never waits and
+    consumes nothing (a pending socket error is read and cleared)."""
+    var b = List[UInt8](length=1, fill=0)
+    while True:
+        var r = sys.recv(sock, Span(b), MSG_PEEK | MSG_DONTWAIT)
+        if r > 0:
+            return IdleState.DATA
+        if r == 0:
+            return IdleState.CLOSED
+        var e = Errno(err_of(r))
+        if e == Errno.EINTR:
+            continue
+        if e == Errno.EAGAIN:
+            return IdleState.EMPTY
+        return IdleState.CLOSED
