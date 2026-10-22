@@ -333,9 +333,9 @@ def parse_response(
     var aliases = List[_Alias]()
     var records = List[_Record]()
     var pos = HEADER_LEN + qlen
-    var owner = List[UInt8]()
+    var rr_name = List[UInt8]()
     for _ in range(ancount):
-        pos = read_name(msg, pos, owner)
+        pos = read_name(msg, pos, rr_name)
         var rtype = _u16(msg, pos)
         var rclass = _u16(msg, pos + 2)
         var ttl = _u32(msg, pos + 4)
@@ -351,14 +351,14 @@ def parse_response(
             var end = read_name(msg, rdata, target)
             if end != rdata + rdlen:
                 raise IoError.of_kind("dns", ErrorKind.InvalidData)
-            aliases.append(_Alias(owner.copy(), target^))
+            aliases.append(_Alias(rr_name.copy(), target^))
         elif rtype == qtype and rtype == TYPE_A:
             if rdlen != 4:
                 raise IoError.of_kind("dns", ErrorKind.InvalidData)
             var ip = Ipv4Addr(
                 msg[rdata], msg[rdata + 1], msg[rdata + 2], msg[rdata + 3]
             )
-            records.append(_Record(owner.copy(), IpAddr(ip), ttl))
+            records.append(_Record(rr_name.copy(), IpAddr(ip), ttl))
         elif rtype == qtype and rtype == TYPE_AAAA:
             if rdlen != 16:
                 raise IoError.of_kind("dns", ErrorKind.InvalidData)
@@ -366,7 +366,7 @@ def parse_response(
             for i in range(16):
                 o[i] = msg[rdata + i]
             records.append(
-                _Record(owner.copy(), IpAddr(Ipv6Addr.from_octets(o)), ttl)
+                _Record(rr_name.copy(), IpAddr(Ipv6Addr.from_octets(o)), ttl)
             )
 
     var name = qname^

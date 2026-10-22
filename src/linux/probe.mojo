@@ -29,26 +29,23 @@ from std.bit import pop_count
 
 from .abi import EpollEvent, Rlimit, UTS_LEN, Utsname
 from .consts import (
-    AT_FDCWD,
     AT_NULL,
     AT_PAGESZ,
     F_DUPFD_CLOEXEC,
-    O_CLOEXEC,
-    O_RDONLY,
     RLIMIT_NOFILE,
 )
 from .errno import Errno
 from .error import ErrorKind, IoError, check
-from .fd import AsFd, OwnedFd
+from .fd import AsFd
+from .fs import read_file
 from .nr import (
     SYS_epoll_pwait2,
     SYS_io_uring_setup,
-    SYS_openat,
     SYS_prlimit64,
     SYS_sched_getaffinity,
     SYS_uname,
 )
-from .sys import close, fcntl, keep_alive, read
+from .sys import close, fcntl, keep_alive
 from .syscall import (
     err_of,
     is_err,
@@ -330,40 +327,11 @@ def cpu_count() raises IoError -> Int:
 # ---- auxv / page size --------------------------------------------------------
 
 
-@inline(.always)
-def _openat(path: Span[UInt8, _], flags: Int) -> Int:
-    """`path` must be NUL-terminated."""
-    return syscall4(SYS_openat, AT_FDCWD, Int(path.unsafe_ptr()), flags, 0)
-
-
 def _read_file(
     path: StaticString, op: StaticString
 ) raises IoError -> List[UInt8]:
-    """Read a whole (small, procfs) file with openat/read; EINTR retried."""
-    var cpath = List[UInt8](capacity=path.byte_length() + 1)
-    for b in path.as_bytes():
-        cpath.append(b)
-    cpath.append(0)
-    var r: Int
-    while True:
-        r = _openat(Span(cpath), O_RDONLY | O_CLOEXEC)
-        if not (is_err(r) and Errno(err_of(r)) == Errno.EINTR):
-            break
-    var fd = OwnedFd(unsafe_from_raw=Int32(check(op, r)))
-    var out = List[UInt8]()
-    var buf = List[UInt8](length=1024, fill=0)
-    while True:
-        var n = read(fd, Span(buf))
-        if n == 0:
-            break
-        if is_err(n):
-            var e = Errno(err_of(n))
-            if e == Errno.EINTR:
-                continue
-            raise IoError.from_errno(op, e)
-        for i in range(n):
-            out.append(buf[i])
-    return out^
+    """Read a whole (small, procfs) file; see `linux.fs.read_file`."""
+    return read_file(path, op)
 
 
 @inline(.always)

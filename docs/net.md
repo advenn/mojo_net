@@ -34,6 +34,7 @@ The M1 spike's raw-epoll server shows this is enough. It held 11k connections at
 | `socket` | L1: `Socket` and every socket option, no policy |
 | `blocking`, `tcp`, `unix` | L2: `TcpStream`, `TcpListener`, `UnixStream`, `UnixListener` and friends |
 | `reader` | `BufReader`: bounded, all-or-nothing frame reads over any `Read` stream (`TcpStream`, `UnixStream`) |
+| `resolv` | `/etc/resolv.conf` (`ResolvConf`), `/etc/hosts` (`Hosts`) and the search list (`search_names`), parsed as glibc does |
 | `dns` | DNS messages, sans-I/O: A/AAAA queries (optionally EDNS(0)) and defensive response parsing that ignores forged or unrelated packets (RFC 5452) |
 | `buffer`, `codec` | re-exports of `bytes.buffer` and `bytes.codec` |
 
@@ -78,7 +79,7 @@ The M1 spike's raw-epoll server shows this is enough. It held 11k connections at
      - Every frame read is all or nothing, so a deadline that expires mid-frame loses nothing.
   2. **DNS stub resolver**, blocking and pure Mojo:
      - the wire codec (`net.dns`): done, fuzzed and ASan-clean;
-     - reads `/etc/hosts` and `resolv.conf` (search, ndots, timeout, attempts);
+     - `/etc/hosts` and `resolv.conf` (search, ndots, timeout, attempts, rotate, edns0, use-vc) and the search list (`net.resolv`): done, checked against glibc's getaddrinfo;
      - UDP A/AAAA queries with random ids, falling back to TCP on truncation;
      - response validation.
   3. **`connect_host(name, port, timeout)`** with Happy Eyeballs v2 (RFC 8305).
