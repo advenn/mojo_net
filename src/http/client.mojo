@@ -11,9 +11,15 @@ small pool. It drives `http.connection.ClientConnection` over a
   literals in brackets. `https` raises `Unsupported` (no TLS yet), user
   info in the authority `InvalidInput`; a fragment is dropped.
 - One deadline per request (`timeout`, default 30 s) covers name
-  resolution, connecting (Happy Eyeballs), sending and receiving.
+  resolution, connecting (Happy Eyeballs), sending and receiving, also a
+  response that keeps trickling in.
+- Request bodies of any size are streamed to the socket in pieces while
+  the connection is watched for the response (RFC 9112 9.5), so a server
+  that answers early (a 413) is heard and a full-duplex one cannot
+  deadlock the request.
 - Responses are read whole, up to `max_body` bytes (default 16 MiB);
-  `InvalidData` beyond, and the connection is dropped.
+  `InvalidData` beyond, and the connection is dropped. At most 32 1xx
+  responses may come before the final one.
 - Headers: the client sends Host (unless the caller gives one),
   User-Agent (likewise), and Content-Length when there is a body or the
   method usually has one (POST, PUT, PATCH). The caller's headers follow,
@@ -21,7 +27,8 @@ small pool. It drives `http.connection.ClientConnection` over a
   (`InvalidInput`): the client frames the body.
 - Connections are kept per host and port, at most `max_idle_per_host` of
   them, and reused only after `max_idle` at most, if `idle_state()` still
-  says EMPTY. A reused connection can still turn out closed by the server
+  says EMPTY and the codec holds nothing unread; connections idle longer
+  are closed whichever host they are for. A reused connection can still turn out closed by the server
   (a race no check avoids). If that happens before any byte of the
   response, an idempotent request (GET, HEAD, OPTIONS, TRACE, PUT, DELETE)
   is sent again, once, on a new connection.
@@ -31,17 +38,24 @@ small pool. It drives `http.connection.ClientConnection` over a
 
 from bytes.buffer import ByteBuffer
 from linux import ErrorKind, IoError
+from linux.consts import POLLERR, POLLHUP, POLLIN, POLLOUT
+from linux.poll import wait_ready
 from linux.time import Deadline, Duration, Instant
 from net.blocking import IdleState
 from net.resolver import Resolver
 from net.tcp import TcpStream
 
-from .connection import E_NO_RESPONSE, ClientConnection, EventKind
+from .connection import E_NO_RESPONSE, ClientConnection, ClientEvent, EventKind
 from .headers import Headers, is_token, lower_ascii
 from .parse import RequestHead
 from .types import Version
 
 comptime _READ_SIZE = 64 * 1024
+comptime _WRITE_PIECE = 64 * 1024
+"""Body bytes handed to the codec at a time, so a body of any size is
+streamed without a copy of all of it."""
+comptime _MAX_INFORMATIONAL = 32
+"""1xx responses accepted before the final one."""
 
 
 # ---- URLs -------------------------------------------------------------------------
@@ -269,6 +283,8 @@ struct Client(Movable):
     var _resolver: Resolver
     var _pool: List[_Conn]
     var _buf: List[UInt8]
+    var _ev: ClientEvent
+    """Reused for every event (`ClientConnection.poll`)."""
 
     def __init__(
         out self,
@@ -290,6 +306,7 @@ struct Client(Movable):
         self._resolver = Resolver.system()
         self._pool = List[_Conn]()
         self._buf = List[UInt8](length=_READ_SIZE, fill=0)
+        self._ev = ClientEvent(EventKind.END)
 
     # ---- requests --------------------------------------------------------
 
@@ -324,6 +341,7 @@ struct Client(Movable):
             or method == "CONNECT"
             or headers.contains("content-length")
             or headers.contains("transfer-encoding")
+            or headers.count("host") > 1
         ):
             raise IoError.of_kind(op, ErrorKind.InvalidInput)
         var head = RequestHead(method, u.target)
@@ -372,39 +390,60 @@ struct Client(Movable):
         mut started: Bool,
     ) raises IoError -> Response:
         """One request and its response on `c`. `started` turns True once a
-        response byte has arrived (after which nothing is retried)."""
+        response byte has arrived (after which nothing is retried).
+
+        The body goes out in pieces while the connection is watched for the
+        response (RFC 9112 9.5): a server that answers before the body ends
+        (a 413, say) is heard, and one that streams its response while the
+        body arrives (an echo) is read from as it writes, so neither can
+        deadlock the request. A response that completes before the request
+        does is returned, and the connection, now out of step, is not kept.
+        """
         c.stream.set_deadline(deadline)
         c.codec.send_request(head)
-        if len(body) > 0:
-            c.codec.send_body(body)
-        c.codec.end_request()
         var out = ByteBuffer()
-        while c.codec.poll_transmit(out) > 0:
-            c.stream.write_all(out.readable_span())
-            out.clear()
+        var sent = 0
+        var ended = False
+        var informational = 0
         var r = Response()
         while True:
-            while True:
-                var got = c.codec.next_event()
-                if not got:
-                    break
-                var ev = got.take()
-                if ev.kind == EventKind.HEAD:
-                    var h = ev.take_head()
-                    r.status = h.status
-                    r.reason = h.reason
-                    r.version = h.version
-                    swap(r.headers, h.headers)
-                elif ev.kind == EventKind.DATA:
-                    if len(r.body) + len(ev.data) > self.max_body:
-                        raise IoError.of_kind("Client.request", ErrorKind.InvalidData)
-                    r.body.extend(Span(ev.data))
-                elif ev.kind == EventKind.END:
-                    swap(r.trailers, ev.trailers)
+            if deadline.is_expired():
+                raise IoError.of_kind("Client.request", ErrorKind.TimedOut)
+            if len(out) == 0:
+                if c.codec.pending_transmit() == 0:
+                    if sent < len(body):
+                        var k = min(_WRITE_PIECE, len(body) - sent)
+                        c.codec.send_body(body[sent : sent + k])
+                        sent += k
+                    elif not ended:
+                        c.codec.end_request()
+                        ended = True
+                _ = c.codec.poll_transmit(out)
+                if len(out) == 0:
+                    break  # the whole request is out
+            var wrote: Optional[Int]
+            try:
+                wrote = c.stream.try_write(out.readable_span())
+            except e:
+                # The server may have answered, then closed (an early 413):
+                # what it sent before is still readable.
+                if self._read_ready(c, r, started, informational, at_eof=True):
                     return r^
-                elif ev.kind == EventKind.UPGRADE:
-                    raise IoError.of_kind("Client.request", ErrorKind.InvalidData)
-                # INFORMATIONAL: skipped
+                raise e
+            if wrote:
+                out.consume(wrote.value())
+                continue
+            var rev = wait_ready(c.stream, Int16(POLLIN | POLLOUT), deadline, "Client.request")
+            if rev & Int16(POLLIN | POLLHUP | POLLERR):
+                if self._read_ready(c, r, started, informational, at_eof=False):
+                    return r^
+        while True:
+            if self._absorb(c, r, informational):
+                return r^
+            if deadline.is_expired():
+                # The stream's deadline bounds each wait; this bounds a
+                # response that keeps trickling in (or a flood of 1xx).
+                raise IoError.of_kind("Client.request", ErrorKind.TimedOut)
             var room = min(_READ_SIZE, c.codec.feed_capacity())
             var n = c.stream.read(Span(self._buf)[0:room])
             if n == 0:
@@ -413,20 +452,83 @@ struct Client(Movable):
                 started = True
                 c.codec.feed(Span(self._buf)[0:n])
 
+    def _read_ready(
+        mut self,
+        mut c: _Conn,
+        mut r: Response,
+        mut started: Bool,
+        mut informational: Int,
+        *,
+        at_eof: Bool,
+    ) raises IoError -> Bool:
+        """Read what has arrived without waiting, into `r`: True once the
+        response is complete. With `at_eof`, the write side failed, so the
+        end of what can be read ends the input."""
+        while True:
+            var got: Optional[Int]
+            try:
+                got = c.stream.try_read(Span(self._buf)[0 : min(_READ_SIZE, c.codec.feed_capacity())])
+            except e:
+                if at_eof:
+                    return False  # nothing more to learn: the caller raises
+                raise e
+            if not got:
+                if at_eof:
+                    c.codec.feed_eof()
+                    return self._absorb(c, r, informational)
+                return self._absorb(c, r, informational)
+            if got.value() == 0:
+                c.codec.feed_eof()
+                return self._absorb(c, r, informational)
+            started = True
+            c.codec.feed(Span(self._buf)[0 : got.value()])
+            if self._absorb(c, r, informational):
+                return True
+
+    def _absorb(
+        mut self, mut c: _Conn, mut r: Response, mut informational: Int
+    ) raises IoError -> Bool:
+        """Move the codec's events into `r`: True at the response's END."""
+        while c.codec.poll(self._ev):
+            ref ev = self._ev
+            if ev.kind == EventKind.HEAD:
+                ref h = ev.head()
+                r.status = h.status
+                r.reason = h.reason
+                r.version = h.version
+                swap(r.headers, h.headers)
+            elif ev.kind == EventKind.DATA:
+                if len(r.body) + len(ev.data) > self.max_body:
+                    raise IoError.of_kind("Client.request", ErrorKind.InvalidData)
+                r.body.extend(Span(ev.data))
+            elif ev.kind == EventKind.END:
+                r.trailers = ev.take_trailers()
+                return True
+            elif ev.kind == EventKind.UPGRADE:
+                raise IoError.of_kind("Client.request", ErrorKind.InvalidData)
+            else:  # INFORMATIONAL: skipped, but not without end
+                informational += 1
+                if informational > _MAX_INFORMATIONAL:
+                    raise IoError.of_kind("Client.request", ErrorKind.InvalidData)
+        return False
+
     # ---- the pool --------------------------------------------------------
 
     def _checkout(mut self, key: String) -> Optional[_Conn]:
         """The most recently returned idle connection for `key` that still
-        looks reusable; stale ones are dropped (closed) on the way."""
-        var i = len(self._pool) - 1
+        looks reusable. Connections idle past `max_idle`, for any key, and
+        stale ones for `key` are dropped (closed) on the way."""
         var now = Instant.now()
+        var i = len(self._pool) - 1
+        while i >= 0:
+            if self.max_idle < now - self._pool[i].idle_since:
+                _ = self._pool.pop(i)
+            i -= 1
+        i = len(self._pool) - 1
         while i >= 0:
             if self._pool[i].key == key:
                 var c = self._pool.pop(i)
-                if (
-                    not (self.max_idle < now - c.idle_since)
-                    and c.stream.idle_state() == IdleState.EMPTY
-                ):
+                if c.stream.idle_state() == IdleState.EMPTY:
                     return c^
             i -= 1
         return None

@@ -8,7 +8,11 @@ as `DATA` pieces, then `END` with the trailers (empty if none). A message
 without a body still gets its `END`. `DATA` comes out as soon as body bytes
 arrive, so its pieces depend on how the input was split; their
 concatenation and every other event do not (contract rule 4, refined for
-byte streams).
+byte streams). `next_event()` returns a new event; `poll(ev)` fills one the
+caller keeps, reusing its head, header arena and buffers, which is what a
+server's hot loop wants. The events box their head and trailers in
+one-element lists: in Mojo 1.2 an `Optional` of a large struct is slow to
+destroy (CLAUDE.md).
 
 **ServerConnection**
 - One request at a time: the next request is parsed only once the current
@@ -16,8 +20,10 @@ byte streams).
   when it is full, `feed_capacity()` is 0 until the response ends, so the
   driver stops reading (backpressure). This is where the codec departs from
   contract rule 5, which assumes a codec never waits on its application.
-- Requests are checked after parsing: HTTP/1.x only (505 otherwise), and
-  exactly one Host in HTTP/1.1, at most one in HTTP/1.0 (RFC 9112 3.2).
+- Requests are checked after parsing: HTTP/1.x only (505 otherwise); one
+  Host in HTTP/1.1 and at most one in HTTP/1.0, with a valid value (RFC
+  9112 3.2); no Content-Length or Transfer-Encoding on CONNECT, whose
+  following bytes are the tunnel's (RFC 9110 9.3.6).
 - `send_response(head)` picks the framing. It uses the head's
   Content-Length if there is one. Otherwise it sends chunked to an
   HTTP/1.1 client (adding `Transfer-Encoding: chunked`) and close-delimited
@@ -32,11 +38,19 @@ byte streams).
 - Persistence (RFC 9112 9.3): HTTP/1.1 keeps the connection unless either
   side sends `Connection: close`; HTTP/1.0 needs `Connection: keep-alive`.
   The codec adds `Connection: close` (or `keep-alive` for a 1.0 client) as
-  needed. A response that ends before its request body closes the
-  connection: the rest of the body is not read.
-- A 101 answering an Upgrade request, or a 2xx answering CONNECT, ends HTTP
-  on the connection once its head is queued: `is_upgraded()`, and
-  `take_remaining()` returns the bytes received after the request.
+  needed, never next to a contradicting field of the application's.
+- A response may go out before its request has fully arrived. The
+  request's remaining events still come (an application that answered may
+  ignore them). Answering before the body has arrived keeps the connection
+  only if what is left is a known length of at most 256 KiB, which the
+  codec goes on reading; otherwise (a chunked or larger rest, or a body the
+  client may withhold because it waited for a 100 Continue that never
+  came) the response says `Connection: close` and the connection closes
+  after it (RFC 9110 10.1.1).
+- A 101 answering an HTTP/1.1 Upgrade request, or a 2xx answering CONNECT,
+  ends HTTP on the connection once its head is queued: `is_upgraded()`,
+  and `take_remaining()` returns the bytes received after the request. The
+  request body must have been read first.
 - A malformed request poisons the input side (rule 6). `error_status()` is
   the status to answer with (400, 414, 431, 501 or 505), which
   `send_error()` sends before the connection closes.
@@ -53,11 +67,17 @@ byte streams).
   response's `HEAD`, `DATA` and `END`. `UPGRADE` reports a 101 answering
   an Upgrade request, or a 2xx answering CONNECT; then `take_remaining()`.
 - Closing: a response that does not keep the connection makes it closing
-  (`should_close()`); requests still in flight are lost (`unanswered()`).
+  from its head on (`should_close()`); requests still in flight are lost
+  (`unanswered()`). So do bytes left over after the last response (RFC
+  9112 6.3: never taken as a response; stray line ends are dropped) and a
+  response with both Transfer-Encoding and Content-Length (possible
+  smuggling).
   EOF before any byte of a response raises `UnexpectedEof` with
   `E_NO_RESPONSE`, so a client knows the server never saw (or never
   answered) the request and may retry an idempotent one.
 """
+
+from std.memory import unsafe_memcpy
 
 from bytes.buffer import ByteBuffer
 from bytes.codec import Codec
@@ -65,7 +85,6 @@ from linux import ErrorKind, IoError
 from linux.time import Instant
 
 from .body import (
-    E_UNEXPECTED_EOF,
     BodyDecoder,
     BodyKind,
     BodyLimits,
@@ -86,6 +105,13 @@ comptime E_HOST = "http: missing or repeated Host"
 comptime E_NO_RESPONSE = "http: connection closed before a response"
 comptime E_UNSOLICITED = "http: response without a request"
 comptime E_BAD_101 = "http: 101 without an upgrade request"
+comptime E_PARTIAL = "http: connection closed in a message head"
+comptime E_CONNECT_BODY = "http: CONNECT with a body"
+
+comptime _DRAIN_LIMIT = 256 * 1024
+"""The request body a server keeps reading after an early response
+(answered before the body ended) to keep the connection; beyond this it
+closes instead."""
 
 comptime _CR: UInt8 = 13
 comptime _LF: UInt8 = 10
@@ -145,27 +171,44 @@ struct EventKind(Equatable, TrivialRegisterPassable, Writable):
 
 
 struct ServerEvent(Movable, Writable):
-    """What a `ServerConnection` received: `HEAD` (`head`, `framing`),
-    `DATA` (`data`), `END` (`trailers`)."""
+    """What a `ServerConnection` received: `HEAD` (`take_head()`,
+    `framing`), `DATA` (`data`), `END` (`take_trailers()`). The head and
+    trailers are boxed in one-element lists to keep the event small: a
+    large struct inside an `Optional` is slow to destroy in Mojo 1.2."""
 
     var kind: EventKind
-    var head: Optional[RequestHead]
     var framing: Framing
     var data: List[UInt8]
-    var trailers: Headers
+    var _head: List[RequestHead]
+    var _trailers: List[Headers]
 
     def __init__(out self, kind: EventKind):
         self.kind = kind
-        self.head = None
         self.framing = Framing.none()
         self.data = List[UInt8]()
-        self.trailers = Headers()
+        self._head = List[RequestHead]()
+        self._trailers = List[Headers]()
+
+    def has_head(self) -> Bool:
+        return len(self._head) > 0
+
+    def head(ref self) raises IoError -> ref [self._head[0]] RequestHead:
+        """The head, borrowed (`HEAD` events). `InvalidInput` otherwise."""
+        if self.kind != EventKind.HEAD or len(self._head) == 0:
+            raise IoError.of_kind("ServerEvent.head", ErrorKind.InvalidInput)
+        return self._head[0]
 
     def take_head(mut self) raises IoError -> RequestHead:
         """Move the head out (`HEAD` events). `InvalidInput` otherwise."""
-        if not self.head:
+        if self.kind != EventKind.HEAD or len(self._head) == 0:
             raise IoError.of_kind("ServerEvent.take_head", ErrorKind.InvalidInput)
-        return self.head.take()
+        return self._head.pop()
+
+    def take_trailers(mut self) -> Headers:
+        """The trailer fields of an `END` event (empty if none)."""
+        if self.kind != EventKind.END or len(self._trailers) == 0:
+            return Headers()
+        return self._trailers.pop()
 
     def take_data(mut self) -> List[UInt8]:
         var out = List[UInt8]()
@@ -174,37 +217,60 @@ struct ServerEvent(Movable, Writable):
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write(self.kind)
-        if self.kind == EventKind.HEAD and self.head:
-            ref h = self.head.value()
+        if self.kind == EventKind.HEAD and len(self._head) > 0:
+            ref h = self._head[0]
             writer.write(" ", h.method, " ", h.target, " ", h.version, " ", self.framing)
         elif self.kind == EventKind.DATA:
             writer.write(" ", String(from_utf8_lossy=Span(self.data)))
-        elif self.kind == EventKind.END and len(self.trailers) > 0:
-            writer.write(" ", self.trailers)
+        elif self.kind == EventKind.END and len(self._trailers) > 0 and len(self._trailers[0]) > 0:
+            writer.write(" ", self._trailers[0])
 
 
 struct ClientEvent(Movable, Writable):
     """What a `ClientConnection` received: `INFORMATIONAL`, `HEAD` and
-    `UPGRADE` (`head`, and `framing` for `HEAD`), `DATA` (`data`), `END`
-    (`trailers`)."""
+    `UPGRADE` (`head()` / `take_head()`, and `framing` for `HEAD`), `DATA`
+    (`data`), `END` (`take_trailers()`). The head and trailers are boxed in
+    one-element lists to keep the event small (see `ServerEvent`)."""
 
     var kind: EventKind
-    var head: Optional[ResponseHead]
     var framing: Framing
     var data: List[UInt8]
-    var trailers: Headers
+    var _head: List[ResponseHead]
+    var _trailers: List[Headers]
 
     def __init__(out self, kind: EventKind):
         self.kind = kind
-        self.head = None
         self.framing = Framing.none()
         self.data = List[UInt8]()
-        self.trailers = Headers()
+        self._head = List[ResponseHead]()
+        self._trailers = List[Headers]()
+
+    @inline(.always)
+    def _has_head(self) -> Bool:
+        return (
+            self.kind == EventKind.HEAD
+            or self.kind == EventKind.INFORMATIONAL
+            or self.kind == EventKind.UPGRADE
+        ) and len(self._head) > 0
+
+    def head(ref self) raises IoError -> ref [self._head[0]] ResponseHead:
+        """The head, borrowed (`INFORMATIONAL`, `HEAD`, `UPGRADE`).
+        `InvalidInput` otherwise."""
+        if not self._has_head():
+            raise IoError.of_kind("ClientEvent.head", ErrorKind.InvalidInput)
+        return self._head[0]
 
     def take_head(mut self) raises IoError -> ResponseHead:
-        if not self.head:
+        """Move the head out. `InvalidInput` for an event without one."""
+        if not self._has_head():
             raise IoError.of_kind("ClientEvent.take_head", ErrorKind.InvalidInput)
-        return self.head.take()
+        return self._head.pop()
+
+    def take_trailers(mut self) -> Headers:
+        """The trailer fields of an `END` event (empty if none)."""
+        if self.kind != EventKind.END or len(self._trailers) == 0:
+            return Headers()
+        return self._trailers.pop()
 
     def take_data(mut self) -> List[UInt8]:
         var out = List[UInt8]()
@@ -213,15 +279,15 @@ struct ClientEvent(Movable, Writable):
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write(self.kind)
-        if self.head:
-            ref h = self.head.value()
+        if self._has_head():
+            ref h = self._head[0]
             writer.write(" ", h.status, " ", h.version)
             if self.kind == EventKind.HEAD:
                 writer.write(" ", self.framing)
         elif self.kind == EventKind.DATA:
             writer.write(" ", String(from_utf8_lossy=Span(self.data)))
-        elif self.kind == EventKind.END and len(self.trailers) > 0:
-            writer.write(" ", self.trailers)
+        elif self.kind == EventKind.END and len(self._trailers) > 0 and len(self._trailers[0]) > 0:
+            writer.write(" ", self._trailers[0])
 
 
 # ---- shared -----------------------------------------------------------------------
@@ -234,6 +300,160 @@ def _persistent(version: Version, headers: Headers) -> Bool:
     if version.at_least_1_1():
         return True
     return headers.has_token("connection", "keep-alive")
+
+
+@fieldwise_init
+struct _Summary(TrivialRegisterPassable):
+    """What one pass over a head's fields finds for framing and
+    persistence (the rest of a request's fields are the application's)."""
+
+    var hosts: Int
+    var host_at: Int
+    """The index of the (last) Host field."""
+    var cls: Int
+    """Content-Length field lines."""
+    var cl_at: Int
+    var has_cl: Bool
+    var has_te: Bool
+    var has_upgrade: Bool
+    var conn_close: Bool
+    var conn_keep_alive: Bool
+    var conn_upgrade: Bool
+    var expect_continue: Bool
+
+
+def _summarize(headers: Headers) -> _Summary:
+    var s = _Summary(0, -1, 0, -1, False, False, False, False, False, False, False)
+    for i in range(len(headers._fields)):
+        var f = headers._fields[i]
+        var name = headers._bytes(f.name, f.name_len)
+        var n = len(name)
+        if n == 4:
+            if eq_ignore_case(name, "host".as_bytes()):
+                s.hosts += 1
+                s.host_at = i
+        elif n == 10:
+            if eq_ignore_case(name, "connection".as_bytes()):
+                var v = headers._bytes(f.value, f.value_len)
+                var pos = 0
+                while True:
+                    var e = next_element(v, pos)
+                    if not e:
+                        break
+                    var b = e.value()
+                    var t = v[b.start : b.end]
+                    if eq_ignore_case(t, "close".as_bytes()):
+                        s.conn_close = True
+                    elif eq_ignore_case(t, "keep-alive".as_bytes()):
+                        s.conn_keep_alive = True
+                    elif eq_ignore_case(t, "upgrade".as_bytes()):
+                        s.conn_upgrade = True
+        elif n == 14:
+            if eq_ignore_case(name, "content-length".as_bytes()):
+                s.has_cl = True
+                s.cls += 1
+                s.cl_at = i
+        elif n == 17:
+            if eq_ignore_case(name, "transfer-encoding".as_bytes()):
+                s.has_te = True
+        elif n == 7:
+            if eq_ignore_case(name, "upgrade".as_bytes()):
+                s.has_upgrade = True
+        elif n == 6:
+            if eq_ignore_case(name, "expect".as_bytes()):
+                var v = headers._bytes(f.value, f.value_len)
+                var pos = 0
+                while True:
+                    var e = next_element(v, pos)
+                    if not e:
+                        break
+                    var b = e.value()
+                    if eq_ignore_case(v[b.start : b.end], "100-continue".as_bytes()):
+                        s.expect_continue = True
+    return s
+
+
+def _valid_host(v: Span[UInt8, _]) -> Bool:
+    """A Host field value (RFC 9112 3.2, RFC 3986 3.2.2): empty, or
+    uri-host [ ":" port ], where uri-host is an IP literal in brackets or a
+    reg-name (unreserved, percent-encoded or sub-delims bytes)."""
+    var n = len(v)
+    var i = 0
+    if n > 0 and v[0] == 91:  # "["
+        i = 1
+        while i < n and v[i] != 93:  # "]"
+            var c = v[i]
+            if not (_is_hex(c) or c == 58 or c == 46 or c == 118 or c == 86):  # : . v V
+                return False
+            i += 1
+        if i == n or i == 1:
+            return False
+        i += 1
+    else:
+        while i < n and v[i] != 58:  # up to ":"
+            var c = v[i]
+            if c == 37:  # "%" HEXDIG HEXDIG
+                if i + 2 >= n or not _is_hex(v[i + 1]) or not _is_hex(v[i + 2]):
+                    return False
+                i += 3
+                continue
+            if not _is_reg_name_byte(c):
+                return False
+            i += 1
+    if i < n:
+        if v[i] != 58:
+            return False
+        for k in range(i + 1, n):
+            if v[k] < 48 or v[k] > 57:
+                return False
+    return True
+
+
+@inline(.always)
+def _is_hex(c: UInt8) -> Bool:
+    return (c >= 48 and c <= 57) or ((c | 0x20) >= 97 and (c | 0x20) <= 102)
+
+
+@inline(.always)
+def _is_reg_name_byte(c: UInt8) -> Bool:
+    """unreserved and sub-delims (RFC 3986 2.2, 2.3)."""
+    if (c >= 48 and c <= 57) or ((c | 0x20) >= 97 and (c | 0x20) <= 122):
+        return True
+    return (
+        c == 45 or c == 46 or c == 95 or c == 126  # - . _ ~
+        or c == 33 or c == 36 or c == 38 or c == 39  # ! $ & '
+        or c == 40 or c == 41 or c == 42 or c == 43  # ( ) * +
+        or c == 44 or c == 59 or c == 61  # , ; =
+    )
+
+
+def _content_length(headers: Headers, s: _Summary) raises IoError -> Optional[Int]:
+    """`content_length` with a fast path for the usual single field of
+    digits (lists, repeats and errors go through the general one)."""
+    if not s.has_cl:
+        return None
+    if s.cls == 1:
+        var f = headers._fields[s.cl_at]
+        var v = headers._bytes(f.value, f.value_len)
+        if len(v) >= 1 and len(v) <= 18:
+            var n = 0
+            var digits = True
+            for b in v:
+                if b < 48 or b > 57:
+                    digits = False
+                    break
+                n = n * 10 + Int(b) - 48
+            if digits:
+                return n
+    return content_length(headers)
+
+
+@inline(.always)
+def _keeps(version: Version, s: _Summary) -> Bool:
+    """`_persistent` from a summary."""
+    if s.conn_close:
+        return False
+    return version.at_least_1_1() or s.conn_keep_alive
 
 
 def _only_chunked(headers: Headers) raises IoError -> Bool:
@@ -267,17 +487,27 @@ def _write_str(mut out: ByteBuffer, s: StringSlice) raises IoError:
 
 def _status_line(mut out: ByteBuffer, status: Int, phrase: StringSlice) raises IoError:
     """`HTTP/1.1 <status> <phrase>` CRLF; the registered phrase if `phrase`
-    is empty."""
-    _write_str(out, "HTTP/1.1 ")
-    out.write_byte(UInt8(48 + status // 100))
-    out.write_byte(UInt8(48 + status // 10 % 10))
-    out.write_byte(UInt8(48 + status % 10))
-    out.write_byte(32)
+    is empty. One bounds check and copy (it runs once per response)."""
     if phrase.byte_length() > 0:
-        _write_str(out, phrase)
+        _status_line_bytes(out, status, phrase.as_bytes())
     else:
-        _write_str(out, reason(status))
-    _crlf(out)
+        _status_line_bytes(out, status, reason(status).as_bytes())
+
+
+def _status_line_bytes(mut out: ByteBuffer, status: Int, phrase: Span[UInt8, _]) raises IoError:
+    var n = 13 + len(phrase) + 2
+    out.ensure_writable(n)
+    var dst = out.writable_span().unsafe_ptr()
+    var lead = "HTTP/1.1 ".as_bytes()
+    unsafe_memcpy(dest=dst, src=lead.unsafe_ptr(), count=9)
+    dst[unsafe_offset=9] = UInt8(48 + status // 100)
+    dst[unsafe_offset=10] = UInt8(48 + status // 10 % 10)
+    dst[unsafe_offset=11] = UInt8(48 + status % 10)
+    dst[unsafe_offset=12] = 32
+    unsafe_memcpy(dest=dst.unsafe_offset(13), src=phrase.unsafe_ptr(), count=len(phrase))
+    dst[unsafe_offset=13 + len(phrase)] = _CR
+    dst[unsafe_offset=14 + len(phrase)] = _LF
+    out.commit(n)
 
 
 # ---- ServerConnection ---------------------------------------------------------------
@@ -306,7 +536,12 @@ struct ServerConnection(Codec, Copyable):
     var _version: Version
     var _keep: Bool
     var _upgrade: Bool
-    var _req_done: Bool
+    var _expect: Bool
+    """The request expects 100-continue."""
+    var _continued: Bool
+    """100 Continue was sent."""
+    var _answered: Bool
+    """Its response ended before its END event was delivered."""
     # its response
     var _out: Int
     var _resp_kind: BodyKind
@@ -327,7 +562,7 @@ struct ServerConnection(Codec, Copyable):
         if (
             max_buffered < limits.max_head
             or max_buffered < body_limits.max_trailers
-            or max_buffered < body_limits.max_chunk_line + 2
+            or max_buffered - 2 < body_limits.max_chunk_line
         ):
             raise IoError.of_kind("ServerConnection.__init__", ErrorKind.InvalidInput)
         self._rx = ByteBuffer(max_size=max_buffered)
@@ -345,7 +580,9 @@ struct ServerConnection(Codec, Copyable):
         self._version = Version.HTTP_1_1
         self._keep = True
         self._upgrade = False
-        self._req_done = True
+        self._expect = False
+        self._continued = False
+        self._answered = False
         self._out = _OUT_NONE
         self._resp_kind = BodyKind.NONE
         self._resp_left = 0
@@ -385,22 +622,36 @@ struct ServerConnection(Codec, Copyable):
         self._eof = True
 
     def next_event(mut self) raises IoError -> Optional[ServerEvent]:
+        """The next event, if one is ready (the `Codec` interface). `poll`
+        does the same into an event the caller reuses, which saves an
+        allocation or two per request."""
+        var ev = ServerEvent(EventKind.END)
+        if self.poll(ev):
+            return ev^
+        return None
+
+    def poll(mut self, mut ev: ServerEvent) raises IoError -> Bool:
+        """Fill `ev` with the next event and return True, or return False
+        when none is ready (`ev` is then unchanged). `ev`'s buffers are
+        reused: a head left in it (not taken) is parsed over, its data and
+        trailers are refilled."""
         if self._failed:
             raise self._failed.value()
         while True:
             if self._in == _HEAD:  # (after _WAIT: the response has ended)
-                return self._next_head()
+                return self._poll_head(ev)
             if self._in == _BODY:
-                var r = self._next_body()
-                if r:
-                    return r^
+                if self._poll_body(ev):
+                    return True
                 if self._in == _BODY:
-                    return None
+                    return False
                 continue
-            return None  # _WAIT (one request at a time), _UPGRADED, _CLOSED
+            return False  # _WAIT (one request at a time), _UPGRADED, _CLOSED
 
-    def _next_head(mut self) raises IoError -> Optional[ServerEvent]:
-        var head = RequestHead()
+    def _poll_head(mut self, mut ev: ServerEvent) raises IoError -> Bool:
+        if len(ev._head) == 0:
+            ev._head.append(RequestHead())
+        ref head = ev._head[0]
         var got: Optional[Int]
         try:
             got = self._parser.request(self._rx.readable_span(), head)
@@ -410,38 +661,47 @@ struct ServerConnection(Codec, Copyable):
             if self._eof:
                 if _only_line_ends(self._rx.readable_span()):
                     self._in = _CLOSED  # closed between requests
-                    return None
-                raise self._poison(IoError.of_kind(E_UNEXPECTED_EOF, ErrorKind.UnexpectedEof), 400)
-            return None
+                    return False
+                raise self._poison(IoError.of_kind(E_PARTIAL, ErrorKind.UnexpectedEof), 400)
+            return False
         self._rx.consume(got.value())
         if head.version.major != 1:
             raise self._poison(IoError.of_kind(E_VERSION, ErrorKind.InvalidData), 505)
-        var hosts = head.headers.count("host")
-        if hosts > 1 or (hosts == 0 and head.version.at_least_1_1()):
+        var sum = _summarize(head.headers)
+        if sum.hosts > 1 or (sum.hosts == 0 and head.version.at_least_1_1()):
             raise self._poison(IoError.of_kind(E_HOST, ErrorKind.InvalidData), 400)
-        var framing: Framing
-        try:
-            framing = request_framing(head)
-        except e:
-            raise self._poison(e, 501 if e.kind == ErrorKind.Unsupported else 400)
+        if sum.hosts == 1:
+            var f = head.headers._fields[sum.host_at]
+            if not _valid_host(head.headers._bytes(f.value, f.value_len)):
+                raise self._poison(IoError.of_kind(E_HOST, ErrorKind.InvalidData), 400)
+        if head.method == "CONNECT" and (sum.has_cl or sum.has_te):
+            # A CONNECT request has no content (RFC 9110 9.3.6): what follows
+            # its head belongs to the tunnel, so framing fields are refused.
+            raise self._poison(IoError.of_kind(E_CONNECT_BODY, ErrorKind.InvalidData), 400)
+        var framing = Framing.none()
+        if sum.has_cl or sum.has_te:
+            try:
+                framing = request_framing(head)
+            except e:
+                raise self._poison(e, 501 if e.kind == ErrorKind.Unsupported else 400)
         self._method = head.method
         self._version = head.version
-        self._keep = _persistent(head.version, head.headers)
-        self._upgrade = head.headers.contains("upgrade") and head.headers.has_token(
-            "connection", "upgrade"
-        )
-        self._body = BodyDecoder(framing, lenient=False, limits=self._body_limits)
-        self._req_done = False
+        self._keep = _keeps(head.version, sum)
+        # Upgrade is ignored in HTTP/1.0 (RFC 9110 7.8), which gets no 1xx.
+        self._upgrade = sum.has_upgrade and sum.conn_upgrade and head.version.at_least_1_1()
+        self._expect = sum.expect_continue and head.version.at_least_1_1()
+        self._continued = False
+        self._answered = False
+        self._body.restart(framing)
         self._out = _OUT_PENDING
         self._in = _BODY
-        var ev = ServerEvent(EventKind.HEAD)
-        ev.head = head^
+        ev.kind = EventKind.HEAD
         ev.framing = framing
-        return ev^
+        return True
 
-    def _next_body(mut self) raises IoError -> Optional[ServerEvent]:
-        """The next DATA or END event, or None with `_in` still `_BODY`
-        when more input is needed (or a phase change to look at)."""
+    def _poll_body(mut self, mut ev: ServerEvent) raises IoError -> Bool:
+        """The next DATA or END event into `ev`, or False with `_in` still
+        `_BODY` when more input is needed (or a phase change to look at)."""
         while True:
             var piece: Piece
             try:
@@ -449,17 +709,23 @@ struct ServerConnection(Codec, Copyable):
             except e:
                 raise self._poison(e, self._body.error_status())
             if piece.len > 0:
-                var ev = ServerEvent(EventKind.DATA)
-                ev.data = List[UInt8](self._rx.readable_span()[piece.start : piece.start + piece.len])
+                ev.kind = EventKind.DATA
+                ev.data.clear()
+                ev.data.extend(self._rx.readable_span()[piece.start : piece.start + piece.len])
                 self._rx.consume(piece.consumed)
-                return ev^
+                return True
             self._rx.consume(piece.consumed)
             if self._body.is_done():
-                self._req_done = True
-                self._in = _WAIT
-                var ev = ServerEvent(EventKind.END)
-                swap(ev.trailers, self._trailers)
-                return ev^
+                # One request at a time: wait for its response to end, unless
+                # it already has.
+                self._in = _HEAD if self._answered else _WAIT
+                self._answered = False
+                ev.kind = EventKind.END
+                if len(ev._trailers) == 0:
+                    ev._trailers.append(Headers())
+                swap(ev._trailers[0], self._trailers)
+                self._trailers.clear()  # the event's old trailers, emptied for reuse
+                return True
             if piece.consumed == 0:
                 if self._eof:
                     try:
@@ -467,7 +733,7 @@ struct ServerConnection(Codec, Copyable):
                     except e:
                         raise self._poison(e, 400)
                     continue
-                return None
+                return False
 
     def error_status(self) -> Int:
         """The status for the last input error (400, 414, 431, 501, 505),
@@ -489,6 +755,7 @@ struct ServerConnection(Codec, Copyable):
         if self._version.at_least_1_1():
             _status_line(self._tx, 100, "Continue")
             _crlf(self._tx)
+            self._continued = True
 
     def send_informational(mut self, head: ResponseHead) raises IoError:
         """A 1xx response other than 101 (103 Early Hints, say) before the
@@ -496,6 +763,9 @@ struct ServerConnection(Codec, Copyable):
         if self._out != _OUT_PENDING or head.status < 100 or head.status > 199 or head.status == 101:
             raise self._misuse("ServerConnection.send_informational")
         _check_reason(head.reason, "ServerConnection.send_informational")
+        var sum = _summarize(head.headers)
+        if sum.has_cl or sum.has_te:  # never on a 1xx (RFC 9110 8.6, RFC 9112 6.1)
+            raise self._misuse("ServerConnection.send_informational")
         if self._version.at_least_1_1():
             self._tx.ensure_writable(16 + head.reason.byte_length() + head.headers.encoded_len() + 2)
             _status_line(self._tx, head.status, head.reason)
@@ -516,15 +786,19 @@ struct ServerConnection(Codec, Copyable):
         if status != 101 and (status < 200 or status > 599):
             raise self._misuse(op)
         _check_reason(head.reason, op)
-        var has_te = head.headers.contains("transfer-encoding")
+        var sum = _summarize(head.headers)
+        var has_te = sum.has_te
         var cl: Optional[Int]
         try:
-            cl = content_length(head.headers)
+            cl = _content_length(head.headers, sum)
         except:
             raise self._misuse(op)
         var connect_ok = self._method == "CONNECT" and status >= 200 and status < 300
         var switch = status == 101 or connect_ok
         if status == 101 and not self._upgrade:
+            raise self._misuse(op)
+        if switch and not self._body.is_done():
+            # The rest of the request body would reach the new protocol.
             raise self._misuse(op)
         if (status == 204 or switch) and (has_te or cl):
             raise self._misuse(op)
@@ -546,15 +820,26 @@ struct ServerConnection(Codec, Copyable):
         var close = (
             not self._keep
             or kind == BodyKind.CLOSE
-            or head.headers.has_token("connection", "close")
+            or sum.conn_close
+            or not self._can_drain()
         ) and not switch
-        var add_close = close and not head.headers.has_token("connection", "close")
-        var add_keep = not close and not switch and not self._version.at_least_1_1()
+        var add_close = close and not sum.conn_close
+        var add_keep = (
+            not close
+            and not switch
+            and not self._version.at_least_1_1()
+            and not sum.conn_keep_alive
+        )
         self._tx.ensure_writable(
             16 + head.reason.byte_length() + head.headers.encoded_len() + 64
         )
         _status_line(self._tx, status, head.reason)
-        head.headers.encode(self._tx)
+        if add_close and sum.conn_keep_alive:
+            # The application's keep-alive no longer holds: drop its
+            # Connection fields rather than send contradictory ones.
+            head.headers._encode_except(self._tx, "connection")
+        else:
+            head.headers.encode(self._tx)
         if add_te:
             _write_str(self._tx, "Transfer-Encoding: chunked\r\n")
         if add_close:
@@ -570,6 +855,18 @@ struct ServerConnection(Codec, Copyable):
         self._resp_kind = kind
         self._resp_left = cl.value() if (kind == BodyKind.LENGTH) else 0
         self._resp_close = close
+
+    def _can_drain(self) -> Bool:
+        """Whether the connection survives a response sent now: true once
+        the request body has arrived, or when what is left of it is a known
+        length within `_DRAIN_LIMIT` that the client will send (it did not
+        wait for a 100 Continue it never got)."""
+        if self._body.is_done():
+            return True
+        if self._expect and not self._continued:
+            return False  # the client may never send it
+        var left = self._body.remaining()
+        return Bool(left) and left.value() <= _DRAIN_LIMIT
 
     def send_body(mut self, data: Span[UInt8, _]) raises IoError:
         """Queue body bytes. For a HEAD request they are dropped, so a GET
@@ -600,25 +897,30 @@ struct ServerConnection(Codec, Copyable):
             raise self._misuse(op)
         if self._resp_kind == BodyKind.LENGTH and self._resp_left > 0:
             raise self._misuse(op)
-        if len(trailers) > 0 and self._resp_kind != BodyKind.CHUNKED:
-            raise self._misuse(op)
+        var head_req = self._method == "HEAD"
+        if len(trailers) > 0 and self._resp_kind != BodyKind.CHUNKED and not head_req:
+            raise self._misuse(op)  # (trailers for HEAD are dropped, like its body)
         if self._resp_kind == BodyKind.CHUNKED:
             encode_last_chunk(trailers, self._tx)
         self._out = _OUT_NONE
-        if self._resp_close or not self._req_done or self._failed:
+        if self._resp_close or self._failed:
             self._closing = True
             self._in = _CLOSED
             self._rx.clear()
         elif self._in == _WAIT:
             self._in = _HEAD
+        else:
+            # The rest of the request (body, END) is still to come: read it,
+            # then go on with the next request.
+            self._answered = True
 
     def send_error(mut self, status: Int) raises IoError:
-        """A minimal response with `status` (usually `error_status()`),
-        `Content-Length: 0` and `Connection: close`; the connection then
-        closes. `InvalidInput` while a response is being sent."""
-        if self._out == _OUT_BODY:
+        """A minimal response with `status` (usually `error_status()`, and
+        always 400..599), `Content-Length: 0` and `Connection: close`; the
+        connection then closes. `InvalidInput` for another status or while
+        a response is being sent."""
+        if self._out == _OUT_BODY or status < 400 or status > 599:
             raise self._misuse("ServerConnection.send_error")
-        check_status(status, "ServerConnection.send_error")
         _status_line(self._tx, status, "")
         _write_str(self._tx, "Content-Length: 0\r\nConnection: close\r\n\r\n")
         self._out = _OUT_NONE
@@ -646,7 +948,11 @@ struct ServerConnection(Codec, Copyable):
         the peer finished sending with no request left to answer."""
         if self._closing or self._failed:
             return True
-        return self._eof and self._out == _OUT_NONE and (self._in == _HEAD or self._in == _CLOSED)
+        # After EOF, bytes still buffered may hold a request to answer: poll
+        # first (it either delivers one or finds the input ended).
+        return self._eof and self._out == _OUT_NONE and (
+            (self._in == _HEAD and len(self._rx) == 0) or self._in == _CLOSED
+        )
 
     def is_upgraded(self) -> Bool:
         return self._in == _UPGRADED
@@ -738,7 +1044,7 @@ struct ClientConnection(Codec, Copyable):
         if (
             max_buffered < limits.max_head
             or max_buffered < body_limits.max_trailers
-            or max_buffered < body_limits.max_chunk_line + 2
+            or max_buffered - 2 < body_limits.max_chunk_line
             or max_in_flight < 1
         ):
             raise IoError.of_kind("ClientConnection.__init__", ErrorKind.InvalidInput)
@@ -775,10 +1081,14 @@ struct ClientConnection(Codec, Copyable):
         than `chunked` or together with Content-Length, or a bad method or
         target."""
         comptime op = "ClientConnection.send_request"
+        if len(self._flight) == 0 and len(self._rx) > 0:
+            self._discard_strays()
         if (
             self._closing
             or self._failed
+            or self._eof
             or self._in == _UPGRADED
+            or self._in == _CLOSED
             or self._out != _OUT_NONE
             or len(self._flight) >= self._max_in_flight
         ):
@@ -803,8 +1113,10 @@ struct ClientConnection(Codec, Copyable):
         )
         self._req_left = cl.value() if (cl and not has_te) else 0
         var close = not _persistent(v, head.headers)
-        var upgrade = head.headers.contains("upgrade") and head.headers.has_token(
-            "connection", "upgrade"
+        var upgrade = (
+            v.at_least_1_1()  # a 101 never answers HTTP/1.0 (RFC 9110 7.8, 15.2)
+            and head.headers.contains("upgrade")
+            and head.headers.has_token("connection", "upgrade")
         )
         self._flight.append(_Sent(head.method, upgrade, close))
         self._out = _OUT_BODY
@@ -882,30 +1194,56 @@ struct ClientConnection(Codec, Copyable):
         self._eof = True
 
     def next_event(mut self) raises IoError -> Optional[ClientEvent]:
+        """The next event, if one is ready (the `Codec` interface); `poll`
+        does the same into an event the caller reuses."""
+        var ev = ClientEvent(EventKind.END)
+        if self.poll(ev):
+            return ev^
+        return None
+
+    def poll(mut self, mut ev: ClientEvent) raises IoError -> Bool:
+        """Fill `ev` with the next event and return True, or return False
+        when none is ready (`ev` is then unchanged). `ev`'s buffers are
+        reused, as for `ServerConnection.poll`."""
         if self._failed:
             raise self._failed.value()
         while True:
             if self._in == _HEAD:
-                return self._next_head()
+                return self._poll_head(ev)
             if self._in == _BODY:
-                var r = self._next_body()
-                if r:
-                    return r^
+                if self._poll_body(ev):
+                    return True
                 if self._in == _BODY:
-                    return None
+                    return False
                 continue
-            return None  # _UPGRADED, _CLOSED
+            return False  # _UPGRADED, _CLOSED
 
-    def _next_head(mut self) raises IoError -> Optional[ClientEvent]:
+    def _discard_strays(mut self):
+        """Bytes received with no request in flight: line ends are dropped
+        (some servers end a message with an extra CRLF); anything else means
+        the connection is out of step, so it closes (RFC 9112 6.3: such data
+        is never taken as a response)."""
+        if _only_line_ends(self._rx.readable_span()):
+            self._rx.clear()
+        else:
+            self._rx.clear()
+            self._closing = True
+            self._in = _CLOSED
+
+    def _poll_head(mut self, mut ev: ClientEvent) raises IoError -> Bool:
         if len(self._flight) == 0:
             if len(self._rx) > 0:
-                raise self._poison(IoError.of_kind(E_UNSOLICITED, ErrorKind.InvalidData))
+                if not _only_line_ends(self._rx.readable_span()):
+                    raise self._poison(IoError.of_kind(E_UNSOLICITED, ErrorKind.InvalidData))
+                self._rx.clear()
             if self._eof:
                 self._in = _CLOSED
-            return None
-        if len(self._rx) > 0:
-            self._seen = True
-        var head = ResponseHead()
+            return False
+        if not self._seen and len(self._rx) > 0 and not _only_line_ends(self._rx.readable_span()):
+            self._seen = True  # (stray line ends do not start a response)
+        if len(ev._head) == 0:
+            ev._head.append(ResponseHead())
+        ref head = ev._head[0]
         var got: Optional[Int]
         try:
             got = self._parser.response(self._rx.readable_span(), head)
@@ -915,47 +1253,52 @@ struct ClientConnection(Codec, Copyable):
             if self._eof:
                 if not self._seen:
                     raise self._poison(IoError.of_kind(E_NO_RESPONSE, ErrorKind.UnexpectedEof))
-                raise self._poison(IoError.of_kind(E_UNEXPECTED_EOF, ErrorKind.UnexpectedEof))
-            return None
+                raise self._poison(IoError.of_kind(E_PARTIAL, ErrorKind.UnexpectedEof))
+            return False
         self._rx.consume(got.value())
         var status = head.status
         if status >= 100 and status < 200 and status != 101:
-            var ev = ClientEvent(EventKind.INFORMATIONAL)
-            ev.head = head^
-            return ev^
+            ev.kind = EventKind.INFORMATIONAL
+            return True
         ref sent = self._flight[0]
         if status == 101:
             if not sent.upgrade:
                 raise self._poison(IoError.of_kind(E_BAD_101, ErrorKind.InvalidData))
-            return self._upgraded(head^)
+            self._upgraded()
+            ev.kind = EventKind.UPGRADE
+            return True
         var framing: Framing
         try:
             framing = response_framing(head, sent.method)
         except e:
             raise self._poison(e)
         if framing.kind == BodyKind.TUNNEL:
-            return self._upgraded(head^)
+            self._upgraded()
+            ev.kind = EventKind.UPGRADE
+            return True
+        var sum = _summarize(head.headers)
         self._resp_keep = (
-            _persistent(head.version, head.headers)
+            _keeps(head.version, sum)
             and not sent.close
             and framing.kind != BodyKind.CLOSE
+            # Transfer-Encoding with Content-Length may be smuggling
+            # (RFC 9112 6.3): read this response, then close.
+            and not (sum.has_te and sum.has_cl)
         )
-        self._body = BodyDecoder(framing, lenient=True, limits=self._body_limits)
+        if not self._resp_keep:
+            self._closing = True  # no requests after this one
+        self._body.restart(framing)
         self._in = _BODY
-        var ev = ClientEvent(EventKind.HEAD)
-        ev.head = head^
+        ev.kind = EventKind.HEAD
         ev.framing = framing
-        return ev^
+        return True
 
-    def _upgraded(mut self, var head: ResponseHead) -> ClientEvent:
+    def _upgraded(mut self):
         _ = self._flight.pop(0)
         self._in = _UPGRADED
         self._closing = True  # no more HTTP requests
-        var ev = ClientEvent(EventKind.UPGRADE)
-        ev.head = head^
-        return ev^
 
-    def _next_body(mut self) raises IoError -> Optional[ClientEvent]:
+    def _poll_body(mut self, mut ev: ClientEvent) raises IoError -> Bool:
         while True:
             var piece: Piece
             try:
@@ -963,23 +1306,29 @@ struct ClientConnection(Codec, Copyable):
             except e:
                 raise self._poison(e)
             if piece.len > 0:
-                var ev = ClientEvent(EventKind.DATA)
-                ev.data = List[UInt8](self._rx.readable_span()[piece.start : piece.start + piece.len])
+                ev.kind = EventKind.DATA
+                ev.data.clear()
+                ev.data.extend(self._rx.readable_span()[piece.start : piece.start + piece.len])
                 self._rx.consume(piece.consumed)
-                return ev^
+                return True
             self._rx.consume(piece.consumed)
             if self._body.is_done():
                 _ = self._flight.pop(0)
                 self._seen = False
                 if self._resp_keep:
                     self._in = _HEAD
+                    if len(self._flight) == 0 and len(self._rx) > 0:
+                        self._discard_strays()
                 else:
                     self._closing = True
                     self._in = _CLOSED
                     self._rx.clear()
-                var ev = ClientEvent(EventKind.END)
-                swap(ev.trailers, self._trailers)
-                return ev^
+                ev.kind = EventKind.END
+                if len(ev._trailers) == 0:
+                    ev._trailers.append(Headers())
+                swap(ev._trailers[0], self._trailers)
+                self._trailers.clear()
+                return True
             if piece.consumed == 0:
                 if self._eof:
                     try:
@@ -987,7 +1336,7 @@ struct ClientConnection(Codec, Copyable):
                     except e:
                         raise self._poison(e)
                     continue
-                return None
+                return False
 
     # ---- state -----------------------------------------------------------
 
@@ -999,6 +1348,7 @@ struct ClientConnection(Codec, Copyable):
             self._in == _HEAD
             and len(self._flight) == 0
             and self._out == _OUT_NONE
+            and len(self._rx) == 0
             and not self._closing
             and not self._failed
             and not self._eof

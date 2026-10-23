@@ -208,18 +208,37 @@ def test_persistence() raises:
     assert_equal(_events(a), "")
 
 
-def test_early_response_closes_the_connection() raises:
+def test_early_response_reads_a_small_rest_or_closes() raises:
+    # Answered before the body ended: a known rest within 256 KiB is still
+    # read (its events delivered) and the connection kept...
     var s = ServerConnection()
-    _feed(s, "POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n0123")
-    assert_equal(_events(s), "HEAD POST /big HTTP/1.1 LENGTH(100) / DATA 0123")
+    _feed(s, "POST /small HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n0123")
+    assert_equal(_events(s), "HEAD POST /small HTTP/1.1 LENGTH(10) / DATA 0123")
     var r = ResponseHead(413)
     r.headers.add("Content-Length", "0")
     s.send_response(r)
-    s.end_response()  # before the body ended: no keep-alive
-    assert_true(s.should_close())
+    s.end_response()
+    assert_false(s.should_close())
     assert_equal(_sent(s), "HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n\r\n")
-    _feed(s, "45678")
-    assert_equal(_events(s), "")
+    _feed(s, "456789GET /next HTTP/1.1\r\nHost: x\r\n\r\n")
+    assert_equal(_events(s), "DATA 456789 / END / HEAD GET /next HTTP/1.1 NONE / END")
+    # ...a larger or unknown rest closes, and the response says so
+    var big = ServerConnection()
+    _feed(big, "POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: 10000000\r\n\r\n0123")
+    _ = _events(big)
+    big.send_response(r)
+    big.end_response()
+    assert_true(big.should_close())
+    assert_equal(_sent(big), "HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    _feed(big, "45678")
+    assert_equal(_events(big), "")
+    var ch = ServerConnection()
+    _feed(ch, "POST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n0123\r\n")
+    _ = _events(ch)
+    ch.send_response(r)
+    ch.end_response()
+    assert_true(ch.should_close())
+    assert_true(_sent(ch).find("Connection: close") >= 0)
 
 
 def test_full_duplex_response_keeps_alive() raises:
@@ -361,7 +380,7 @@ def test_end_of_input() raises:
     var mid = ServerConnection()
     _feed(mid, "GET / HT")
     mid.feed_eof()
-    assert_equal(_error(mid), "400 UnexpectedEof http: body ended early")
+    assert_equal(_error(mid), "400 UnexpectedEof http: connection closed in a message head")
     var body = ServerConnection()
     _feed(body, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\n\r\nabc")
     body.feed_eof()

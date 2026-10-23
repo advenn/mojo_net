@@ -8,7 +8,7 @@ HTTP/1.1 for Mojo on Linux, per RFC 9110 (semantics) and RFC 9112 (message synta
 
 It is the base of the HTTP server (roadmap step 3). Package rules and the shared contracts are in `docs/design.md`; the transport is `net` (`docs/net.md`).
 
-**Status: active.** H1–H5 are done: core types, the header map, the head parser, body framing, the connection codecs and a blocking client. H6 (polish: review, performance, the guide) is next.
+**Status: H1–H6 done.** Core types, the header map, the head parser, body framing, the connection codecs and a blocking client, independently reviewed and tuned. Next is the HTTP server (roadmap step 3), which builds on `ServerConnection`.
 
 ## Scope
 **In scope:**
@@ -46,6 +46,74 @@ The parser is strict where leniency enables request smuggling or response splitt
 - **Limits** (configurable): the whole head, the number of fields, chunk-size digits, chunk extensions and trailers are bounded, so a peer cannot make a parser buffer without end.
 
 A server-side parse error carries the status to answer with (400, 414, 431, 501 or 505), and the connection is then closed.
+
+## Using the client
+```mojo
+from http.client import Client
+from http.headers import Headers
+from linux.time import Duration
+
+
+def main() raises:
+    var client = Client(timeout=Duration.from_secs(10))  # per request, DNS included
+    var r = client.get("http://example.com/")
+    print(r.status, r.reason, r.headers.get("content-type").value())
+    print(r.text())
+
+    var h = Headers()
+    h.add("Accept", "application/json")
+    var p = client.request("POST", "http://127.0.0.1:8080/items", h, "{}".as_bytes())
+    print(p.status)  # same host and port again: the connection is reused
+```
+
+- **Errors are `IoError`s:**
+  - `InvalidInput` for a bad URL, method or header;
+  - `Unsupported` for https;
+  - `TimedOut` past the deadline (`e.is_deadline()`);
+  - `InvalidData` for a malformed response, or one larger than `max_body`;
+  - otherwise the transport's error, for example `ConnectionRefused`.
+- **Status codes are not errors:** a 404 is a `Response` with `status == 404`.
+- **What the client sends:** it sets Host, User-Agent and Content-Length. It refuses a caller's Content-Length or Transfer-Encoding, because it frames the body itself.
+- **Retries:** if a reused connection was closed before any byte of the response, an idempotent request (GET, HEAD, OPTIONS, TRACE, PUT, DELETE) is sent again on a new connection, once. Other methods raise, because the server may have acted on them.
+
+## Using the server codec
+`ServerConnection` does HTTP for one connection and no I/O. The driver feeds it what the socket reads and sends what it hands out. This is the loop of `examples/http/hello_server.mojo` (edge-triggered epoll) without the epoll part:
+
+```mojo
+var conn = ServerConnection()
+var ev = ServerEvent(EventKind.END)  # reused: its buffers are refilled
+var out = ByteBuffer()
+while True:
+    while conn.poll(ev):  # raises on a malformed request: answer conn.error_status()
+        if ev.kind == EventKind.HEAD:
+            ref req = ev.head()  # method, target, version, headers
+        elif ev.kind == EventKind.DATA:
+            pass  # a piece of the request body: ev.data
+        else:  # END: the request is complete
+            var r = ResponseHead(200)
+            r.headers.add("Content-Length", "2")
+            conn.send_response(r)
+            conn.send_body("ok".as_bytes())
+            conn.end_response()
+    while conn.poll_transmit(out) > 0:
+        stream.write_all(out.readable_span())
+        out.clear()
+    if conn.should_close():
+        break
+    var n = stream.read(Span(buf)[0 : min(len(buf), conn.feed_capacity())])
+    if n == 0:
+        conn.feed_eof()
+    else:
+        conn.feed(Span(buf)[0:n])
+```
+
+- **The codec frames responses:**
+  - With Content-Length, the body must match it.
+  - Without one, it adds `Transfer-Encoding: chunked`, or closes after the body for an HTTP/1.0 client.
+  - It adds `Connection: close` when the connection will close.
+- **One request at a time:** the next request's events come after `end_response`.
+- **`poll(ev)` or `next_event()`:** `poll` reuses one event, so a hot loop allocates almost nothing per request. `next_event()` returns a new one (the `Codec` interface).
+- **Errors:** after a malformed request, `send_error(conn.error_status())` answers 400, 414, 431, 501 or 505 and the connection closes.
 
 ## Modules
 | Module | What |
@@ -102,4 +170,23 @@ A server-side parse error carries the status to answer with (400, 414, 431, 501 
   - **Tested** against Python's `http.server` (`tests/http/http_peer.py`): bodies by length, chunked with trailers and to the close; HEAD; the headers sent; reuse and what is not pooled; the retry, through a route that drops second requests; the deadline; `max_body`; errors.
   - **The server codec** is tested the other way round: `tests/http/test_server_interop.mojo` drives `ServerConnection` over a socket for Python's `http.client` (keep-alive, both request framings, HEAD, close) and for raw pipelined requests read back by Python's response parser.
   - **Example:** `examples/http/http_get.mojo`.
-- **H6: polish.** Interop against Python's `http.server` and `http.client`, examples, the guide, an independent review, performance.
+- **H6: polish.** Done.
+  - **Review.** Two independent reviews, one of parsing and framing, one of the connections and the client, found 17 issues (3 and 14). All are fixed, with regression tests in `tests/http/test_http_regressions.mojo` and `test_http_client_regressions.mojo`, each of which fails on the old code. The parser held up against the known request-smuggling vectors. The most serious issues:
+    - The client pooled a connection while its codec still held unread bytes, so later responses went to the wrong requests. Leftovers now close the connection (RFC 9112 6.3).
+    - Answering a bodiless request on its HEAD event ended keep-alive.
+    - The client's deadline did not bound a response that keeps trickling in, nor a stream of 1xx responses.
+    - The client wrote a whole body before reading, so a full-duplex server deadlocked it and an early 413 was missed; bodies of 64 MiB or more failed. Bodies are now streamed while the response is watched for.
+    - Host values were not validated, a 101 could switch before the request body was read, and `max_chunk_line = Int.MAX` overflowed a limit check.
+    - Early responses now keep the connection when the rest of the body is short (256 KiB at most, read by the codec), and otherwise say `Connection: close`.
+  - **Performance.**
+    - **Cause:** in Mojo 1.2, destroying an `Optional` of a large struct costs 100–260 ns (CLAUDE.md), and `next_event` paid that on every call.
+    - **Changes:** events now box their head and trailers, and `poll(ev)` refills one event, reusing its buffers. One pass over a head's fields decides framing and persistence. The status line is written in one step, and a single Content-Length is parsed directly.
+    - **Result:** the server codec's work per request went from about 2 µs to about 0.7 µs.
+    - **End to end:** measured with `examples/http/hello_server.mojo` and `bench/http/load.mojo` on one core each of a 4-core laptop:
+
+      | Load | Throughput | CPU per request, vs a server writing canned bytes |
+      |---|---|---|
+      | 50 keep-alive connections | ~141k req/s | ~6.8 µs vs ~6.1 µs |
+      | 16 pipelined per connection | over 1M req/s | ~0.97 µs vs ~0.46 µs |
+  - **Interop:** the client against Python's `http.server`, the server codec against Python's `http.client` and its response parser; the guide above; the examples `http_get` and `hello_server`.
+- **Later:** a streaming response API on the client, redirects, content codings, TLS (with `net`).

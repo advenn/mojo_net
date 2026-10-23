@@ -221,8 +221,9 @@ def _transfer_codings(headers: Headers) raises IoError -> Optional[_Codings]:
 
 
 def _parameters(v: Span[UInt8, _], start: Int, end: Int) -> Int:
-    """Parameters `*( OWS ";" OWS token "=" ( token / quoted-string ) )` in
-    `v[start:end]` (RFC 9110 5.6.6): how many, or -1 if malformed."""
+    """Transfer-coding parameters `*( OWS ";" OWS token BWS "=" BWS ( token
+    / quoted-string ) )` in `v[start:end]` (RFC 9110 10.1.4): how many, or
+    -1 if malformed."""
     var n = 0
     var k = start
     while True:
@@ -238,9 +239,15 @@ def _parameters(v: Span[UInt8, _], start: Int, end: Int) -> Int:
         var t = k
         while k < end and is_tchar(v[k]):
             k += 1
-        if k == t or k == end or v[k] != _EQ:
+        if k == t:
+            return -1
+        while k < end and is_ows(v[k]):  # BWS
+            k += 1
+        if k == end or v[k] != _EQ:
             return -1
         k += 1
+        while k < end and is_ows(v[k]):  # BWS
+            k += 1
         var q = _token_or_quoted(v, k, end)
         if q < 0:
             return -1
@@ -318,7 +325,13 @@ def response_framing(
         return Framing.none()
     if request_method == "CONNECT" and s >= 200 and s < 300:
         return Framing(BodyKind.TUNNEL, 0)
-    var te = _transfer_codings(head.headers)
+    var te: Optional[_Codings]
+    try:
+        te = _transfer_codings(head.headers)
+    except:
+        # Present but malformed (or empty): chunked is not the final coding,
+        # so the body runs until the connection closes (RFC 9112 6.3).
+        return Framing(BodyKind.CLOSE, 0)
     if te:
         var c = te.value()
         if c.chunked > 1:
@@ -413,6 +426,19 @@ struct BodyDecoder(Copyable, Movable):
                 max_head=limits.max_trailers, max_fields=limits.max_trailer_fields
             ),
         )
+        self._done = framing.kind == BodyKind.NONE or (
+            framing.kind == BodyKind.LENGTH and framing.length == 0
+        )
+        self._status = 0
+
+    def restart(mut self, framing: Framing):
+        """Start decoding a new body framed as `framing`, keeping the
+        allocations (and the leniency and limits)."""
+        self._kind = framing.kind
+        self._remaining = framing.length if framing.kind == BodyKind.LENGTH else 0
+        self._state = _SIZE
+        self._scanned = 0
+        self._trailers.reset()
         self._done = framing.kind == BodyKind.NONE or (
             framing.kind == BodyKind.LENGTH and framing.length == 0
         )
@@ -524,7 +550,7 @@ struct BodyDecoder(Copyable, Movable):
         var lf = _first[_lf_v, _lf_b](data, line + self._scanned, n)
         if lf == n:
             self._scanned = n - line
-            if n - line > lim + 1:  # even a CR before the coming LF leaves too much
+            if n - line - 1 > lim:  # even a CR before the coming LF leaves too much
                 raise self._fail(E_CHUNK_LINE_TOO_LONG)
             return -1
         self._scanned = 0

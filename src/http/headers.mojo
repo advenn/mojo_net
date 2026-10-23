@@ -604,6 +604,20 @@ struct Headers(Copyable, Defaultable, Movable, Sized, Writable):
             at += 2
         out.commit(total)
 
+    def _encode_except(self, mut out: ByteBuffer, name: StringSlice) raises IoError:
+        """`encode` without the `name` fields."""
+        var skip = name.as_bytes()
+        for f in self._fields:
+            var nb = self._bytes(f.name, f.name_len)
+            if eq_ignore_case(nb, skip):
+                continue
+            out.write_bytes(nb)
+            out.write_byte(_COLON)
+            out.write_byte(_SP)
+            out.write_bytes(self._bytes(f.value, f.value_len))
+            out.write_byte(_CR)
+            out.write_byte(_LF)
+
     def write_to(self, mut writer: Some[Writer]):
         """`name: value` CRLF per field line (values as strings)."""
         for f in self._fields:

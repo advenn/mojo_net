@@ -17,6 +17,13 @@ Routes:
     *    /flaky            the first request on a connection gets "ok"; any later
                            one is read and the connection closed without an answer
     POST|PUT /echo         the request body back (Content-Length or chunked request)
+    PUT  /count            reads the body in pieces and answers its length
+    PUT  /echo-stream      answers at once and echoes the body as it arrives (full duplex)
+    PUT  /reject-hold      an early 413 without reading the body, then 5 s of not reading
+    GET  /left             "first", plus an unsolicited second response in the same write
+    HEAD /head0            a HEAD response followed by a stray last chunk "0\r\n\r\n"
+    GET  /1xx              a stream of 100 Continue responses for 5 s, then "late"
+    GET  /drip             Content-Length 50, one byte every 100 ms
 """
 
 import http.server
@@ -99,14 +106,68 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, b"late")
         elif path == "/echo" and self.command in ("POST", "PUT"):
             self._send(200, self._read_body(), [("X-Method", self.command)])
+        elif path == "/count":
+            left = int(self.headers.get("Content-Length", "0"))
+            total = 0
+            while left > 0:
+                d = self.rfile.read(min(1 << 20, left))
+                if not d:
+                    break
+                total += len(d)
+                left -= len(d)
+            self._send(200, str(total).encode())
+        elif path == "/echo-stream":
+            n = int(self.headers.get("Content-Length", "0"))
+            self.send_response(200)
+            self.send_header("Content-Length", str(n))
+            self.end_headers()
+            self.wfile.flush()
+            left = n
+            while left > 0:
+                d = self.rfile.read1(min(65536, left))
+                if not d:
+                    return
+                self.wfile.write(d)
+                self.wfile.flush()
+                left -= len(d)
+        elif path == "/reject-hold":
+            self.wfile.write(b"HTTP/1.1 413 Content Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+            self.wfile.flush()
+            time.sleep(5)  # neither reads the body nor closes
+            self.close_connection = True
+        elif path == "/left":
+            self.wfile.write(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst"
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nEVIL!"
+            )
+        elif path == "/head0" and self.command == "HEAD":
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+        elif path == "/1xx":
+            blob = b"HTTP/1.1 100 Continue\r\n\r\n" * 1000
+            end = time.time() + 5
+            while time.time() < end:
+                self.wfile.write(blob)
+            self._send(200, b"late")
+        elif path == "/drip":
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\n")
+            self.wfile.flush()
+            for _ in range(50):
+                time.sleep(0.1)
+                self.wfile.write(b"x")
+                self.wfile.flush()
         else:
             self._send(404, b"not found")
 
     do_GET = do_HEAD = do_POST = do_PUT = do_DELETE = _route
 
 
+class Server(http.server.ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        pass  # clients that give up mid-response (the tests make some do so)
+
+
 def main():
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = Server(("127.0.0.1", 0), Handler)
     server.daemon_threads = True
     print("PORT", server.server_address[1], flush=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()

@@ -167,7 +167,10 @@ def test_response_framing() raises:
     assert_equal(_resp_framing(200, ["Transfer-Encoding: chunked, gzip"]), "CLOSE")
     assert_equal(_resp_framing(200, ["Transfer-Encoding: chunked"], "GET", Version.HTTP_1_0), "CLOSE")
     assert_equal(_resp_framing(200, ["Transfer-Encoding: chunked, chunked"]), _invalid(E_TE_CODINGS))
-    assert_equal(_resp_framing(200, ["Transfer-Encoding: "]), _invalid(E_TE_CODINGS))
+    # present but empty or malformed: chunked is not the final coding, so
+    # the body runs to the close (RFC 9112 6.3)
+    assert_equal(_resp_framing(200, ["Transfer-Encoding: "]), "CLOSE")
+    assert_equal(_resp_framing(200, ["Transfer-Encoding: chunked;"]), "CLOSE")
     assert_equal(_resp_framing(200, ["Content-Length: 5"]), "LENGTH(5)")
     assert_equal(_resp_framing(200, ["Content-Length: 5x"]), _invalid(E_CONTENT_LENGTH))
     assert_equal(_resp_framing(200, []), "CLOSE")

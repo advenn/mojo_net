@@ -60,7 +60,7 @@ pixi run bench build               # rt benchmarks (bench/rt/README.md)
   - `src/linux`: the syscall layer.
   - `src/bytes`: `ByteBuffer`, and the sans-I/O `Codec` trait (`bytes.codec`, contract 1).
   - `src/net`: sockets.
-  - `src/http`: HTTP/1.1. `types` (versions, methods, status codes), `headers` (`Headers`: arena-backed, case-insensitive, ordered; validated adds; exact bytes plus a string view for obs-text), `parse` (`HeadParser`: incremental heads, strict requests, lenient responses, limits; `RequestHead` / `ResponseHead`; `for_trailers` for field sections), `body` (framing decisions, `BodyDecoder` returning ranges of the caller's input, chunk encoding), `connection` (`ServerConnection` / `ClientConnection`: the `Codec`s for one connection; the server answers one request at a time), `client` (`Client`: blocking, pooled, one deadline per request; imports `net`, so not re-exported from `http`). `tests/http/http_peer.py` (started by `http_peer.mojo`) is Python's http.server with test routes. `tests/http/head_oracle.py` and `tests/http/chunked_oracle.py` are the Python references for differential fuzzing; keep them in step with any rule change.
+  - `src/http`: HTTP/1.1. `types` (versions, methods, status codes), `headers` (`Headers`: arena-backed, case-insensitive, ordered; validated adds; exact bytes plus a string view for obs-text), `parse` (`HeadParser`: incremental heads, strict requests, lenient responses, limits; `RequestHead` / `ResponseHead`; `for_trailers` for field sections), `body` (framing decisions, `BodyDecoder` returning ranges of the caller's input, chunk encoding), `connection` (`ServerConnection` / `ClientConnection`: the `Codec`s for one connection; the server answers one request at a time; `poll(ev)` refills a reused event, `next_event()` returns new ones), `client` (`Client`: blocking, pooled, one deadline per request; imports `net`, so not re-exported from `http`). `tests/http/http_peer.py` (started by `http_peer.mojo`) is Python's http.server with test routes. `tests/http/head_oracle.py` and `tests/http/chunked_oracle.py` are the Python references for differential fuzzing; keep them in step with any rule change.
   - `src/rt` (frozen): `core` (Loop + proactor), `driver` (trait), `epoll_driver`, `sim` (simulator), `event_loop`, `timers`, `slab`, `mailbox`, `evented` (`TcpServer[H]`/`dial[H]` connections driving a `ConnHandler`).
 - **`net` modules:**
   - `addr`: addresses.
@@ -108,6 +108,11 @@ pixi run bench build               # rt benchmarks (bench/rt/README.md)
   - **Workaround:** keep the struct alive past the loop (`_ = x^` after it, or pass it whole to a function).
   - **Found** when a benchmark parsed into a local `ResponseHead` (last use of `headers`) and then reassigned `reason` in a loop.
   - **Repro**, which crashes on 1.2.0: `struct H(Movable)` with `var s: String` and `var l: List[UInt8]`; `var h = H(); h.l.append(1); for _ in range(1000): h.s = String("ab")`.
+- **`Optional` of a large struct is slow (Mojo 1.2.0).**
+  - **Cost:** `Optional` is a `Variant`. When its destructor is not inlined (a type used across modules), it takes the whole value by value and rebuilds it byte by byte: about 900 instructions for a 256-byte struct, roughly 100–260 ns per `Optional` destroyed, even an empty one. A nested `Optional` inside makes it worse.
+  - **Where it bit:** `ServerConnection.next_event()` returned an `Optional` of a 256-byte event on every call, which cost ~2 µs per request.
+  - **Workaround:** keep structs that travel in an `Optional` small: box big payloads in a one-element `List` (24 bytes; the same `Optional` then costs ~5 ns). In hot loops, prefer an API that fills a caller-owned value (`poll(mut ev)`) over returning `Optional`.
+  - **Diagnosis:** look for `Variant::__deinit__` calls in `mojo build --emit asm` output.
 - **ABI structs:**
   - Use `Array[UInt8, N]` for C arrays, never `SIMD`. SIMD is aligned to its full width, which made `sockaddr_in6` 48 bytes.
   - A struct with `Array` fields can't be `TrivialRegisterPassable`; use `(Copyable, Movable)`.

@@ -290,7 +290,7 @@ def test_end_of_input() raises:
     var m = _asked()
     _feed(m, "HTTP/1.1 200 OK\r\nContent-")
     m.feed_eof()
-    assert_equal(_error(m), "UnexpectedEof http: body ended early")
+    assert_equal(_error(m), "UnexpectedEof http: connection closed in a message head")
     var b = _asked()
     _feed(b, "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nabc")
     b.feed_eof()

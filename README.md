@@ -41,7 +41,7 @@ More in `examples/net/`:
 - a readiness-loop echo server: edge-triggered epoll and `try_read` / `try_write`, with no runtime;
 - a UDP echo server (blocking, or an epoll loop with batched `recvmmsg` / `sendmmsg`) and a UDP ping client.
 
-And in `examples/http/`: `http_get`, a small `curl` built on `http.client.Client`.
+And in `examples/http/`: `http_get`, a small `curl` built on `http.client.Client`; `hello_server`, an epoll server driving one `ServerConnection` per connection (over 1M pipelined requests per second on one core).
 
 ## Develop
 Everything runs through [pixi](https://pixi.sh):
