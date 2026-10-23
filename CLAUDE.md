@@ -9,12 +9,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Work on one library must not gate or leak into another.
 - Package status:
   - `linux`, `bytes`: shared base layers;
-  - `net`: the TCP library, the active work;
+  - `net`: the TCP/UDP library (client side done; packaging left);
+  - `http`: the HTTP/1.1 library, the active work (`docs/http.md`);
   - `rt`: an experimental event-loop runtime, **frozen** until Mojo's async/await stabilizes. Keep it compiling and green; add no features unless the user unfreezes it.
 
 **Docs:**
 - `docs/design.md`: packages, import rules and the numbered contracts that code comments cite. Read it before changing any package.
-- Per-library docs: `docs/net.md` (scope, L2 contract, readiness-loop rules, milestones) and `docs/rt.md`.
+- Per-library docs: `docs/net.md` (scope, L2 contract, readiness-loop rules, milestones), `docs/http.md` (scope, strictness rules, milestones) and `docs/rt.md`.
 - `docs/spikes.md`: measured facts (threads, the Mojo runtime, callbacks, the 10k-connection epoll spike).
 
 ## Commands
@@ -48,8 +49,9 @@ pixi run bench build               # rt benchmarks (bench/rt/README.md)
 **Test-only Python:** some tests use the pixi env's Python as an oracle (`ipaddress`) or as a peer process. It is never used in `src/`.
 
 ## Layout and rules
-- **Packages:** imports only point downward: `rt → net → bytes → linux`. `linux` imports only `std`.
+- **Packages:** imports only point downward: `rt → net → bytes → linux`, and `http → net → bytes → linux`. `linux` imports only `std`.
   - Nothing outside `rt` imports `rt`.
+  - `http` is sans-I/O: in `src/http`, only `client.mojo` and `server.mojo` may import `net` (`SANS_IO` in `tools/check_imports.py`).
   - `pixi run import-check` enforces these rules for `src/`, `tests/`, `examples/`, `bench/` and `spikes/`.
   - A new library gets an entry in `ALLOWED` in `tools/check_imports.py`.
   - Per-package directories:
@@ -58,6 +60,7 @@ pixi run bench build               # rt benchmarks (bench/rt/README.md)
   - `src/linux`: the syscall layer.
   - `src/bytes`: `ByteBuffer`, and the sans-I/O `Codec` trait (`bytes.codec`, contract 1).
   - `src/net`: sockets.
+  - `src/http`: HTTP/1.1. `types` (versions, methods, status codes), `headers` (`Headers`: arena-backed, case-insensitive, ordered; validated adds; exact bytes plus a string view for obs-text).
   - `src/rt` (frozen): `core` (Loop + proactor), `driver` (trait), `epoll_driver`, `sim` (simulator), `event_loop`, `timers`, `slab`, `mailbox`, `evented` (`TcpServer[H]`/`dial[H]` connections driving a `ConnHandler`).
 - **`net` modules:**
   - `addr`: addresses.

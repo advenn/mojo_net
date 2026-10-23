@@ -33,7 +33,11 @@ ALLOWED = {
     "bytes": {"linux", "bytes"},
     "net": {"linux", "bytes", "net"},
     "rt": {"linux", "bytes", "net", "rt"},
+    "http": {"linux", "bytes", "net", "http"},
 }
+# Packages whose protocol logic is sans-I/O: in src/, only the listed
+# modules may import `net` (the rest only parse and build bytes).
+SANS_IO = {"http": {"client.mojo", "server.mojo"}}
 AREAS = ("src", "tests", "examples", "bench")
 FIXED = {"spikes": "net"}
 
@@ -103,6 +107,14 @@ def check(root):
                     text = f.read()
                 strict = rel.split(os.sep)[0] == "src"
                 for line, name in imports(text):
+                    if (
+                        strict
+                        and name == "net"
+                        and pkg in SANS_IO
+                        and os.path.basename(rel) not in SANS_IO[pkg]
+                    ):
+                        bad.append(f"{rel}:{line}: src/{pkg} modules are sans-I/O: only {sorted(SANS_IO[pkg])} may import net")
+                        continue
                     if name == "std" or name in ALLOWED[pkg]:
                         continue
                     if name in ALLOWED:
@@ -125,9 +137,12 @@ def _self_test():
         "tests/rt/h.mojo": ("from test_loop_harness import H\nfrom rt.core import Loop\n", None),
         "examples/net/i.mojo": ("# from rt import nothing\nfrom net.tcp import TcpStream\n", None),
         "examples/j.mojo": ("from net.tcp import TcpStream\n", "put it under examples/<package>/"),
-        "bench/http/k.mojo": ("from net.tcp import TcpStream\n", "unknown package 'http'"),
+        "bench/ftp/k.mojo": ("from net.tcp import TcpStream\n", "unknown package 'ftp'"),
         "spikes/l.mojo": ("from rt.core import Loop\n", "net may not import rt"),
         "bench/rt/m.mojo": ("from bench_common import Ticker\nfrom rt.core import Loop\n", None),
+        "src/http/parse.mojo": ("from net.tcp import TcpStream\n", "are sans-I/O"),
+        "src/http/client.mojo": ("from net.tcp import TcpStream\nfrom bytes.codec import Codec\n", None),
+        "src/http/n.mojo": ("from rt.core import Loop\n", "http may not import rt"),
     }
     with tempfile.TemporaryDirectory() as root:
         for rel, (src, _) in plant.items():
@@ -147,8 +162,8 @@ def _self_test():
         expected = sum(1 for _, w in plant.values() if w is not None)
         if len(bad) != expected:
             errors.append(f"expected {expected} violations, got {len(bad)}:\n{report}")
-        if files != 11:
-            errors.append(f"expected 11 files checked, got {files}")
+        if files != 14:
+            errors.append(f"expected 14 files checked, got {files}")
         if errors:
             sys.exit("check_imports self-test failed:\n" + "\n".join(errors))
 

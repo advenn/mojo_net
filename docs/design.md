@@ -21,14 +21,15 @@ So a Mojo upgrade, or a change in a shared layer, lands in every package in one 
 |---|---|---|---|
 | `linux` | raw syscalls, ABI mirrors, errno, `IoError`, fds, clock, poll/epoll/eventfd wrappers, probing (including fd-table pre-growth) | stable (M1) | `std` only |
 | `bytes` | `ByteBuffer`, and the sans-I/O `Codec` contract (contract 1) with the reference `LineCodec` | stable (M1) | `linux` |
-| `net` | the TCP/socket library (`docs/net.md`): addresses, socket options (L1), blocking TCP/Unix with deadlines (L2), buffered frame reads (`BufReader`); next: DNS, connect-by-name | **active**: M2, TCP v1 | `linux`, `bytes` |
+| `net` | the TCP/UDP library (`docs/net.md`): addresses, socket options (L1), blocking TCP/Unix with deadlines and nonblocking `try_*` calls (L2), buffered frame reads (`BufReader`), DNS and connect-by-name (Happy Eyeballs), UDP | TCP client (M2) and UDP (M3) done; packaging left | `linux`, `bytes` |
+| `http` | the HTTP/1.1 library (`docs/http.md`): message types, the header map; next: a sans-I/O parser, body framing, connection codecs, a blocking client | **active**: H2 | `linux`, `bytes`; `net` only in `http.client` and `http.server` |
 | `rt` | experimental completion-based event loop (`docs/rt.md`): epoll and simulator backends, timers, slab, mailbox, `rt.evented` connections | **frozen** until Mojo's async/await stabilizes | `linux`, `bytes`, `net` |
 
 - **Nothing outside `rt` imports `rt`.** `rt` builds on `net`, never the reverse.
 - **The same rules cover all code.** They apply to `tests/<pkg>`, `examples/<pkg>` and `bench/<pkg>`. `spikes/` (M1 evidence) follows `net`'s rules.
-- **Planned libraries** (an HTTP library, database drivers) each get `src/<pkg>`, `tests/<pkg>`, `examples/<pkg>`, `docs/<pkg>.md`, and an entry in `ALLOWED` in `tools/check_imports.py`.
+- **Protocol libraries** (`http`, and the planned database drivers) each get `src/<pkg>`, `tests/<pkg>`, `examples/<pkg>`, `docs/<pkg>.md`, and an entry in `ALLOWED` in `tools/check_imports.py`.
   - Their protocol logic is a sans-I/O codec built on `bytes` (contract 1).
-  - Their transport uses `net`.
+  - Their transport uses `net`, from named modules only: `SANS_IO` in `tools/check_imports.py` lists the `src/<pkg>` modules that may import `net` (for `http`: `client.mojo` and `server.mojo`).
 
 ## Fixed decisions
 - **Platform:** Linux only, x86_64 and aarch64.
@@ -95,5 +96,6 @@ Code comments cite these by number, so keep the numbering stable. Contracts 2, 3
 
 ## Documents
 - `docs/net.md`: the TCP library. Covers its scope, the L2 blocking contract, the rules for readiness-loop servers, and milestones.
+- `docs/http.md`: the HTTP/1.1 library. Covers its scope, the parser's strictness rules, and milestones.
 - `docs/rt.md`: the frozen runtime. Covers how contracts 2–7 are realised, the simulator, and the M2 gate.
 - `docs/spikes.md`: measured facts. Covers threads, the Mojo runtime, callbacks, and the 10k-connection epoll spike.
