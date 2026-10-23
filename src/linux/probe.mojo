@@ -336,6 +336,56 @@ def cpu_count() raises IoError -> Int:
         raise IoError.from_errno("sched_getaffinity", e)
 
 
+def _quota_of(cpu_max: String) -> Optional[Int]:
+    """CPUs from a cgroup v2 `cpu.max` ("<quota> <period>", or "max ..."),
+    rounded up; None for no quota."""
+    var parts = cpu_max.strip().split(" ")
+    if len(parts) != 2 or parts[0] == "max":
+        return None
+    try:
+        var quota = atol(parts[0])
+        var period = atol(parts[1])
+        if quota <= 0 or period <= 0:
+            return None
+        return max((quota + period - 1) // period, 1)
+    except:
+        return None
+
+
+def cpu_quota() -> Optional[Int]:
+    """The CPUs this process's cgroup (v2) lets it use on average: the
+    tightest `cpu.max` quota on its way up the hierarchy, over its period,
+    rounded up (`docker run --cpus=1.5` gives 2). None without a quota,
+    under cgroup v1, or when the files cannot be read. Unlike `cpu_count`,
+    this sees CFS quotas."""
+    var path: String
+    try:
+        var text = String(from_utf8_lossy=Span(read_file("/proc/self/cgroup", "cpu_quota")))
+        path = String()
+        var found = False
+        for line in text.split("\n"):
+            if line.startswith("0::"):
+                path = String(line[byte=3:].strip())
+                found = True
+        if not found:
+            return None  # cgroup v1
+    except:
+        return None
+    var best = Optional[Int](None)
+    while True:
+        try:
+            var at = String("/sys/fs/cgroup", path, "/cpu.max") if path != "/" else String("/sys/fs/cgroup/cpu.max")
+            var q = _quota_of(String(from_utf8_lossy=Span(read_file(at, "cpu_quota"))))
+            if q and (not best or q.value() < best.value()):
+                best = q
+        except:
+            pass  # (the root cgroup has no cpu.max)
+        if path == "/" or path.byte_length() == 0:
+            return best
+        var cut = path.rfind("/")
+        path = String(path[byte=0:cut]) if cut > 0 else String("/")
+
+
 # ---- auxv / page size --------------------------------------------------------
 
 

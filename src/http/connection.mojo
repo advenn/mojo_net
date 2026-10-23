@@ -939,14 +939,23 @@ struct ServerConnection(Codec, Copyable):
             # then go on with the next request.
             self._answered = True
 
-    def send_error(mut self, status: Int) raises IoError:
+    def send_error(mut self, status: Int, date: StringSlice = "") raises IoError:
         """A minimal response with `status` (usually `error_status()`, and
-        always 400..599), `Content-Length: 0` and `Connection: close`; the
-        connection then closes. `InvalidInput` for another status or while
-        a response is being sent."""
+        always 400..599), `Content-Length: 0` and `Connection: close`, and a
+        Date field if `date` is given (an IMF-fixdate: a server with a clock
+        sends one, RFC 9110 6.6.1); the connection then closes.
+        `InvalidInput` for another status, a `date` that is no field value,
+        or while a response is being sent."""
         if self._out == _OUT_BODY or status < 400 or status > 599:
             raise self._misuse("ServerConnection.send_error")
+        for b in date.as_bytes():
+            if not is_field_byte(b):
+                raise self._misuse("ServerConnection.send_error")
         _status_line(self._tx, status, "")
+        if date.byte_length() > 0:
+            _write_str(self._tx, "Date: ")
+            _write_str(self._tx, date)
+            _write_str(self._tx, "\r\n")
         _write_str(self._tx, "Content-Length: 0\r\nConnection: close\r\n\r\n")
         self._out = _OUT_NONE
         self._closing = True
@@ -992,6 +1001,19 @@ struct ServerConnection(Codec, Copyable):
             self._closing = True
             self._in = _CLOSED
             self._rx.clear()
+
+    def head_begun(self) -> Bool:
+        """Bytes of a next request head have arrived: more than the line
+        ends a server ignores before a request line (RFC 9112 2.2)."""
+        return self._in == _HEAD and not _only_line_ends(self._rx.readable_span())
+
+    def trim(mut self, keep: Int) raises IoError:
+        """Give back empty buffers that grew past `keep` bytes (an idle
+        connection does not need room for its largest message)."""
+        if len(self._tx) == 0 and self._tx.capacity() > keep:
+            self._tx = ByteBuffer()
+        if len(self._rx) == 0 and self._rx.capacity() > keep:
+            self._rx = ByteBuffer(max_size=self._rx.max_size())
 
     def input_pending(self) -> Bool:
         """Whether the client may still be sending when the connection

@@ -2,7 +2,72 @@
 
 An HTTP/1.1 server for Mojo on Linux (roadmap step 3). It is built on the `http` library's sans-I/O `ServerConnection` and on `net`'s nonblocking sockets. Package rules and contracts are in `docs/design.md`; HTTP itself is in `docs/http.md`.
 
-**Status: active.** S1 (the serving loop), S2 (streaming), S3 (graceful shutdown, signals and worker processes) and S4 (routing and static files) are done; S5 (polish) is next.
+**Status: done through S5:** the serving loop, streaming, graceful shutdown with signals and worker processes, routing and static files, and an independent review with its fixes. Leads for later are at the end.
+
+## Guide
+**A server** is a `Handler` run by a `Server`:
+```mojo
+from net.addr import SocketAddr
+from server import Handler, Request, Response, Server, ServerConfig, Stop
+
+
+struct Hello(Handler):
+    var hits: Int
+
+    def __init__(out self):
+        self.hits = 0
+
+    def handle(mut self, req: Request, mut res: Response) raises:
+        self.hits += 1
+        res.text(200, String("hello, request ", self.hits, "\n"))
+
+
+def main() raises:
+    var stop = Stop.on_signals()  # first in main: it may run the program again
+    var server = Server(Hello(), ServerConfig(server_name="hello"))
+    server.bind(SocketAddr.parse("0.0.0.0:8080"))
+    server.stop_on(stop^)  # SIGTERM or Ctrl-C: a graceful shutdown
+    server.run()  # returns when it has finished
+```
+- **`handle`** gets the whole request: `req.method`, `req.target` (`path()`, `query()`), `req.host()`, `req.headers`, `req.body` (`text()`), `req.peer`. It fills the response: `res.text(...)`, `res.bytes(...)`, or `status`, `headers` and `body` directly. The server adds `Date`, `Content-Length` and the configured `Server`; HEAD drops the body; an error raised gets a 500.
+- **`path()` is raw,** not percent-decoded. Make access decisions on decoded segments, as `Router` matches them: `/%61dmin` is `/admin`.
+- **One loop serves every connection** of the process, so `handle` must not block: no blocking I/O, no sleeping. Handler state needs no locks.
+- **`ServerConfig`** holds the limits and timeouts: `max_connections`, `max_body`, the header, idle, read, write, linger and shutdown timeouts, `min_rate`, `limits` for request heads, `reuseport`, `server_name`. `Server(...)` refuses one that cannot work (`InvalidInput`): a `server_name` that is no field value, `max_connections` past the id space.
+
+**Routes** go to functions instead (see Routing), with parameters:
+```mojo
+def user(mut app: App, req: Request, params: Params, mut res: Response) raises:
+    res.text(200, String("user ", params["id"], "\n"))
+
+var router = Router(App())  # App is a Handler: what no route takes goes to it
+router.get("/users/:id", user)
+router.get("/static/*path", static_file)  # app.files.serve(req, params["path"], res)
+var server = Server(router^)
+```
+
+**Static files** come from `StaticFiles.open(dir)`, behind a route (see Static files). The application passes `produce` and `stream_ended` on to it, because large files stream.
+
+**Streaming** responses are a `res.stream()` in `handle`, then `produce` calls that append pieces as the client takes them (see Streaming). Server-sent events are streams that pause when there is nothing to send: something else (another request, `Server.wake`) wakes them when there is. Request bodies stream into `on_body` when `stream_request` says so.
+
+**Several cores:** `run_workers` runs the program as one worker process per CPU on the same port, under a supervisor that restarts them and stops them gracefully (see Processes):
+```mojo
+def main() raises:
+    var stop = run_workers(WorkerConfig())  # first in main
+    if not stop:
+        return  # the supervisor, after its workers have stopped
+    var server = Server(App(), ServerConfig(reuseport=True))
+    server.bind(SocketAddr.parse("0.0.0.0:8080"))
+    server.stop_on(stop.take())
+    server.run()
+```
+
+**Running it:**
+- Build the program (`pixi run mojo build -I src app.mojo -o app`). Signals and workers both execute the program again, which under `mojo run` means compiling it again.
+- Under systemd, `KillMode=mixed` or the default `control-group` both work: SIGTERM starts a graceful stop, which `stop_timeout` bounds (15 s by default). Keep `TimeoutStopSec` above that. (With `control-group`, each worker sees its lifeline close and then gets SIGTERM itself; that is still one graceful stop.)
+- In a container, the supervisor can be PID 1: it reaps the orphans PID 1 inherits, and where the seccomp profile refuses clone3 (Docker's default) it starts workers with clone(2). `workers=0` sizes the pool by the container's CPU quota too (`--cpus`). Docker's default stop timeout is 10 s: raise it (`--stop-timeout`, `stop_grace_period`), or lower `stop_timeout` and `shutdown_timeout`.
+- Raise the open-files limit for many connections. `bind` raises the soft limit to the hard one itself.
+
+**Embedding:** `step(timeout)` runs one turn of the loop, for a program with other work to interleave, and for tests.
 
 ## Model
 **One thread and one edge-triggered epoll loop per process**, with one `ServerConnection` per connection.
@@ -13,24 +78,31 @@ An HTTP/1.1 server for Mojo on Linux (roadmap step 3). It is built on the `http`
 - **Handlers must not block:** the loop serves every connection of the process. Blocking work belongs in another process, or in a future runtime.
 - **A trait rather than a function:** Mojo 1.2 function values cannot capture state, and a handler usually needs some (a pool, counters, configuration).
 
-## Behaviour (S1)
+## Behaviour
 - **Requests:**
-  - Keep-alive and pipelining; pipelined requests are answered in order.
+  - Keep-alive and pipelining; pipelined requests are answered in order. Line ends before a request line are ignored (RFC 9112 2.2).
+  - An absolute-form target (`http://host/path`, which a server must accept) becomes its path and query in `target`, and its authority, which replaces Host, is `host()` (RFC 9112 3.2.2).
   - HEAD: a GET handler answers it, and its body is dropped.
   - `Expect: 100-continue` is answered when the body will be accepted.
-  - Request bodies are limited to `max_body`. Beyond it the server answers 413, as soon as Content-Length says so.
-  - Malformed requests get their status (400, 414, 431, 501 or 505) and the connection closes.
-  - A handler that raises gets a 500.
+  - Request bodies are limited to `max_body`. Beyond it the server answers 413, as soon as Content-Length says so. That answer is the request's only one: a rest that then stalls or breaks closes the connection without another response.
+  - Malformed requests get their status (400, 414, 431, 501 or 505), with a Date, and the connection closes.
+  - A handler that raises gets a 500. So does an answer the server cannot send as asked:
+    - a buffered body that does not match the handler's Content-Length, or is over 63 MiB (stream larger ones);
+    - a 101, or a 2xx to CONNECT, since the server does no upgrades or tunnels.
 - **Timeouts** (`ServerConfig`), against clients that are slow or stall:
   - `header_timeout`: a request head must arrive within it once it starts, else 408.
   - `idle_timeout`: how long a kept-alive connection may sit idle.
-  - `read_timeout`: the most time without progress while a body arrives (408).
-  - `write_timeout`: the most time a response may wait on a client that does not read.
+  - `read_timeout`: while a body arrives (408).
+  - `write_timeout`: while a response waits on a client that does not read. At its end the connection is aborted (RST), so that the kernel does not go on sending what was queued, up to a send buffer, at the client's pace.
+  - **Minimum rate:** the read and write timeouts restart only when a window's worth of progress has passed: `min_rate` (512 B/s) times the timeout, so 15 KB per 30 s window by default. A client dripping a byte at a time is cut at the timeout. `min_rate=0` restarts them on any progress.
+- **Fairness:** a connection gets a slice of each turn: 64 KiB read and written, or 128 requests answered. Then it waits for the next turn, which does not wait for readiness. A client that pipelines without pause cannot keep the loop from the others, nor from accepting, the timeouts and stop requests.
 - **Backpressure:** a connection reads nothing while its output is pending.
 - **Responses** get `Date` and `Content-Length`, and `Server` if configured.
 - **Resources:**
   - At start the fd limit is raised and the fd table pre-grown (docs/spikes.md).
-  - Above `max_connections`, or on EMFILE, accepting pauses.
+  - Above `max_connections` accepting pauses. On EMFILE, and on any other accept error but the network errors accept(2) passes on (those just skip that connection), it pauses for 100 ms.
+  - An idle connection gives back every buffer grown past 16 KiB: the bodies, the header arenas, the codec's receive and output buffers. Whatever a client once sent or asked for, an idle connection holds about 100 KiB at most.
+  - Connection ids are 40 bits of a per-server count above 24 bits of slot, so an id is not reused before 2^40 connections.
 
 ## Closing and shutdown (S3)
 **Lingering close.** When the server ends a connection, it closes it at once unless the client may still be sending: a request answered before its body arrived (413, 408), requests pipelined after the last response, a malformed request (`ServerConnection.input_pending()`).
@@ -64,17 +136,23 @@ def main() raises:
 **Call it first in `main`.** Workers are new executions of the program (`/proc/self/exe` with the same arguments and environment, plus `MOJO_NET_WORKER`), so what comes before runs in every process. Run a built binary: under `mojo run`, each execution compiles the program again.
 
 **The supervisor** is the process that calls `run_workers` first:
-- **Starting:** it starts `workers` processes (default: one per CPU it may run on). Worker i's runtime starts on the i-th allowed CPU, so it starts one runtime thread instead of one per CPU (docs/spikes.md). Its affinity then widens to all of them, unless `pin`.
-- **Restarting:** a worker that ends is restarted after `restart_delay` (100 ms). The delay doubles, up to `max_restart_delay` (10 s), while workers keep ending within a second of starting. Starts, ends and restarts are logged on stderr.
+- **Starting:** it starts `workers` processes (default: one per CPU it may run on, and no more than its cgroup's CPU quota, `linux.probe.cpu_quota`). Worker i's runtime starts on the i-th allowed CPU, so it starts one runtime thread instead of one per CPU (docs/spikes.md). Its affinity then widens to all of them, unless `pin`.
+- **clone3 refused:** where a seccomp profile refuses clone3 (Docker's default, with ENOSYS), workers start through clone(2) with CLONE_PIDFD. If processes cannot be made at all (ENOSYS or EPERM from both), `run_workers` raises instead of retrying forever.
+- **Restarting:** a worker that ends is restarted after `restart_delay` (100 ms). Each further end within a second of starting, in a row, doubles the delay (from at least 50 ms, so a `restart_delay` of 0 grows too), up to `max_restart_delay` (10 s). Starts, ends and restarts are logged on stderr.
 - **Stopping:** on SIGTERM or SIGINT, it closes each worker's lifeline (a socketpair), which asks the worker to shut down gracefully. It waits up to `stop_timeout` (15 s; keep it longer than the workers' `shutdown_timeout`), then kills what is left, and `run_workers` returns None. A second signal kills the workers at once.
 - **A worker whose supervisor dies** sees its lifeline close, and shuts down gracefully as well.
-- **Ctrl-C in a terminal** signals the whole process group: workers get SIGINT directly too, and treat it like the lifeline.
+- **Ctrl-C in a terminal** signals the whole process group: workers get SIGINT directly too, and treat it like the lifeline. A second Ctrl-C stops them at once.
+- **Robust starts:** fds 0, 1 and 2 are opened on /dev/null where closed, so that no socket lands there and gets the log. The supervisor blocks SIGPIPE, so a broken stderr pipe cannot kill it (its log writes just fail); workers start without that. Workers remove `MOJO_NET_WORKER` from the environment their own children get.
+- **As PID 1** (a container's init), the supervisor also reaps the orphans it inherits, which would otherwise stay zombies.
 
-**`Stop`** is what a server stops on: SIGTERM or SIGINT, and in a worker its lifeline. The first request asks for a graceful shutdown; a signal after it asks to stop at once, closing every connection.
+**`Stop`** is what a server stops on: SIGTERM or SIGINT, and in a worker its lifeline. The first request asks for a graceful shutdown. Only a signal after an earlier signal asks to stop at once, closing every connection; the lifeline only ever asks gracefully, and bytes on it mean nothing (only its end does).
 
 **Signals without handlers.** The library installs no signal handlers, so a stop signal is read from a signalfd. That works only if every thread blocks the signal. The Mojo runtime starts its threads before `main`, with the mask the process was started with; blocking in `main` therefore loses most SIGTERMs to the runtime's handler, which ends the process (25 of 30 runs in the spike, docs/spikes.md).
 - So `Stop.on_signals` and `run_workers` block SIGTERM and SIGINT, check every thread's mask in `/proc/self/task`, and if one does not block them, execute the program again: the new image's threads start with the mask.
+- That happens at most once (`MOJO_NET_REEXEC` marks it). If some thread still does not block them after it, because something unblocks them, a warning goes to stderr, and a stop signal may end the process at once.
 - Workers inherit the mask from the supervisor and need no second execution.
+- **Children inherit the mask:** processes the server starts get SIGTERM and SIGINT blocked, as exec keeps the mask. Reset it where they should stop on those: `linux.process.spawn(signal_mask=...)`, or `signal.pthread_sigmask` in a Python `preexec_fn`.
+- **An ignored SIGINT is still a stop request:** a SIGINT the parent set to be ignored (a background job of a script) is blocked, not discarded, and so it reaches the signalfd.
 
 **In a container**, the supervisor can be PID 1. It handles SIGTERM, so `docker stop` and Kubernetes stop it gracefully. Their kill deadline (Docker: 10 s by default) must exceed `stop_timeout`, or the stop must be configured shorter.
 
@@ -129,15 +207,18 @@ Large files are streamed, so the application passes `produce` and `stream_ended`
 
 **No path leaves the directory:**
 - First, the path itself is checked: no empty, "." or ".." segment, and no NUL (404). One trailing "/" names a directory.
+- Dotfiles (`.env`, `.git/`) are 404 too, except `.well-known` (ACME challenges live there), unless `StaticFiles.open(..., dotfiles=True)`.
 - Then the kernel keeps the open beneath the directory: openat2 with `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`. A symlink out of it gets 404 too.
-- Only regular files are served. Files are opened nonblocking, so that a FIFO put in the directory cannot stall the loop; it then gets 404 like any other non-regular file.
-- A file the server may not read gets 403.
+- Only regular files are served. Files are opened nonblocking, so that a FIFO put in the directory cannot stall the loop; it then gets 404 like any other non-regular file (a socket, a device).
+- A path through a file (`a.txt/x`), a symlink loop or a name too long gets 404; a file the server may not read gets 403.
 
 **Responses:**
-- **Fields:** Content-Type (from the extension), Content-Length, Last-Modified, an ETag (size and modification time, like nginx's) and `Accept-Ranges: bytes`.
+- **Fields:** Content-Type (from the extension), Content-Length, Last-Modified (never later than now: a future modification time is replaced, RFC 9110 8.8.2.1), an ETag (size and modification time, like nginx's) and `Accept-Ranges: bytes`.
 - **Directories:** a directory serves its `index.html`, after a 301 to the path with a trailing "/" when it lacks one. There are no listings.
-- **Conditional requests** (RFC 9110 13.2.2): If-None-Match (weak comparison) answers 304; only without it, If-Modified-Since does.
-- **Ranges** (RFC 9110 14):
+- **Conditional requests,** in RFC 9110 13.2.2's order:
+  - If-Match (strong comparison), and only without it If-Unmodified-Since, answer 412 when they fail. A resumed download of a file that changed gets 412, not new bytes after old ones.
+  - Then If-None-Match (weak comparison) answers 304; only without it, If-Modified-Since does.
+- **Ranges** (RFC 9110 14), for GET only (HEAD ignores Range):
   - one byte range gets 206 with Content-Range, an unsatisfiable one 416;
   - several ranges, a malformed one, or an If-Range that does not match get the whole file;
   - an empty file ignores Range.
@@ -151,7 +232,8 @@ The `Handler` hooks beyond `handle` all have defaults, so a handler that buffers
 
 **Request bodies.** `stream_request(req)` is asked at each request's head.
 - If it returns True, the body goes to `on_body(req, data)` piece by piece as it arrives, without `max_body`. `handle` follows at the body's end, with `req.body` empty.
-- `read_timeout` still applies between pieces, and `Expect: 100-continue` is answered as for a buffered body.
+- If the body never completes, `body_cut(req)` is called instead of `handle`: the client left, stalled or sent a malformed body, `on_body` raised, or a shutdown closed the connection. It is where what `stream_request` set up (an open file) is released.
+- `read_timeout` and `min_rate` still apply, and `Expect: 100-continue` is answered as for a buffered body.
 
 **Responses.** `handle` calls `res.stream()`, and the head goes out at once.
 - **Framing:** chunked, unless the handler set Content-Length; then `produce` must give exactly that many bytes, or the connection closes.
@@ -167,7 +249,7 @@ The `Handler` hooks beyond `handle` all have defaults, so a handler that buffers
 
 **Ends and errors.**
 - `Handler.stream_ended(req, finished)` is called once for every response made with `res.stream()`:
-  - `finished` when its whole body went out, or when it had none to send (HEAD, 204, 304);
+  - `finished` when its whole body was handed to the connection (it may still be on its way to the client), or when it had none to send (HEAD, 204, 304);
   - otherwise when it was cut: the client left, `produce` raised, the head was refused, or a shutdown timed out.
 
   It is where a stream's resources (an open file, a subscription) are released.
@@ -244,3 +326,45 @@ The `Handler` hooks beyond `handle` all have defaults, so a handler that buffers
     - **Tests** (`tests/server/test_static.mojo`, over a scratch directory): types, the index and its redirect, every way out refused (raw and encoded "..", empty segments, symlinks out, a FIFO, an unreadable file), conditional requests and their precedence, ranges (206, 416, suffixes, If-Range, several ranges), a 1 MiB file streamed and checked, HEAD, and an abandoned download whose file is closed (32 MiB: a 1 MiB file fit in the socket buffers, and its stream finished before the client left). Also the three date forms with RFC 850's century rule, and the type table. `tests/server/test_streaming.mojo` counts each mode's `stream_ended` calls.
     - **Planted bugs:** 21 of 21 caught, once the abandoned download was made too large for the socket buffers; that was the one that survived at first.
 - **S5: polish.** Interop, an independent review, benchmarks, and the guide.
+  - **The guide** (above). Its first example is built and run: it serves, then stops on SIGTERM with exit 0.
+  - **Interop with curl** (8.14 here; skipped without it), in `tests/server/test_curl.mojo`:
+    - keep-alive across URLs, POST, a chunked upload, and a 2 MiB body with `Expect: 100-continue` (curl waits for the 100);
+    - HEAD, a range, a file compared byte for byte, a chunked streamed response, HTTP/1.0 with `Connection: close`, 405 with Allow, and 404.
+
+    Also tried by hand against `examples/server/files.mojo`: the 301 to a directory, `--path-as-is` traversal refused, and a 304.
+  - **Where the time goes**, measured by splitting the server process's CPU into user and system time, with the server and the load generator (`bench/http/load.mojo`) on separate CPUs, against `examples/http/hello_server.mojo` on the bare codec:
+
+    | Load | Server: user + system per request | Bare codec |
+    |---|---|---|
+    | 50 keep-alive connections | 2.1–2.6 µs + 6.1–6.8 µs | 1.2–1.5 µs + 5.3–5.9 µs |
+    | 16 pipelined per connection | 0.9–1.2 µs + 0.3–0.5 µs | 0.5–0.7 µs + 0.3 µs |
+
+    - The kernel's share dominates without pipelining: epoll, recv and send through loopback TCP for every request.
+    - What the server adds is about 0.4–0.5 µs of user time per request (`Request` and `Response`, the header scans, the hooks), plus one clock read per loop turn.
+    - That read is a syscall without libc (161 ns, against 17 ns through the vDSO; docs/spikes.md). Calling the vDSO's `clock_gettime` would remove most of it (a lead for later).
+  - **At 2,000 connections** (`examples/server/hello.mojo`, one core):
+    - keep-alive: 103k req/s, and the median round trip is about 19 ms, which is 2,000 requests in flight queued on one core;
+    - 4 pipelined per connection: 293k req/s;
+    - after each run the process is back to 5 open descriptors, at 27–29 MB RSS.
+  - **The independent review:** three reviewers, one each for protocol and security, resources and the loop, and processes and signals. They reported 35 distinct findings and found no request smuggling, desync, client-driven header injection or path escape. Every finding that could be reproduced was, first by a regression test failing on the old code:
+    - `tests/server/test_server_regressions.mojo`;
+    - `tests/server/test_static_regressions.mojo`;
+    - `tests/server/test_process_regressions.mojo`;
+    - `tests/linux/test_process_faults.mojo` (the clone3 refusal, through the fault seam);
+    - new cases in `tests/linux/test_process.mojo` and `tests/linux/test_probe.mojo`.
+
+    The most severe:
+    - **One client could hold the loop.** Pipelining without pause, it got every turn: one `step()` measured 5.5 s, during which no other connection, accept, timeout or stop request was served. Fixed with per-connection slices.
+    - **Workers never started in a default Docker container,** whose seccomp profile refuses clone3 (now clone(2)).
+    - **A graceful stop under systemd's default `KillMode=control-group` cut in-flight requests.** A worker took its own SIGTERM, after its lifeline closed, as a second request.
+    - **A slow-drip client held a connection forever** (now `min_rate` per timeout window, and RST at the write timeout).
+    - **A resumed download of a changed file was silently corrupted** (If-Match and If-Unmodified-Since were ignored).
+    - **A broken stderr pipe killed the supervisor and every worker** (SIGPIPE).
+
+    The others are in the sections above: a cut streamed body (`body_cut`), a second response after an early 413, dropped answers for 101 or a wrong Content-Length, stray CRLFs, a large `max_head`, `step()` spinning after a shutdown, buffers kept at their peak, accept errors, id reuse, the redirect echoing an absolute-form authority, a future Last-Modified, `server_name` injection, HEAD with Range, Date on errors, dotfiles, and the supervisor items (stdio, PID 1 orphans, backoff, environment, the re-exec bound, the cgroup quota, a failed registration).
+    - A suspicion the reviewer could not reproduce is handled too: before closing at once, the server reads once more, and lingers if a late pipelined request arrived. Closing with it unread would reset the connection.
+    - **Planted bugs:** 33 of the first 36 caught. Of the three survivors:
+      - the stdio fix was hidden by the lifeline fix (log lines on a lifeline no longer stop a worker); the test now checks the supervisor's fds 0–2 directly;
+      - `body_cut` at close was reached by no case until a client resetting mid-body was added;
+      - `body_cut` on a malformed body is defense in depth: without it the hook still comes, when the connection closes after its 400.
+  - **Leads for later:** a vDSO clock; sendfile for large files (it needs the SIGPIPE decision in `linux/sys.mojo`); precompressed files; and TLS, which is a project of its own.

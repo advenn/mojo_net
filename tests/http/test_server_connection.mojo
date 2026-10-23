@@ -391,6 +391,29 @@ def test_continue_and_informational() raises:
     assert_equal(kinds, 3)
 
 
+def test_an_early_answer_to_an_unanswered_expect_closes() raises:
+    # A client waiting for 100 Continue may never send its body: answering
+    # without the 100 closes the connection, even for a short body (RFC
+    # 9110 10.1.1)...
+    var r = ResponseHead(417)
+    r.headers.add("Content-Length", "0")
+    var waiting = _one("POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n")
+    waiting.send_response(r)
+    waiting.end_response()
+    assert_true(waiting.should_close())
+    assert_true(_sent(waiting).find("Connection: close") >= 0)
+    assert_true(waiting.input_pending())
+    # ...but after the 100, the client sends it: a short rest is read on
+    var continued = _one("POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n")
+    continued.send_continue()
+    continued.send_response(r)
+    continued.end_response()
+    assert_false(continued.should_close())
+    assert_false(_sent(continued).find("Connection: close") >= 0)
+    _feed(continued, "okGET /next HTTP/1.1\r\nHost: x\r\n\r\n")
+    assert_equal(_events(continued), "DATA ok / END / HEAD GET /next HTTP/1.1 NONE / END")
+
+
 def test_upgrade_and_connect() raises:
     var s = ServerConnection()
     _feed(s, "GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n\x81\x05hello")

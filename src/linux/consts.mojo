@@ -244,9 +244,12 @@ comptime SIGUSR2: Int = 12
 
 # Processes (clone3 / waitid)
 comptime CLONE_PIDFD: Int = 4096
+comptime P_ALL: Int = 0
+comptime P_PID: Int = 1
 comptime P_PIDFD: Int = 3
 comptime WEXITED: Int = 4
 comptime WNOHANG: Int = 1
+comptime WNOWAIT: Int = 16777216
 comptime CLD_EXITED: Int = 1
 comptime CLD_KILLED: Int = 2
 comptime CLD_DUMPED: Int = 3

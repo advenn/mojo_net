@@ -5,6 +5,7 @@ from /proc/<pid>/status, so no shell in between can change them), `Exec`
 (this program's arguments and environment, edits, NUL bytes), and this
 process's threads and whether all of them block a signal."""
 
+from std.python import Python
 from std.testing import TestSuite, assert_equal, assert_false, assert_true
 
 from linux import Epoll
@@ -14,7 +15,17 @@ from linux.error import ErrorKind
 from linux.fd import OwnedFd
 from linux.fs import read_file
 from linux.nr import SYS_gettid
-from linux.process import Child, Exec, ExitStatus, all_threads_block, allowed_cpus, set_allowed_cpus, spawn, threads
+from linux.process import (
+    Child,
+    Exec,
+    ExitStatus,
+    all_threads_block,
+    allowed_cpus,
+    reap_others,
+    set_allowed_cpus,
+    spawn,
+    threads,
+)
 from linux.syscall import syscall0
 from linux.signal import SignalSet, block, blocked, set_mask
 from linux import sys
@@ -172,6 +183,51 @@ def test_threads_and_their_masks() raises:
     assert_false(all_threads_block(SignalSet.of(SIGUSR2)))
     _ = set_mask(before)
     assert_true(all_threads_block(SignalSet.empty()))
+
+
+def test_a_child_can_start_with_another_signal_mask() raises:
+    var before = blocked()
+    _ = block(SignalSet.of(SIGUSR2, SIGTERM))
+    var sleeper = Exec("/bin/sleep", ["sleep", "30"])
+    var c = spawn(sleeper, signal_mask=SignalSet.of(SIGTERM))  # USR2 not
+    _ = set_mask(before)
+    var sigblk = _status_field(c.pid, "SigBlk")
+    var low = atol(sigblk[byte = sigblk.byte_length() - 8 :], base=16)
+    assert_equal((low >> (SIGUSR2 - 1)) & 1, 0)
+    assert_equal((low >> (SIGTERM - 1)) & 1, 1)
+    c.signal(SIGKILL)
+    assert_equal(c.wait(), ExitStatus(-1, SIGKILL))
+
+
+def test_reap_others_leaves_the_known_children() raises:
+    var six = _sh("exit 6")
+    var mine = spawn(six)
+    var t = Instant.now()
+    while t.elapsed() < Duration.from_millis(300):  # (let it end)
+        pass
+    # A child this test does not know about: started by Python, ended, a
+    # zombie until someone waits for it.
+    var subprocess = Python.import_module("subprocess")
+    var other = subprocess.Popen(Python.list("/bin/sh", "-c", "exit 0"))
+    var other_pid = Int(py=other.pid)
+    t = Instant.now()
+    while t.elapsed() < Duration.from_millis(300):
+        pass
+    var known = List[Int]()
+    known.append(mine.pid)
+    var reaped = 0
+    for _ in range(3):  # (the first child it meets may be the known one)
+        reaped += reap_others(known)
+        if reaped > 0:
+            break
+        _ = mine.try_wait()  # reap ours, so the other comes up
+    assert_equal(reaped, 1)
+    var gone = False
+    try:
+        _ = Python.import_module("os").kill(other_pid, 0)
+    except:
+        gone = True  # (reaped: no such process)
+    assert_true(gone)
 
 
 def test_a_nul_in_an_argument_is_refused() raises:

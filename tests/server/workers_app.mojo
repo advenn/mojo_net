@@ -2,10 +2,10 @@
 under `run_workers` (WORKERS of them; 0 for one process with
 `Stop.on_signals`). PIN=1 pins the workers; CRASH=1 makes every worker
 exit with status 3 as soon as it starts; STUBBORN=1 makes the workers
-ignore stop requests (no `stop_on`); STOP_TIMEOUT_MS sets the
-supervisor's `stop_timeout`. Routes: /pid ("<worker> <pid>"),
-/upload (the body's length), /threads ("<threads> <Cpus_allowed_list>"
-of the worker)."""
+ignore stop requests (no `stop_on`); STOP_TIMEOUT_MS and RESTART_DELAY_MS
+set the supervisor's `stop_timeout` and `restart_delay`. Routes: /pid
+("<worker> <pid>"), /upload (the body's length), /threads ("<threads>
+<Cpus_allowed_list>" of the worker), /env (its MOJO_NET_WORKER)."""
 
 from std.os import getenv
 from std.sys import argv, exit
@@ -43,6 +43,8 @@ struct App(Handler):
             res.text(200, String("got ", len(req.body)))
         elif path == "/threads":
             res.text(200, String(len(threads()), " ", _cpus_allowed()))
+        elif path == "/env":
+            res.text(200, String("[", getenv("MOJO_NET_WORKER"), "]"))
         else:
             res.text(404, "")
 
@@ -57,6 +59,9 @@ def main() raises:
         var timeout = getenv("STOP_TIMEOUT_MS")
         if timeout.byte_length() > 0:
             config.stop_timeout = Duration.from_millis(atol(timeout))
+        var delay = getenv("RESTART_DELAY_MS")
+        if delay.byte_length() > 0:
+            config.restart_delay = Duration.from_millis(atol(delay))
         var w = run_workers(config)
         if not w:
             return

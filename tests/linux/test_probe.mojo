@@ -21,7 +21,9 @@ from linux.probe import (
     KernelVersion,
     ProbePolicy,
     auxv_lookup,
+    _quota_of,
     cpu_count,
+    cpu_quota,
     get_rlimit,
     has_epoll_pwait2,
     io_uring_setup_probe,
@@ -76,6 +78,17 @@ def _open_fd_count() raises -> Int:
 
 
 # ---- KernelVersion parsing --------------------------------------------------
+
+
+def test_cgroup_cpu_quota_rounds_up() raises:
+    assert_equal(_quota_of("max 100000").or_else(-1), -1)  # no quota
+    assert_equal(_quota_of("150000 100000\n").or_else(-1), 2)  # --cpus=1.5
+    assert_equal(_quota_of("100000 100000").or_else(-1), 1)
+    assert_equal(_quota_of("50000 100000").or_else(-1), 1)  # (at least one)
+    assert_equal(_quota_of("400000 100000").or_else(-1), 4)
+    assert_equal(_quota_of("garbage").or_else(-1), -1)
+    assert_equal(_quota_of("0 100000").or_else(-1), -1)
+    _ = cpu_quota()  # reads this host's cgroup without failing
 
 
 def test_parse_release_table() raises:

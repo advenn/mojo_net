@@ -4,11 +4,13 @@ children (`spawn`) and waiting for them through pidfds (`Child`), CPU
 affinity, and this process's threads (`threads`, `all_threads_block`).
 
 `spawn` is clone3 with CLONE_PIDFD (a fork) followed at once by execve in
-the child. Between the two the child runs only raw syscalls on memory laid
-out before the clone (`Exec`). Every Mojo process has threads, and a child
-copied from one may find a lock (the allocator's, say) held forever by a
-thread that does not exist in it: it must not allocate or free before
-execve replaces it.
+the child; where a seccomp profile refuses clone3 (Docker's default, with
+ENOSYS), clone(2) with CLONE_PIDFD does the same. Between the clone and
+execve the child runs only raw syscalls on memory laid out before the
+clone (`Exec`). Every Mojo process has threads, and a child copied from
+one may find a lock (the allocator's, say) held forever by a thread that
+does not exist in it: it must not allocate or free before execve
+replaces it.
 """
 
 from std.bit import pop_count
@@ -21,16 +23,21 @@ from .consts import (
     F_SETFD,
     O_CLOEXEC,
     O_RDONLY,
+    P_ALL,
+    P_PID,
     P_PIDFD,
     SIGCHLD,
+    SIG_SETMASK,
     WEXITED,
     WNOHANG,
+    WNOWAIT,
 )
 from .errno import Errno
 from .error import ErrorKind, IoError, check
 from .fd import AsFd, OwnedFd
 from .fs import read_file
 from .nr import (
+    SYS_clone,
     SYS_clone3,
     SYS_execve,
     SYS_exit_group,
@@ -38,6 +45,7 @@ from .nr import (
     SYS_getdents64,
     SYS_openat,
     SYS_pidfd_send_signal,
+    SYS_rt_sigprocmask,
     SYS_sched_getaffinity,
     SYS_sched_setaffinity,
     SYS_waitid,
@@ -269,19 +277,23 @@ struct Child(AsFd, Movable, Writable):
         writer.write("Child(pid=", self.pid, ")")
 
 
-def _child(path: Int, argv: Int, envp: Int, keep: Int, cpus: Int):
+def _child(path: Int, argv: Int, envp: Int, keep: Int, cpus: Int, mask: Int):
     """The new child, until execve: raw syscalls on prepared memory only
     (see the module docs). Never returns."""
     if cpus != 0:
         _ = syscall3(SYS_sched_setaffinity, 0, _CPU_WORDS * 8, cpus)
     if keep >= 0:
         _ = syscall3(SYS_fcntl, keep, F_SETFD, 0)  # survives execve
+    if mask != 0:
+        _ = syscall4(SYS_rt_sigprocmask, SIG_SETMASK, mask, 0, 8)
     _ = syscall3(SYS_execve, path, argv, envp)
     while True:
         _ = syscall1(SYS_exit_group, 127)
 
 
-def spawn(mut program: Exec, *, keep: Int32 = -1, cpu: Int = -1) raises IoError -> Child:
+def spawn(
+    mut program: Exec, *, keep: Int32 = -1, cpu: Int = -1, signal_mask: Optional[SignalSet] = None
+) raises IoError -> Child:
     """Start `program` in a new child process.
 
     - `keep`: a descriptor (CLOEXEC, like every descriptor this library
@@ -290,8 +302,9 @@ def spawn(mut program: Exec, *, keep: Int32 = -1, cpu: Int = -1) raises IoError 
       execve. The Mojo runtime sizes its thread pool by the affinity at
       start, so the program starts one runtime thread instead of one per
       CPU; it may widen its own affinity afterwards.
-    - The child inherits the calling thread's signal mask, and its other
-      dispositions as execve leaves them.
+    - `signal_mask`: the child's signal mask from before execve. Without one it
+      inherits the calling thread's, which is what a program that blocked
+      SIGTERM for a signalfd may not want its children to have.
     - A child whose execve fails exits with status 127."""
     program._layout()
     var mask = List[UInt64](length=_CPU_WORDS, fill=0)
@@ -308,18 +321,52 @@ def spawn(mut program: Exec, *, keep: Int32 = -1, cpu: Int = -1) raises IoError 
     var argv = program._argv_ptr()
     var envp = program._envp_ptr()
     var cpus = Int(mask.unsafe_ptr()) if cpu >= 0 else 0
+    var sigs: UInt64 = signal_mask.value().bits if signal_mask else 0
+    var sigs_at = Int(Pointer(to=sigs)) if signal_mask else 0
+    var op: StaticString = "clone3"
     var r = syscall2(SYS_clone3, Int(Pointer(to=args)), 88)
     if r == 0:
-        _child(path, argv, envp, Int(keep), cpus)
+        _child(path, argv, envp, Int(keep), cpus, sigs_at)
+    if is_err(r) and (Errno(err_of(r)) == Errno.ENOSYS or Errno(err_of(r)) == Errno.EPERM):
+        # clone3 refused (a seccomp filter): clone(2) with CLONE_PIDFD,
+        # which stores the pidfd at parent_tid, its third argument on both
+        # architectures (they differ in the fourth and fifth, unused here).
+        op = "clone"
+        r = syscall5(SYS_clone, CLONE_PIDFD | SIGCHLD, 0, Int(Pointer(to=pidfd)), 0, 0)
+        if r == 0:
+            _child(path, argv, envp, Int(keep), cpus, sigs_at)
     # Everything the child reads stays alive (and undestroyed) past the
     # clone on both sides: in the child, nothing after `_child` runs.
     keep_alive(args)
     keep_alive(mask)
+    keep_alive(sigs)
     keep_alive(program)
     keep_alive(pidfd)
     if is_err(r):
-        raise IoError.from_errno("clone3", Errno(err_of(r)))
+        raise IoError.from_errno(op, Errno(err_of(r)))
     return Child(r, OwnedFd(unsafe_from_raw=pidfd))
+
+
+def reap_others(known: List[Int]) raises IoError -> Int:
+    """Reap children that ended and are not among the pids in `known`:
+    orphans a process running as PID 1 (in a container) inherits, which
+    would otherwise stay zombies. Stops at the first one that is in
+    `known` (its own pidfd reaps it). Returns how many it reaped."""
+    var reaped = 0
+    while True:
+        var info = Siginfo()
+        var r = syscall5(SYS_waitid, P_ALL, 0, Int(Pointer(to=info)), WEXITED | WNOHANG | WNOWAIT, 0)
+        keep_alive(info)
+        if is_err(r) or info.pid == 0:
+            return reaped  # (ECHILD: no children at all)
+        var pid = Int(info.pid)
+        for i in range(len(known)):
+            if known[i] == pid:
+                return reaped
+        var done = Siginfo()
+        _ = syscall5(SYS_waitid, P_PID, pid, Int(Pointer(to=done)), WEXITED | WNOHANG, 0)
+        keep_alive(done)
+        reaped += 1
 
 
 def allowed_cpus() raises IoError -> List[Int]:

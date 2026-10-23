@@ -21,20 +21,23 @@ leaves that directory.
     router.get("/assets/*path", assets)
 
 - **Paths.** The path given (a route's decoded rest) is checked first: no
-  empty, "." or ".." segment, and no NUL (404). The kernel then keeps the
-  open beneath the directory (openat2 with RESOLVE_BENEATH): no symlink
-  out of it either. Only regular files are served; a FIFO or a device is
-  a 404 (and is opened nonblocking, so it cannot stall the loop).
+  empty, "." or ".." segment, and no NUL (404); dotfiles (`.env`, `.git/`)
+  are 404 too, but for `.well-known`, unless `dotfiles` is set. The kernel
+  then keeps the open beneath the directory (openat2 with
+  RESOLVE_BENEATH): no symlink out of it either. Only regular files are
+  served; a FIFO, socket or device is a 404 (and is opened nonblocking,
+  so it cannot stall the loop).
 - **Directories** serve their index file (`index.html`), after a 301 to
   the path with a trailing "/" when it has none. There are no listings.
 - **Responses** carry Content-Type (from the extension), Content-Length,
-  Last-Modified, an ETag (size and modification time, as nginx makes
-  them) and `Accept-Ranges: bytes`.
-- **Conditional requests** (RFC 9110 13): If-None-Match, else
-  If-Modified-Since, answer 304.
-- **Ranges** (RFC 9110 14): one byte range gets 206 with Content-Range,
-  and an unsatisfiable one 416; several ranges, or an If-Range that does
-  not match, get the whole file.
+  Last-Modified (never later than now, RFC 9110 8.8.2.1), an ETag (size
+  and modification time, as nginx makes them) and `Accept-Ranges: bytes`.
+- **Conditional requests** (RFC 9110 13.2.2, in its order): If-Match
+  (strong comparison), else If-Unmodified-Since, failing answer 412; then
+  If-None-Match (weak), else If-Modified-Since, answer 304.
+- **Ranges** (RFC 9110 14), for GET only: one byte range gets 206 with
+  Content-Range, and an unsatisfiable one 416; several ranges, or an
+  If-Range that does not match, get the whole file.
 - **Bodies** up to 64 KiB are read whole. Larger ones are streamed
   (`res.stream()`) in 64 KiB pieces as the client takes them, which is
   why the application passes `produce` and `stream_ended` on (for the
@@ -45,8 +48,10 @@ leaves that directory.
 from std.collections import Dict
 
 from linux import ErrorKind, IoError
+from linux.errno import Errno
 from linux.fd import OwnedFd
 from linux.fs import is_dir, is_regular, open_beneath, open_dir, pread, stat_fd
+from linux.time import NANOS_PER_SEC, unix_time_ns
 from http.headers import next_element
 
 from .date import http_date, parse_http_date
@@ -147,12 +152,15 @@ def _hex(mut out: String, v: Int):
         out += chr(Int(tmp[i]))
 
 
-def _safe(path: StringSlice) -> Bool:
-    """No empty, "." or ".." segment and no NUL ("" itself is the root)."""
+def _safe(path: StringSlice, dotfiles: Bool) -> Bool:
+    """No empty, "." or ".." segment and no NUL ("" itself is the root);
+    unless `dotfiles`, no segment starting with "." but `.well-known`."""
     if path.byte_length() == 0:
         return True
     for seg in path.split("/"):
         if seg.byte_length() == 0 or seg == "." or seg == "..":
+            return False
+        if seg.startswith(".") and not dotfiles and not (seg == ".well-known"):
             return False
         for b in seg.as_bytes():
             if b == 0:
@@ -165,6 +173,21 @@ def _opaque(tag: StringSlice) -> StringSlice[tag.origin]:
     if tag.startswith("W/"):
         return tag[byte=2:]
     return tag
+
+
+def _strong_match(header: StringSlice, etag: StringSlice) -> Bool:
+    """If-Match `header` names `etag` (strong comparison: a weak tag never
+    matches) or is "*"."""
+    var h = header.as_bytes()
+    var pos = 0
+    while True:
+        var e = next_element(h, pos)
+        if not e:
+            return False
+        var b = e.value()
+        var item = StringSlice(unsafe_from_utf8=h[b.start : b.end])
+        if item == "*" or (not item.startswith("W/") and item == etag):
+            return True
 
 
 def _none_match(header: StringSlice, etag: StringSlice) -> Bool:
@@ -256,22 +279,28 @@ struct StaticFiles(Movable):
     var _root: OwnedFd
     var index: String
     """The file a directory serves."""
+    var dotfiles: Bool
+    """Serve files and directories whose names start with "." (`.env`,
+    `.git/`); `.well-known` is served either way."""
     var _transfers: List[Optional[_Transfer]]
     var _free: List[Int]
     var _by_id: Dict[UInt64, Int]
 
-    def __init__(out self, var root: OwnedFd, index: String):
+    def __init__(out self, var root: OwnedFd, index: String, dotfiles: Bool = False):
         self._root = root^
         self.index = index
+        self.dotfiles = dotfiles
         self._transfers = List[Optional[_Transfer]]()
         self._free = List[Int]()
         self._by_id = Dict[UInt64, Int]()
 
     @staticmethod
-    def open(root: StringSlice, index: StringSlice = "index.html") raises IoError -> StaticFiles:
+    def open(
+        root: StringSlice, index: StringSlice = "index.html", dotfiles: Bool = False
+    ) raises IoError -> StaticFiles:
         """Serve the directory at `root` (`NotFound`, or `InvalidInput` if
         it is not one)."""
-        return StaticFiles(open_dir(root), String(index))
+        return StaticFiles(open_dir(root), String(index), dotfiles)
 
     def owns(self, req: Request) -> Bool:
         """Whether `req`'s response is a file this streams."""
@@ -292,7 +321,7 @@ struct StaticFiles(Movable):
         # One trailing "/" names a directory ("sub/"): checked without it.
         var dir_only = path.endswith("/")
         var rel = path[byte = 0 : path.byte_length() - 1] if dir_only else path
-        if not _safe(rel) or (dir_only and rel.byte_length() == 0):
+        if not _safe(rel, self.dotfiles) or (dir_only and rel.byte_length() == 0):
             res.text(404, "Not Found\n")
             return
         var name = String(rel) if rel.byte_length() > 0 else String(".")
@@ -334,11 +363,27 @@ struct StaticFiles(Movable):
         etag += "."
         _hex(etag, Int(st.mtime_nsec))
         etag += "\""
-        var modified = Int(st.mtime_sec)
+        # Never later than now: a future modification time is replaced by
+        # the time of the response (RFC 9110 8.8.2.1).
+        var modified = min(Int(st.mtime_sec), Int(unix_time_ns() // NANOS_PER_SEC))
         res.headers.set("ETag", etag)
         res.headers.set("Last-Modified", http_date(modified))
         res.headers.set("Accept-Ranges", "bytes")
-        # conditional requests (RFC 9110 13.2.2): If-None-Match first
+        # Preconditions, in RFC 9110 13.2.2's order: If-Match, else
+        # If-Unmodified-Since (412 when they fail)...
+        var im = req.headers.get("if-match")
+        var failed = False
+        if im:
+            failed = not _strong_match(im.value(), etag)
+        else:
+            var ius = req.headers.get("if-unmodified-since")
+            if ius:
+                var before = parse_http_date(String(ius.value()).strip())
+                failed = Bool(before) and modified > before.value()
+        if failed:
+            res.text(412, "Precondition Failed\n")
+            return
+        # ...then If-None-Match, else If-Modified-Since (304)
         var inm = req.headers.get("if-none-match")
         var not_modified = False
         if inm:
@@ -355,7 +400,7 @@ struct StaticFiles(Movable):
         var last = size - 1
         var partial = False
         var rh = req.headers.get("range")
-        if rh:
+        if rh and req.method == "GET":  # (Range is defined for GET only)
             var ok = True
             var ir = req.headers.get("if-range")
             if ir:
@@ -407,8 +452,16 @@ struct StaticFiles(Movable):
     def _refuse(self, e: IoError, mut res: Response) raises:
         if e.kind == ErrorKind.PermissionDenied:
             res.text(403, "Forbidden\n")
-        elif e.kind == ErrorKind.NotFound or e.kind == ErrorKind.InvalidInput:
-            res.text(404, "Not Found\n")  # (InvalidInput: it would leave the directory)
+        elif (
+            e.kind == ErrorKind.NotFound
+            or e.kind == ErrorKind.InvalidInput  # it would leave the directory
+            or e.errno == Errno.ENOTDIR  # a file in the middle of the path
+            or e.errno == Errno.ELOOP  # a symlink loop
+            or e.errno == Errno.ENXIO  # a socket
+            or e.errno == Errno.ENODEV  # a device without a driver
+            or e.errno == Errno.ENAMETOOLONG
+        ):
+            res.text(404, "Not Found\n")
         else:
             raise e
 

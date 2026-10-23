@@ -25,6 +25,7 @@ comptime SYS_kill: Int = 62 if _X86 else 129
 comptime SYS_tgkill: Int = 234 if _X86 else 131
 comptime SYS_execve: Int = 59 if _X86 else 221
 comptime SYS_clone3: Int = 435 if _X86 else 435
+comptime SYS_clone: Int = 56 if _X86 else 220
 comptime SYS_waitid: Int = 247 if _X86 else 95
 comptime SYS_pidfd_send_signal: Int = 424 if _X86 else 424
 comptime SYS_rt_sigprocmask: Int = 14 if _X86 else 135

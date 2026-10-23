@@ -507,6 +507,9 @@ struct Router[A: Handler](Handler):
     def on_body(mut self, req: Request, data: Span[UInt8, _]) raises:
         self.app.on_body(req, data)
 
+    def body_cut(mut self, req: Request):
+        self.app.body_cut(req)
+
     def produce(mut self, req: Request, mut out: List[UInt8]) raises -> Bool:
         return self.app.produce(req, out)
 
