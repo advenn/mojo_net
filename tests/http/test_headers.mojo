@@ -234,7 +234,7 @@ def test_obs_text_keeps_exact_bytes_and_a_lossy_string() raises:
     var raw = List[UInt8]()
     for b in [0x41, 0xE9, 0x42]:  # "A", Latin-1 e-acute, "B"
         raw.append(UInt8(b))
-    h._push(Span(_bytes("Content-Disposition")), Span(raw))
+    h._push(Span(_bytes("Content-Disposition")), Span(raw), utf8=False)
     var exact = h.get_bytes("content-disposition").value()
     assert_equal(len(exact), 3)
     assert_equal(Int(exact[1]), 0xE9)
@@ -305,7 +305,7 @@ def test_copy_is_independent_and_compact() raises:
     h.set("Live", "2")
     assert_equal(String(c.get("live").value()), "1")
     assert_equal(String(h.get("live").value()), "2")
-    assert_equal(len(c._data), 5)  # "Live" + "1": no garbage copied
+    assert_equal(c._used, 5)  # "Live" + "1": no garbage copied
 
 
 def test_compaction_keeps_both_views_of_obs_text() raises:
@@ -314,12 +314,12 @@ def test_compaction_keeps_both_views_of_obs_text() raises:
     for b in [0x61, 0xFF, 0xFE, 0x62]:  # "a", two non-UTF-8 bytes, "b"
         raw.append(UInt8(b))
     h.add("Before", "1")
-    h._push(Span(_bytes("X-Raw")), Span(raw))
+    h._push(Span(_bytes("X-Raw")), Span(raw), utf8=False)
     h.add("After", "2")
-    var before = len(h._data)
+    var before = h._used
     for i in range(3000):
         h.set("Churn", String("c" * 20, i))
-    assert_true(len(h._data) < before + 4096 + 64)  # compacted at least once
+    assert_true(h._used < before + 4096 + 64)  # compacted at least once
     assert_equal(String(h.get("x-raw").value()), "a��b")
     var exact = h.get_bytes("x-raw").value()
     assert_equal(len(exact), 4)
@@ -476,7 +476,8 @@ def test_random_operations_match_a_model() raises:
     var live = 0
     for i in range(len(names)):
         live += names[i].byte_length() + values[i].byte_length()
-    assert_true(len(h._data) < 2 * live + 2 * 4096, String("arena ", len(h._data), " for ", live, " live bytes"))
+    assert_true(h._used < 2 * live + 2 * 4096, String("arena holds ", h._used, " for ", live, " live bytes"))
+    assert_true(len(h._data) <= 64 * 1024)  # capacity too (unbounded growth would be ~1 MB)
 
 
 def main() raises:

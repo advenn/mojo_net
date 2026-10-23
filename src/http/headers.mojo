@@ -53,6 +53,9 @@ comptime _TCHAR_HI: UInt64 = 0x57FFFFFFC7FFFFFE
 comptime _COMPACT_MIN = 4096
 """Garbage bytes below which the arena is never compacted."""
 
+comptime _MIN_ARENA = 256
+"""The smallest arena allocated."""
+
 
 # ---- field syntax -------------------------------------------------------------
 
@@ -220,18 +223,24 @@ struct Headers(Copyable, Defaultable, Movable, Sized, Writable):
     """Ordered, case-insensitive HTTP fields (see the module docs)."""
 
     var _data: List[UInt8]
+    """The arena. Its length is its capacity: the first `_used` bytes hold
+    the names and values (like `ByteBuffer`, appends are a bounds check and
+    a copy)."""
+    var _used: Int
     var _fields: List[_Field]
     var _garbage: Int
     """Arena bytes no field refers to any more."""
 
     def __init__(out self):
         self._data = List[UInt8]()
+        self._used = 0
         self._fields = List[_Field]()
         self._garbage = 0
 
     def __init__(out self, *, capacity: Int):
         """Room for `capacity` fields of average size without regrowing."""
-        self._data = List[UInt8](capacity=capacity * 32)
+        self._data = List[UInt8](unsafe_uninit_length=max(capacity, 0) * 32)
+        self._used = 0
         self._fields = List[_Field](capacity=capacity)
         self._garbage = 0
 
@@ -239,7 +248,11 @@ struct Headers(Copyable, Defaultable, Movable, Sized, Writable):
         """A compact copy (garbage is not copied)."""
         self = Self(capacity=len(copy._fields))
         for f in copy._fields:
-            self._push(copy._bytes(f.name, f.name_len), copy._bytes(f.value, f.value_len))
+            self._push(
+                copy._bytes(f.name, f.name_len),
+                copy._bytes(f.value, f.value_len),
+                utf8=f.text == f.value,
+            )
 
     # ---- size -------------------------------------------------------------
 
@@ -254,7 +267,7 @@ struct Headers(Copyable, Defaultable, Movable, Sized, Writable):
 
     def clear(mut self):
         """Remove every field, keeping the allocated capacity."""
-        self._data.clear()
+        self._used = 0
         self._fields.clear()
         self._garbage = 0
 
@@ -274,7 +287,7 @@ struct Headers(Copyable, Defaultable, Movable, Sized, Writable):
         var n = name.as_bytes()
         var v = value.as_bytes()
         var t = Self._checked(n, v, "Headers.add")
-        self._push(n, v[t.start : t.end])
+        self._push(n, v[t.start : t.end], utf8=True)
 
     def set(mut self, name: StringSlice, value: StringSlice) raises IoError:
         """Replace every `name` field with one line holding `value`, at the
@@ -285,12 +298,12 @@ struct Headers(Copyable, Defaultable, Movable, Sized, Writable):
         var t = Self._checked(n, v, "Headers.set")
         var first = self._find(n, 0)
         if first < 0:
-            self._push(n, v[t.start : t.end])
+            self._push(n, v[t.start : t.end], utf8=True)
             return
         _ = self._drop_after(n, first + 1)
         var f = self._fields[first]
         self._garbage += f.stored()
-        var nv = self._store(n, v[t.start : t.end])
+        var nv = self._store(n, v[t.start : t.end], utf8=True)
         self._fields[first] = nv
         self._maybe_compact()
 
@@ -305,24 +318,85 @@ struct Headers(Copyable, Defaultable, Movable, Sized, Writable):
                 raise IoError.of_kind(op, ErrorKind.InvalidInput)
         return trim_ows(value)
 
-    def _store(mut self, name: Span[UInt8, _], value: Span[UInt8, _]) -> _Field:
+    @inline(.always)
+    def _reserve(mut self, n: Int):
+        """Room for `n` more arena bytes."""
+        if self._used + n > len(self._data):
+            self._grow(n)
+
+    @no_inline
+    def _grow(mut self, n: Int):
+        var cap = max(self._used + n, 2 * len(self._data), _MIN_ARENA)
+        var data = List[UInt8](unsafe_uninit_length=cap)
+        if self._used > 0:
+            unsafe_memcpy(
+                dest=data.unsafe_ptr(),
+                src=self._data.unsafe_ptr(),
+                count=self._used,
+            )
+        self._data = data^
+
+    @inline(.always)
+    def _append(mut self, s: Span[UInt8, _]) -> Int:
+        """Copy `s` (never a view of the arena) to the end of the arena and
+        return where it starts."""
+        var at = self._used
+        var n = len(s)
+        if n > 0:
+            self._reserve(n)
+            unsafe_memcpy(
+                dest=self._data.unsafe_ptr().unsafe_offset(at),
+                src=s.unsafe_ptr(),
+                count=n,
+            )
+            self._used = at + n
+        return at
+
+    def _store(
+        mut self, name: Span[UInt8, _], value: Span[UInt8, _], *, utf8: Bool
+    ) -> _Field:
         """Copy `name` and `value` into the arena (they are already valid)
-        and return the record; the caller places it."""
-        var at = len(self._data)
-        self._data.extend(name)
-        self._data.extend(value)
-        var vat = at + len(name)
-        if _is_ascii(value) or _is_utf8(value):
+        and return the record; the caller places it. `utf8` says the value
+        is known to be UTF-8 (ASCII, or from a string); otherwise it is
+        checked, and a lossy copy is stored for the string view."""
+        self._reserve(len(name) + len(value))
+        var at = self._append(name)
+        var vat = self._append(value)
+        if utf8 or _is_ascii(value) or _is_utf8(value):
             return _Field(at, len(name), vat, len(value), vat, len(value))
         var text = String(from_utf8_lossy=value)
-        var tat = len(self._data)
-        self._data.extend(text.as_bytes())
+        var tat = self._append(text.as_bytes())
         return _Field(at, len(name), vat, len(value), tat, text.byte_length())
 
-    def _push(mut self, name: Span[UInt8, _], value: Span[UInt8, _]):
+    @inline(.always)
+    def _adopt(mut self, raw: Span[UInt8, _]) -> Int:
+        """Copy a block of received field lines into the arena in one go
+        and return where it starts, so the parser can record fields as
+        offsets into it (`_push_at`) instead of copying each one. The
+        bytes around the names and values (": ", CR LF) stay in the arena
+        until the next `clear()`; they are not counted as garbage."""
+        return self._append(raw)
+
+    @inline(.always)
+    def _push_at(mut self, name: Int, name_len: Int, value: Int, value_len: Int, *, utf8: Bool):
+        """Append a field whose name and value are already in the arena
+        (see `_adopt`) and valid. `utf8`: the value has no byte above 0x7F;
+        otherwise it is checked, and a lossy copy is stored for the string
+        view."""
+        if utf8 or _is_utf8(self._bytes(value, value_len)):
+            self._fields.append(_Field(name, name_len, value, value_len, value, value_len))
+            return
+        var text = String(from_utf8_lossy=self._bytes(value, value_len))
+        var tat = self._append(text.as_bytes())
+        self._fields.append(_Field(name, name_len, value, value_len, tat, text.byte_length()))
+
+    @inline(.always)
+    def _push(mut self, name: Span[UInt8, _], value: Span[UInt8, _], *, utf8: Bool):
         """Append a field whose name and value are already valid: the
-        parser's entry point, after it checked the bytes itself."""
-        self._fields.append(self._store(name, value))
+        parser's entry point, after it checked the bytes itself (`utf8`:
+        it saw no byte above 0x7F)."""
+        var f = self._store(name, value, utf8=utf8)
+        self._fields.append(f)
 
     # ---- removing ---------------------------------------------------------
 
@@ -349,21 +423,29 @@ struct Headers(Copyable, Defaultable, Movable, Sized, Writable):
         return dropped
 
     def _maybe_compact(mut self):
-        if self._garbage < _COMPACT_MIN or self._garbage * 2 < len(self._data):
+        if self._garbage < _COMPACT_MIN or self._garbage * 2 < self._used:
             return
-        var data = List[UInt8](capacity=len(self._data) - self._garbage)
+        var live = self._used - self._garbage
+        var data = List[UInt8](unsafe_uninit_length=max(live, _MIN_ARENA))
+        var dst = data.unsafe_ptr()
+        var src = self._data.unsafe_ptr()
+        var at = 0
         for i in range(len(self._fields)):
             var f = self._fields[i]
-            var at = len(data)
-            data.extend(self._bytes(f.name, f.name_len))
-            var vat = len(data)
-            data.extend(self._bytes(f.value, f.value_len))
+            var nat = at
+            unsafe_memcpy(dest=dst.unsafe_offset(at), src=src.unsafe_offset(f.name), count=f.name_len)
+            at += f.name_len
+            var vat = at
+            unsafe_memcpy(dest=dst.unsafe_offset(at), src=src.unsafe_offset(f.value), count=f.value_len)
+            at += f.value_len
             var tat = vat
             if f.text != f.value:
-                tat = len(data)
-                data.extend(self._bytes(f.text, f.text_len))
-            self._fields[i] = _Field(at, f.name_len, vat, f.value_len, tat, f.text_len)
+                tat = at
+                unsafe_memcpy(dest=dst.unsafe_offset(at), src=src.unsafe_offset(f.text), count=f.text_len)
+                at += f.text_len
+            self._fields[i] = _Field(nat, f.name_len, vat, f.value_len, tat, f.text_len)
         self._data = data^
+        self._used = at
         self._garbage = 0
 
     # ---- lookup -----------------------------------------------------------

@@ -10,6 +10,7 @@ enforces it.
 """
 
 from .headers import Headers
+from .parse import HeadParser, Limits, RequestHead, ResponseHead
 from .types import (
     CONNECT,
     DELETE,

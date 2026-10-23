@@ -60,7 +60,7 @@ pixi run bench build               # rt benchmarks (bench/rt/README.md)
   - `src/linux`: the syscall layer.
   - `src/bytes`: `ByteBuffer`, and the sans-I/O `Codec` trait (`bytes.codec`, contract 1).
   - `src/net`: sockets.
-  - `src/http`: HTTP/1.1. `types` (versions, methods, status codes), `headers` (`Headers`: arena-backed, case-insensitive, ordered; validated adds; exact bytes plus a string view for obs-text).
+  - `src/http`: HTTP/1.1. `types` (versions, methods, status codes), `headers` (`Headers`: arena-backed, case-insensitive, ordered; validated adds; exact bytes plus a string view for obs-text), `parse` (`HeadParser`: incremental heads, strict requests, lenient responses, limits; `RequestHead` / `ResponseHead`). `tests/http/head_oracle.py` is the parser's Python reference for differential fuzzing; keep it in step with any rule change.
   - `src/rt` (frozen): `core` (Loop + proactor), `driver` (trait), `epoll_driver`, `sim` (simulator), `event_loop`, `timers`, `slab`, `mailbox`, `evented` (`TcpServer[H]`/`dial[H]` connections driving a `ConnHandler`).
 - **`net` modules:**
   - `addr`: addresses.
@@ -102,6 +102,12 @@ pixi run bench build               # rt benchmarks (bench/rt/README.md)
   - When only a raw address reaches the kernel (for example inside a `Msghdr`), call `sys.keep_alive(x)` after the syscall.
   - Registering an fd with epoll does **not** keep its owner alive: whoever registers must own the fd until `EPOLL_CTL_DEL`.
   - The regression test is `tests/linux/test_sys.mojo::test_owner_outlives_syscall_when_last_use`.
+- **Field reassignment in a loop corrupts memory (Mojo 1.2.0 compiler bug).**
+  - **Trigger:** a local struct with heap-owning fields (`String`, `List`, ...). After one field's last use, a loop reassigns another field. The heap is corrupted, and the crash comes later, inside the runtime's allocator.
+  - **Not affected:** straight-line reassignment, and function arguments (`mut` / `ref`), because only locals get field-wise early destruction.
+  - **Workaround:** keep the struct alive past the loop (`_ = x^` after it, or pass it whole to a function).
+  - **Found** when a benchmark parsed into a local `ResponseHead` (last use of `headers`) and then reassigned `reason` in a loop.
+  - **Repro**, which crashes on 1.2.0: `struct H(Movable)` with `var s: String` and `var l: List[UInt8]`; `var h = H(); h.l.append(1); for _ in range(1000): h.s = String("ab")`.
 - **ABI structs:**
   - Use `Array[UInt8, N]` for C arrays, never `SIMD`. SIMD is aligned to its full width, which made `sockaddr_in6` 48 bytes.
   - A struct with `Array` fields can't be `TrivialRegisterPassable`; use `(Copyable, Movable)`.
@@ -125,6 +131,7 @@ pixi run bench build               # rt benchmarks (bench/rt/README.md)
   - `String.splitlines()` also splits on `\t` (verified on 1.2.0rc2 and 1.2.0); use `split("\n")`. This matters for HTTP parsing.
   - `TestSuite.run()` rejects unknown argv, and its times are in milliseconds.
   - Memory copies are spelled `unsafe_memcpy` / `unsafe_memmove`.
+  - In a string literal, `"\xff"` is the code point U+00FF (two UTF-8 bytes), not the byte 0xFF. Tests that need raw bytes build lists, or encode a literal as Latin-1 (`tests/http/test_parse.mojo::_b`).
 - **Runtime threads:** every Mojo process starts 1 + (CPUs in its affinity mask) runtime threads before `main`. Because a process is always multi-threaded, each kernel fd-table doubling stalls the fd-creating syscall for 20–40 ms. Long-running servers must pre-grow the fd table with `linux.probe.pregrow_fd_table(listener)` (see `docs/spikes.md`).
 - **`assert_equal`** needs identical types (`Int(buf[i])` vs `ord("x")`).
 - **Spellings to use:** `def` only (no `fn`), `comptime` (no `alias`), `Self.T` for struct parameters, `std.` import prefix, `@inline(.always)`, and `Layout[T](count=n)` (not the nightly-only `length=`).

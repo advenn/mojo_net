@@ -8,7 +8,7 @@ HTTP/1.1 for Mojo on Linux, per RFC 9110 (semantics) and RFC 9112 (message synta
 
 It is the base of the HTTP server (roadmap step 3). Package rules and the shared contracts are in `docs/design.md`; the transport is `net` (`docs/net.md`).
 
-**Status: active.** H1 (core types, header map) is done; H2 (parser) is next.
+**Status: active.** H1 (core types, header map) and H2 (head parser) are done; H3 (body framing) is next.
 
 ## Scope
 **In scope:**
@@ -52,6 +52,7 @@ A server-side parse error carries the status to answer with (400, 414, 431, 501 
 |---|---|
 | `types` | `Version`, method names (`GET`, ...), status classes, `check_status`, `reason` (the IANA registry's phrases) |
 | `headers` | `Headers`: ordered, case-insensitive multimap with validated adds, `get` / `get_all` / `combined` / `has_token`, exact bytes and a string view for obs-text, wire encoding. Also the field-syntax helpers the parser uses (`is_token`, `next_element`, ...) |
+| `parse` | `HeadParser`: incremental, limit-checked parsing of request and response heads into `RequestHead` / `ResponseHead`, which also encode themselves; `Limits`; the `E_*` rule names errors carry |
 
 ## Milestones
 - **H1: core types and the header map.** Done.
@@ -59,7 +60,12 @@ A server-side parse error carries the status to answer with (400, 414, 431, 501 
   - `Headers`: one byte arena plus offset records, so a message's fields cost two buffers and `clear()` reuses them. Garbage from `set` / `remove` is compacted once it outweighs the live bytes.
   - Tested against the RFC 9110 grammar (tchar, field bytes) and Python's `HTTPStatus`, with a randomized model check and planted bugs.
   - Measured: 10 typical request fields stored in ~190 ns, a lookup ~30 ns, encoding ~110 ns.
-- **H2: message-head parser.** Incremental (resumes the end-of-head scan where it stopped), limits, the strictness rules above; fuzzed with random splits and mutations, and benchmarked.
+- **H2: message-head parser.** Done.
+  - `HeadParser.request` / `response` take the unconsumed bytes and return None until the head is complete. The scan resumes where it stopped, so the work is linear however the bytes are split: a 60 KB head fed one byte per call costs 25 ns per call.
+  - The strictness rules above, and limits on the whole head, the start line and the field count, checked as bytes arrive. Errors name the rule broken, and requests carry the status to answer (400, 414 or 431). The limit errors do not depend on how the input was split.
+  - Scans test 32 bytes per step with SIMD masks (LF search, token and target checks, value validation), and the field lines are copied into the header arena once, with fields recorded as offsets.
+  - Tested rule by rule, and differentially against `tests/http/head_oracle.py`, an independent Python implementation from the RFC ABNF: 20,000 generated and mutated heads, each parsed whole and in random pieces. Every bug planted in the mutation runs (over 30, before and after the SIMD rewrite) is caught.
+  - Measured on an i5-1145G7, owned heads included: picohttpparser's 705-byte benchmark request in ~510 ns (1.4 GB/s), a 215-byte response with 7 fields in ~285 ns, a minimal request in ~125 ns; large heads at 4.4 GB/s.
 - **H3: body framing.** Content-Length, chunked with trailers, close-delimited; the RFC 9112 6.3 rules.
 - **H4: connection codecs.** `ClientConnection` and `ServerConnection` implementing `Codec`: keep-alive, pipelining, 1xx, HEAD / 204 / 304, `Connection: close`, upgrades.
 - **H5: blocking client.** `Url`, a keep-alive pool checked with `idle_state()`, `connect_host`, one deadline per request, bounded and streaming bodies; `http://` only.
