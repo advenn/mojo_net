@@ -54,8 +54,18 @@ destroy (CLAUDE.md).
 - A malformed request poisons the input side (rule 6). `error_status()` is
   the status to answer with (400, 414, 431, 501 or 505), which
   `send_error()` sends before the connection closes.
+- `close_gracefully()` (a server shutting down): the request in progress
+  gets the last response on the connection, which says `Connection: close`
+  if its head has not gone out yet; requests after it are not read. An
+  idle connection (nothing received since the last response) closes at
+  once.
 - `should_close()`: once `poll_transmit` has handed everything out, the
-  driver closes the connection.
+  driver closes the connection. If `input_pending()`, the client may
+  still be sending (input was left unread), and the driver should close
+  in stages, as RFC 9112 9.6 describes: shut down its write side, and
+  read and drop input until the client's end, or for a while. A reset
+  from closing at once can erase the response before the client reads
+  it.
 
 **ClientConnection**
 - `send_request(head)` takes its framing from the head:
@@ -548,6 +558,10 @@ struct ServerConnection(Codec, Copyable):
     var _resp_left: Int
     var _resp_close: Bool
     var _closing: Bool
+    var _draining: Bool
+    """`close_gracefully()` was called: no request after the current one."""
+    var _unread: Bool
+    """The connection closed with input left unread (`input_pending()`)."""
 
     def __init__(
         out self,
@@ -588,6 +602,8 @@ struct ServerConnection(Codec, Copyable):
         self._resp_left = 0
         self._resp_close = False
         self._closing = False
+        self._draining = False
+        self._unread = False
 
     # ---- receive ---------------------------------------------------------
 
@@ -718,7 +734,13 @@ struct ServerConnection(Codec, Copyable):
             if self._body.is_done():
                 # One request at a time: wait for its response to end, unless
                 # it already has.
-                self._in = _HEAD if self._answered else _WAIT
+                if self._answered and self._draining:
+                    self._closing = True  # it was the last one
+                    self._unread = len(self._rx) > 0
+                    self._in = _CLOSED
+                    self._rx.clear()
+                else:
+                    self._in = _HEAD if self._answered else _WAIT
                 self._answered = False
                 ev.kind = EventKind.END
                 if len(ev._trailers) == 0:
@@ -819,6 +841,7 @@ struct ServerConnection(Codec, Copyable):
             kind = BodyKind.CLOSE
         var close = (
             not self._keep
+            or self._draining
             or kind == BodyKind.CLOSE
             or sum.conn_close
             or not self._can_drain()
@@ -905,6 +928,8 @@ struct ServerConnection(Codec, Copyable):
         self._out = _OUT_NONE
         if self._resp_close or self._failed:
             self._closing = True
+            # unread: the rest of this request, or what came after it
+            self._unread = self._in != _WAIT or len(self._rx) > 0
             self._in = _CLOSED
             self._rx.clear()
         elif self._in == _WAIT:
@@ -925,6 +950,7 @@ struct ServerConnection(Codec, Copyable):
         _write_str(self._tx, "Content-Length: 0\r\nConnection: close\r\n\r\n")
         self._out = _OUT_NONE
         self._closing = True
+        self._unread = True  # what the client sends is not followed
         self._in = _CLOSED
         self._rx.clear()
 
@@ -947,6 +973,32 @@ struct ServerConnection(Codec, Copyable):
         return len(self._rx)
 
     # ---- state -----------------------------------------------------------
+
+    def close_gracefully(mut self):
+        """Take no request after the current one (a server shutting down).
+        A response being sent is the last: the connection closes after it.
+        A request waiting for its response, or still arriving, gets the
+        last one, with `Connection: close`. An idle connection, with
+        nothing received since its last response but line ends, closes at
+        once (`should_close()`). Calling it again changes nothing."""
+        self._draining = True
+        if self._out == _OUT_BODY:
+            self._resp_close = True
+        elif (
+            self._out == _OUT_NONE
+            and self._in == _HEAD
+            and _only_line_ends(self._rx.readable_span())
+        ):
+            self._closing = True
+            self._in = _CLOSED
+            self._rx.clear()
+
+    def input_pending(self) -> Bool:
+        """Whether the client may still be sending when the connection
+        closes: input was left unread (a request answered before its body
+        arrived, requests pipelined after the last response, a malformed
+        request). Then close in stages (see the module docs)."""
+        return self._unread or Bool(self._failed)
 
     def should_close(self) -> Bool:
         """Whether the driver closes the connection once everything queued

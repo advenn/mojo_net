@@ -2,7 +2,7 @@
 
 An HTTP/1.1 server for Mojo on Linux (roadmap step 3). It is built on the `http` library's sans-I/O `ServerConnection` and on `net`'s nonblocking sockets. Package rules and contracts are in `docs/design.md`; HTTP itself is in `docs/http.md`.
 
-**Status: active.** S1 (the serving loop) and S2 (streaming) are done; S3 (processes) is next.
+**Status: active.** S1 (the serving loop) and S2 (streaming) are done. Of S3, graceful shutdown and lingering close are done; worker processes and signals are next.
 
 ## Model
 **One thread and one edge-triggered epoll loop per process**, with one `ServerConnection` per connection.
@@ -31,6 +31,22 @@ An HTTP/1.1 server for Mojo on Linux (roadmap step 3). It is built on the `http`
 - **Resources:**
   - At start the fd limit is raised and the fd table pre-grown (docs/spikes.md).
   - Above `max_connections`, or on EMFILE, accepting pauses.
+
+## Closing and shutdown (S3)
+**Lingering close.** When the server ends a connection, it closes it at once unless the client may still be sending: a request answered before its body arrived (413, 408), requests pipelined after the last response, a malformed request (`ServerConnection.input_pending()`).
+- Such a connection closes in stages, as RFC 9112 9.6 describes. The server shuts down its write side after the response, then reads and drops the client's input until the client's end of input, or for at most `linger_timeout` (2 s).
+- Closing at once would answer the client's next bytes with a reset, and a reset can erase the response before the client has read it.
+
+**Graceful shutdown.** `Server.shutdown()` begins it, and `step()` (or `run()`, which then returns) carries it out:
+1. The connections the kernel has queued are accepted, without the `max_connections` cap, because their clients may have sent requests already. Then the listener closes, and new connections are refused.
+2. Each connection first reads what has arrived, so a request already sent counts as in progress. Then `close_gracefully()` stops it taking requests:
+   - an idle connection closes now;
+   - a request in progress gets its response, the last on its connection, saying `Connection: close` if its head has not gone out yet;
+   - requests pipelined after it are not answered, and the client retries them on another connection.
+3. `Handler.shutting_down()` is called once. Streams last until `shutdown_timeout` unless they end, so a handler with long-lived ones (server-sent events) ends them there by waking them.
+4. After `shutdown_timeout` (10 s), whatever is left closes. `stopped()` is True once no connection is left.
+
+The trigger (SIGTERM, or a supervisor) is the rest of S3.
 
 ## Streaming (S2)
 The `Handler` hooks beyond `handle` all have defaults, so a handler that buffers needs none of them.
@@ -87,6 +103,12 @@ The `Handler` hooks beyond `handle` all have defaults, so a handler that buffers
     - a streamed HEAD response lacked its GET's `Transfer-Encoding`.
 
     Each has a test, checked to fail on the old code.
-- **S3: processes.** Start N workers on one port and restart them if they die; graceful shutdown (stop accepting, finish in-flight requests, close idle connections).
+- **S3: processes and shutdown.**
+  - **Part 1, done:** graceful shutdown and lingering close (above), with `ServerConnection.close_gracefully()` and `input_pending()` in the codec.
+    - **Tests** (`tests/server/test_shutdown.mojo`, plus codec cases): idle connections closed; an upload in progress answered with `Connection: close` and the request pipelined after it dropped; connections the kernel had queued accepted and answered; the listener gone; a stream ended by the hook, or cut at the timeout; a client still sending after its 413 gets an orderly end of input, not a reset; lingering ends at its timeout; a connection with nothing unread closes at once.
+    - **Planted bugs:** 19 of 20 caught. The survivor only costs time: lingering after an end of input that was already read.
+  - **Part 2, next:** start N worker processes on one port, restart those that die, and stop them all gracefully on SIGTERM.
+    - The Mojo runtime starts its threads before `main`, with the signal mask the process was started with. A signalfd therefore receives SIGTERM reliably only if the signal was blocked at exec. The 30-run spike, recorded in `docs/spikes.md`, shows this.
+    - The plan: block the signals and re-execute the program once, read them from a signalfd in the loop, and spawn workers with `clone3` and `execve`, using pidfds and a lifeline socketpair per worker.
 - **S4: routing.** Method and path routes, path parameters, and static files.
 - **S5: polish.** Interop, an independent review, benchmarks, and the guide.

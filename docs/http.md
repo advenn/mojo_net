@@ -114,6 +114,9 @@ while True:
 - **One request at a time:** the next request's events come after `end_response`.
 - **`poll(ev)` or `next_event()`:** `poll` reuses one event, so a hot loop allocates almost nothing per request. `next_event()` returns a new one (the `Codec` interface).
 - **Errors:** after a malformed request, `send_error(conn.error_status())` answers 400, 414, 431, 501 or 505 and the connection closes.
+- **Closing well** (added for the server's S3):
+  - `close_gracefully()` stops taking requests, for a server shutting down. The request in progress gets the last response, which says `Connection: close` if its head has not gone out yet, and an idle connection closes at once.
+  - When `should_close()` and `input_pending()` are both true, the client may still be sending. Close in stages (RFC 9112 9.6): shut down the write side, read and drop input until the client's end or a timeout, then close. Closing at once can reset the connection before the client reads the response.
 
 ## Modules
 | Module | What |

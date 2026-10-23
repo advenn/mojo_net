@@ -188,8 +188,22 @@ signals with handlers (SigCgt): 1 2 3 4 5 6 7 8 10 11 12 15 24 25 31 33
 - SIGPIPE (13) keeps its default action, so `MSG_NOSIGNAL` is still mandatory.
 
 The library itself still installs no handlers. M2 decisions affected by this:
-- **Graceful shutdown via `signalfd`** must block SIGTERM/SIGINT first. I expect blocked signals to go to the signalfd rather than the runtime's handler, but **this was not tested**.
+- **Graceful shutdown via `signalfd`** must block SIGTERM/SIGINT in every thread, which takes a re-exec (measured below).
 - **SIGUSR1 cannot be used as a default-terminate signal.**
+
+### Receiving SIGTERM through a signalfd (measured for the server's S3)
+A process-directed signal goes to any thread that does not block it. Blocking SIGTERM in `main` therefore leaves the runtime's threads to take it, and their handler then ends the process. The spike was a built binary: a signalfd for SIGTERM/SIGINT in an edge-triggered epoll loop, sent SIGTERM at a random moment, 30 runs per mode.
+
+| Mode | Threads blocking SIGTERM (at `main`, of 9) | Result |
+|---|---|---|
+| Blocked in `main` only | 1 | killed (exit -15) in 25 runs; read from the signalfd in 5 |
+| Blocked, then re-exec of `/proc/self/exe` with the same argv and environment (from `/proc/self/cmdline` and `/proc/self/environ`) | 9 | read from the signalfd in 30 of 30, exit 0 |
+
+**What this shows:**
+- **The signal mask survives `execve`.** The runtime's threads, created before `main`, take the mask of the thread that starts them. Blocking first and then re-executing the program is the only way found for library code to get a mask that every thread has.
+- **While starting,** a runtime thread briefly blocks every signal (`SigBlk: fffffffffffbfeff`), then takes the inherited mask.
+- **Reading the signalfd directly** in a blocking `read`, with nothing blocked anywhere, also survived in the first spike. The thread in the read is the one woken, and it dequeues the signal before a handler can run. This does not hold in an epoll loop, which returns to user space first, so it is no basis for a design.
+- **Under `mojo run`** the re-exec compiles the program again. Workers and services should be built binaries.
 
 ---
 

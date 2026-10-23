@@ -1,8 +1,9 @@
 """`http.connection.ServerConnection`: requests and bodies as events, one
 request at a time with backpressure, response framing and the headers the
-codec adds, persistence, early responses, 100-continue and other 1xx,
-upgrades and CONNECT, request errors and their statuses, end of input,
-send-side misuse, and the same transcript whatever the input split."""
+codec adds, persistence, graceful closes, early responses, 100-continue
+and other 1xx, upgrades and CONNECT, request errors and their statuses,
+end of input, send-side misuse, and the same transcript whatever the input
+split."""
 
 from std.testing import TestSuite, assert_equal, assert_false, assert_true
 
@@ -206,6 +207,118 @@ def test_persistence() raises:
     assert_true(a.should_close())
     _feed(a, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")  # ignored after the close
     assert_equal(_events(a), "")
+
+
+def test_close_gracefully_lets_the_current_request_finish() raises:
+    # idle: closes at once (also with only line ends since the last
+    # response, and on a connection that never got anything), and stays
+    # closed
+    var idle = _one("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    _ok(idle)
+    _ = _sent(idle)
+    _feed(idle, "\r\n")
+    idle.close_gracefully()
+    assert_true(idle.should_close())
+    _feed(idle, "GET /late HTTP/1.1\r\nHost: x\r\n\r\n")
+    assert_equal(_events(idle), "")
+    var fresh = ServerConnection()
+    fresh.close_gracefully()
+    fresh.close_gracefully()  # again: no change
+    assert_true(fresh.should_close())
+    # a head on its way: answered, with Connection: close; what was
+    # pipelined after it is not read
+    var partial = ServerConnection()
+    _feed(partial, "GET /p HTTP/1.1\r\nHo")
+    assert_equal(_events(partial), "")
+    partial.close_gracefully()
+    assert_false(partial.should_close())
+    _feed(partial, "st: x\r\n\r\nGET /next HTTP/1.1\r\nHost: x\r\n\r\n")
+    assert_equal(_events(partial), "HEAD GET /p HTTP/1.1 NONE / END")
+    _ok(partial, "p")
+    assert_equal(_sent(partial), "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\np")
+    assert_true(partial.should_close())
+    assert_equal(_events(partial), "")
+    # a request awaiting its response, from an HTTP/1.0 keep-alive client:
+    # close, not keep-alive
+    var waiting = _one("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
+    waiting.close_gracefully()
+    _ok(waiting)
+    assert_equal(_sent(waiting), "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    assert_true(waiting.should_close())
+    # a response under way (its head already queued, keeping the
+    # connection): it ends, then the connection closes
+    var sending = _one("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    sending.send_response(ResponseHead(200))
+    sending.send_body("ab".as_bytes())
+    sending.close_gracefully()
+    assert_false(sending.should_close())
+    sending.end_response()
+    assert_equal(_sent(sending), "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n")
+    assert_true(sending.should_close())
+    # answered early, its short rest still read: closes at its END
+    var early = ServerConnection()
+    _feed(early, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nab")
+    _ = _events(early)
+    var r = ResponseHead(413)
+    r.headers.add("Content-Length", "0")
+    early.send_response(r)
+    early.end_response()
+    early.close_gracefully()
+    assert_false(early.should_close())
+    _feed(early, "cdGET /next HTTP/1.1\r\nHost: x\r\n\r\n")
+    assert_equal(_events(early), "DATA cd / END")
+    assert_true(early.should_close())
+    assert_equal(_events(early), "")
+
+
+def test_input_pending_says_when_to_close_in_stages() raises:
+    # everything read: close at once
+    var done = _one("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    _ok(done)
+    assert_true(done.should_close())
+    assert_false(done.input_pending())
+    var idle = ServerConnection()
+    idle.close_gracefully()
+    assert_false(idle.input_pending())
+    # requests pipelined after the last response
+    var piped = _one("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\nGET /2 HTTP/1.1\r\n")
+    _ok(piped)
+    assert_true(piped.should_close())
+    assert_true(piped.input_pending())
+    # a body answered before it arrived, too large to read on
+    var early = ServerConnection()
+    _feed(early, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10000000\r\n\r\nab")
+    _ = _events(early)
+    var r = ResponseHead(413)
+    r.headers.add("Content-Length", "0")
+    early.send_response(r)
+    early.end_response()
+    assert_true(early.should_close())
+    assert_true(early.input_pending())
+    # a malformed request, answered or not; any error response
+    var bad = ServerConnection()
+    _feed(bad, "GET  / HTTP/1.1\r\n\r\n")
+    _ = _error(bad)
+    assert_true(bad.input_pending())
+    bad.send_error(400)
+    assert_true(bad.input_pending())
+    var late = ServerConnection()
+    _feed(late, "GET / HT")
+    late.send_error(408)
+    assert_true(late.input_pending())
+    # the last request of a graceful close, read to its end, with or
+    # without input after it
+    for extra in range(2):
+        var g = ServerConnection()
+        _feed(g, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nab")
+        _ = _events(g)
+        g.send_response(r)
+        g.end_response()
+        g.close_gracefully()
+        _feed(g, "cd" if extra == 0 else "cdGET / HTTP/1.1\r\n")
+        _ = _events(g)
+        assert_true(g.should_close())
+        assert_equal(g.input_pending(), extra == 1)
 
 
 def test_early_response_reads_a_small_rest_or_closes() raises:

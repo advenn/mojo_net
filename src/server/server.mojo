@@ -38,6 +38,18 @@ The loop, per connection:
   nothing to send pauses until its connection is woken (`Server.wake`,
   `Handler.take_wakes`); a client that leaves a paused stream ends it.
 - Accepting pauses at `max_connections`, and for 100 ms on EMFILE.
+- Lingering close (RFC 9112 9.6): when the server ends a connection
+  whose client may still be sending (input was left unread:
+  `ServerConnection.input_pending()`), it shuts down its write side and
+  reads and drops the client's input until its end, or for at most
+  `linger_timeout`, before closing. Closing at once would reset the
+  connection, and a reset can destroy the last response before the
+  client reads it. Other connections close at once.
+- Graceful shutdown (`shutdown()`): the connections already queued are
+  accepted and the listener closed; idle connections close, requests in
+  progress get their responses (the last on their connections, saying
+  `Connection: close`), and whatever is left closes after
+  `shutdown_timeout`. `stopped()` says when no connection is left.
 """
 
 from bytes.buffer import ByteBuffer
@@ -51,6 +63,7 @@ from linux.consts import EPOLLERR, EPOLLET, EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLLRD
 from linux.probe import pregrow_fd_table, raise_nofile_limit
 from linux.time import Duration, Instant
 from net.addr import SocketAddr
+from net.socket import Shutdown
 from net.tcp import TcpAccepted, TcpListener, TcpStream
 
 from .date import DateCache
@@ -70,6 +83,9 @@ comptime _BODY = 1
 """A request's head arrived; its body is being read."""
 comptime _PRODUCING = 2
 """A streamed response is being produced (`Handler.produce`)."""
+comptime _LINGERING = 3
+"""Closing: the write side is shut down, input is read and dropped until
+its end (lingering close)."""
 
 
 # ---- configuration ------------------------------------------------------------------
@@ -90,6 +106,12 @@ struct ServerConfig(Copyable, Movable):
     """The longest wait for more of a request body (408 after)."""
     var write_timeout: Duration
     """The longest wait for a client to take more of its response."""
+    var linger_timeout: Duration
+    """How long a closing connection reads and drops the client's input
+    before it is closed anyway (see the module docs)."""
+    var shutdown_timeout: Duration
+    """How long `shutdown()` lets requests in progress finish before it
+    closes what is left."""
     var reuseport: Bool
     """Bind with SO_REUSEPORT, for one server process per core."""
     var server_name: String
@@ -106,6 +128,8 @@ struct ServerConfig(Copyable, Movable):
         idle_timeout: Duration = Duration.from_secs(60),
         read_timeout: Duration = Duration.from_secs(30),
         write_timeout: Duration = Duration.from_secs(30),
+        linger_timeout: Duration = Duration.from_secs(2),
+        shutdown_timeout: Duration = Duration.from_secs(10),
         reuseport: Bool = False,
         server_name: StringSlice = "",
         limits: Limits = Limits(),
@@ -116,6 +140,8 @@ struct ServerConfig(Copyable, Movable):
         self.idle_timeout = idle_timeout
         self.read_timeout = read_timeout
         self.write_timeout = write_timeout
+        self.linger_timeout = linger_timeout
+        self.shutdown_timeout = shutdown_timeout
         self.reuseport = reuseport
         self.server_name = String(server_name)
         self.limits = limits
@@ -124,7 +150,7 @@ struct ServerConfig(Copyable, Movable):
         """How often timeouts are checked: a quarter of the shortest one,
         at most a second, at least 10 ms."""
         var t = min(
-            min(self.header_timeout, self.idle_timeout),
+            min(min(self.header_timeout, self.idle_timeout), self.linger_timeout),
             min(self.read_timeout, self.write_timeout),
         )
         var q = Duration.from_nanos(t.as_nanos() // 4)
@@ -269,6 +295,14 @@ trait Handler(Deinitable, Movable):
         every call into the handler."""
         return List[UInt64]()
 
+    def shutting_down(mut self):
+        """Called once when the server begins a graceful shutdown. Streams
+        last until `shutdown_timeout` unless they end: a handler with
+        long-lived ones (server-sent events) ends them here, by waking them
+        (`take_wakes` is asked after this call) so that `produce` returns
+        False."""
+        pass
+
 
 # ---- one connection ---------------------------------------------------------------------
 
@@ -298,6 +332,8 @@ struct _Conn(Movable):
     """The streamed response waits for a wake."""
     var hangup: Bool
     """Epoll reported that the peer closed or half-closed (sticky)."""
+    var eof: Bool
+    """The end of the client's input was read."""
 
     def __init__(out self, var stream: TcpStream, peer: SocketAddr, id: UInt64, config: ServerConfig, now: Instant) raises IoError:
         self.stream = stream^
@@ -316,6 +352,7 @@ struct _Conn(Movable):
         self.streamed = False
         self.paused = False
         self.hangup = False
+        self.eof = False
 
     def service[H: Handler](
         mut self,
@@ -334,8 +371,15 @@ struct _Conn(Movable):
         while True:
             if not self.flush(config, now):
                 return True  # wait for the next writable edge
+            if self.state == _LINGERING:
+                return self.linger(chunk)
             if self.http.should_close():
-                return False
+                if self.eof or not self.http.input_pending():
+                    return False  # nothing more is coming: close now
+                self.stream.shutdown(Shutdown.WRITE)  # (after the response)
+                self.state = _LINGERING
+                self.deadline = now + config.linger_timeout
+                return self.linger(chunk)
             if self.state == _PRODUCING:
                 if not self.paused and self.produce(handler, config, now):
                     continue  # more body went out: flush it
@@ -353,6 +397,7 @@ struct _Conn(Movable):
             if not got:
                 return True  # wait for the next readable edge
             if got.value() == 0:
+                self.eof = True
                 self.http.feed_eof()
                 if self.state == _PRODUCING:
                     return False  # nobody left to stream to
@@ -363,6 +408,37 @@ struct _Conn(Movable):
                     self.deadline = now + config.header_timeout
                 elif self.state == _BODY:
                     self.deadline = now + config.read_timeout  # progress
+
+    def absorb(mut self, mut chunk: List[UInt8], config: ServerConfig, now: Instant) raises IoError:
+        """Feed the codec what has arrived, without serving it: a shutdown
+        reads first, so that a request already sent counts as in progress
+        when it stops taking requests."""
+        while self.state != _LINGERING and not self.eof:
+            var room = min(len(chunk), self.http.feed_capacity())
+            if room == 0:
+                return
+            var got = self.stream.try_read(Span(chunk)[0:room])
+            if not got:
+                return
+            if got.value() == 0:
+                self.eof = True
+                self.http.feed_eof()
+                return
+            self.http.feed(Span(chunk)[0 : got.value()])
+            if self.state == _WAITING and not self.head_started:
+                self.head_started = True
+                self.deadline = now + config.header_timeout
+
+    def linger(mut self, mut chunk: List[UInt8]) raises IoError -> Bool:
+        """Read and drop input until the socket would block (True: wait for
+        more, or for the linger timeout) or the client's input ends
+        (False: close)."""
+        while True:
+            var got = self.stream.try_read(Span(chunk))
+            if not got:
+                return True
+            if got.value() == 0:
+                return False
 
     def flush(mut self, config: ServerConfig, now: Instant) raises IoError -> Bool:
         """Write queued output until the socket would block: False if some
@@ -645,6 +721,9 @@ struct Server[H: Handler](Movable):
     """Slots whose paused streams were woken, served in the next turn."""
     var _serving: List[Int]
     """The woken slots this turn serves (reused)."""
+    var _stopping: Bool
+    """`shutdown()` was called."""
+    var _stop_deadline: Instant
 
     def __init__(out self, var handler: Self.H, config: ServerConfig = ServerConfig()) raises IoError:
         self.handler = handler^
@@ -664,6 +743,8 @@ struct Server[H: Handler](Movable):
         self._gens = List[UInt32]()
         self._woken = List[Int]()
         self._serving = List[Int]()
+        self._stopping = False
+        self._stop_deadline = self._now
 
     def bind(mut self, addr: SocketAddr) raises IoError:
         """Listen on `addr` (port 0 picks one: see `local_addr`), with
@@ -716,21 +797,66 @@ struct Server[H: Handler](Movable):
         return n
 
     def run(mut self) raises IoError:
-        """Serve until the process ends."""
-        while True:
+        """Serve until a graceful shutdown has finished (`shutdown()`), or
+        the process ends."""
+        while not self.stopped():
             self.step(Duration.from_secs(1))
+
+    def shutdown(mut self):
+        """Begin a graceful shutdown (see the module docs); `step` or `run`
+        carries it out. Calling it again changes nothing."""
+        if self._stopping:
+            return
+        self._stopping = True
+        var now = Instant.now()
+        self._now = now
+        self._stop_deadline = now + self.config.shutdown_timeout
+        if self._listener:
+            # Connections the kernel has queued may have sent requests:
+            # take them before closing the listener resets them.
+            self._accept(now, limit=False)
+            try:
+                self._ep.delete(self._listener.value())
+            except:
+                pass
+            self._listener = None
+        self._paused_until = None
+        self._backlog = False
+        self.handler.shutting_down()
+        self._take_wakes()
+        for slot in range(len(self._conns)):
+            if not self._conns[slot]:
+                continue
+            # First take in what has arrived (a request sent but not yet
+            # read is in progress), then stop taking requests.
+            var ok = True
+            try:
+                self._conns[slot].value().absorb(self._chunk, self.config, now)
+            except:
+                ok = False
+            if not ok:
+                self._close(slot)
+                continue
+            self._conns[slot].value().http.close_gracefully()
+            self._serve(slot, now)
+
+    def stopped(self) -> Bool:
+        """A graceful shutdown has finished: no connection is left."""
+        return self._stopping and self._live == 0
 
     def step(mut self, timeout: Duration) raises IoError:
         """One turn of the loop: wait up to `timeout` for readiness, serve
         what is ready, accept new connections, check timeouts. `run` calls
         it forever; a test or an embedding program can call it itself."""
-        if not self._listener:
+        if not self._listener and not self._stopping:
             raise IoError.of_kind("Server.step", ErrorKind.NotConnected)
         # The wait is timed from the last turn's clock reading: close enough
         # for timeouts, and it saves a syscall (every clock read is one).
         var wait = min(timeout, self._next_sweep - self._now)
         if self._paused_until:
             wait = min(wait, self._paused_until.value() - self._now)
+        if self._stopping:
+            wait = min(wait, self._stop_deadline - self._now)
         if len(self._woken) > 0:
             wait = Duration.ZERO
         var n = self._ep.wait(self._events, Optional[Duration](wait))
@@ -761,8 +887,12 @@ struct Server[H: Handler](Movable):
         if self._paused_until and now >= self._paused_until.value():
             self._paused_until = None
             accept_now = True  # the edge may have come while paused
-        if accept_now or self._backlog:
+        if (accept_now or self._backlog) and self._listener:
             self._accept(now)
+        if self._stopping and now >= self._stop_deadline:
+            for slot in range(len(self._conns)):
+                if self._conns[slot]:
+                    self._close(slot)  # what is left after shutdown_timeout
         if now >= self._next_sweep:
             self._sweep(now)
             self._next_sweep = now + self.config._sweep_every()
@@ -788,10 +918,12 @@ struct Server[H: Handler](Movable):
         self._free.append(slot)
         self._live -= 1
 
-    def _accept(mut self, now: Instant):
+    def _accept(mut self, now: Instant, limit: Bool = True):
+        """Accept what the listener has queued: up to `max_connections`, or
+        all of it if not `limit` (a shutdown takes everything queued)."""
         self._backlog = False
         while True:
-            if self._live >= self.config.max_connections:
+            if limit and self._live >= self.config.max_connections:
                 self._backlog = True  # take the rest when one closes
                 return
             var acc: Optional[TcpAccepted]
@@ -834,8 +966,8 @@ struct Server[H: Handler](Movable):
                 continue
             if now < c.deadline or c.state == _PRODUCING:
                 continue
-            if c.state == _WAITING and not c.head_started:
-                self._close(slot)  # idle: close quietly
+            if c.state == _LINGERING or (c.state == _WAITING and not c.head_started):
+                self._close(slot)  # done lingering, or idle: close quietly
                 continue
             var answered = False
             try:
