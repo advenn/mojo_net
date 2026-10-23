@@ -8,7 +8,7 @@ HTTP/1.1 for Mojo on Linux, per RFC 9110 (semantics) and RFC 9112 (message synta
 
 It is the base of the HTTP server (roadmap step 3). Package rules and the shared contracts are in `docs/design.md`; the transport is `net` (`docs/net.md`).
 
-**Status: active.** H1 (core types, header map), H2 (head parser) and H3 (body framing) are done; H4 (connection codecs) is next.
+**Status: active.** H1–H5 are done: core types, the header map, the head parser, body framing, the connection codecs and a blocking client. H6 (polish: review, performance, the guide) is next.
 
 ## Scope
 **In scope:**
@@ -54,6 +54,8 @@ A server-side parse error carries the status to answer with (400, 414, 431, 501 
 | `headers` | `Headers`: ordered, case-insensitive multimap with validated adds, `get` / `get_all` / `combined` / `has_token`, exact bytes and a string view for obs-text, wire encoding. Also the field-syntax helpers the parser uses (`is_token`, `next_element`, ...) |
 | `parse` | `HeadParser`: incremental, limit-checked parsing of request and response heads into `RequestHead` / `ResponseHead`, which also encode themselves; `Limits`; the `E_*` rule names errors carry |
 | `body` | `request_framing` / `response_framing` (RFC 9112 6.3) and `content_length`; `BodyDecoder`: Content-Length, chunked with trailers, or to the end of the connection, returning ranges of the caller's input (`Piece`); `encode_chunk` / `encode_last_chunk` |
+| `connection` | `ServerConnection` and `ClientConnection`: one HTTP/1.1 connection each side as a `Codec` (events `HEAD` / `DATA` / `END`, plus `INFORMATIONAL` and `UPGRADE` for clients); framing and persistence headers on what they send |
+| `client` | `Client`: blocking requests to `http://` URLs with one deadline each, whole responses up to `max_body`, a keep-alive pool and a safe retry; `Url`, `Response`. Not re-exported from `http` (it imports `net`) |
 
 ## Milestones
 - **H1: core types and the header map.** Done.
@@ -73,6 +75,31 @@ A server-side parse error carries the status to answer with (400, 414, 431, 501 
   - Chunked: hex sizes (at most 15 significant digits), validated extensions, line ends as for heads (bare LF in responses only), and trailers through `HeadParser.for_trailers`. A chunk-size line is scanned incrementally. Its limit, like the trailer limits, gives the same error however the input is split.
   - Tested by decision tables and rule cases, every case at feed sizes 1 to 9, and differentially against `tests/http/chunked_oracle.py`, an independent Python decoder: 20,000 generated and mutated bodies, decoded whole and in random pieces. All 28 planted bugs are caught.
   - Measured: ~55 ns of framing per chunk, whatever its size.
-- **H4: connection codecs.** `ClientConnection` and `ServerConnection` implementing `Codec`: keep-alive, pipelining, 1xx, HEAD / 204 / 304, `Connection: close`, upgrades.
-- **H5: blocking client.** `Url`, a keep-alive pool checked with `idle_state()`, `connect_host`, one deadline per request, bounded and streaming bodies; `http://` only.
+- **H4: connection codecs.** Done.
+  - Both implement `Codec`. Events are a `HEAD`, the body as `DATA` pieces, then `END` with the trailers. `DATA` comes out as soon as body bytes arrive. Contract rule 4 is refined for byte streams: the pieces depend on the split, but their concatenation and every other event do not.
+  - `ServerConnection`:
+    - **One request at a time.** Pipelined requests wait in the bounded receive buffer, and `feed_capacity()` falls to 0 until the response ends (backpressure).
+    - **Request checks:** HTTP/1.x only (505); the Host count per RFC 9112 3.2 (400).
+    - **Response framing:** the application's Content-Length, or else chunked (HTTP/1.1) or close-delimited (HTTP/1.0). No body for HEAD and 1xx/204/304. `Connection: close` or `keep-alive` is added as persistence needs.
+    - **Early responses:** a response that ends before its request body closes the connection. A full-duplex echo keeps it.
+    - **Continue and 1xx:** `send_continue` and 1xx responses; a no-op for HTTP/1.0 clients.
+    - **Switching:** 101 to an Upgrade request and 2xx to CONNECT hand the connection over (`take_remaining`).
+    - **Errors:** a malformed request carries its status (400, 414, 431, 501, 505), and `send_error` answers it.
+  - `ClientConnection`:
+    - **Requests** are validated (version, Host count, `chunked`-only Transfer-Encoding) and framed from their heads. Pipelining is optional (`max_in_flight`), with responses matched in order, so HEAD and CONNECT frame correctly.
+    - **Events:** 1xx are `INFORMATIONAL`; 101 needs an Upgrade request.
+    - **Closing:** a closing response makes the connection unusable for more requests.
+    - **EOF** before any response byte raises `E_NO_RESPONSE`, which tells a client it may retry an idempotent request.
+  - Tested per behaviour on both sides, and for the same merged transcript at feed sizes 1 to 13 over mixed pipelined exchanges. A 34-mutant run over the two codecs checks the tests.
+- **H5: blocking client.** Done.
+  - `Client.request(method, url, headers, body)`, plus `get`, `head` and `post`, returning a whole `Response` (status, headers, body, trailers).
+  - **URLs:** `Url.parse` takes `http://` only (https is `Unsupported`), with IPv6 literals and no user info.
+  - **Deadline:** one per request, covering DNS, Happy Eyeballs, sending and receiving.
+  - **Body limit:** `max_body`; past it, `InvalidData`.
+  - **Headers it adds:** Host, User-Agent and Content-Length unless the caller gives them. A caller's framing headers are refused.
+  - **Pool:** per host and port, at most `max_idle_per_host` connections, each reused within `max_idle` and only if `idle_state()` is EMPTY.
+  - **Retry:** if a reused connection is dropped before any response byte (`E_NO_RESPONSE`, reset, broken pipe), an idempotent request is sent again, once, on a new connection. Other methods are not.
+  - **Tested** against Python's `http.server` (`tests/http/http_peer.py`): bodies by length, chunked with trailers and to the close; HEAD; the headers sent; reuse and what is not pooled; the retry, through a route that drops second requests; the deadline; `max_body`; errors.
+  - **The server codec** is tested the other way round: `tests/http/test_server_interop.mojo` drives `ServerConnection` over a socket for Python's `http.client` (keep-alive, both request framings, HEAD, close) and for raw pipelined requests read back by Python's response parser.
+  - **Example:** `examples/http/http_get.mojo`.
 - **H6: polish.** Interop against Python's `http.server` and `http.client`, examples, the guide, an independent review, performance.

@@ -10,7 +10,7 @@ Native Mojo networking libraries for Linux (x86_64 and aarch64, kernel 5.15+):
 | `linux` | raw syscalls (inline asm), ABI mirrors, errno and `IoError`, fds, clocks, poll/epoll/eventfd, probing | stable |
 | `bytes` | `ByteBuffer` and the sans-I/O `Codec` contract that protocol codecs implement | stable |
 | `net` | the TCP/UDP library: addresses, every socket option, TCP/Unix streams with deadlines, connect by name, buffered frame reads, UDP sockets (blocking, nonblocking, batched, multicast) ([docs/net.md](docs/net.md)) | TCP client and UDP stable |
-| `http` | HTTP/1.1: message types, the header map, a sans-I/O head parser and body framing so far; connection codecs and a blocking client next ([docs/http.md](docs/http.md)) | in progress |
+| `http` | HTTP/1.1: a sans-I/O head parser, body framing and connection codecs for both sides, and a blocking client with a keep-alive pool ([docs/http.md](docs/http.md)) | in progress |
 | `rt` | an experimental completion-based event loop ([docs/rt.md](docs/rt.md)) | frozen |
 
 Imports point downward only (`linux` ← `bytes` ← `net` ← `rt`, and `net` ← `http`), and only `rt` may import `rt`. `http`'s protocol code is sans-I/O: only its client and server modules import `net`. CI checks these rules. Design, package rules and shared contracts: [docs/design.md](docs/design.md).
@@ -40,6 +40,8 @@ More in `examples/net/`:
 - a Redis `PING`, with sans-I/O RESP encoding and parsing;
 - a readiness-loop echo server: edge-triggered epoll and `try_read` / `try_write`, with no runtime;
 - a UDP echo server (blocking, or an epoll loop with batched `recvmmsg` / `sendmmsg`) and a UDP ping client.
+
+And in `examples/http/`: `http_get`, a small `curl` built on `http.client.Client`.
 
 ## Develop
 Everything runs through [pixi](https://pixi.sh):

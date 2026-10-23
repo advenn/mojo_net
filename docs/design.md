@@ -22,7 +22,7 @@ So a Mojo upgrade, or a change in a shared layer, lands in every package in one 
 | `linux` | raw syscalls, ABI mirrors, errno, `IoError`, fds, clock, poll/epoll/eventfd wrappers, probing (including fd-table pre-growth) | stable (M1) | `std` only |
 | `bytes` | `ByteBuffer`, and the sans-I/O `Codec` contract (contract 1) with the reference `LineCodec` | stable (M1) | `linux` |
 | `net` | the TCP/UDP library (`docs/net.md`): addresses, socket options (L1), blocking TCP/Unix with deadlines and nonblocking `try_*` calls (L2), buffered frame reads (`BufReader`), DNS and connect-by-name (Happy Eyeballs), UDP | TCP client (M2) and UDP (M3) done; packaging left | `linux`, `bytes` |
-| `http` | the HTTP/1.1 library (`docs/http.md`): message types, the header map, the sans-I/O head parser and body framing; next: connection codecs, a blocking client | **active**: H4 | `linux`, `bytes`; `net` only in `http.client` and `http.server` |
+| `http` | the HTTP/1.1 library (`docs/http.md`): message types, the header map, the sans-I/O head parser, body framing, server and client connection codecs, and a blocking client | **active**: H6 | `linux`, `bytes`; `net` only in `http.client` and `http.server` |
 | `rt` | experimental completion-based event loop (`docs/rt.md`): epoll and simulator backends, timers, slab, mailbox, `rt.evented` connections | **frozen** until Mojo's async/await stabilizes | `linux`, `bytes`, `net` |
 
 - **Nothing outside `rt` imports `rt`.** `rt` builds on `net`, never the reverse.
@@ -57,6 +57,7 @@ Code comments cite these by number, so keep the numbering stable. Contracts 2, 3
      - `poll_transmit(out)`, which appends pending output to a `ByteBuffer` the driver owns;
      - `next_deadline()` and `handle_timeout(now)`.
    - `feed` copies what it keeps, because receive buffers are only lent (contract 4).
+   - Events are invariant under any input split (rule 4), except that a byte stream (an HTTP body) may be delivered in different pieces as it arrives: only their concatenation is invariant.
 2. **Completions.** Every `rt` backend honors these:
    - Every op completes exactly once; multishot completions carry `more`.
    - Cancel is two-phase: the target still completes, with its real result or `Canceled`.

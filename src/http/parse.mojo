@@ -392,7 +392,7 @@ def _version_at(data: ImmSpan[UInt8, _], at: Int) -> Optional[Version]:
 # ---- the parser -----------------------------------------------------------------
 
 
-struct HeadParser(Movable):
+struct HeadParser(Copyable, Movable):
     """Finds and parses one message head at a time (see the module docs).
     `for_requests()` is strict; `for_responses()` adds RFC 9112's two
     leniencies."""

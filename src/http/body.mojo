@@ -380,7 +380,7 @@ comptime _TRAILERS = 3
 comptime _DONE = 4
 
 
-struct BodyDecoder(Movable):
+struct BodyDecoder(Copyable, Movable):
     """Decodes one received body (see the module docs)."""
 
     var _kind: BodyKind

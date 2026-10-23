@@ -39,7 +39,11 @@ Rules every `Codec` follows:
 4. **Any chunking.** Input may arrive split at any byte boundary, including
    empty `feed`s. However the stream is cut, a driver that follows rule 5
    gets the same sequence of events (and the same kind of any terminal
-   error), whatever its receive size. `drive_chunked` checks it.
+   error), whatever its receive size. `drive_chunked` checks it. One
+   refinement: a codec may deliver a byte stream (an HTTP body) as data
+   events as soon as bytes arrive, so that streaming is not delayed; then
+   only the concatenation of consecutive data events is invariant, and a
+   check merges them first (`tests/http` does). Such a codec says so.
 5. **Feed what fits, then drain.** `feed_capacity()` is how many bytes the
    next `feed` may carry: a codec that bounds its unparsed input reports
    the room left (the default, `Int.MAX`, means unbounded). The driver
