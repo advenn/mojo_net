@@ -454,6 +454,36 @@ def test_response_leniencies() raises:
     assert_equal(_rs("HTTP/1.1 200 OK\r\nX: a\r\n b\x00\r\n\r\n"), _bad(E_FIELD_VALUE))
 
 
+# ---- field sections (trailers) ----------------------------------------------------
+
+
+def test_field_sections_without_a_start_line() raises:
+    var p = HeadParser.for_trailers(lenient=False, limits=Limits())
+    var h = Headers()
+    var empty = _b("\r\nGET")
+    assert_equal(p.fields(Span(empty), h).value(), 2)  # the first empty line ends it
+    assert_equal(len(h), 0)
+    var two = _b("A: 1\r\nB:  2 \r\n\r\nrest")
+    for k in range(len(two) - 4):  # incomplete at every cut
+        assert_false(p.fields(Span(two)[0:k], h), String(k))
+    assert_equal(p.fields(Span(two), h).value(), len(two) - 4)
+    assert_equal(String(h), "A: 1\r\nB: 2\r\n")
+    assert_equal(p.fields(Span(_b("C: 3\r\n\r\n")), h).value(), 8)  # appends; reusable
+    assert_equal(len(h), 3)
+    var tight = HeadParser.for_trailers(lenient=False, limits=Limits(max_head=8, max_fields=1))
+    var outcome = String()
+    try:
+        _ = tight.fields(Span(_b("A: 1\r\nB: 2\r\n\r\n")), h)
+    except e:
+        outcome = String(tight.error_status(), " ", e.op)
+    assert_equal(outcome, String("431 ", E_HEAD_TOO_LARGE))
+    var lenient = HeadParser.for_trailers(lenient=True, limits=Limits())
+    var f = Headers()
+    var folded = _b("A: 1\n b\n\n")
+    assert_equal(lenient.fields(Span(folded), f).value(), len(folded))
+    assert_equal(String(f), "A: 1 b\r\n")
+
+
 # ---- encoding -------------------------------------------------------------------
 
 

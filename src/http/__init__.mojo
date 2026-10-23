@@ -9,6 +9,18 @@ Only `http.client` and `http.server` import `net`; `tools/check_imports.py`
 enforces it.
 """
 
+from .body import (
+    BodyDecoder,
+    BodyKind,
+    BodyLimits,
+    Framing,
+    Piece,
+    content_length,
+    encode_chunk,
+    encode_last_chunk,
+    request_framing,
+    response_framing,
+)
 from .headers import Headers
 from .parse import HeadParser, Limits, RequestHead, ResponseHead
 from .types import (

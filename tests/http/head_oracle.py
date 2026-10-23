@@ -35,11 +35,13 @@ FIELD_BYTES = re.compile(rb"[\t\x20-\x7e\x80-\xff]*\Z")
 WS = (b" ", b"\t")
 
 
-def parse(data, request, max_head, max_start_line, max_fields):
-    """("more",) | ("err", status, rule) | ("ok", consumed, start, fields)."""
+def parse(data, request, max_head, max_start_line, max_fields, fields_only=False):
+    """("more",) | ("err", status, rule) | ("ok", consumed, start, fields).
+    `fields_only` parses a trailer section: no start line, and the first
+    empty line ends it (start is then None in the result)."""
     lenient = not request
     pos = 0
-    start = None
+    start = b"" if fields_only else None
     lines = []
     while True:
         lf = data.find(b"\n", pos)
@@ -70,7 +72,9 @@ def parse(data, request, max_head, max_start_line, max_fields):
                 return ("err", 431, E_TOO_MANY_FIELDS)
         pos = lf + 1
 
-    if request:
+    if fields_only:
+        st = None
+    elif request:
         m = REQUEST_LINE.match(start)
         if not m:
             return ("err", 400, E_REQUEST_LINE)

@@ -8,7 +8,7 @@ HTTP/1.1 for Mojo on Linux, per RFC 9110 (semantics) and RFC 9112 (message synta
 
 It is the base of the HTTP server (roadmap step 3). Package rules and the shared contracts are in `docs/design.md`; the transport is `net` (`docs/net.md`).
 
-**Status: active.** H1 (core types, header map) and H2 (head parser) are done; H3 (body framing) is next.
+**Status: active.** H1 (core types, header map), H2 (head parser) and H3 (body framing) are done; H4 (connection codecs) is next.
 
 ## Scope
 **In scope:**
@@ -53,6 +53,7 @@ A server-side parse error carries the status to answer with (400, 414, 431, 501 
 | `types` | `Version`, method names (`GET`, ...), status classes, `check_status`, `reason` (the IANA registry's phrases) |
 | `headers` | `Headers`: ordered, case-insensitive multimap with validated adds, `get` / `get_all` / `combined` / `has_token`, exact bytes and a string view for obs-text, wire encoding. Also the field-syntax helpers the parser uses (`is_token`, `next_element`, ...) |
 | `parse` | `HeadParser`: incremental, limit-checked parsing of request and response heads into `RequestHead` / `ResponseHead`, which also encode themselves; `Limits`; the `E_*` rule names errors carry |
+| `body` | `request_framing` / `response_framing` (RFC 9112 6.3) and `content_length`; `BodyDecoder`: Content-Length, chunked with trailers, or to the end of the connection, returning ranges of the caller's input (`Piece`); `encode_chunk` / `encode_last_chunk` |
 
 ## Milestones
 - **H1: core types and the header map.** Done.
@@ -66,7 +67,12 @@ A server-side parse error carries the status to answer with (400, 414, 431, 501 
   - Scans test 32 bytes per step with SIMD masks (LF search, token and target checks, value validation), and the field lines are copied into the header arena once, with fields recorded as offsets.
   - Tested rule by rule, and differentially against `tests/http/head_oracle.py`, an independent Python implementation from the RFC ABNF: 20,000 generated and mutated heads, each parsed whole and in random pieces. Every bug planted in the mutation runs (over 30, before and after the SIMD rewrite) is caught.
   - Measured on an i5-1145G7, owned heads included: picohttpparser's 705-byte benchmark request in ~510 ns (1.4 GB/s), a 215-byte response with 7 fields in ~285 ns, a minimal request in ~125 ns; large heads at 4.4 GB/s.
-- **H3: body framing.** Content-Length, chunked with trailers, close-delimited; the RFC 9112 6.3 rules.
+- **H3: body framing.** Done.
+  - `request_framing` / `response_framing`: the RFC 9112 6.3 decision, with the strictness rules above. A request answers 400 (`InvalidData`) or 501 (`Unsupported`, for codings other than `chunked`).
+  - `BodyDecoder` is caller-buffered like `HeadParser`. Each `decode` returns a `Piece`: the bytes to drop, and where the body data lies among them. Data is never copied by the decoder and comes out as it arrives, also in the middle of a chunk.
+  - Chunked: hex sizes (at most 15 significant digits), validated extensions, line ends as for heads (bare LF in responses only), and trailers through `HeadParser.for_trailers`. A chunk-size line is scanned incrementally. Its limit, like the trailer limits, gives the same error however the input is split.
+  - Tested by decision tables and rule cases, every case at feed sizes 1 to 9, and differentially against `tests/http/chunked_oracle.py`, an independent Python decoder: 20,000 generated and mutated bodies, decoded whole and in random pieces. All 28 planted bugs are caught.
+  - Measured: ~55 ns of framing per chunk, whatever its size.
 - **H4: connection codecs.** `ClientConnection` and `ServerConnection` implementing `Codec`: keep-alive, pipelining, 1xx, HEAD / 204 / 304, `Connection: close`, upgrades.
 - **H5: blocking client.** `Url`, a keep-alive pool checked with `idle_state()`, `connect_host`, one deadline per request, bounded and streaming bodies; `http://` only.
 - **H6: polish.** Interop against Python's `http.server` and `http.client`, examples, the guide, an independent review, performance.

@@ -408,17 +408,22 @@ struct HeadParser(Movable):
     has begun."""
     var _ends: List[Int]
     """The LF of each line from the start line on, as the scan finds them
-    (the parse then needs no second search); kept across heads."""
+    (the parse then needs no second search); kept across heads. In
+    fields-only mode it starts with -1, standing for a start line that
+    ends just before the input."""
+    var _fields_only: Bool
     var _status: Int
 
-    def __init__(out self, *, lenient: Bool, limits: Limits):
+    def __init__(out self, *, lenient: Bool, limits: Limits, fields_only: Bool = False):
         self._limits = limits
         self._lenient = lenient
         self._scanned = 0
         self._line = 0
         self._start = -1
         self._ends = List[Int](capacity=32)
+        self._fields_only = fields_only
         self._status = 0
+        self.reset()
 
     @staticmethod
     def for_requests(limits: Limits = Limits()) -> HeadParser:
@@ -428,12 +433,23 @@ struct HeadParser(Movable):
     def for_responses(limits: Limits = Limits()) -> HeadParser:
         return HeadParser(lenient=True, limits=limits)
 
+    @staticmethod
+    def for_trailers(*, lenient: Bool, limits: Limits) -> HeadParser:
+        """A parser for field sections without a start line: the trailer
+        section of a chunked body (`fields`). The section ends at the first
+        empty line, which may be the first line (no trailers)."""
+        return HeadParser(lenient=lenient, limits=limits, fields_only=True)
+
     def reset(mut self):
         """Forget a partial scan (the input was replaced)."""
         self._scanned = 0
         self._line = 0
-        self._start = -1
         self._ends.clear()
+        if self._fields_only:
+            self._start = 0
+            self._ends.append(-1)
+        else:
+            self._start = -1
 
     def error_status(self) -> Int:
         """The status for the last error a request caused (400, 414 or 431),
@@ -523,6 +539,19 @@ struct HeadParser(Movable):
         self.reset()
         return end
 
+    def fields(
+        mut self, data: ImmSpan[UInt8, _], mut headers: Headers
+    ) raises IoError -> Optional[Int]:
+        """Parse a field section (see `for_trailers`) from the start of
+        `data`, appending its fields to `headers`: None if it is not
+        complete yet, else the bytes it took, its blank line included."""
+        var end = self._find_end(data)
+        if end < 0:
+            return None
+        self._parse_fields(data, headers)
+        self.reset()
+        return end
+
     # ---- start lines ----------------------------------------------------
 
     @inline(.always)
@@ -604,8 +633,8 @@ struct HeadParser(Movable):
         by `_find_end`."""
         var p = data.unsafe_ptr()
         var last = len(self._ends) - 1
-        if last < 1:
-            return
+        if last < 2:
+            return  # no field lines
         # One copy of all the field lines; fields are then offsets into it
         # (arena offset = base + index in data).
         var first = self._line_start(1)
