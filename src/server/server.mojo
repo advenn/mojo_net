@@ -32,6 +32,11 @@ The loop, per connection:
   arrives (408), `write_timeout` without progress while output waits.
 - A malformed request is answered with its status (400, 414, 431, 501,
   505) and the connection closes; a handler that raises gets a 500.
+- Streaming (the `Handler` hooks): a request body can go to the handler
+  piece by piece (`on_body`), and a response body can come from it while
+  less than `_HIGH_WATER` of output is queued (`produce`). A stream with
+  nothing to send pauses until its connection is woken (`Server.wake`,
+  `Handler.take_wakes`); a client that leaves a paused stream ends it.
 - Accepting pauses at `max_connections`, and for 100 ms on EMFILE.
 """
 
@@ -42,7 +47,7 @@ from http.parse import Limits, RequestHead, ResponseHead
 from http.types import Version
 from linux import Epoll, ErrorKind, IoError
 from linux.abi import EpollEvent
-from linux.consts import EPOLLET, EPOLLIN, EPOLLOUT, EPOLLRDHUP
+from linux.consts import EPOLLERR, EPOLLET, EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLLRDHUP
 from linux.probe import pregrow_fd_table, raise_nofile_limit
 from linux.time import Duration, Instant
 from net.addr import SocketAddr
@@ -63,6 +68,8 @@ comptime _WAITING = 0
 """Between requests: waiting for (the rest of) a head."""
 comptime _BODY = 1
 """A request's head arrived; its body is being read."""
+comptime _PRODUCING = 2
+"""A streamed response is being produced (`Handler.produce`)."""
 
 
 # ---- configuration ------------------------------------------------------------------
@@ -139,8 +146,11 @@ struct Request(Movable):
     var trailers: Headers
     var peer: SocketAddr
     """The client's address."""
+    var id: UInt64
+    """The connection's id, for `Server.wake` (and `Handler.take_wakes`):
+    it names this connection while it lives and never another one."""
 
-    def __init__(out self, peer: SocketAddr):
+    def __init__(out self, peer: SocketAddr, id: UInt64 = 0):
         self.method = String()
         self.target = String()
         self.version = Version.HTTP_1_1
@@ -148,6 +158,7 @@ struct Request(Movable):
         self.body = List[UInt8]()
         self.trailers = Headers()
         self.peer = peer
+        self.id = id
 
     def path(self) -> StringSlice[origin_of(self.target)]:
         """The target up to its query ("?"), for an origin-form target."""
@@ -178,12 +189,21 @@ struct Response(Movable):
     """Empty for the registered phrase."""
     var headers: Headers
     var body: List[UInt8]
+    var _stream: Bool
 
     def __init__(out self):
         self.status = 200
         self.reason = String()
         self.headers = Headers()
         self.body = List[UInt8]()
+        self._stream = False
+
+    def stream(mut self):
+        """Make this a streamed response: the head goes out now (chunked,
+        unless the handler set Content-Length), then the body comes from
+        `Handler.produce`, piece by piece, as the client takes it. `body`
+        is ignored."""
+        self._stream = True
 
     def text(
         mut self,
@@ -208,16 +228,46 @@ struct Response(Movable):
         self.reason = String()
         self.headers.clear()
         self.body.clear()
+        self._stream = False
 
 
 trait Handler(Deinitable, Movable):
-    """The application: one `handle` call per complete request."""
+    """The application: one `handle` call per complete request, and, with
+    the defaulted hooks, streamed request bodies and streamed responses.
+    No method may block: the loop serves every connection of the
+    process."""
 
     def handle(mut self, req: Request, mut res: Response) raises:
-        """Fill `res` for `req` (it starts as an empty 200). It must not
-        block: the loop serves every connection of the process. An error it
-        raises is answered with 500."""
+        """Fill `res` for `req` (it starts as an empty 200), or call
+        `res.stream()`. An error it raises is answered with 500."""
         ...
+
+    def stream_request(mut self, req: Request) raises -> Bool:
+        """Called at a request's head: True to take its body as it arrives
+        (`on_body`), unbuffered and without `max_body`; `handle` follows at
+        its end with `req.body` empty. False (the default) buffers it. An
+        error answers 500 (as from `on_body`)."""
+        return False
+
+    def on_body(mut self, req: Request, data: Span[UInt8, _]) raises:
+        """A piece of a streamed request body. An error answers 500 at once
+        and the rest of the request is ignored: read and dropped if it is
+        short, else the connection closes after the 500."""
+        pass
+
+    def produce(mut self, req: Request, mut out: List[UInt8]) raises -> Bool:
+        """Append more of a streamed response's body to `out` (empty when
+        called): True while more will come, False at its end. Appending
+        nothing and returning True pauses the stream until `Server.wake`
+        (or `take_wakes`) names its connection. An error ends the
+        connection (the response is under way)."""
+        return False
+
+    def take_wakes(mut self) -> List[UInt64]:
+        """Connection ids (`Request.id`) whose paused streams to resume,
+        collected by the handler since the last call. The server asks after
+        every call into the handler."""
+        return List[UInt64]()
 
 
 # ---- one connection ---------------------------------------------------------------------
@@ -242,13 +292,19 @@ struct _Conn(Movable):
     var write_deadline: Instant
     var rejected: Bool
     """The current request was answered early (413); its body is ignored."""
+    var streamed: Bool
+    """The current request's body goes to `Handler.on_body`."""
+    var paused: Bool
+    """The streamed response waits for a wake."""
+    var hangup: Bool
+    """Epoll reported that the peer closed or half-closed (sticky)."""
 
-    def __init__(out self, var stream: TcpStream, peer: SocketAddr, config: ServerConfig, now: Instant) raises IoError:
+    def __init__(out self, var stream: TcpStream, peer: SocketAddr, id: UInt64, config: ServerConfig, now: Instant) raises IoError:
         self.stream = stream^
         self.http = ServerConnection(limits=config.limits)
         self.ev = ServerEvent(EventKind.END)
         self.out = ByteBuffer()
-        self.req = Request(peer)
+        self.req = Request(peer, id)
         self.res = Response()
         self.state = _WAITING
         self.first = True
@@ -257,6 +313,9 @@ struct _Conn(Movable):
         self.blocked = False
         self.write_deadline = now
         self.rejected = False
+        self.streamed = False
+        self.paused = False
+        self.hangup = False
 
     def service[H: Handler](
         mut self,
@@ -265,24 +324,38 @@ struct _Conn(Movable):
         date: DateCache,
         mut chunk: List[UInt8],
         now: Instant,
+        hangup: Bool,
     ) raises -> Bool:
         """Run the connection until its socket would block: False once it
-        is finished (the codec says close, or the peer is gone)."""
+        is finished (the codec says close, or the peer is gone). `hangup`:
+        the readiness event says the peer closed or half-closed."""
+        if hangup:
+            self.hangup = True
         while True:
             if not self.flush(config, now):
                 return True  # wait for the next writable edge
             if self.http.should_close():
                 return False
-            if self.dispatch(handler, config, date, now) or self.http.pending_transmit() > 0:
+            if self.state == _PRODUCING:
+                if not self.paused and self.produce(handler, config, now):
+                    continue  # more body went out: flush it
+            elif self.dispatch(handler, config, date, now) or self.http.pending_transmit() > 0:
                 continue  # output came (a response, a 100 Continue): flush it first
+            # Only a paused stream reads while _PRODUCING (one that has
+            # something to send loops above), and a client that leaves it,
+            # or half-closes, ends it.
             var room = min(len(chunk), self.http.feed_capacity())
             if room == 0:
-                return True
+                # Pipelined input fills the codec, so the end of input
+                # cannot be read: the hangup flag tells it instead.
+                return not (self.state == _PRODUCING and self.hangup)
             var got = self.stream.try_read(Span(chunk)[0:room])
             if not got:
                 return True  # wait for the next readable edge
             if got.value() == 0:
                 self.http.feed_eof()
+                if self.state == _PRODUCING:
+                    return False  # nobody left to stream to
             else:
                 self.http.feed(Span(chunk)[0 : got.value()])
                 if self.state == _WAITING and not self.head_started:
@@ -327,10 +400,21 @@ struct _Conn(Movable):
             if not got:
                 return False
             if self.ev.kind == EventKind.HEAD:
-                if self.start(config, date, now):
-                    return True  # answered at once (413)
+                if self.start(handler, config, date, now):
+                    return True  # answered at once (413, or a hook failed)
             elif self.ev.kind == EventKind.DATA:
                 if self.rejected:
+                    continue
+                if self.streamed:
+                    self.deadline = now + config.read_timeout  # progress
+                    var ok = True
+                    try:
+                        handler.on_body(self.req, Span(self.ev.data))
+                    except:
+                        ok = False
+                    if not ok:
+                        self.fail(config, date)
+                        return True
                     continue
                 if len(self.req.body) + len(self.ev.data) > config.max_body:
                     self.reject(config, date)
@@ -340,20 +424,53 @@ struct _Conn(Movable):
                 self.req.body.extend(Span(self.ev.data))
             else:  # END
                 var answered = not self.rejected
+                self.first = False
                 if answered:
                     swap(self.req.trailers, self.ev._trailers[0])
-                    self.answer(handler, config, date)
-                self.state = _WAITING
-                self.first = False
-                self.head_started = self.http.buffered() > 0
-                var t = config.header_timeout if self.head_started else config.idle_timeout
-                self.deadline = now + t
+                    if self.answer(handler, config, date):
+                        self.state = _PRODUCING  # until produce says the end
+                        self.paused = False
+                        return True
+                self.waiting(config, now)
                 if answered and self.http.pending_transmit() + len(self.out) >= _HIGH_WATER:
                     return True
 
-    def start(mut self, config: ServerConfig, date: DateCache, now: Instant) raises -> Bool:
+    def waiting(mut self, config: ServerConfig, now: Instant):
+        """Between requests again: the idle timeout, or the header one if
+        the next head has begun."""
+        self.state = _WAITING
+        self.head_started = self.http.buffered() > 0
+        var t = config.header_timeout if self.head_started else config.idle_timeout
+        self.deadline = now + t
+
+    def produce[H: Handler](
+        mut self, mut handler: H, config: ServerConfig, now: Instant
+    ) raises -> Bool:
+        """Pull streamed body from the handler while the output is under
+        `_HIGH_WATER`: True if some went out (flush it), False if the stream
+        paused (nothing to send until a wake). At the stream's end the
+        response is ended and the connection goes back to its requests."""
+        var sent = False
+        while self.http.pending_transmit() + len(self.out) < _HIGH_WATER:
+            self.res.body.clear()
+            var more = handler.produce(self.req, self.res.body)
+            if len(self.res.body) > 0:
+                self.http.send_body(Span(self.res.body))
+                sent = True
+            if not more:
+                self.http.end_response()
+                self.waiting(config, now)
+                return True
+            if len(self.res.body) == 0:
+                self.paused = True
+                return sent
+        return sent
+
+    def start[H: Handler](
+        mut self, mut handler: H, config: ServerConfig, date: DateCache, now: Instant
+    ) raises -> Bool:
         """A request head arrived: move it into `req`. True if it was
-        answered at once (a body over `max_body`)."""
+        answered at once (a body over `max_body`, or a failing hook)."""
         ref h = self.ev.head()
         swap(self.req.method, h.method)
         swap(self.req.target, h.target)
@@ -364,13 +481,29 @@ struct _Conn(Movable):
         self.rejected = False
         self.state = _BODY
         self.deadline = now + config.read_timeout
+        var ok = True
+        try:
+            self.streamed = handler.stream_request(self.req)
+        except:
+            ok = False
+        if not ok:
+            self.fail(config, date)
+            return True
         var length = self.ev.framing.length
-        if length > config.max_body:
+        if not self.streamed and length > config.max_body:
             self.reject(config, date)
             return True
         if self.req.version.at_least_1_1() and self.req.headers.has_token("expect", "100-continue"):
             self.http.send_continue()
         return False
+
+    def fail(mut self, config: ServerConfig, date: DateCache) raises:
+        """A hook raised before the request ended: answer 500; the rest of
+        the request is ignored."""
+        self.rejected = True
+        self.res._reset()
+        self.res.text(500, "Internal Server Error\n")
+        _ = self.send(config, date)
 
     def reject(mut self, config: ServerConfig, date: DateCache) raises:
         """Answer 413 before the body ends; its rest is then ignored (the
@@ -378,11 +511,13 @@ struct _Conn(Movable):
         self.rejected = True
         self.res._reset()
         self.res.text(413, "Request body too large\n")
-        self.send(config, date)
+        _ = self.send(config, date)
 
     def answer[H: Handler](
         mut self, mut handler: H, config: ServerConfig, date: DateCache
-    ) raises:
+    ) raises -> Bool:
+        """Run the handler and send its response: True if it is a stream
+        whose body is still to come."""
         self.res._reset()
         var failed = False
         try:
@@ -392,12 +527,14 @@ struct _Conn(Movable):
         if failed:
             self.res._reset()
             self.res.text(500, "Internal Server Error\n")
-        self.send(config, date)
+        return self.send(config, date)
 
-    def send(mut self, config: ServerConfig, date: DateCache) raises:
+    def send(mut self, config: ServerConfig, date: DateCache) raises -> Bool:
         """Queue `res` with the fields the server adds. If the codec refuses
         the handler's head (an invalid field combination), a 500 goes out
-        instead."""
+        instead. A streamed response gets its head only (the codec chunks
+        it, unless the handler gave a Content-Length): True then, unless
+        it has no body to stream (HEAD, 204, 304)."""
         var head = ResponseHead(self.res.status, self.res.reason)
         swap(head.headers, self.res.headers)
         var has = _scan(head.headers)
@@ -408,8 +545,14 @@ struct _Conn(Movable):
             head.headers._push("Server".as_bytes(), config.server_name.as_bytes(), utf8=True)
         var s = head.status
         var bodiless = (s >= 100 and s < 200) or s == 204 or s == 304
+        var streaming = self.res._stream and not bodiless and self.req.method != "HEAD"
         if not bodiless and not has.framing:
-            _push_decimal(head.headers, "Content-Length", len(self.res.body))
+            if not self.res._stream:
+                _push_decimal(head.headers, "Content-Length", len(self.res.body))
+            elif not streaming and self.req.version.at_least_1_1():
+                # HEAD: the fields its GET gets (RFC 9110 9.3.2), where the
+                # codec would chunk the body
+                head.headers._push("Transfer-Encoding".as_bytes(), "chunked".as_bytes(), utf8=True)
         var refused = False
         try:
             self.http.send_response(head)
@@ -420,10 +563,14 @@ struct _Conn(Movable):
             fallback.headers.add("Date", date.current())
             fallback.headers.add("Content-Length", "0")
             self.http.send_response(fallback)
-        elif not bodiless:
+        elif streaming:
+            swap(head.headers, self.res.headers)
+            return True  # the body comes from produce
+        elif not bodiless and not self.res._stream:
             self.http.send_body(Span(self.res.body))
         self.http.end_response()
         swap(head.headers, self.res.headers)  # keep the allocation for the next one
+        return False
 
 
 @fieldwise_init
@@ -492,6 +639,12 @@ struct Server[H: Handler](Movable):
     var _next_sweep: Instant
     var _now: Instant
     """The clock as read after the last wait (one read per turn)."""
+    var _gens: List[UInt32]
+    """Per slot: the generation of its current connection (ids name it)."""
+    var _woken: List[Int]
+    """Slots whose paused streams were woken, served in the next turn."""
+    var _serving: List[Int]
+    """The woken slots this turn serves (reused)."""
 
     def __init__(out self, var handler: Self.H, config: ServerConfig = ServerConfig()) raises IoError:
         self.handler = handler^
@@ -508,6 +661,9 @@ struct Server[H: Handler](Movable):
         self._backlog = False
         self._next_sweep = Instant.now()
         self._now = self._next_sweep
+        self._gens = List[UInt32]()
+        self._woken = List[Int]()
+        self._serving = List[Int]()
 
     def bind(mut self, addr: SocketAddr) raises IoError:
         """Listen on `addr` (port 0 picks one: see `local_addr`), with
@@ -528,6 +684,25 @@ struct Server[H: Handler](Movable):
     def connections(self) -> Int:
         """Open connections."""
         return self._live
+
+    def wake(mut self, id: UInt64):
+        """Resume the paused stream of connection `id` (`Request.id`). It is
+        served in the next turn, which then does not wait for readiness. An
+        id whose connection has closed, or whose stream is not paused, is
+        ignored."""
+        var slot = Int(id >> 32)
+        var gen = UInt32(id & 0xFFFFFFFF)
+        if slot >= len(self._conns) or not self._conns[slot] or self._gens[slot] != gen:
+            return
+        ref c = self._conns[slot].value()
+        if c.state == _PRODUCING and c.paused:
+            c.paused = False
+            self._woken.append(slot)
+
+    def _take_wakes(mut self):
+        var ids = self.handler.take_wakes()
+        for i in range(len(ids)):
+            self.wake(ids[i])
 
     def queued_output(self) -> Int:
         """Response bytes produced and not yet taken by the sockets, over
@@ -556,6 +731,8 @@ struct Server[H: Handler](Movable):
         var wait = min(timeout, self._next_sweep - self._now)
         if self._paused_until:
             wait = min(wait, self._paused_until.value() - self._now)
+        if len(self._woken) > 0:
+            wait = Duration.ZERO
         var n = self._ep.wait(self._events, Optional[Duration](wait))
         var now = Instant.now()
         self._now = now
@@ -569,7 +746,18 @@ struct Server[H: Handler](Movable):
             var slot = Int(key)
             if slot >= len(self._conns) or not self._conns[slot]:
                 continue  # closed earlier in this batch
-            self._serve(slot, now)
+            var hup = self._events[i].events() & UInt32(EPOLLRDHUP | EPOLLHUP | EPOLLERR)
+            self._serve(slot, now, hup != 0)
+        # Streams woken since the last turn. Wakes that serving them causes
+        # wait for the next turn, so a handler that keeps waking a stream
+        # keeps the loop busy but cannot keep it from its sockets.
+        if len(self._woken) > 0:
+            swap(self._serving, self._woken)
+            for i in range(len(self._serving)):
+                var slot = self._serving[i]
+                if slot < len(self._conns) and self._conns[slot]:
+                    self._serve(slot, now)
+            self._serving.clear()
         if self._paused_until and now >= self._paused_until.value():
             self._paused_until = None
             accept_now = True  # the edge may have come while paused
@@ -579,14 +767,15 @@ struct Server[H: Handler](Movable):
             self._sweep(now)
             self._next_sweep = now + self.config._sweep_every()
 
-    def _serve(mut self, slot: Int, now: Instant):
+    def _serve(mut self, slot: Int, now: Instant, hangup: Bool = False):
         var alive: Bool
         try:
             alive = self._conns[slot].value().service(
-                self.handler, self.config, self._date, self._chunk, now
+                self.handler, self.config, self._date, self._chunk, now, hangup
             )
         except:
             alive = False  # reset, broken pipe: drop the connection
+        self._take_wakes()
         if not alive:
             self._close(slot)
 
@@ -623,9 +812,12 @@ struct Server[H: Handler](Movable):
             else:
                 slot = len(self._conns)
                 self._conns.append(None)
+                self._gens.append(0)
+            self._gens[slot] += 1
+            var id = (UInt64(slot) << 32) | UInt64(self._gens[slot])
             try:
                 self._ep.add(stream, UInt32(EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET), UInt64(slot))
-                self._conns[slot] = _Conn(stream^, peer, self.config, now)
+                self._conns[slot] = _Conn(stream^, peer, id, self.config, now)
                 self._live += 1
             except:
                 self._free.append(slot)  # (the stream closes here)
@@ -640,7 +832,7 @@ struct Server[H: Handler](Movable):
                 if now >= c.write_deadline:
                     self._close(slot)
                 continue
-            if now < c.deadline:
+            if now < c.deadline or c.state == _PRODUCING:
                 continue
             if c.state == _WAITING and not c.head_started:
                 self._close(slot)  # idle: close quietly

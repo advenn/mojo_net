@@ -3,7 +3,7 @@
 Native Mojo networking libraries for Linux (x86_64 and aarch64, kernel 5.15+):
 - raw syscalls, with no libc on the I/O path;
 - sockets;
-- an HTTP/1.1 library (in progress), and the layers that an HTTP server and database drivers will build on.
+- an HTTP/1.1 library, and an HTTP/1.1 server (in progress); database drivers will build on the same layers.
 
 | Package | What | Status |
 |---|---|---|
@@ -11,10 +11,10 @@ Native Mojo networking libraries for Linux (x86_64 and aarch64, kernel 5.15+):
 | `bytes` | `ByteBuffer` and the sans-I/O `Codec` contract that protocol codecs implement | stable |
 | `net` | the TCP/UDP library: addresses, every socket option, TCP/Unix streams with deadlines, connect by name, buffered frame reads, UDP sockets (blocking, nonblocking, batched, multicast) ([docs/net.md](docs/net.md)) | TCP client and UDP stable |
 | `http` | HTTP/1.1: a sans-I/O head parser, body framing and connection codecs for both sides, and a blocking client with a keep-alive pool ([docs/http.md](docs/http.md)) | done |
-| `server` | an HTTP/1.1 server: one epoll loop per process, a `Handler` trait, timeouts and backpressure; one process per core with SO_REUSEPORT ([docs/server.md](docs/server.md)) | in progress |
+| `server` | an HTTP/1.1 server: one epoll loop per process, a `Handler` trait, timeouts and backpressure, streamed bodies and server-sent events; one process per core with SO_REUSEPORT ([docs/server.md](docs/server.md)) | in progress |
 | `rt` | an experimental completion-based event loop ([docs/rt.md](docs/rt.md)) | frozen |
 
-Imports point downward only (`linux` ← `bytes` ← `net` ← `rt`, and `net` ← `http`), and only `rt` may import `rt`. `http`'s protocol code is sans-I/O: only its client and server modules import `net`. CI checks these rules. Design, package rules and shared contracts: [docs/design.md](docs/design.md).
+Imports point downward only (`linux` ← `bytes` ← `net` ← `rt`, and `net` ← `http` ← `server`), and only `rt` may import `rt`. `http`'s protocol code is sans-I/O: only its client module imports `net`. CI checks these rules. Design, package rules and shared contracts: [docs/design.md](docs/design.md).
 
 ## Use
 There is no published package yet. Pin the same Mojo as `pixi.toml`, and put `src/` on the include path (`mojo run -I src ...`).
