@@ -173,6 +173,7 @@ def _run(mode: StaticString) raises -> String:
         s.step(Duration.from_millis(5))
         if t.elapsed() > Duration.from_secs(60):
             _ = proc.kill()
+            _ = Python.import_module("shutil").rmtree(root, ignore_errors=True)
             raise Error(String("client ", mode, " timed out"))
     # A client that left mid-file is seen when the server's next probe of
     # its zero window draws a reset (TCP's persist timer: about 200 ms).
@@ -180,12 +181,9 @@ def _run(mode: StaticString) raises -> String:
     while s.connections() > 0 and drain.elapsed() < Duration.from_secs(3):
         s.step(Duration.from_millis(5))
     var out = String(String(py=proc.communicate()[0]).strip())
+    _ = Python.import_module("shutil").rmtree(root)  # (before asserting: no leftovers)
     assert_equal(s.connections(), 0, String(mode, ": connections left"))
     assert_equal(s.handler.app.files.transfers(), 0, String(mode, ": files left open"))
-    var shutil = Python.import_module("shutil")
-    var os = Python.import_module("os")
-    _ = os.chmod(String(root, "/pub/secret.txt"), 0o600)
-    _ = shutil.rmtree(root)
     return out^
 
 

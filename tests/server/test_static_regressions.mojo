@@ -133,6 +133,7 @@ def _run(mode: StaticString) raises -> String:
         s.step(Duration.from_millis(5))
         if t.elapsed() > Duration.from_secs(60):
             _ = proc.kill()
+            _ = Python.import_module("shutil").rmtree(root, ignore_errors=True)
             raise Error(String("client ", mode, " timed out"))
     var out = String(String(py=proc.communicate()[0]).strip())
     var shutil = Python.import_module("shutil")

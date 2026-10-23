@@ -141,6 +141,7 @@ def test_curl_against_the_server() raises:
         s.step(Duration.from_millis(5))
         if t.elapsed() > Duration.from_secs(120):
             _ = proc.kill()
+            _ = shutil.rmtree(root, ignore_errors=True)
             raise Error("curl timed out")
     var drain = Instant.now()
     while s.connections() > 0 and drain.elapsed() < Duration.from_secs(3):
