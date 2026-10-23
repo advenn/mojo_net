@@ -28,6 +28,7 @@ WANTED = [
     # files / fds
     "openat", "read", "write", "readv", "writev", "close", "fcntl", "dup3",
     "pipe2", "ioctl", "fstat", "sendfile", "splice", "getdents64",
+    "openat2", "statx", "pread64",
     # memory
     "mmap", "munmap", "madvise", "mprotect",
     # sockets

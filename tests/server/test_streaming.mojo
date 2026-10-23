@@ -174,6 +174,9 @@ struct App(Handler):
     var spins: Int
     var stop: Bool
     var stopped_while_spinning: Bool
+    var finished: Int
+    var cut: Int
+    """`stream_ended` calls, by outcome."""
 
     def __init__(out self):
         self.got = 0
@@ -188,6 +191,8 @@ struct App(Handler):
         self.spins = 0
         self.stop = False
         self.stopped_while_spinning = False
+        self.finished = 0
+        self.cut = 0
 
     def stream_request(mut self, req: Request) raises -> Bool:
         if req.path() == "/upload" or req.path() == "/upload-fail":
@@ -288,6 +293,12 @@ struct App(Handler):
         swap(w, self.wakes)
         return w^
 
+    def stream_ended(mut self, req: Request, finished: Bool):
+        if finished:
+            self.finished += 1
+        else:
+            self.cut += 1
+
 
 comptime _VALVE = 1000000
 """Spins after which `/spin` gives up: long after `/stop` should have come."""
@@ -330,6 +341,16 @@ def _finish(mut s: Server[App], proc: PythonObject, mode: StaticString) raises -
         # paced by the client: never much more than the high-water mark
         assert_true(peak < 1024 * 1024, String("queued ", peak))
         assert_equal(s.handler.produced_for_head, 0)  # HEAD never produces
+    # every stream ends once: finished, or cut
+    var ends = String(s.handler.finished, " finished, ", s.handler.cut, " cut")
+    var want = String("1 finished, 0 cut")
+    if mode == "download":
+        want = "3 finished, 0 cut"  # the download, HEAD (at once), the sized one
+    elif mode == "upload":
+        want = "0 finished, 0 cut"
+    elif mode == "abandon" or mode == "flood" or mode == "outside" or mode == "failing":
+        want = "0 finished, 1 cut"
+    assert_equal(ends, want, String(mode, ": stream_ended"))
     if mode == "headraw":
         assert_equal(s.handler.produced_for_head, 0)
     if mode == "spin":

@@ -186,6 +186,17 @@ comptime F_SETFD: Int = 2
 comptime F_GETFL: Int = 3
 comptime F_SETFL: Int = 4
 comptime FD_CLOEXEC: Int = 1
+comptime O_PATH: Int = 2097152
+
+# openat2 / statx
+comptime RESOLVE_BENEATH: Int = 8
+comptime RESOLVE_NO_MAGICLINKS: Int = 2
+comptime RESOLVE_NO_SYMLINKS: Int = 4
+comptime STATX_BASIC_STATS: Int = 2047
+comptime AT_EMPTY_PATH: Int = 4096
+comptime S_IFMT: Int = 61440
+comptime S_IFREG: Int = 32768
+comptime S_IFDIR: Int = 16384
 
 # ioctl
 comptime FIONREAD: Int = 21531

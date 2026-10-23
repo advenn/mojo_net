@@ -2,7 +2,7 @@
 
 An HTTP/1.1 server for Mojo on Linux (roadmap step 3). It is built on the `http` library's sans-I/O `ServerConnection` and on `net`'s nonblocking sockets. Package rules and contracts are in `docs/design.md`; HTTP itself is in `docs/http.md`.
 
-**Status: active.** S1 (the serving loop), S2 (streaming) and S3 (graceful shutdown, signals and worker processes) are done. Of S4, routing is done; static files are next.
+**Status: active.** S1 (the serving loop), S2 (streaming), S3 (graceful shutdown, signals and worker processes) and S4 (routing and static files) are done; S5 (polish) is next.
 
 ## Model
 **One thread and one edge-triggered epoll loop per process**, with one `ServerConnection` per connection.
@@ -117,6 +117,35 @@ A malformed percent-encoding gets 400. Matching is strict: no trailing-slash red
 
 **Measured:** 100 to 300 ns per match over 12 routes and paths of 1 to 4 segments (the minimum over batches, on a loaded machine).
 
+## Static files (S4)
+`StaticFiles` answers requests with the files of one directory, from a route; `examples/server/files.mojo` is a whole file server.
+```mojo
+def assets(mut app: App, req: Request, params: Params, mut res: Response) raises:
+    app.files.serve(req, params["path"], res)
+
+router.get("/assets/*path", assets)
+```
+Large files are streamed, so the application passes `produce` and `stream_ended` on to `files`.
+
+**No path leaves the directory:**
+- First, the path itself is checked: no empty, "." or ".." segment, and no NUL (404). One trailing "/" names a directory.
+- Then the kernel keeps the open beneath the directory: openat2 with `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`. A symlink out of it gets 404 too.
+- Only regular files are served. Files are opened nonblocking, so that a FIFO put in the directory cannot stall the loop; it then gets 404 like any other non-regular file.
+- A file the server may not read gets 403.
+
+**Responses:**
+- **Fields:** Content-Type (from the extension), Content-Length, Last-Modified, an ETag (size and modification time, like nginx's) and `Accept-Ranges: bytes`.
+- **Directories:** a directory serves its `index.html`, after a 301 to the path with a trailing "/" when it lacks one. There are no listings.
+- **Conditional requests** (RFC 9110 13.2.2): If-None-Match (weak comparison) answers 304; only without it, If-Modified-Since does.
+- **Ranges** (RFC 9110 14):
+  - one byte range gets 206 with Content-Range, an unsatisfiable one 416;
+  - several ranges, a malformed one, or an If-Range that does not match get the whole file;
+  - an empty file ignores Range.
+- **Bodies:** up to 64 KiB are read whole. Larger ones stream in 64 KiB pieces as the client takes them (`produce`), and `stream_ended` closes the file however the response ends.
+- **Reads block:** they are plain preads, so a file not in the page cache stalls the loop while the disk reads it.
+
+**HTTP dates** in conditional fields are read in all three forms, which recipients must accept (`parse_http_date`, RFC 9110 5.6.7).
+
 ## Streaming (S2)
 The `Handler` hooks beyond `handle` all have defaults, so a handler that buffers needs none of them.
 
@@ -137,8 +166,14 @@ The `Handler` hooks beyond `handle` all have defaults, so a handler that buffers
 - **HEAD** gets the head only, with the fields its GET gets (`Transfer-Encoding: chunked`), and `produce` is never called. So do 204 and 304.
 
 **Ends and errors.**
+- `Handler.stream_ended(req, finished)` is called once for every response made with `res.stream()`:
+  - `finished` when its whole body went out, or when it had none to send (HEAD, 204, 304);
+  - otherwise when it was cut: the client left, `produce` raised, the head was refused, or a shutdown timed out.
+
+  It is where a stream's resources (an open file, a subscription) are released.
 - A paused stream lasts as long as its handler wants: the header, idle and read timeouts do not apply to it, and the write timeout applies while its output waits.
-- A client that closes or half-closes its side while its stream is paused ends the stream, as nginx does. This also holds when the client's pipelined requests fill the codec, so that no read can see the end of input: epoll's hangup flag tells instead.
+- A client that closes or half-closes its side while its stream is paused ends the stream, as nginx does.
+- A client that half-closes while output waits for it may still be reading, so the stream goes on. If the client is gone, the server's next probe of its zero window draws a reset (TCP's persist timer, about 200 ms), and the stream is cut then; a peer that never answers is cut at `write_timeout`. This also holds when the client's pipelined requests fill the codec, so that no read can see the end of input: epoll's hangup flag tells instead.
 - An error from `stream_request` or `on_body` answers 500, ignores the rest of the request, and closes the connection after the response (unless the rest is short enough to drain).
 - An error from `produce` cuts the response: the connection closes, and the client sees an incomplete body.
 
@@ -205,5 +240,7 @@ The `Handler` hooks beyond `handle` all have defaults, so a handler that buffers
   - **Part 1, done:** `Router` (above).
     - **Tests** (`tests/server/test_router.mojo`): every rule above case by case, a server running a router over the wire, and a differential check of 12,000 matches against a naive matcher. The naive matcher ranks every matching route by its segment kinds, which is the specificity rule stated directly.
     - **Planted bugs:** 19 of 19 caught.
-  - **Part 2, next:** static files.
+  - **Part 2, done:** `StaticFiles` (above), `Handler.stream_ended`, and `linux.fs` gaining `open_dir`, `open_beneath` (openat2), `stat_fd` (statx: the same struct on both architectures, unlike `stat`) and `pread`.
+    - **Tests** (`tests/server/test_static.mojo`, over a scratch directory): types, the index and its redirect, every way out refused (raw and encoded "..", empty segments, symlinks out, a FIFO, an unreadable file), conditional requests and their precedence, ranges (206, 416, suffixes, If-Range, several ranges), a 1 MiB file streamed and checked, HEAD, and an abandoned download whose file is closed (32 MiB: a 1 MiB file fit in the socket buffers, and its stream finished before the client left). Also the three date forms with RFC 850's century rule, and the type table. `tests/server/test_streaming.mojo` counts each mode's `stream_ended` calls.
+    - **Planted bugs:** 21 of 21 caught, once the abandoned download was made too large for the socket buffers; that was the one that survived at first.
 - **S5: polish.** Interop, an independent review, benchmarks, and the guide.

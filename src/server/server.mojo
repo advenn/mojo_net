@@ -300,6 +300,14 @@ trait Handler(Deinitable, Movable):
         every call into the handler."""
         return List[UInt64]()
 
+    def stream_ended(mut self, req: Request, finished: Bool):
+        """A response made with `res.stream()` is over; called once for
+        each. `finished`: its whole body went out, or it had none (HEAD,
+        204, 304). Otherwise it was cut: the client left, `produce` raised,
+        the head was refused, or a shutdown timed out. Release what the
+        stream held here (open files, subscriptions)."""
+        pass
+
     def shutting_down(mut self):
         """Called once when the server begins a graceful shutdown. Streams
         last until `shutdown_timeout` unless they end: a handler with
@@ -339,6 +347,8 @@ struct _Conn(Movable):
     """Epoll reported that the peer closed or half-closed (sticky)."""
     var eof: Bool
     """The end of the client's input was read."""
+    var refused: Bool
+    """The codec refused the handler's last head (a 500 went instead)."""
 
     def __init__(out self, var stream: TcpStream, peer: SocketAddr, id: UInt64, config: ServerConfig, now: Instant) raises IoError:
         self.stream = stream^
@@ -358,6 +368,7 @@ struct _Conn(Movable):
         self.paused = False
         self.hangup = False
         self.eof = False
+        self.refused = False
 
     def service[H: Handler](
         mut self,
@@ -541,6 +552,7 @@ struct _Conn(Movable):
             if not more:
                 self.http.end_response()
                 self.waiting(config, now)
+                handler.stream_ended(self.req, True)
                 return True
             if len(self.res.body) == 0:
                 self.paused = True
@@ -606,9 +618,14 @@ struct _Conn(Movable):
         except:
             failed = True
         if failed:
+            if self.res._stream:
+                handler.stream_ended(self.req, False)  # (it may hold something)
             self.res._reset()
             self.res.text(500, "Internal Server Error\n")
-        return self.send(config, date)
+        var streaming = self.send(config, date)
+        if self.res._stream and not streaming:
+            handler.stream_ended(self.req, not self.refused)  # nothing to stream
+        return streaming
 
     def send(mut self, config: ServerConfig, date: DateCache) raises -> Bool:
         """Queue `res` with the fields the server adds. If the codec refuses
@@ -639,6 +656,7 @@ struct _Conn(Movable):
             self.http.send_response(head)
         except:
             refused = True
+        self.refused = refused
         if refused:
             var fallback = ResponseHead(500)
             fallback.headers.add("Date", date.current())
@@ -941,6 +959,10 @@ struct Server[H: Handler](Movable):
             self._close(slot)
 
     def _close(mut self, slot: Int):
+        if self._conns[slot].value().state == _PRODUCING:
+            # its stream is cut
+            self.handler.stream_ended(self._conns[slot].value().req, False)
+            self._take_wakes()
         try:
             self._ep.delete(self._conns[slot].value().stream)
         except:

@@ -452,3 +452,61 @@ struct SignalfdSiginfo(Copyable, Movable):
         self.uid = 0
         self._pad = 0
         self._rest = Array[UInt64, 13](fill=0)
+
+
+@fieldwise_init
+struct OpenHow(Copyable, Movable):
+    """`struct open_how` (24 bytes), as openat2 takes it: open flags, the
+    mode for O_CREAT, and RESOLVE_* restrictions on the path walk."""
+
+    var flags: UInt64
+    var mode: UInt64
+    var resolve: UInt64
+
+
+struct Statx(Copyable, Movable):
+    """`struct statx` (256 bytes, the same on x86_64 and aarch64, unlike
+    `struct stat`), as statx fills it. Only the fields used are named."""
+
+    var mask: UInt32
+    """Which fields the kernel filled (STATX_*)."""
+    var blksize: UInt32
+    var attributes: UInt64
+    var nlink: UInt32
+    var uid: UInt32
+    var gid: UInt32
+    var mode: UInt16
+    """The file type (S_IFMT bits) and permissions."""
+    var _pad0: UInt16
+    var ino: UInt64
+    var size: UInt64
+    var blocks: UInt64
+    var _attributes_mask: UInt64
+    var _atime: Array[UInt64, 2]
+    var _btime: Array[UInt64, 2]
+    var _ctime: Array[UInt64, 2]
+    var mtime_sec: Int64
+    var mtime_nsec: UInt32
+    var _mtime_reserved: Int32
+    var _rest: Array[UInt64, 16]
+
+    def __init__(out self):
+        self.mask = 0
+        self.blksize = 0
+        self.attributes = 0
+        self.nlink = 0
+        self.uid = 0
+        self.gid = 0
+        self.mode = 0
+        self._pad0 = 0
+        self.ino = 0
+        self.size = 0
+        self.blocks = 0
+        self._attributes_mask = 0
+        self._atime = Array[UInt64, 2](fill=0)
+        self._btime = Array[UInt64, 2](fill=0)
+        self._ctime = Array[UInt64, 2](fill=0)
+        self.mtime_sec = 0
+        self.mtime_nsec = 0
+        self._mtime_reserved = 0
+        self._rest = Array[UInt64, 16](fill=0)

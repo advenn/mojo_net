@@ -513,6 +513,9 @@ struct Router[A: Handler](Handler):
     def take_wakes(mut self) -> List[UInt64]:
         return self.app.take_wakes()
 
+    def stream_ended(mut self, req: Request, finished: Bool):
+        self.app.stream_ended(req, finished)
+
     def shutting_down(mut self):
         self.app.shutting_down()
 

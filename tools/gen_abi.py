@@ -39,6 +39,7 @@ HEADERS = """
 #include <sys/resource.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/timerfd.h>
 #include <sys/uio.h>
@@ -46,6 +47,7 @@ HEADERS = """
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <linux/openat2.h>
 #include <linux/sched.h>
 #include <linux/sockios.h>
 """
@@ -105,7 +107,10 @@ CONSTS = [
     ("open / fcntl",
      ["O_RDONLY", "O_WRONLY", "O_RDWR", "O_NONBLOCK", "O_CLOEXEC", "AT_FDCWD",
       "F_DUPFD_CLOEXEC", "F_GETFD", "F_SETFD", "F_GETFL", "F_SETFL",
-      "FD_CLOEXEC"]),
+      "FD_CLOEXEC", "O_PATH"]),
+    ("openat2 / statx",
+     ["RESOLVE_BENEATH", "RESOLVE_NO_MAGICLINKS", "RESOLVE_NO_SYMLINKS",
+      "STATX_BASIC_STATS", "AT_EMPTY_PATH", "S_IFMT", "S_IFREG", "S_IFDIR"]),
     ("ioctl", ["FIONREAD", "FIONBIO", "SIOCINQ", "SIOCOUTQ", "SIOCGIFINDEX"]),
     ("Interfaces", ["IF_NAMESIZE"]),
     ("Clocks", ["CLOCK_REALTIME", "CLOCK_MONOTONIC", "CLOCK_MONOTONIC_RAW",
@@ -243,6 +248,14 @@ STRUCTS = [
     ("siginfo_t", "Siginfo",
      [("si_signo", "signo"), ("si_errno", "errno"), ("si_code", "code"),
       ("si_pid", "pid"), ("si_uid", "uid"), ("si_status", "status")]),
+    ("struct open_how", "OpenHow",
+     [("flags", "flags"), ("mode", "mode"), ("resolve", "resolve")]),
+    ("struct statx", "Statx",
+     [("stx_mask", "mask"), ("stx_blksize", "blksize"),
+      ("stx_attributes", "attributes"), ("stx_nlink", "nlink"),
+      ("stx_uid", "uid"), ("stx_gid", "gid"), ("stx_mode", "mode"),
+      ("stx_ino", "ino"), ("stx_size", "size"), ("stx_blocks", "blocks"),
+      ("stx_mtime.tv_sec", "mtime_sec"), ("stx_mtime.tv_nsec", "mtime_nsec")]),
     ("struct signalfd_siginfo", "SignalfdSiginfo",
      [("ssi_signo", "signo"), ("ssi_errno", "errno"), ("ssi_code", "code"),
       ("ssi_pid", "pid"), ("ssi_uid", "uid")]),
