@@ -23,7 +23,7 @@ So a Mojo upgrade, or a change in a shared layer, lands in every package in one 
 | `bytes` | `ByteBuffer`, and the sans-I/O `Codec` contract (contract 1) with the reference `LineCodec` | stable (M1) | `linux` |
 | `net` | the TCP/UDP library (`docs/net.md`): addresses, socket options (L1), blocking TCP/Unix with deadlines and nonblocking `try_*` calls (L2), buffered frame reads (`BufReader`), DNS and connect-by-name (Happy Eyeballs), UDP | TCP client (M2) and UDP (M3) done; packaging left | `linux`, `bytes` |
 | `http` | the HTTP/1.1 library (`docs/http.md`): message types, the header map, the sans-I/O head parser, body framing, server and client connection codecs, and a blocking client | H1–H6 done | `linux`, `bytes`; `net` only in `http.client` |
-| `server` | the HTTP/1.1 server (`docs/server.md`): one epoll loop per process over `ServerConnection`s, a `Handler` trait, timeouts, backpressure, streaming; SO_REUSEPORT for multi-core | **active**: S1–S2 done, S3 in progress | `linux`, `bytes`, `net`, `http` |
+| `server` | the HTTP/1.1 server (`docs/server.md`): one epoll loop per process over `ServerConnection`s, a `Handler` trait, timeouts, backpressure, streaming; SO_REUSEPORT for multi-core | **active**: S1–S3 done | `linux`, `bytes`, `net`, `http` |
 | `rt` | experimental completion-based event loop (`docs/rt.md`): epoll and simulator backends, timers, slab, mailbox, `rt.evented` connections | **frozen** until Mojo's async/await stabilizes | `linux`, `bytes`, `net` |
 
 - **Nothing outside `rt` imports `rt`.** `rt` builds on `net`, never the reverse.
@@ -43,6 +43,10 @@ So a Mojo upgrade, or a change in a shared layer, lands in every package in one 
   - Mojo is pinned exactly: `1.2.0`, from Modular's stable channel (`https://conda.modular.com/max`).
   - Packages ship as source, with the constraint `>=1.2,<1.3`.
   - No private or underscore stdlib APIs (the test-only `linux.fault` is the one exception), and no nightly-only spellings.
+- **Signals are data, not handlers.** The library installs no signal handlers.
+  - A program that wants a signal blocks it and reads it from a signalfd (`linux.signal`).
+  - The block must hold in every thread, and the Mojo runtime starts its threads before `main` with the exec-time mask. So the library blocks the signal and executes the program again when some thread does not block it (`server.process`; measured in `docs/spikes.md`).
+  - Child processes are clone3 + execve (`linux.process.spawn`), with only raw syscalls on memory prepared beforehand in between, since a forked copy of a threaded process must not allocate.
 - **No async/await yet.** Mojo marks it unstable.
   - The libraries expose blocking APIs, plus nonblocking building blocks for callers that run their own readiness loop.
   - An async runtime waits for Mojo's async design ("the compiler generates coroutines, the library schedules them"), which will shape its API. That is why `rt` is frozen.

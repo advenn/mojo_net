@@ -365,3 +365,90 @@ struct Mmsghdr(Copyable, Movable):
     var hdr: Msghdr
     var len: UInt32
     """Bytes sent or received for this message (set by the kernel)."""
+
+
+struct CloneArgs(Copyable, Movable):
+    """`struct clone_args` (88 bytes, the size since Linux 5.7), as clone3
+    takes it. Pointer fields (`pidfd`, `child_tid`, `parent_tid`) hold
+    addresses."""
+
+    var flags: UInt64
+    var pidfd: UInt64
+    """Where the kernel stores the child's pidfd (with CLONE_PIDFD)."""
+    var child_tid: UInt64
+    var parent_tid: UInt64
+    var exit_signal: UInt64
+    """The signal the parent gets when the child ends (SIGCHLD for a
+    child that waitid sees without __WALL)."""
+    var stack: UInt64
+    var stack_size: UInt64
+    var tls: UInt64
+    var set_tid: UInt64
+    var set_tid_size: UInt64
+    var cgroup: UInt64
+
+    def __init__(out self):
+        """All zero: a fork-like clone on the caller's stack."""
+        self.flags = 0
+        self.pidfd = 0
+        self.child_tid = 0
+        self.parent_tid = 0
+        self.exit_signal = 0
+        self.stack = 0
+        self.stack_size = 0
+        self.tls = 0
+        self.set_tid = 0
+        self.set_tid_size = 0
+        self.cgroup = 0
+
+
+struct Siginfo(Copyable, Movable):
+    """`siginfo_t` (128 bytes) with the fields `waitid` fills for a child:
+    `code` is CLD_EXITED (then `status` is its exit code) or CLD_KILLED /
+    CLD_DUMPED (then `status` is the signal)."""
+
+    var signo: Int32
+    var errno: Int32
+    var code: Int32
+    var _pad0: Int32
+    var pid: Int32
+    """0 if waitid with WNOHANG found no child that changed state."""
+    var uid: UInt32
+    var status: Int32
+    var _pad1: Int32
+    var _rest: Array[UInt64, 12]
+
+    def __init__(out self):
+        """Zeroed (`pid` 0: nothing found)."""
+        self.signo = 0
+        self.errno = 0
+        self.code = 0
+        self._pad0 = 0
+        self.pid = 0
+        self.uid = 0
+        self.status = 0
+        self._pad1 = 0
+        self._rest = Array[UInt64, 12](fill=0)
+
+
+struct SignalfdSiginfo(Copyable, Movable):
+    """`struct signalfd_siginfo` (128 bytes): one signal read from a
+    signalfd. Only the leading fields are mirrored by name."""
+
+    var signo: UInt32
+    var errno: Int32
+    var code: Int32
+    var pid: UInt32
+    """The sender's pid (for `kill`)."""
+    var uid: UInt32
+    var _pad: UInt32
+    var _rest: Array[UInt64, 13]
+
+    def __init__(out self):
+        self.signo = 0
+        self.errno = 0
+        self.code = 0
+        self.pid = 0
+        self.uid = 0
+        self._pad = 0
+        self._rest = Array[UInt64, 13](fill=0)

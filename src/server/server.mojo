@@ -50,6 +50,9 @@ The loop, per connection:
   progress get their responses (the last on their connections, saying
   `Connection: close`), and whatever is left closes after
   `shutdown_timeout`. `stopped()` says when no connection is left.
+  `stop_on(stop)` begins one on SIGTERM or SIGINT, or when a worker's
+  supervisor asks (`server.process`); a second signal closes everything
+  at once.
 """
 
 from bytes.buffer import ByteBuffer
@@ -67,8 +70,10 @@ from net.socket import Shutdown
 from net.tcp import TcpAccepted, TcpListener, TcpStream
 
 from .date import DateCache
+from .process import Stop
 
 comptime _LISTENER: UInt64 = UInt64.MAX
+comptime _STOP: UInt64 = UInt64.MAX - 1
 comptime _PAUSE = Duration.from_millis(100)
 comptime _READ_CHUNK = 64 * 1024
 comptime _HIGH_WATER = 64 * 1024
@@ -724,6 +729,8 @@ struct Server[H: Handler](Movable):
     var _stopping: Bool
     """`shutdown()` was called."""
     var _stop_deadline: Instant
+    var _stop: Optional[Stop]
+    """What asks for the shutdown (`stop_on`)."""
 
     def __init__(out self, var handler: Self.H, config: ServerConfig = ServerConfig()) raises IoError:
         self.handler = handler^
@@ -745,6 +752,7 @@ struct Server[H: Handler](Movable):
         self._serving = List[Int]()
         self._stopping = False
         self._stop_deadline = self._now
+        self._stop = None
 
     def bind(mut self, addr: SocketAddr) raises IoError:
         """Listen on `addr` (port 0 picks one: see `local_addr`), with
@@ -844,6 +852,21 @@ struct Server[H: Handler](Movable):
         """A graceful shutdown has finished: no connection is left."""
         return self._stopping and self._live == 0
 
+    def stop_on(mut self, var stop: Stop) raises IoError:
+        """Shut down when `stop` asks (`server.process.Stop`): gracefully at
+        the first request (SIGTERM, SIGINT, or the supervisor of a worker),
+        and at once, closing every connection, at a signal after it. `run`
+        then returns when the shutdown has finished."""
+        self._ep.add(stop.signals, UInt32(EPOLLIN), _STOP)
+        if stop.lifeline:
+            self._ep.add(stop.lifeline.value(), UInt32(EPOLLIN | EPOLLRDHUP), _STOP)
+        self._stop = stop^
+
+    def _close_all(mut self):
+        for slot in range(len(self._conns)):
+            if self._conns[slot]:
+                self._close(slot)
+
     def step(mut self, timeout: Duration) raises IoError:
         """One turn of the loop: wait up to `timeout` for readiness, serve
         what is ready, accept new connections, check timeouts. `run` calls
@@ -864,10 +887,14 @@ struct Server[H: Handler](Movable):
         self._now = now
         self._date.refresh(now)
         var accept_now = False
+        var asked = False
         for i in range(n):
             var key = self._events[i].data()
             if key == _LISTENER:
                 accept_now = True
+                continue
+            if key == _STOP:
+                asked = True
                 continue
             var slot = Int(key)
             if slot >= len(self._conns) or not self._conns[slot]:
@@ -889,10 +916,14 @@ struct Server[H: Handler](Movable):
             accept_now = True  # the edge may have come while paused
         if (accept_now or self._backlog) and self._listener:
             self._accept(now)
+        if asked and self._stop:
+            var what = self._stop.value().requested()
+            if what != Stop.NONE:
+                self.shutdown()
+            if what == Stop.NOW:
+                self._close_all()
         if self._stopping and now >= self._stop_deadline:
-            for slot in range(len(self._conns)):
-                if self._conns[slot]:
-                    self._close(slot)  # what is left after shutdown_timeout
+            self._close_all()  # what is left after shutdown_timeout
         if now >= self._next_sweep:
             self._sweep(now)
             self._next_sweep = now + self.config._sweep_every()

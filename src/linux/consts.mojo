@@ -221,13 +221,24 @@ comptime GRND_RANDOM: Int = 2
 comptime SIG_BLOCK: Int = 0
 comptime SIG_UNBLOCK: Int = 1
 comptime SIG_SETMASK: Int = 2
+comptime SIGHUP: Int = 1
 comptime SIGINT: Int = 2
+comptime SIGKILL: Int = 9
 comptime SIGPIPE: Int = 13
 comptime SIGALRM: Int = 14
 comptime SIGTERM: Int = 15
 comptime SIGCHLD: Int = 17
 comptime SIGUSR1: Int = 10
 comptime SIGUSR2: Int = 12
+
+# Processes (clone3 / waitid)
+comptime CLONE_PIDFD: Int = 4096
+comptime P_PIDFD: Int = 3
+comptime WEXITED: Int = 4
+comptime WNOHANG: Int = 1
+comptime CLD_EXITED: Int = 1
+comptime CLD_KILLED: Int = 2
+comptime CLD_DUMPED: Int = 3
 
 # Timers
 comptime TIMER_ABSTIME: Int = 1

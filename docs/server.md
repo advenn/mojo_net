@@ -2,12 +2,12 @@
 
 An HTTP/1.1 server for Mojo on Linux (roadmap step 3). It is built on the `http` library's sans-I/O `ServerConnection` and on `net`'s nonblocking sockets. Package rules and contracts are in `docs/design.md`; HTTP itself is in `docs/http.md`.
 
-**Status: active.** S1 (the serving loop) and S2 (streaming) are done. Of S3, graceful shutdown and lingering close are done; worker processes and signals are next.
+**Status: active.** S1 (the serving loop), S2 (streaming) and S3 (graceful shutdown, signals and worker processes) are done; S4 (routing) is next.
 
 ## Model
 **One thread and one edge-triggered epoll loop per process**, with one `ServerConnection` per connection.
 - This is the model `docs/design.md` describes for concurrency without a runtime: no threads, no async.
-- For several cores, run N processes on one port with `SO_REUSEPORT`, and the kernel spreads the connections. S3 adds a helper that starts and supervises the processes.
+- For several cores, run N processes on one port with `SO_REUSEPORT`, and the kernel spreads the connections. `run_workers` starts and supervises them (see Processes).
 
 **Handlers.** The application implements `Handler.handle(req, mut res)`. It is called once per request, with the whole request (the body buffered up to `max_body`). Defaulted hooks stream bodies instead, in either direction (see Streaming).
 - **Handlers must not block:** the loop serves every connection of the process. Blocking work belongs in another process, or in a future runtime.
@@ -46,7 +46,37 @@ An HTTP/1.1 server for Mojo on Linux (roadmap step 3). It is built on the `http`
 3. `Handler.shutting_down()` is called once. Streams last until `shutdown_timeout` unless they end, so a handler with long-lived ones (server-sent events) ends them there by waking them.
 4. After `shutdown_timeout` (10 s), whatever is left closes. `stopped()` is True once no connection is left.
 
-The trigger (SIGTERM, or a supervisor) is the rest of S3.
+`Server.stop_on(stop)` connects the trigger: a `Stop` from `Stop.on_signals()` or `run_workers` (below).
+
+## Processes (S3)
+```mojo
+def main() raises:
+    var stop = run_workers(WorkerConfig(workers=4))  # or Stop.on_signals() for one process
+    if not stop:
+        return  # the supervisor: its workers have ended
+    var server = Server(App(), ServerConfig(reuseport=True))
+    server.bind(SocketAddr.parse("0.0.0.0:8080"))
+    server.stop_on(stop.take())
+    server.run()  # returns when the shutdown has finished
+```
+`examples/server/workers.mojo` is this program.
+
+**Call it first in `main`.** Workers are new executions of the program (`/proc/self/exe` with the same arguments and environment, plus `MOJO_NET_WORKER`), so what comes before runs in every process. Run a built binary: under `mojo run`, each execution compiles the program again.
+
+**The supervisor** is the process that calls `run_workers` first:
+- **Starting:** it starts `workers` processes (default: one per CPU it may run on). Worker i's runtime starts on the i-th allowed CPU, so it starts one runtime thread instead of one per CPU (docs/spikes.md). Its affinity then widens to all of them, unless `pin`.
+- **Restarting:** a worker that ends is restarted after `restart_delay` (100 ms). The delay doubles, up to `max_restart_delay` (10 s), while workers keep ending within a second of starting. Starts, ends and restarts are logged on stderr.
+- **Stopping:** on SIGTERM or SIGINT, it closes each worker's lifeline (a socketpair), which asks the worker to shut down gracefully. It waits up to `stop_timeout` (15 s; keep it longer than the workers' `shutdown_timeout`), then kills what is left, and `run_workers` returns None. A second signal kills the workers at once.
+- **A worker whose supervisor dies** sees its lifeline close, and shuts down gracefully as well.
+- **Ctrl-C in a terminal** signals the whole process group: workers get SIGINT directly too, and treat it like the lifeline.
+
+**`Stop`** is what a server stops on: SIGTERM or SIGINT, and in a worker its lifeline. The first request asks for a graceful shutdown; a signal after it asks to stop at once, closing every connection.
+
+**Signals without handlers.** The library installs no signal handlers, so a stop signal is read from a signalfd. That works only if every thread blocks the signal. The Mojo runtime starts its threads before `main`, with the mask the process was started with; blocking in `main` therefore loses most SIGTERMs to the runtime's handler, which ends the process (25 of 30 runs in the spike, docs/spikes.md).
+- So `Stop.on_signals` and `run_workers` block SIGTERM and SIGINT, check every thread's mask in `/proc/self/task`, and if one does not block them, execute the program again: the new image's threads start with the mask.
+- Workers inherit the mask from the supervisor and need no second execution.
+
+**In a container**, the supervisor can be PID 1. It handles SIGTERM, so `docker stop` and Kubernetes stop it gracefully. Their kill deadline (Docker: 10 s by default) must exceed `stop_timeout`, or the stop must be configured shorter.
 
 ## Streaming (S2)
 The `Handler` hooks beyond `handle` all have defaults, so a handler that buffers needs none of them.
@@ -107,8 +137,30 @@ The `Handler` hooks beyond `handle` all have defaults, so a handler that buffers
   - **Part 1, done:** graceful shutdown and lingering close (above), with `ServerConnection.close_gracefully()` and `input_pending()` in the codec.
     - **Tests** (`tests/server/test_shutdown.mojo`, plus codec cases): idle connections closed; an upload in progress answered with `Connection: close` and the request pipelined after it dropped; connections the kernel had queued accepted and answered; the listener gone; a stream ended by the hook, or cut at the timeout; a client still sending after its 413 gets an orderly end of input, not a reset; lingering ends at its timeout; a connection with nothing unread closes at once.
     - **Planted bugs:** 19 of 20 caught. The survivor only costs time: lingering after an end of input that was already read.
-  - **Part 2, next:** start N worker processes on one port, restart those that die, and stop them all gracefully on SIGTERM.
-    - The Mojo runtime starts its threads before `main`, with the signal mask the process was started with. A signalfd therefore receives SIGTERM reliably only if the signal was blocked at exec. The 30-run spike, recorded in `docs/spikes.md`, shows this.
-    - The plan: block the signals and re-execute the program once, read them from a signalfd in the loop, and spawn workers with `clone3` and `execve`, using pidfds and a lifeline socketpair per worker.
+  - **Part 2, done:** signals and worker processes (above).
+    - Built on `linux.signal` (sets, thread masks, `SignalFd`) and `linux.process`:
+      - `Exec`;
+      - `spawn`: clone3 with a pidfd, then raw syscalls only until execve;
+      - `Child`: signal and wait through the pidfd;
+      - affinity, `threads`, `all_threads_block`.
+    - **Tests:**
+      - `tests/linux/test_signal.mojo` and `tests/linux/test_process.mojo` cover exit codes and signals, a failed execve, pidfd readiness, the descriptor a child keeps, and the CPU and mask a child starts with. They read `/proc/<pid>/status` directly, so no shell in between can change what is checked.
+      - `tests/server/test_workers.mojo` builds `tests/server/workers_app.mojo` and drives it from Python. It covers workers with one runtime thread each and a widened (or pinned) affinity, a killed worker restarted, and a request in progress that finishes when the supervisor gets SIGTERM, with exit 0 after. Also:
+        - a second signal stopping at once, and workers that ignore a stop killed at `stop_timeout`;
+        - workers stopping when their supervisor dies;
+        - a crash loop restarted later and later;
+        - a supervisor that inherited SIGCHLD ignored, so the kernel reaps its children itself;
+        - a worker started without a supervisor's mask;
+        - a single process stopping on SIGINT, or at once on a second.
+
+        The driver kills each supervisor's process group when it ends, so a failure leaves no process behind.
+    - **Planted bugs:** 17 of 18 caught at first. The survivor (workers that ignore a stop were never killed) is now tested.
+    - **Found and fixed while testing:**
+      - a worker handed a blocking lifeline hung in its first stop request;
+      - a supervisor that inherited SIGCHLD ignored crashed at the first worker exit (ECHILD);
+      - a worker not started by a supervisor trusted a signal mask it did not have;
+      - a failed spawn ended the supervisor; it now retries with backoff.
+
+      Each fix has a test that fails on the old code, except the retry: making clone3 fail would take a process limit on the whole user.
 - **S4: routing.** Method and path routes, path parameters, and static files.
 - **S5: polish.** Interop, an independent review, benchmarks, and the guide.

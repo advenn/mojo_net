@@ -18,6 +18,8 @@ WANTED = [
     "getpid", "gettid", "getuid", "geteuid", "getgid", "getegid",
     "exit_group", "uname", "getrandom", "prlimit64", "getcpu",
     "sched_getaffinity", "sched_setaffinity", "sched_yield", "kill", "tgkill",
+    # processes (the server's workers)
+    "execve", "clone3", "waitid", "pidfd_send_signal",
     # signals
     "rt_sigprocmask", "rt_sigaction", "signalfd4",
     # time

@@ -44,7 +44,9 @@ HEADERS = """
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <linux/sched.h>
 #include <linux/sockios.h>
 """
 
@@ -111,8 +113,12 @@ CONSTS = [
     ("mmap", ["PROT_NONE", "PROT_READ", "PROT_WRITE", "MAP_SHARED",
               "MAP_PRIVATE", "MAP_ANONYMOUS", "MAP_POPULATE"]),
     ("Resources / random", ["RLIMIT_NOFILE", "GRND_NONBLOCK", "GRND_RANDOM"]),
-    ("Signals", ["SIG_BLOCK", "SIG_UNBLOCK", "SIG_SETMASK", "SIGINT", "SIGPIPE",
-                 "SIGALRM", "SIGTERM", "SIGCHLD", "SIGUSR1", "SIGUSR2"]),
+    ("Signals", ["SIG_BLOCK", "SIG_UNBLOCK", "SIG_SETMASK", "SIGHUP", "SIGINT",
+                 "SIGKILL", "SIGPIPE", "SIGALRM", "SIGTERM", "SIGCHLD",
+                 "SIGUSR1", "SIGUSR2"]),
+    ("Processes (clone3 / waitid)",
+     ["CLONE_PIDFD", "P_PIDFD", "WEXITED", "WNOHANG", "CLD_EXITED",
+      "CLD_KILLED", "CLD_DUMPED"]),
     ("Timers", ["TIMER_ABSTIME", "SIGEV_THREAD_ID"]),
     ("Aux vector (/proc/self/auxv)",
      ["AT_NULL", "AT_PAGESZ", "AT_UID", "AT_EUID", "AT_GID", "AT_EGID",
@@ -228,6 +234,18 @@ STRUCTS = [
     ("struct ipv6_mreq", "Ipv6Mreq",
      [("ipv6mr_multiaddr", "multiaddr"), ("ipv6mr_interface", "interface")]),
     ("struct mmsghdr", "Mmsghdr", [("msg_hdr", "hdr"), ("msg_len", "len")]),
+    ("struct clone_args", "CloneArgs",
+     [("flags", "flags"), ("pidfd", "pidfd"), ("child_tid", "child_tid"),
+      ("parent_tid", "parent_tid"), ("exit_signal", "exit_signal"),
+      ("stack", "stack"), ("stack_size", "stack_size"), ("tls", "tls"),
+      ("set_tid", "set_tid"), ("set_tid_size", "set_tid_size"),
+      ("cgroup", "cgroup")]),
+    ("siginfo_t", "Siginfo",
+     [("si_signo", "signo"), ("si_errno", "errno"), ("si_code", "code"),
+      ("si_pid", "pid"), ("si_uid", "uid"), ("si_status", "status")]),
+    ("struct signalfd_siginfo", "SignalfdSiginfo",
+     [("ssi_signo", "signo"), ("ssi_errno", "errno"), ("ssi_code", "code"),
+      ("ssi_pid", "pid"), ("ssi_uid", "uid")]),
 ]
 
 # Mirrors kept outside linux.abi ({Mojo type: module}); currently none.
