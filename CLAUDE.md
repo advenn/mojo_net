@@ -10,12 +10,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Package status:
   - `linux`, `bytes`: shared base layers;
   - `net`: the TCP/UDP library (client side done; packaging left);
-  - `http`: the HTTP/1.1 library, the active work (`docs/http.md`);
+  - `http`: the HTTP/1.1 library, done through H6 (`docs/http.md`);
+  - `server`: the HTTP server (roadmap step 3), the active work (`docs/server.md`);
   - `rt`: an experimental event-loop runtime, **frozen** until Mojo's async/await stabilizes. Keep it compiling and green; add no features unless the user unfreezes it.
 
 **Docs:**
 - `docs/design.md`: packages, import rules and the numbered contracts that code comments cite. Read it before changing any package.
-- Per-library docs: `docs/net.md` (scope, L2 contract, readiness-loop rules, milestones), `docs/http.md` (scope, strictness rules, milestones) and `docs/rt.md`.
+- Per-library docs: `docs/net.md` (scope, L2 contract, readiness-loop rules, milestones), `docs/http.md` (scope, strictness rules, milestones), `docs/server.md` (model, behaviour, milestones) and `docs/rt.md`.
 - `docs/spikes.md`: measured facts (threads, the Mojo runtime, callbacks, the 10k-connection epoll spike).
 
 ## Commands
@@ -51,7 +52,8 @@ pixi run bench build               # rt benchmarks (bench/rt/README.md)
 ## Layout and rules
 - **Packages:** imports only point downward: `rt → net → bytes → linux`, and `http → net → bytes → linux`. `linux` imports only `std`.
   - Nothing outside `rt` imports `rt`.
-  - `http` is sans-I/O: in `src/http`, only `client.mojo` and `server.mojo` may import `net` (`SANS_IO` in `tools/check_imports.py`).
+  - `http` is sans-I/O: in `src/http`, only `client.mojo` may import `net` (`SANS_IO` in `tools/check_imports.py`).
+  - `server` (the HTTP server, roadmap step 3) builds on `http` and `net`.
   - `pixi run import-check` enforces these rules for `src/`, `tests/`, `examples/`, `bench/` and `spikes/`.
   - A new library gets an entry in `ALLOWED` in `tools/check_imports.py`.
   - Per-package directories:
@@ -60,6 +62,7 @@ pixi run bench build               # rt benchmarks (bench/rt/README.md)
   - `src/linux`: the syscall layer.
   - `src/bytes`: `ByteBuffer`, and the sans-I/O `Codec` trait (`bytes.codec`, contract 1).
   - `src/net`: sockets.
+  - `src/server`: the HTTP server. `server` (`Server[H: Handler]`, `ServerConfig`, `Request`, `Response`; `step()` runs one loop turn, which is how tests drive it) and `date` (`http_date`, `DateCache`). Tests run the loop while a Python client process talks to it.
   - `src/http`: HTTP/1.1. `types` (versions, methods, status codes), `headers` (`Headers`: arena-backed, case-insensitive, ordered; validated adds; exact bytes plus a string view for obs-text), `parse` (`HeadParser`: incremental heads, strict requests, lenient responses, limits; `RequestHead` / `ResponseHead`; `for_trailers` for field sections), `body` (framing decisions, `BodyDecoder` returning ranges of the caller's input, chunk encoding), `connection` (`ServerConnection` / `ClientConnection`: the `Codec`s for one connection; the server answers one request at a time; `poll(ev)` refills a reused event, `next_event()` returns new ones), `client` (`Client`: blocking, pooled, one deadline per request; imports `net`, so not re-exported from `http`). `tests/http/http_peer.py` (started by `http_peer.mojo`) is Python's http.server with test routes. `tests/http/head_oracle.py` and `tests/http/chunked_oracle.py` are the Python references for differential fuzzing; keep them in step with any rule change.
   - `src/rt` (frozen): `core` (Loop + proactor), `driver` (trait), `epoll_driver`, `sim` (simulator), `event_loop`, `timers`, `slab`, `mailbox`, `evented` (`TcpServer[H]`/`dial[H]` connections driving a `ConnHandler`).
 - **`net` modules:**

@@ -940,6 +940,12 @@ struct ServerConnection(Codec, Copyable):
         """Bytes queued for sending."""
         return len(self._tx)
 
+    def buffered(self) -> Int:
+        """Received bytes held and not yet consumed: a partial head, say
+        (a driver's timeout tells an idle connection from a slow request
+        this way)."""
+        return len(self._rx)
+
     # ---- state -----------------------------------------------------------
 
     def should_close(self) -> Bool:

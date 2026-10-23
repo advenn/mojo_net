@@ -5,9 +5,10 @@ state machines, and a blocking client.
 The protocol modules are sans-I/O (docs/design.md, contract 1): they parse
 and build bytes and never touch a socket or a clock, so the same code runs
 under a blocking stream, an epoll loop or a test that feeds byte arrays.
-Only `http.client` and `http.server` import `net`; `tools/check_imports.py`
-enforces it. They are not re-exported here, so importing the protocol
-modules never pulls in the transport: `from http.client import Client`.
+Only `http.client` imports `net`; `tools/check_imports.py` enforces it. It
+is not re-exported here, so importing the protocol modules never pulls in
+the transport: `from http.client import Client`. The server is its own
+package, `server` (docs/server.md).
 """
 
 from .body import (

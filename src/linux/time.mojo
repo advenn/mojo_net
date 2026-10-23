@@ -18,7 +18,7 @@ virtual time, so code that takes a `Clock` must not call `Instant.now()`.
 from std.os import abort
 
 from .abi import Timespec
-from .consts import CLOCK_MONOTONIC, TIMER_ABSTIME
+from .consts import CLOCK_MONOTONIC, CLOCK_REALTIME, TIMER_ABSTIME
 from .errno import Errno
 from .error import IoError
 from .nr import SYS_clock_gettime, SYS_clock_nanosleep
@@ -197,6 +197,21 @@ struct Duration(Comparable, TrivialRegisterPassable, Writable):
             writer.write(self._ns // NANOS_PER_MICRO, "us")
         else:
             writer.write(self._ns, "ns")
+
+
+# ---- wall-clock time -----------------------------------------------------------
+
+
+def unix_time_ns() -> Int:
+    """CLOCK_REALTIME now: nanoseconds since 1970-01-01T00:00:00Z. For
+    showing the time (an HTTP Date field); measure durations with `Instant`,
+    since this clock jumps when the system time is set. Aborts as
+    `Instant.now()` does if the clock cannot be read."""
+    var ts = Timespec(0, 0)
+    var r = clock_gettime(CLOCK_REALTIME, ts)
+    if is_err(r):
+        abort("clock_gettime(CLOCK_REALTIME) failed")
+    return ts.sec * NANOS_PER_SEC + ts.nsec
 
 
 # ---- Instant -----------------------------------------------------------------

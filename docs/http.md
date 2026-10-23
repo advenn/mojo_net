@@ -25,7 +25,7 @@ It is the base of the HTTP server (roadmap step 3). Package rules and the shared
 - Content codings (gzip, br). Bodies are delivered as sent, with the coding headers.
 - Cookie jars, caches and proxies.
 
-**Sans-I/O.** Every protocol module parses and builds bytes and never touches a socket or a clock (design contract 1). So the same code runs under a blocking stream, an epoll loop or a test that feeds byte arrays. Only `http.client` and `http.server` import `net`; `tools/check_imports.py` enforces it.
+**Sans-I/O.** Every protocol module parses and builds bytes and never touches a socket or a clock (design contract 1). So the same code runs under a blocking stream, an epoll loop or a test that feeds byte arrays. Only `http.client` imports `net`; `tools/check_imports.py` enforces it. The server is a separate package (`docs/server.md`).
 
 ## Strictness
 The parser is strict where leniency enables request smuggling or response splitting, and lenient only where RFC 9112 allows it and real peers need it.

@@ -516,3 +516,8 @@ The C baseline is the same algorithm in C. The tokio server is idiomatic code: a
 - `spikes/epoll_echo/bench.py`: the `matrix`, `one`, `burst` and `emfile` commands. `check_echo.py`: the correctness checks. `run.sh`: build plus the commands above.
 - `spikes/epoll_echo/syscall_cost.mojo`, `fdtable_grow.c`: the cost microbenchmarks.
 - `spikes/epoll_echo/out/`: build output and `matrix-*.json` results.
+
+## Clock reads cost a syscall (measured 2026-10-23)
+`linux.time` reads `CLOCK_MONOTONIC` and `CLOCK_REALTIME` with the raw `clock_gettime` syscall: there is no vDSO without libc.
+- **Cost:** about 161 ns per read on an i5-1145G7, against 17 ns for the stdlib's vDSO-backed `perf_counter_ns`.
+- **Consequence:** an event loop reads the clock once per turn and passes that instant down, and wall-clock text (an HTTP `Date`) is reformatted at most once a second. `server.Server` and `server.DateCache` do both.

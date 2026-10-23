@@ -26,7 +26,8 @@ import re
 import sys
 import tempfile
 
-# Dependencies point downward only: linux <- bytes <- net <- rt.
+# Dependencies point downward only: linux <- bytes <- net <- rt, and
+# net <- http <- server.
 # `rt` is frozen and experimental: nothing outside it may import it.
 ALLOWED = {
     "linux": {"linux"},
@@ -34,10 +35,11 @@ ALLOWED = {
     "net": {"linux", "bytes", "net"},
     "rt": {"linux", "bytes", "net", "rt"},
     "http": {"linux", "bytes", "net", "http"},
+    "server": {"linux", "bytes", "net", "http", "server"},
 }
 # Packages whose protocol logic is sans-I/O: in src/, only the listed
 # modules may import `net` (the rest only parse and build bytes).
-SANS_IO = {"http": {"client.mojo", "server.mojo"}}
+SANS_IO = {"http": {"client.mojo"}}
 AREAS = ("src", "tests", "examples", "bench")
 FIXED = {"spikes": "net"}
 
@@ -143,6 +145,8 @@ def _self_test():
         "src/http/parse.mojo": ("from net.tcp import TcpStream\n", "are sans-I/O"),
         "src/http/client.mojo": ("from net.tcp import TcpStream\nfrom bytes.codec import Codec\n", None),
         "src/http/n.mojo": ("from rt.core import Loop\n", "http may not import rt"),
+        "src/server/o.mojo": ("from http.connection import ServerConnection\nfrom net.tcp import TcpListener\n", None),
+        "src/http/p.mojo": ("from server import Server\n", "http may not import server"),
     }
     with tempfile.TemporaryDirectory() as root:
         for rel, (src, _) in plant.items():
@@ -162,8 +166,8 @@ def _self_test():
         expected = sum(1 for _, w in plant.values() if w is not None)
         if len(bad) != expected:
             errors.append(f"expected {expected} violations, got {len(bad)}:\n{report}")
-        if files != 14:
-            errors.append(f"expected 14 files checked, got {files}")
+        if files != 16:
+            errors.append(f"expected 16 files checked, got {files}")
         if errors:
             sys.exit("check_imports self-test failed:\n" + "\n".join(errors))
 
