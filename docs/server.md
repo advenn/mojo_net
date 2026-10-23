@@ -2,7 +2,7 @@
 
 An HTTP/1.1 server for Mojo on Linux (roadmap step 3). It is built on the `http` library's sans-I/O `ServerConnection` and on `net`'s nonblocking sockets. Package rules and contracts are in `docs/design.md`; HTTP itself is in `docs/http.md`.
 
-**Status: active.** S1 (the serving loop), S2 (streaming) and S3 (graceful shutdown, signals and worker processes) are done; S4 (routing) is next.
+**Status: active.** S1 (the serving loop), S2 (streaming) and S3 (graceful shutdown, signals and worker processes) are done. Of S4, routing is done; static files are next.
 
 ## Model
 **One thread and one edge-triggered epoll loop per process**, with one `ServerConnection` per connection.
@@ -77,6 +77,45 @@ def main() raises:
 - Workers inherit the mask from the supervisor and need no second execution.
 
 **In a container**, the supervisor can be PID 1. It handles SIGTERM, so `docker stop` and Kubernetes stop it gracefully. Their kill deadline (Docker: 10 s by default) must exceed `stop_timeout`, or the stop must be configured shorter.
+
+## Routing (S4)
+```mojo
+struct App(Handler):  # what no route takes, and the streaming hooks
+    def handle(mut self, req: Request, mut res: Response) raises:
+        res.text(404, "not found\n")
+
+
+def get_user(mut app: App, req: Request, params: Params, mut res: Response) raises:
+    res.text(200, String("user ", params["id"], "\n"))
+
+
+def main() raises:
+    var router = Router(App())
+    router.get("/users/:id", get_user)
+    router.post("/users", create_user)
+    var server = Server(router^)
+```
+**`Router[A: Handler]`** sends requests to route functions, `def(mut A, Request, Params, mut Response) raises`. Everything else goes to the application `A` itself: requests no route takes, and every streaming and shutdown hook. Parameters come as an argument, because `handle` gets the request immutably.
+
+**Patterns:** "/" and segments.
+- Text matches itself.
+- `:name` matches one non-empty segment.
+- `*name`, last only, matches the rest of the path (one or more segments, an empty one too), joined by "/".
+
+**Matching:**
+- The path (the target up to its query, also of an absolute-form target) is split at "/" and percent-decoded segment by segment, so an encoded "/" never splits one.
+- The most specific pattern with a route for the method wins: at each segment, text beats a parameter, which beats the rest, with backtracking. So `/users/me` beats `/users/:id`, whatever order the routes were added in, but only for methods `/users/me` has.
+- HEAD uses the GET route.
+- When the path matches but the method has none: 405 with `Allow`, the union of the methods of every pattern that matches. OPTIONS gets 204 and the same `Allow`.
+
+**Not routed** (the application gets these):
+- a segment that decodes to something with "/" or NUL in it;
+- an asterisk-form target;
+- a path deeper than 128 segments.
+
+A malformed percent-encoding gets 400. Matching is strict: no trailing-slash redirects, no case folding, and no dot-segment removal (`/a/../b` is three segments; whoever maps paths to files must refuse those).
+
+**Measured:** 100 to 300 ns per match over 12 routes and paths of 1 to 4 segments (the minimum over batches, on a loaded machine).
 
 ## Streaming (S2)
 The `Handler` hooks beyond `handle` all have defaults, so a handler that buffers needs none of them.
@@ -162,5 +201,9 @@ The `Handler` hooks beyond `handle` all have defaults, so a handler that buffers
       - a failed spawn ended the supervisor; it now retries with backoff.
 
       Each fix has a test that fails on the old code, except the retry: making clone3 fail would take a process limit on the whole user.
-- **S4: routing.** Method and path routes, path parameters, and static files.
+- **S4: routing and static files.**
+  - **Part 1, done:** `Router` (above).
+    - **Tests** (`tests/server/test_router.mojo`): every rule above case by case, a server running a router over the wire, and a differential check of 12,000 matches against a naive matcher. The naive matcher ranks every matching route by its segment kinds, which is the specificity rule stated directly.
+    - **Planted bugs:** 19 of 19 caught.
+  - **Part 2, next:** static files.
 - **S5: polish.** Interop, an independent review, benchmarks, and the guide.
