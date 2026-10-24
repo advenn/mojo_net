@@ -6,9 +6,10 @@ A PostgreSQL client for Mojo on Linux, speaking the frontend/backend protocol (v
 - the cryptographic primitives;
 - the sans-I/O codec for a session (`PgConnection`);
 - a blocking client (`pg.client`), tested against PostgreSQL 18;
-- the extended query protocol: parameters and prepared statements.
+- the extended query protocol: parameters and prepared statements;
+- types: binary values for the common types, typed accessors, and a statement cache.
 
-Next is P5: binary values for the common types, and a statement cache.
+Next is P6: transactions, a connection pool, and waiting for notifications.
 
 ## Scope
 **In scope:**
@@ -88,7 +89,14 @@ def main() raises:
   - `query_params(sql, params)` takes a `Params` for NULLs, raw bytes (`add_binary`, bytea) or declared types (`add_text(value, oid)`).
   - `execute(sql, args...)` returns the rows affected.
   - `simple_query(sql)` runs a script of several statements, without parameters, and returns each one's result.
-  - `Rows` has `columns`, `tag`, and per value `is_null`, `text`, `int`, `bool`, and `value` for the bytes. Values are in text form for now.
+  - `Rows` has `columns`, `tag`, and per value `is_null`, `value` (the bytes as they came) and the typed accessors.
+    - **The accessors:** `text`, `int`, `float`, `bool`, `bytes` (bytea), `date` (`pg.types.Date`), and `timestamp` (microseconds since 1970, UTC for timestamptz).
+    - **Either form:** they read the binary or the text form alike, and `text` gives the server's own text for either.
+- **The statement cache** (`Config.statement_cache`, 256 by default; `statement_cache_capacity` in a URI):
+  - The first run of a SQL text prepares it, which costs one extra round trip and tells the column types. Every later run is one round trip without the server's parse, with binary results where `pg.types` reads them (`SELECT 1` takes 11.5 µs, against 13.5 µs through the simple protocol).
+  - The least recently used statement goes first when the cache is full, closed on the server too.
+  - When a cached plan's result type changes (after `ALTER TABLE`: 0A000), the statement is prepared afresh and run once more, outside a transaction.
+  - 0 turns the cache off: each query then uses the unnamed statement, with text results, as PgBouncer's transaction pooling needs.
 - **Errors raise `PgError`.**
   - A server error (`is_server()`, the SQLSTATE in `code()`, every field in `server()`) leaves the session usable.
   - Anything else closes it: a transport or protocol error, or the server ending the session.
@@ -155,7 +163,7 @@ while True:
   - `PgEvent` and `EventKind` are the events.
 - **`config`:** `Config`, from code or a connection URI, with the settings a session needs.
 - **`client`:** the blocking `Client`, `Rows` and `PgError`. It is the only module that imports `net`, and is not re-exported from `pg`.
-- **Planned:** `types`, values in binary and text form (P4).
+- **`types`:** the OIDs of the built-in types, and which of them travel in binary form. It also holds their binary forms, the server's text for them, and parsers for the text forms of dates, timestamps and bytea. `Date` is a calendar date.
 
 ## Milestones
 - **P1: cryptographic primitives.** Done.
@@ -254,9 +262,26 @@ while True:
     - `SELECT 1` takes 13.4 µs through `simple_query` (pgbench's simple mode: 13.2), and 16.5 µs through `query` (pgbench's extended mode: 15.0).
     - The extended path costs about 1 µs more client CPU than the simple one: 5.3–5.9 µs per query against 4.2–4.9, syscalls included.
     - **Lead:** each receive first tries a `recv` that returns EAGAIN, since the answer to a just-sent query cannot be there yet.
-- **P5: types and a statement cache.**
-  - **Binary results** for bool, the integers, the floats, text, bytea, uuid, date and the timestamps, with numeric as text, and typed accessors for them.
-  - **A statement cache per connection:** prepare and describe once per SQL text. The parameters are then encoded for their types, and the results requested in binary where the type allows.
+- **P5: types and a statement cache.** Done.
+  - **`pg.types`:** binary forms for bool, the integers and oid, bytea, uuid, date, time, timestamp and the text types.
+    - It writes the server's own text for each: ISO dates with BC years, the infinities, fractions without trailing zeros, the whole range up to 294276 AD.
+    - It parses the text forms of dates, timestamps and timestamptz (offsets such as `+05:30`) and bytea.
+    - The floats, timestamptz, numeric and the rest stay in text, where the text is exact or depends on the session.
+  - **`Rows`:** typed accessors, which raise `PgError` like the rest of `pg.client`.
+  - **The client's statement cache:** described above; `cached_statements()` says how many statements it holds.
+  - **Tests:**
+    - **`tests/pg/test_types.mojo`:** 3000 random dates and 3000 random timestamps against Python's datetime, for the binary form, the text written and the text parsed.
+    - **Against PostgreSQL, binary against text:** the client's text of each binary value equals the server's own text for the same value. That covers each type's limits (int8's, 5874897 AD, 294276 AD, BC dates, the infinities, the text types), plus 2000 random dates and 2000 random timestamps.
+    - **Typed accessors** in either form.
+    - **The cache:** reuse, least-recently-used eviction checked in `pg_prepared_statements`, the 0A000 retry and its refusal inside a transaction, a refused statement evicting nothing, and the cache turned off.
+    - **Bugs the tests found:** int8's limit overflowed when counted from 1970. A failed prepare evicted a cached statement first. And text columns, which arrive in binary form, were refused by the date and timestamp accessors.
+    - **Planted bugs:** 31, of which the first run caught 29.
+      - One was equivalent: Mojo's `Int(UInt64)` already keeps the bits, so the signed cast it removed changed nothing.
+      - One showed dead code: `atof` reads NaN and the infinities itself, so those special cases are gone.
+      - One, freed cache slots never reused (a leak in long sessions), needed a white-box test, now there.
+  - **Measured on the Unix socket:**
+    - `query("SELECT 1")` runs at about 86,000 a second (11.5 µs), against pgbench's prepared mode at 92,900 and our P4 unnamed path at 59,000.
+    - With a parameter, it runs at about 81,000 a second.
 - **P6: transactions, a pool, LISTEN/NOTIFY.**
   - **Transactions:** a scope that rolls back on error.
   - **Pool:** connections are health-checked and reset before reuse.

@@ -77,6 +77,7 @@ from .message import (
     AUTH_SSPI,
     AUTHENTICATION,
     BACKEND_KEY_DATA,
+    BINARY,
     BIND_COMPLETE,
     BackendKey,
     CLOSE_COMPLETE,
@@ -587,7 +588,10 @@ struct PgConnection(Codec, Copyable):
             raise IoError.of_kind(E_NO_SESSION, ErrorKind.InvalidInput)
         self._request.clear()
         write_parse(self._request, "", sql, params)
-        write_bind(self._request, "", "", params, result_format)
+        if result_format != TEXT and result_format != BINARY:
+            raise IoError.of_kind("pg: invalid result format", ErrorKind.InvalidInput)
+        var formats: List[Int] = [result_format]
+        write_bind(self._request, "", "", params, Span(formats))
         write_describe(self._request, PORTAL, "")
         write_execute(self._request, "")
         write_sync(self._request)
@@ -612,20 +616,26 @@ struct PgConnection(Codec, Copyable):
         self._queries += 1
         self._extended.append(True)
 
-    def execute_prepared(mut self, name: StringSlice, params: Params, result_format: Int = TEXT) raises IoError:
+    def execute_prepared(mut self, name: StringSlice, params: Params, result_formats: Span[Int, _]) raises IoError:
         """Queue Bind of the prepared statement `name` to `params`, a
-        Describe of the portal, Execute and Sync. Events as for `execute`,
-        without PARSE_COMPLETE."""
+        Describe of the portal, Execute and Sync. `result_formats`: one
+        format per result column (`TEXT` or `BINARY`), one for all, or none
+        for text. Events as for `execute`, without PARSE_COMPLETE."""
         if not self.is_open():
             raise IoError.of_kind(E_NO_SESSION, ErrorKind.InvalidInput)
         self._request.clear()
-        write_bind(self._request, "", name, params, result_format)
+        write_bind(self._request, "", name, params, result_formats)
         write_describe(self._request, PORTAL, "")
         write_execute(self._request, "")
         write_sync(self._request)
         self._tx.write_bytes(self._request.readable_span())
         self._queries += 1
         self._extended.append(True)
+
+    def execute_prepared(mut self, name: StringSlice, params: Params) raises IoError:
+        """`execute_prepared` with every result column in text form."""
+        var none = List[Int]()
+        self.execute_prepared(name, params, Span(none))
 
     def close_statement(mut self, name: StringSlice) raises IoError:
         """Queue Close of the prepared statement `name`, and Sync. Events:

@@ -38,6 +38,7 @@ from .connection import DEFAULT_MAX_MESSAGE, AuthMethods, Startup
 
 comptime DEFAULT_PORT = 5432
 comptime DEFAULT_CONNECT_TIMEOUT = Duration.from_secs(30)
+comptime DEFAULT_STATEMENT_CACHE = 256
 
 comptime E_URI = "pg: invalid connection URI"
 comptime E_TLS = "pg: TLS is not supported (sslmode, channel_binding)"
@@ -62,6 +63,10 @@ struct Config(Copyable, Movable):
     var allow: AuthMethods
     """The authentication a server may ask for (libpq's `require_auth`)."""
     var max_message: Int
+    var statement_cache: Int
+    """How many prepared statements the client keeps per connection (the
+    least recently used goes first); 0 for none, as PgBouncer's
+    transaction pooling needs."""
     var _params: List[String]
 
     def __init__(
@@ -76,6 +81,7 @@ struct Config(Copyable, Movable):
         connect_timeout: Duration = DEFAULT_CONNECT_TIMEOUT,
         allow: AuthMethods = AuthMethods.ALL,
         max_message: Int = DEFAULT_MAX_MESSAGE,
+        statement_cache: Int = DEFAULT_STATEMENT_CACHE,
     ):
         self.host = host
         self.port = port
@@ -86,6 +92,7 @@ struct Config(Copyable, Movable):
         self.connect_timeout = connect_timeout
         self.allow = allow
         self.max_message = max_message
+        self.statement_cache = statement_cache
         self._params = List[String]()
 
     def set(mut self, name: String, value: String):
@@ -216,6 +223,8 @@ struct Config(Copyable, Movable):
                 raise IoError.of_kind(E_TLS, ErrorKind.Unsupported)
         elif name == "require_auth":
             self.allow = _require_auth(value)
+        elif name == "statement_cache_capacity":  # (pgx's name)
+            self.statement_cache = _number(value.as_bytes())
         else:
             raise IoError.of_kind("pg: unknown connection parameter", ErrorKind.InvalidInput)
 

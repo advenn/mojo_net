@@ -18,10 +18,11 @@ from std.testing import TestSuite, assert_equal, assert_false, assert_true
 
 from linux import ErrorKind, IoError
 from linux.time import Duration, Instant
-from pg import FAILED_TRANSACTION, IDLE, IN_TRANSACTION, AuthMethods, Params
+from pg import BINARY, FAILED_TRANSACTION, IDLE, IN_TRANSACTION, TEXT, AuthMethods, Params
 from pg.client import Client, PgError, Rows
 from pg.config import Config
 from pg.message import FIELD_CONSTRAINT
+from pg.types import Date
 from pg_server import PgServer, passwords, users
 
 
@@ -122,7 +123,7 @@ def _queries(server: PgServer) raises:
         try:
             _ = big.int(0, col)
         except e:
-            refused += Int(e.kind == ErrorKind.InvalidData)
+            refused += Int(e.io.kind == ErrorKind.InvalidData)
     assert_equal(refused, 2)
     db^.close()
 
@@ -275,6 +276,119 @@ def _parameters(server: PgServer) raises:
     db^.close()
 
 
+def _types(server: PgServer) raises:
+    var db = Client.connect(server.unix("trusty"))
+    # Each value in binary form, written as text by the client, against the
+    # server's own text form of it (simple_query: text).
+    var values = [
+        "true", "false", "0::int2", "(-32768)::int2", "32767::int2", "2147483647", "(-2147483648)::int4",
+        "9223372036854775807::int8", "(-9223372036854775808)::int8", "4294967295::oid", "'\\x00ff10'::bytea",
+        "''::bytea", "'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid", "'2024-02-29'::date", "'0001-01-01'::date",
+        "'0001-01-01 BC'::date", "'4713-01-01 BC'::date", "'5874897-12-31'::date", "'infinity'::date",
+        "'-infinity'::date", "'00:00:00'::time", "'23:59:59.999999'::time", "'12:00:00.5'::time",
+        "'2024-02-29 13:45:00.123'::timestamp", "'0001-01-01 00:00:00 BC'::timestamp",
+        "'294276-12-31 23:59:59.999999'::timestamp", "'infinity'::timestamp", "'-infinity'::timestamp",
+        "'héllo'::text", "'abc'::varchar(5)", "'ab'::char(4)", "'x'::\"char\"", "'n'::name",
+    ]
+    for i in range(len(values)):
+        var sql = String("SELECT ", values[i])
+        var r = db.query(sql)
+        assert_equal(r.columns[0].format, BINARY, values[i])
+        assert_equal(r.text(0, 0), db.simple_query(sql)[0].text(0, 0), values[i])
+    # 2000 random dates and timestamps, each beside its text
+    var dates = db.query(
+        "SELECT d, d::text FROM (SELECT date '2000-01-01' + (random() * 2000000 - 1000000)::int AS d"
+        + " FROM generate_series(1, 2000)) s"
+    )
+    for i in range(len(dates)):
+        assert_equal(dates.text(i, 0), dates.text(i, 1))
+        assert_true(dates.date(i, 0) == dates.date(i, 1))
+    var stamps = db.query(
+        "SELECT t, t::text FROM (SELECT timestamp '2000-01-01' + (random() * 200000 - 100000) * interval '1 day'"
+        + " AS t FROM generate_series(1, 2000)) s"
+    )
+    for i in range(len(stamps)):
+        assert_equal(stamps.text(i, 0), stamps.text(i, 1))
+        assert_equal(stamps.timestamp(i, 0), stamps.timestamp(i, 1))
+    # the typed accessors, in either form
+    var r = db.query(
+        "SELECT 7::int2, (-7)::int8, 1.5::float8, 'NaN'::float8, '-Infinity'::float4, 2.25::numeric,"
+        + " '\\x00ff'::bytea, date '2024-02-29', timestamptz '2024-02-29 13:45:00+05:30', true"
+    )
+    assert_equal(r.int(0, 0), 7)
+    assert_equal(r.int(0, 1), -7)
+    assert_equal(r.float(0, 2), 1.5)
+    assert_true(r.float(0, 3) != r.float(0, 3))  # NaN
+    assert_equal(r.float(0, 4), -Float64.MAX * 10)  # -inf
+    assert_equal(r.float(0, 5), 2.25)
+    assert_equal(r.columns[2].format, TEXT)  # (floats and numeric stay in text)
+    var b = r.bytes(0, 6)
+    assert_equal(len(b), 2)
+    assert_equal(b[1], 255)
+    assert_true(r.date(0, 7) == Date(2024, 2, 29, 0))
+    assert_equal(r.columns[8].format, TEXT)  # timestamptz
+    assert_equal(r.timestamp(0, 8), (Date(2024, 2, 29, 0).days_since_1970() * 86400 + 8 * 3600 + 15 * 60) * 1000000)
+    assert_true(r.bool(0, 9))
+    var text_bytes = db.simple_query("SELECT '\\x00ff'::bytea")[0].bytes(0, 0)
+    assert_equal(len(text_bytes), 2)
+    db^.close()
+
+
+def _statement_cache(server: PgServer) raises:
+    var config = server.tcp("trusty")
+    config.statement_cache = 2
+    var db = Client.connect(config)
+    for _ in range(3):
+        assert_equal(db.query("SELECT $1::int + 1", 1).int(0, 0), 2)
+    assert_equal(db.cached_statements(), 1)
+    _ = db.query("SELECT 2")
+    _ = db.query("SELECT $1::int + 1", 1)  # (now SELECT 2 is the least recently used)
+    _ = db.query("SELECT 3")  # (evicts SELECT 2)
+    assert_equal(db.cached_statements(), 2)
+    # The server holds what the cache holds (looked at through simple_query,
+    # which uses no prepared statement and so evicts nothing).
+    var inspected = db.simple_query("SELECT statement FROM pg_prepared_statements ORDER BY name")
+    ref held = inspected[0]
+    assert_equal(len(held), 2)
+    assert_equal(held.text(0, 0), "SELECT $1::int + 1")
+    assert_equal(held.text(1, 0), "SELECT 3")
+    # a statement whose result type changes: prepared afresh, once
+    _ = db.execute("CREATE TEMP TABLE inv (a int)")
+    _ = db.execute("INSERT INTO inv VALUES (1)")
+    assert_equal(db.query("SELECT * FROM inv").width(), 1)
+    _ = db.execute("ALTER TABLE inv ADD COLUMN b text DEFAULT 'x'")
+    var r = db.query("SELECT * FROM inv")
+    assert_equal(r.width(), 2)
+    assert_equal(r.text(0, 1), "x")
+    # inside a transaction it cannot be retried
+    _ = db.execute("BEGIN")
+    _ = db.query("SELECT * FROM inv")
+    _ = db.execute("ALTER TABLE inv ADD COLUMN c int")
+    assert_equal(_query_error(db, "SELECT * FROM inv").code(), "0A000")
+    _ = db.execute("ROLLBACK")
+    assert_equal(db.query("SELECT * FROM inv").width(), 2)
+    # evicted statements' slots are reused: the cache does not grow
+    for i in range(20):
+        _ = db.query(String("SELECT ", i))
+    assert_equal(db.cached_statements(), 2)
+    assert_equal(len(db._statements), 2)
+    # a statement the server refuses is not cached
+    var before = db.cached_statements()
+    assert_equal(_query_error(db, "SELEC 1").code(), "42601")
+    assert_equal(db.cached_statements(), before)
+    db^.close()
+    # without the cache: the unnamed statement, text results
+    var plain = server.tcp("trusty")
+    plain.statement_cache = 0
+    var p = Client.connect(plain)
+    var t = p.query("SELECT $1::int * 2", 21)
+    assert_equal(t.int(0, 0), 42)
+    assert_equal(t.columns[0].format, TEXT)
+    assert_equal(p.cached_statements(), 0)
+    assert_equal(p.query("SELECT count(*) FROM pg_prepared_statements").int(0, 0), 0)
+    p^.close()
+
+
 def _run(server: PgServer, which: Int) -> String:
     """Body `which` against `server`: "" or why it failed."""
     try:
@@ -298,8 +412,12 @@ def _run(server: PgServer, which: Int) -> String:
             _ended_by_the_server(server)
         elif which == 9:
             _server_stops(server)
-        else:
+        elif which == 10:
             _parameters(server)
+        elif which == 11:
+            _types(server)
+        else:
+            _statement_cache(server)
     except e:
         return String(e)
     return ""
@@ -357,6 +475,14 @@ def test_the_server_stops() raises:
 
 def test_parameters() raises:
     _with_server(10)
+
+
+def test_types() raises:
+    _with_server(11)
+
+
+def test_statement_cache() raises:
+    _with_server(12)
 
 
 def test_connect_deadline() raises:

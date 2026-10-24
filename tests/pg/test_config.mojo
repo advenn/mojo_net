@@ -54,6 +54,8 @@ def test_hosts_ports_and_sockets() raises:
     assert_equal(c.socket_path(), "/tmp/.s.PGSQL.7000")
     c = Config.parse("postgresql://dave@h?connect_timeout=0")
     assert_true(c.connect_timeout == Duration.ZERO)
+    assert_equal(c.statement_cache, 256)
+    assert_equal(Config.parse("postgresql://dave@h?statement_cache_capacity=0").statement_cache, 0)
 
 
 def test_require_auth() raises:

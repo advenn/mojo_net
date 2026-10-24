@@ -14,7 +14,7 @@ Native Mojo networking libraries for Linux (x86_64 and aarch64, kernel 5.15+):
 | `net` | the TCP/UDP library: addresses, every socket option, TCP/Unix streams with deadlines, connect by name, buffered frame reads, UDP sockets (blocking, nonblocking, batched, multicast) ([docs/net.md](docs/net.md)) | TCP client and UDP stable |
 | `http` | HTTP/1.1: a sans-I/O head parser, body framing and connection codecs for both sides, and a blocking client with a keep-alive pool ([docs/http.md](docs/http.md)) | done |
 | `server` | an HTTP/1.1 server: one epoll loop per process, a `Handler` trait, timeouts and backpressure, streamed bodies and server-sent events, graceful shutdown on SIGTERM; supervised worker processes on one port with SO_REUSEPORT; a router and static files ([docs/server.md](docs/server.md)) | done through S5 |
-| `pg` | a PostgreSQL driver: a sans-I/O protocol codec, authentication up to SCRAM-SHA-256, a blocking client ([docs/pg.md](docs/pg.md)) | in progress: the codec, a blocking client and parameters are done (P4 of 7) |
+| `pg` | a PostgreSQL driver: a sans-I/O protocol codec, authentication up to SCRAM-SHA-256, a blocking client ([docs/pg.md](docs/pg.md)) | in progress: the codec, a blocking client, parameters and binary types are done (P5 of 7) |
 | `rt` | an experimental completion-based event loop ([docs/rt.md](docs/rt.md)) | frozen |
 
 Imports point downward only (`linux` ← `bytes` ← `net` ← `rt`, and `net` ← `http` ← `server`; `crypto` imports only the standard library, and `pg` builds on it and `net`), and only `rt` may import `rt`. The protocol code of `http` and `pg` is sans-I/O: only their client modules import `net`. CI checks these rules. Design, package rules and shared contracts: [docs/design.md](docs/design.md).

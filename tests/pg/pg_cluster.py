@@ -97,7 +97,20 @@ def start():
 
 
 def stop(root):
-    subprocess.run(["pg_ctl", "-D", os.path.join(root, "data"), "-m", "immediate", "stop"], capture_output=True)
+    """Stop the cluster at once and remove it, whatever fails on the way:
+    if pg_ctl cannot stop it, the postmaster is killed by its PID file."""
+    data = os.path.join(root, "data")
+    try:
+        r = subprocess.run(["pg_ctl", "-D", data, "-m", "immediate", "-w", "stop"], capture_output=True)
+        stopped = r.returncode == 0
+    except OSError:
+        stopped = False
+    if not stopped:
+        try:
+            with open(os.path.join(data, "postmaster.pid")) as f:
+                os.kill(int(f.readline()), 9)  # (its children exit with it)
+        except (OSError, ValueError):
+            pass
     shutil.rmtree(root, ignore_errors=True)
 
 

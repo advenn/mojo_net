@@ -40,7 +40,7 @@ def test_what_execute_sends() raises:
     c.execute("SELECT $1, $2, $3, $4", p)
     assert_equal(
         _s(o.frontend_text(sent(c))),
-        "P |SELECT $1, $2, $3, $4|0,0,0,1082 | B |||t:42,t:it's; DROP TABLE t,NULL,t:2024-01-01|0 | D P  | E |0 | S",
+        "P |SELECT $1, $2, $3, $4|0,0,0,1082 | B |||t:42,t:it's; DROP TABLE t,NULL,t:2024-01-01| | D P  | E |0 | S",
     )
     assert_equal(c.pending_queries(), 1)
     # the value formats: no code when all are text, one when all are
@@ -55,9 +55,9 @@ def test_what_execute_sends() raises:
     mixed.add(1)
     mixed.add_binary(Span(raw), 17)
     c.execute("SELECT $1, $2", mixed)
-    assert_equal(_s(o.frontend_text(sent(c))), "P |SELECT $1, $2|0,17 | B ||0,1|t:1,b:0001ff|0 | D P  | E |0 | S")
+    assert_equal(_s(o.frontend_text(sent(c))), "P |SELECT $1, $2|0,17 | B ||0,1|t:1,b:0001ff| | D P  | E |0 | S")
     c.execute("SELECT 1", Params())
-    assert_equal(_s(o.frontend_text(sent(c))), "P |SELECT 1| | B ||||0 | D P  | E |0 | S")
+    assert_equal(_s(o.frontend_text(sent(c))), "P |SELECT 1| | B |||| | D P  | E |0 | S")
 
 
 def test_an_unnamed_statement_cycle() raises:
@@ -100,7 +100,7 @@ def test_prepare_execute_close() raises:
         "PARSE_COMPLETE|PARAMETER_DESCRIPTION 23|ROW_DESCRIPTION name:25|READY I",
     )
     c.execute_prepared("s1", _ints(7))
-    assert_equal(_s(o.frontend_text(sent(c))), "B |s1||t:7|0 | D P  | E |0 | S")
+    assert_equal(_s(o.frontend_text(sent(c))), "B |s1||t:7| | D P  | E |0 | S")
     assert_equal(
         give(
             c,
@@ -109,6 +109,21 @@ def test_prepare_execute_close() raises:
         ),
         "BIND_COMPLETE|ROW_DESCRIPTION name:25|DATA_ROW x|COMMAND_COMPLETE SELECT 1|READY I",
     )
+    # result formats per column: one each when they differ, one when all
+    # are binary, none when all are text
+    var formats: List[Int] = [BINARY, TEXT]
+    c.execute_prepared("s1", _ints(7), Span(formats))
+    var all_binary: List[Int] = [BINARY, BINARY]
+    c.execute_prepared("s1", _ints(7), Span(all_binary))
+    var all_text: List[Int] = [TEXT, TEXT]
+    c.execute_prepared("s1", _ints(7), Span(all_text))
+    assert_equal(
+        _s(o.frontend_text(sent(c))),
+        "B |s1||t:7|1,0 | D P  | E |0 | S | B |s1||t:7|1 | D P  | E |0 | S | B |s1||t:7| | D P  | E |0 | S",
+    )
+    for _ in range(3):
+        _ = give(c, _s(o.bind_complete()) + _s(o.no_data()) + _s(o.command_complete("SELECT 0")) + _s(o.ready("I")))
+    assert_true(c.is_idle())
     c.close_statement("s1")
     assert_equal(_s(o.frontend_text(sent(c))), "C S s1 | S")
     assert_equal(give(c, _s(o.close_complete()) + _s(o.ready("I"))), "CLOSE_COMPLETE|READY I")

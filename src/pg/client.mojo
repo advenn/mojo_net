@@ -37,6 +37,9 @@ the server breaking the protocol, or a FATAL error such as an
 administrator's shutdown (57P01).
 """
 
+from std.collections import Dict
+from std.memory import bitcast
+
 from bytes.buffer import ByteBuffer
 from linux import ErrorKind, IoError
 from linux.random import fill_random
@@ -49,7 +52,36 @@ from net.unix import UnixStream
 
 from .config import Config
 from .connection import EventKind, PgConnection, PgEvent
-from .message import BackendKey, Column, Notification, Params, ServerMessage, rows_affected, write_cancel_request
+from .message import (
+    BINARY,
+    be_u32,
+    IDLE,
+    TEXT,
+    BackendKey,
+    Column,
+    Notification,
+    Params,
+    ServerMessage,
+    rows_affected,
+    write_cancel_request,
+)
+from .types import (
+    BYTEA,
+    DATE,
+    FLOAT4,
+    FLOAT8,
+    TIMESTAMP,
+    Date,
+    binary_date,
+    binary_int,
+    binary_timestamp_us,
+    is_text_like,
+    parse_bytea_hex,
+    parse_date,
+    parse_timestamp_us,
+    wants_binary,
+    write_binary_as_text,
+)
 
 comptime CANCEL_GRACE = Duration.from_secs(5)
 """How long the server gets to end a cancelled query's cycle."""
@@ -164,39 +196,171 @@ struct Rows(Movable, Sized):
         var start = self._at[k]
         return Span(self._data)[start : start + max(self._at[k + 1], 0)]
 
-    def text(self, row: Int, col: Int) -> String:
-        """A value as text ("" for NULL)."""
-        return String(from_utf8_lossy=self.value(row, col))
+    def _binary(self, col: Int) -> Bool:
+        """Whether the column's values need binary decoding (a text-like
+        type's binary form is its text)."""
+        return self.columns[col].format == BINARY and not is_text_like(self.columns[col].type_oid)
 
-    def int(self, row: Int, col: Int) raises IoError -> Int:
-        """A value of an integer column. `InvalidData` for NULL or a value
-        that is no decimal integer."""
+    def _not_null(self, row: Int, col: Int, what: StaticString) raises IoError:
+        if self.is_null(row, col):
+            raise IoError.of_kind(what, ErrorKind.InvalidData)
+
+    def _text(self, row: Int, col: Int) raises IoError -> String:
+        var v = self.value(row, col)
+        if self.is_null(row, col):
+            return String()
+        if self._binary(col):
+            var out = String()
+            write_binary_as_text(out, self.columns[col].type_oid, v)
+            return out^
+        return String(from_utf8_lossy=v)
+
+    def _int(self, row: Int, col: Int) raises IoError -> Int:
+        comptime op = "pg: not an integer value"
+        self._not_null(row, col, op)
         var b = self.value(row, col)
-        if self.is_null(row, col) or len(b) == 0 or len(b) > 20:
-            raise IoError.of_kind("pg: not an integer value", ErrorKind.InvalidData)
+        if self._binary(col):
+            return binary_int(self.columns[col].type_oid, b)
+        if len(b) == 0 or len(b) > 20:
+            raise IoError.of_kind(op, ErrorKind.InvalidData)
         var neg = Int(b[0]) == ord("-")
         var i = 1 if neg else 0
         if i == len(b):
-            raise IoError.of_kind("pg: not an integer value", ErrorKind.InvalidData)
+            raise IoError.of_kind(op, ErrorKind.InvalidData)
         var n = 0
         while i < len(b):
             var c = b[i]
             if c < 48 or c > 57 or n > (Int.MAX - 9) // 10:
-                raise IoError.of_kind("pg: not an integer value", ErrorKind.InvalidData)
+                raise IoError.of_kind(op, ErrorKind.InvalidData)
             n = n * 10 + Int(c) - 48
             i += 1
         return -n if neg else n
 
-    def bool(self, row: Int, col: Int) raises IoError -> Bool:
-        """A value of a boolean column ("t" or "f" in text form)."""
+    def _float(self, row: Int, col: Int) raises IoError -> Float64:
+        comptime op = "pg: not a number"
+        self._not_null(row, col, op)
         var b = self.value(row, col)
-        if self.is_null(row, col) or len(b) != 1 or (Int(b[0]) != ord("t") and Int(b[0]) != ord("f")):
-            raise IoError.of_kind("pg: not a boolean value", ErrorKind.InvalidData)
+        if self._binary(col):
+            var oid = self.columns[col].type_oid
+            if oid == FLOAT8 and len(b) == 8:
+                return bitcast[DType.float64]((UInt64(be_u32(b, 0)) << 32) | UInt64(be_u32(b, 4)))
+            if oid == FLOAT4 and len(b) == 4:
+                return Float64(bitcast[DType.float32](be_u32(b, 0)))
+            raise IoError.of_kind(op, ErrorKind.InvalidData)
+        try:
+            return atof(String(from_utf8_lossy=b))  # (NaN and the infinities too)
+        except:
+            raise IoError.of_kind(op, ErrorKind.InvalidData)
+
+    def _bool(self, row: Int, col: Int) raises IoError -> Bool:
+        comptime op = "pg: not a boolean value"
+        self._not_null(row, col, op)
+        var b = self.value(row, col)
+        if self._binary(col):
+            if len(b) != 1:
+                raise IoError.of_kind(op, ErrorKind.InvalidData)
+            return b[0] != 0
+        if len(b) != 1 or (Int(b[0]) != ord("t") and Int(b[0]) != ord("f")):
+            raise IoError.of_kind(op, ErrorKind.InvalidData)
         return Int(b[0]) == ord("t")
+
+    def _bytes(self, row: Int, col: Int) raises IoError -> List[UInt8]:
+        comptime op = "pg: not a bytea value"
+        self._not_null(row, col, op)
+        if self._binary(col):
+            if self.columns[col].type_oid != BYTEA:
+                raise IoError.of_kind(op, ErrorKind.InvalidData)
+            return List[UInt8](self.value(row, col))
+        return parse_bytea_hex(self.value(row, col))
+
+    def _date(self, row: Int, col: Int) raises IoError -> Date:
+        comptime op = "pg: not a date value"
+        self._not_null(row, col, op)
+        if self._binary(col):
+            if self.columns[col].type_oid != DATE:
+                raise IoError.of_kind(op, ErrorKind.InvalidData)
+            return binary_date(self.value(row, col))
+        return parse_date(self.value(row, col))
+
+    def _timestamp(self, row: Int, col: Int) raises IoError -> Int:
+        comptime op = "pg: not a timestamp value"
+        self._not_null(row, col, op)
+        if self._binary(col):
+            if self.columns[col].type_oid != TIMESTAMP:
+                raise IoError.of_kind(op, ErrorKind.InvalidData)
+            return binary_timestamp_us(self.value(row, col))
+        return parse_timestamp_us(self.value(row, col))
+
+    def text(self, row: Int, col: Int) raises PgError -> String:
+        """A value in the server's text form ("" for NULL), whichever form
+        it came in (`pg.types`)."""
+        try:
+            return self._text(row, col)
+        except e:
+            raise PgError(e)
+
+    def int(self, row: Int, col: Int) raises PgError -> Int:
+        """A value of an integer column (or a decimal integer in text form).
+        `InvalidData` for NULL or anything else."""
+        try:
+            return self._int(row, col)
+        except e:
+            raise PgError(e)
+
+    def float(self, row: Int, col: Int) raises PgError -> Float64:
+        """A value of a float4, float8 or numeric column (or any number in
+        text form), "NaN" and the infinities included."""
+        try:
+            return self._float(row, col)
+        except e:
+            raise PgError(e)
+
+    def bool(self, row: Int, col: Int) raises PgError -> Bool:
+        """A value of a boolean column ("t" or "f" in text form)."""
+        try:
+            return self._bool(row, col)
+        except e:
+            raise PgError(e)
+
+    def bytes(self, row: Int, col: Int) raises PgError -> List[UInt8]:
+        """A bytea value's bytes."""
+        try:
+            return self._bytes(row, col)
+        except e:
+            raise PgError(e)
+
+    def date(self, row: Int, col: Int) raises PgError -> Date:
+        """A date value."""
+        try:
+            return self._date(row, col)
+        except e:
+            raise PgError(e)
+
+    def timestamp(self, row: Int, col: Int) raises PgError -> Int:
+        """A timestamp or timestamptz value, as microseconds since
+        1970-01-01 00:00:00: UTC for timestamptz, the wall-clock time taken
+        as UTC for a timestamp without a time zone. `Int.MAX` and `Int.MIN`
+        stand for 'infinity' and '-infinity'."""
+        try:
+            return self._timestamp(row, col)
+        except e:
+            raise PgError(e)
 
     def rows_affected(self) -> Optional[Int]:
         """The row count in the command tag, if it has one."""
         return rows_affected(self.tag)
+
+
+@fieldwise_init
+struct _Statement(Copyable, Movable):
+    """A statement the client prepared (an empty name: a free slot)."""
+
+    var name: String
+    var sql: String
+    var formats: List[Int]
+    """Per result column: `BINARY` where `pg.types` reads that form."""
+    var used: Int
+    """When it was last used, for evicting the least recently used."""
 
 
 struct Client(Movable):
@@ -212,6 +376,11 @@ struct Client(Movable):
     var _usable: Bool
     var _notices: List[ServerMessage]
     var _notifications: List[Notification]
+    var _statements: List[_Statement]
+    var _by_sql: Dict[String, Int]
+    """The slot in `_statements` of each prepared SQL text."""
+    var _clock: Int
+    var _named: Int
 
     def __init__(out self, var sock: Socket, var conn: PgConnection, config: Config):
         self._sock = sock^
@@ -223,6 +392,10 @@ struct Client(Movable):
         self._usable = True
         self._notices = List[ServerMessage]()
         self._notifications = List[Notification]()
+        self._statements = List[_Statement]()
+        self._by_sql = Dict[String, Int]()
+        self._clock = 0
+        self._named = 0
 
     @staticmethod
     def connect(config: Config) raises PgError -> Client:
@@ -343,17 +516,106 @@ struct Client(Movable):
         return self.query_params(sql, params, timeout).rows_affected().or_else(0)
 
     def query_params(mut self, sql: StringSlice, params: Params, timeout: Duration = Duration.ZERO) raises PgError -> Rows:
-        """Run one statement with `params`, through the extended protocol and
-        the unnamed statement: one round trip."""
+        """Run one statement with `params` through the extended protocol.
+
+        With the statement cache (`Config.statement_cache`), the first run
+        of a SQL text prepares it, which costs a round trip and tells the
+        column types. Then every run binds the prepared statement and asks
+        for binary results where `pg.types` reads them. Without the cache,
+        each run uses the unnamed statement with text results: one round
+        trip, as poolers that cannot keep statements need."""
         self._check_usable()
+        var deadline = _deadline(timeout)
+        if self._config.statement_cache <= 0:
+            try:
+                self._conn.execute(sql, params)
+            except e:
+                raise PgError(e)  # (InvalidInput: the session is unharmed)
+            var current = Rows()
+            return _last(self._cycle(deadline, current))
+        var slot = self._statement(sql, deadline)
         try:
-            self._conn.execute(sql, params)
+            return self._run(slot, params, deadline)
         except e:
-            raise PgError(e)  # (InvalidInput: the session is unharmed)
-        var all = self._results(timeout)
-        if len(all) == 0:
-            return Rows()
-        return all.pop()
+            # 0A000: the result type changed under the cached plan (DDL).
+            # Outside a transaction, prepare it afresh and run once more.
+            if e.code() != "0A000" or self.transaction_status() != IDLE or not self.is_usable():
+                raise e.copy()
+        self._forget(slot, deadline)
+        slot = self._statement(sql, deadline)
+        return self._run(slot, params, deadline)
+
+    def _run(mut self, slot: Int, params: Params, deadline: Deadline) raises PgError -> Rows:
+        try:
+            self._conn.execute_prepared(self._statements[slot].name, params, Span(self._statements[slot].formats))
+        except e:
+            raise PgError(e)
+        var current = Rows()
+        return _last(self._cycle(deadline, current))
+
+    def _statement(mut self, sql: StringSlice, deadline: Deadline) raises PgError -> Int:
+        """The slot of `sql`'s prepared statement, prepared now if it is not
+        cached (a round trip; the server's error, a syntax error say, is
+        raised and nothing is cached)."""
+        var key = String(sql)
+        self._clock += 1
+        var found = self._by_sql.get(key)
+        if found:
+            self._statements[found.value()].used = self._clock
+            return found.value()
+        self._named += 1
+        var name = String("mojo_", self._named)
+        try:
+            self._conn.prepare(name, sql, Params())
+        except e:
+            raise PgError(e)
+        var described = Rows()
+        _ = self._cycle(deadline, described)
+        var formats = List[Int](capacity=len(described.columns))
+        for i in range(len(described.columns)):
+            formats.append(BINARY if wants_binary(described.columns[i].type_oid) else TEXT)
+        if len(self._by_sql) >= self._config.statement_cache:
+            # (only now: a statement the server refused evicts nothing)
+            var oldest = -1
+            for i in range(len(self._statements)):
+                if self._statements[i].name.byte_length() > 0 and (
+                    oldest < 0 or self._statements[i].used < self._statements[oldest].used
+                ):
+                    oldest = i
+            self._forget(oldest, deadline)
+        var slot = -1
+        for i in range(len(self._statements)):
+            if self._statements[i].name.byte_length() == 0:
+                slot = i
+                break
+        if slot < 0:
+            slot = len(self._statements)
+            self._statements.append(_Statement(name, key, formats^, self._clock))
+        else:
+            self._statements[slot] = _Statement(name, key, formats^, self._clock)
+        self._by_sql[key] = slot
+        return slot
+
+    def _forget(mut self, slot: Int, deadline: Deadline) raises PgError:
+        """Drop a cached statement, and close it on the server (a round
+        trip)."""
+        var name = self._statements[slot].name
+        try:
+            _ = self._by_sql.pop(self._statements[slot].sql)
+        except:
+            pass
+        self._statements[slot].name = String()
+        self._statements[slot].sql = String()
+        try:
+            self._conn.close_statement(name)
+        except e:
+            raise PgError(e)
+        var none = Rows()
+        _ = self._cycle(deadline, none)
+
+    def cached_statements(self) -> Int:
+        """How many prepared statements the cache holds."""
+        return len(self._by_sql)
 
     def simple_query(mut self, sql: StringSlice, timeout: Duration = Duration.ZERO) raises PgError -> List[Rows]:
         """Run one or more statements, separated by semicolons, through the
@@ -365,16 +627,17 @@ struct Client(Movable):
             self._conn.query(sql)
         except e:
             raise PgError(e)  # (a NUL in `sql`: the session is unharmed)
-        return self._results(timeout)
+        var current = Rows()
+        return self._cycle(_deadline(timeout), current)
 
     def _check_usable(self) raises PgError:
         if not self.is_usable():
             raise PgError(IoError.of_kind("pg: the connection is closed", ErrorKind.Closed))
 
-    def _results(mut self, timeout: Duration) raises PgError -> List[Rows]:
-        """Send what is queued and gather the results until READY."""
-        var deadline = _deadline(timeout)
-        var current = Rows()
+    def _cycle(mut self, deadline: Deadline, mut current: Rows) raises PgError -> List[Rows]:
+        """Send what is queued and gather the results until READY. `current`
+        is left with the last RowDescription that no CommandComplete closed
+        (a prepared statement's columns)."""
         var results = List[Rows]()
         var error = List[ServerMessage]()
         var sent = False
@@ -479,6 +742,12 @@ struct Client(Movable):
             except:
                 pass
         self._close_now()
+
+
+def _last(var all: List[Rows]) -> Rows:
+    if len(all) == 0:
+        return Rows()
+    return all.pop()
 
 
 def _deadline(timeout: Duration) -> Deadline:

@@ -616,25 +616,38 @@ def write_parse(mut out: ByteBuffer, name: StringSlice, sql: StringSlice, params
 
 
 def write_bind(
-    mut out: ByteBuffer, portal: StringSlice, statement: StringSlice, params: Params, result_format: Int
+    mut out: ByteBuffer, portal: StringSlice, statement: StringSlice, params: Params, result_formats: Span[Int, _]
 ) raises IoError:
     """A Bind: portal `portal` ("" for the unnamed one) from the prepared
-    statement `statement` with `params`; every result column in
-    `result_format` (`TEXT` or `BINARY`)."""
+    statement `statement` with `params`. `result_formats`: one format
+    (`TEXT` or `BINARY`) per result column, or a single one for all of
+    them, or none for text."""
     comptime op = "pg: invalid Bind"
     var pb = portal.as_bytes()
     var sb = statement.as_bytes()
     _check_string(pb, op)
     _check_string(sb, op)
     var n = len(params)
-    if n > MAX_PARAMS or (result_format != TEXT and result_format != BINARY):
+    if n > MAX_PARAMS or len(result_formats) > MAX_PARAMS:
         raise IoError.of_kind(op, ErrorKind.InvalidInput)
+    var same = True
+    for f in result_formats:
+        if f != TEXT and f != BINARY:
+            raise IoError.of_kind(op, ErrorKind.InvalidInput)
+        same = same and f == result_formats[0]
+    # result codes: none for all text, one when all agree, else one each
+    var result_codes = 0
+    if len(result_formats) > 0:
+        if not same:
+            result_codes = len(result_formats)
+        elif result_formats[0] == BINARY:
+            result_codes = 1
     var binary = 0
     for i in range(n):
         binary += params.format(i)
     # format codes: none when all are text, one when all are binary
     var codes = 0 if binary == 0 else (1 if binary == n else n)
-    var size = len(pb) + 1 + len(sb) + 1 + 2 + 2 * codes + 2 + 2 + 2
+    var size = len(pb) + 1 + len(sb) + 1 + 2 + 2 * codes + 2 + 2 + 2 * result_codes
     for i in range(n):
         size += 4 + len(params.value(i))
     _header(out, _BIND, size, "pg: parameters too long")
@@ -654,8 +667,12 @@ def write_bind(
             var v = params.value(i)
             _put_i32(out, len(v))
             out.write_bytes(v)
-    _put_i16(out, 1)
-    _put_i16(out, result_format)
+    _put_i16(out, result_codes)
+    if result_codes == 1:
+        _put_i16(out, BINARY)
+    elif result_codes > 1:
+        for f in result_formats:
+            _put_i16(out, f)
 
 
 def write_describe(mut out: ByteBuffer, kind: UInt8, name: StringSlice) raises IoError:
