@@ -199,28 +199,40 @@ def test_a_child_can_start_with_another_signal_mask() raises:
     assert_equal(c.wait(), ExitStatus(-1, SIGKILL))
 
 
+def _until_ended(pid: Int) raises:
+    """Wait until child `pid` has ended, without reaping it (at most 30 s:
+    a loaded machine can take far longer than a fixed pause)."""
+    var os = Python.import_module("os")
+    var time = Python.import_module("time")
+    var t = Instant.now()
+    while String(os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)) == "None":
+        if t.elapsed() > Duration.from_secs(30):
+            raise Error("child ", pid, " did not end")
+        _ = time.sleep(0.002)
+
+
 def test_reap_others_leaves_the_known_children() raises:
     var six = _sh("exit 6")
     var mine = spawn(six)
-    var t = Instant.now()
-    while t.elapsed() < Duration.from_millis(300):  # (let it end)
-        pass
+    _until_ended(mine.pid)
     # A child this test does not know about: started by Python, ended, a
-    # zombie until someone waits for it.
+    # zombie until someone waits for it. `other` must stay alive until the
+    # end: destroying a Popen runs its __del__, which reaps the child if it
+    # has ended, and Mojo destroys a value right after its last use.
     var subprocess = Python.import_module("subprocess")
     var other = subprocess.Popen(Python.list("/bin/sh", "-c", "exit 0"))
     var other_pid = Int(py=other.pid)
-    t = Instant.now()
-    while t.elapsed() < Duration.from_millis(300):
-        pass
+    _until_ended(other_pid)
     var known = List[Int]()
     known.append(mine.pid)
-    var reaped = 0
-    for _ in range(3):  # (the first child it meets may be the known one)
-        reaped += reap_others(known)
-        if reaped > 0:
-            break
-        _ = mine.try_wait()  # reap ours, so the other comes up
+    # It stops at the first known child it meets, which may be ours: then
+    # reap ours (once) and the other comes up.
+    var ours_reaped = False
+    var reaped = reap_others(known)
+    if reaped == 0:
+        assert_equal(mine.wait(), ExitStatus(6, 0))
+        ours_reaped = True
+        reaped = reap_others(known)
     assert_equal(reaped, 1)
     var gone = False
     try:
@@ -228,6 +240,9 @@ def test_reap_others_leaves_the_known_children() raises:
     except:
         gone = True  # (reaped: no such process)
     assert_true(gone)
+    if not ours_reaped:
+        assert_equal(mine.wait(), ExitStatus(6, 0))
+    _ = other.pid  # (the last use of `other`: see above)
 
 
 def test_a_nul_in_an_argument_is_refused() raises:

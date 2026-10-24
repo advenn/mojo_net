@@ -109,6 +109,7 @@ pixi run bench build               # rt benchmarks (bench/rt/README.md)
   - When only a raw address reaches the kernel (for example inside a `Msghdr`), call `sys.keep_alive(x)` after the syscall.
   - Registering an fd with epoll does **not** keep its owner alive: whoever registers must own the fd until `EPOLL_CTL_DEL`.
   - The regression test is `tests/linux/test_sys.mojo::test_owner_outlives_syscall_when_last_use`.
+  - A `PythonObject` is destroyed after its last use too. A `subprocess.Popen` destroyed early runs its `__del__`, which reaps the child if it has ended; that made `tests/linux/test_process.mojo` fail with ECHILD under load. A test that needs the child to stay a zombie keeps the object alive (`_ = p.pid` at the end).
 - **Field reassignment in a loop corrupts memory (Mojo 1.2.0 compiler bug).**
   - **Trigger:** a local struct with heap-owning fields (`String`, `List`, ...). After one field's last use, a loop reassigns another field. The heap is corrupted, and the crash comes later, inside the runtime's allocator.
   - **Not affected:** straight-line reassignment, and function arguments (`mut` / `ref`), because only locals get field-wise early destruction.
