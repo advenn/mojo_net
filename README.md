@@ -3,18 +3,21 @@
 Native Mojo networking libraries for Linux (x86_64 and aarch64, kernel 5.15+):
 - raw syscalls, with no libc on the I/O path;
 - sockets;
-- an HTTP/1.1 library, and an HTTP/1.1 server; database drivers will build on the same layers.
+- an HTTP/1.1 library, and an HTTP/1.1 server;
+- a PostgreSQL driver, in progress, building on the same layers.
 
 | Package | What | Status |
 |---|---|---|
 | `linux` | raw syscalls (inline asm), ABI mirrors, errno and `IoError`, fds, clocks, poll/epoll/eventfd, probing | stable |
-| `bytes` | `ByteBuffer` and the sans-I/O `Codec` contract that protocol codecs implement | stable |
+| `bytes` | `ByteBuffer`, base64, and the sans-I/O `Codec` contract that protocol codecs implement | stable |
+| `crypto` | SHA-256, MD5, HMAC-SHA-256, PBKDF2 and a constant-time comparison, for authentication protocols (no ciphers) | done for `pg` |
 | `net` | the TCP/UDP library: addresses, every socket option, TCP/Unix streams with deadlines, connect by name, buffered frame reads, UDP sockets (blocking, nonblocking, batched, multicast) ([docs/net.md](docs/net.md)) | TCP client and UDP stable |
 | `http` | HTTP/1.1: a sans-I/O head parser, body framing and connection codecs for both sides, and a blocking client with a keep-alive pool ([docs/http.md](docs/http.md)) | done |
 | `server` | an HTTP/1.1 server: one epoll loop per process, a `Handler` trait, timeouts and backpressure, streamed bodies and server-sent events, graceful shutdown on SIGTERM; supervised worker processes on one port with SO_REUSEPORT; a router and static files ([docs/server.md](docs/server.md)) | done through S5 |
+| `pg` | a PostgreSQL driver: a sans-I/O protocol codec, authentication up to SCRAM-SHA-256, a blocking client ([docs/pg.md](docs/pg.md)) | in progress (P1 of 6) |
 | `rt` | an experimental completion-based event loop ([docs/rt.md](docs/rt.md)) | frozen |
 
-Imports point downward only (`linux` ← `bytes` ← `net` ← `rt`, and `net` ← `http` ← `server`), and only `rt` may import `rt`. `http`'s protocol code is sans-I/O: only its client module imports `net`. CI checks these rules. Design, package rules and shared contracts: [docs/design.md](docs/design.md).
+Imports point downward only (`linux` ← `bytes` ← `net` ← `rt`, and `net` ← `http` ← `server`; `crypto` imports only the standard library), and only `rt` may import `rt`. `http`'s protocol code is sans-I/O: only its client module imports `net`. CI checks these rules. Design, package rules and shared contracts: [docs/design.md](docs/design.md).
 
 ## Use
 There is no published package yet. Pin the same Mojo as `pixi.toml`, and put `src/` on the include path (`mojo run -I src ...`).

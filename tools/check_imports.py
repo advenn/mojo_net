@@ -36,6 +36,7 @@ ALLOWED = {
     "rt": {"linux", "bytes", "net", "rt"},
     "http": {"linux", "bytes", "net", "http"},
     "server": {"linux", "bytes", "net", "http", "server"},
+    "crypto": {"crypto"},
 }
 # Packages whose protocol logic is sans-I/O: in src/, only the listed
 # modules may import `net` (the rest only parse and build bytes).

@@ -12,11 +12,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - `net`: the TCP/UDP library (client side done; packaging left);
   - `http`: the HTTP/1.1 library, done through H6 (`docs/http.md`);
   - `server`: the HTTP server (roadmap step 3), done through S5 (`docs/server.md`);
+  - `pg`: the PostgreSQL driver, the active work (`docs/pg.md`). P1 is done: `crypto` (hashes and MACs for authentication) and `bytes.base64`;
   - `rt`: an experimental event-loop runtime, **frozen** until Mojo's async/await stabilizes. Keep it compiling and green; add no features unless the user unfreezes it.
 
 **Docs:**
 - `docs/design.md`: packages, import rules and the numbered contracts that code comments cite. Read it before changing any package.
-- Per-library docs: `docs/net.md` (scope, L2 contract, readiness-loop rules, milestones), `docs/http.md` (scope, strictness rules, milestones), `docs/server.md` (model, behaviour, milestones) and `docs/rt.md`.
+- Per-library docs: `docs/net.md` (scope, L2 contract, readiness-loop rules, milestones), `docs/http.md` (scope, strictness rules, milestones), `docs/server.md` (model, behaviour, milestones), `docs/pg.md` (scope, decisions, milestones) and `docs/rt.md`.
 - `docs/spikes.md`: measured facts (threads, the Mojo runtime, callbacks, the 10k-connection epoll spike).
 
 ## Commands
@@ -50,7 +51,7 @@ pixi run bench build               # rt benchmarks (bench/rt/README.md)
 **Test-only Python:** some tests use the pixi env's Python as an oracle (`ipaddress`) or as a peer process. It is never used in `src/`.
 
 ## Layout and rules
-- **Packages:** imports only point downward: `rt → net → bytes → linux`, and `http → net → bytes → linux`. `linux` imports only `std`.
+- **Packages:** imports only point downward: `rt → net → bytes → linux`, and `http → net → bytes → linux`. `linux` and `crypto` import only `std`.
   - Nothing outside `rt` imports `rt`.
   - `http` is sans-I/O: in `src/http`, only `client.mojo` may import `net` (`SANS_IO` in `tools/check_imports.py`).
   - `server` (the HTTP server, roadmap step 3) builds on `http` and `net`.
@@ -60,7 +61,8 @@ pixi run bench build               # rt benchmarks (bench/rt/README.md)
     - `src/<pkg>`, `tests/<pkg>`, `examples/<pkg>`, `bench/<pkg>`;
     - `docs/<pkg>.md`.
   - `src/linux`: the syscall layer. `fs` reads small files and opens files beneath a directory (`open_beneath`: openat2 with RESOLVE_BENEATH; `stat_fd`: statx; `pread`). Processes and signals: `signal` (`SignalSet`, thread masks, `SignalFd`) and `process` (`Exec`; `spawn` with clone3, or clone(2) where seccomp refuses clone3, then execve, with an optional child `signal_mask`; `Child` held by a pidfd; `reap_others` for PID 1; affinity; `threads`; `all_threads_block`). `probe.cpu_quota` reads a cgroup v2 `cpu.max`.
-  - `src/bytes`: `ByteBuffer`, and the sans-I/O `Codec` trait (`bytes.codec`, contract 1).
+  - `src/bytes`: `ByteBuffer`, the sans-I/O `Codec` trait (`bytes.codec`, contract 1), and `base64` (RFC 4648; strict decoding).
+  - `src/crypto`: `sha256` (`Sha256`, `sha256`), `md5`, `hmac` (`HmacSha256`, `pbkdf2_hmac_sha256`) and `compare` (`equal_constant_time`). Scalar code for authentication (SCRAM, PostgreSQL's MD5), not bulk hashing; MD5 is broken as a hash. `tests/crypto` checks the RFC vectors and Python's hashlib/hmac.
   - `src/net`: sockets.
   - `src/server`: the HTTP server. `server` (`Server[H: Handler]`, `ServerConfig`, `Request`, `Response`; `step()` runs one loop turn, which is how tests drive it), `date` (`http_date`, `DateCache`) `process` (`Stop`: SIGTERM/SIGINT or a worker's lifeline, given to `Server.stop_on`; `run_workers`: a supervisor that runs the program as N workers on one port) `router` (`Router[A: Handler]`: a segment trie of route functions `def(mut A, Request, Params, mut Response)`; the app is the fallback and gets the hooks) and `static` (`StaticFiles`: openat2 beneath a directory, conditionals, ranges; large files stream, so the app passes `produce` and `stream_ended` on). Streaming goes through the defaulted `Handler` hooks: `stream_request`/`on_body` (and `body_cut` when such a body never completes) for request bodies; `res.stream()` plus `produce` for responses, paused by appending nothing and woken by id (`Request.id`, `Server.wake`, `take_wakes`), with `stream_ended` once each is over. A connection gets a slice per turn (64 KiB or 128 requests; then the `_again` list, like wakes), and the read and write timeouts need `min_rate` per window. `shutdown()` drains gracefully (`stopped()`, the `shutting_down` hook, `shutdown_timeout`), and a close with input left unread lingers (`ServerConnection.input_pending()`). Tests run the loop while a Python client process talks to it.
   - `src/http`: HTTP/1.1. `types` (versions, methods, status codes), `headers` (`Headers`: arena-backed, case-insensitive, ordered; validated adds; exact bytes plus a string view for obs-text), `parse` (`HeadParser`: incremental heads, strict requests, lenient responses, limits; `RequestHead` / `ResponseHead`; `for_trailers` for field sections), `body` (framing decisions, `BodyDecoder` returning ranges of the caller's input, chunk encoding), `connection` (`ServerConnection` / `ClientConnection`: the `Codec`s for one connection; the server answers one request at a time; `poll(ev)` refills a reused event, `next_event()` returns new ones), `client` (`Client`: blocking, pooled, one deadline per request; imports `net`, so not re-exported from `http`). `tests/http/http_peer.py` (started by `http_peer.mojo`) is Python's http.server with test routes. `tests/http/head_oracle.py` and `tests/http/chunked_oracle.py` are the Python references for differential fuzzing; keep them in step with any rule change.
@@ -118,6 +120,7 @@ pixi run bench build               # rt benchmarks (bench/rt/README.md)
   - **Where it bit:** `ServerConnection.next_event()` returned an `Optional` of a 256-byte event on every call, which cost ~2 µs per request.
   - **Workaround:** keep structs that travel in an `Optional` small: box big payloads in a one-element `List` (24 bytes; the same `Optional` then costs ~5 ns). In hot loops, prefer an API that fills a caller-owned value (`poll(mut ev)`) over returning `Optional`.
   - **Diagnosis:** look for `Variant::__deinit__` calls in `mojo build --emit asm` output.
+- **Runtime indexes into a wide `SIMD` are slow (Mojo 1.2.0).** SHA-256 with its message schedule in a `SIMD[DType.uint32, 64]`, indexed in a runtime loop, ran at 29 MB/s. Unrolled with `comptime for` (constant indexes, the schedule in an `Array`), it runs at ~260 MB/s, because the values stay in registers (`src/crypto/sha256.mojo`).
 - **ABI structs:**
   - Use `Array[UInt8, N]` for C arrays, never `SIMD`. SIMD is aligned to its full width, which made `sockaddr_in6` 48 bytes.
   - A struct with `Array` fields can't be `TrivialRegisterPassable`; use `(Copyable, Movable)`.

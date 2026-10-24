@@ -20,15 +20,17 @@ So a Mojo upgrade, or a change in a shared layer, lands in every package in one 
 | Package | Role | Status | May import |
 |---|---|---|---|
 | `linux` | raw syscalls, ABI mirrors, errno, `IoError`, fds, clock, poll/epoll/eventfd wrappers, probing (including fd-table pre-growth) | stable (M1) | `std` only |
-| `bytes` | `ByteBuffer`, and the sans-I/O `Codec` contract (contract 1) with the reference `LineCodec` | stable (M1) | `linux` |
+| `bytes` | `ByteBuffer`, base64, and the sans-I/O `Codec` contract (contract 1) with the reference `LineCodec` | stable (M1) | `linux` |
+| `crypto` | hashes and MACs for authentication protocols: SHA-256, MD5, HMAC-SHA-256, PBKDF2, constant-time comparison (no ciphers) | done for `pg` (P1) | `std` only |
 | `net` | the TCP/UDP library (`docs/net.md`): addresses, socket options (L1), blocking TCP/Unix with deadlines and nonblocking `try_*` calls (L2), buffered frame reads (`BufReader`), DNS and connect-by-name (Happy Eyeballs), UDP | TCP client (M2) and UDP (M3) done; packaging left | `linux`, `bytes` |
 | `http` | the HTTP/1.1 library (`docs/http.md`): message types, the header map, the sans-I/O head parser, body framing, server and client connection codecs, and a blocking client | H1–H6 done | `linux`, `bytes`; `net` only in `http.client` |
 | `server` | the HTTP/1.1 server (`docs/server.md`): one epoll loop per process over `ServerConnection`s, a `Handler` trait, timeouts, backpressure, streaming; SO_REUSEPORT for multi-core | S1–S5 done | `linux`, `bytes`, `net`, `http` |
+| `pg` | the PostgreSQL driver (`docs/pg.md`): a sans-I/O protocol 3.0 codec, authentication up to SCRAM-SHA-256, a blocking client | planned (P2 next) | `linux`, `bytes`, `crypto`; `net` only in `pg.client` |
 | `rt` | experimental completion-based event loop (`docs/rt.md`): epoll and simulator backends, timers, slab, mailbox, `rt.evented` connections | **frozen** until Mojo's async/await stabilizes | `linux`, `bytes`, `net` |
 
 - **Nothing outside `rt` imports `rt`.** `rt` builds on `net`, never the reverse.
 - **The same rules cover all code.** They apply to `tests/<pkg>`, `examples/<pkg>` and `bench/<pkg>`. `spikes/` (M1 evidence) follows `net`'s rules.
-- **Protocol libraries** (`http`, and the planned database drivers) each get `src/<pkg>`, `tests/<pkg>`, `examples/<pkg>`, `docs/<pkg>.md`, and an entry in `ALLOWED` in `tools/check_imports.py`.
+- **Protocol libraries** (`http`, `pg`, and later database drivers) each get `src/<pkg>`, `tests/<pkg>`, `examples/<pkg>`, `docs/<pkg>.md`, and an entry in `ALLOWED` in `tools/check_imports.py`.
   - Their protocol logic is a sans-I/O codec built on `bytes` (contract 1).
   - Their transport uses `net`, from named modules only: `SANS_IO` in `tools/check_imports.py` lists the `src/<pkg>` modules that may import `net` (for `http`: `client.mojo`).
 
@@ -104,5 +106,6 @@ Code comments cite these by number, so keep the numbering stable. Contracts 2, 3
 - `docs/net.md`: the TCP library. Covers its scope, the L2 blocking contract, the rules for readiness-loop servers, and milestones.
 - `docs/http.md`: the HTTP/1.1 library. Covers its scope, the parser's strictness rules, and milestones.
 - `docs/server.md`: the HTTP server. Covers its model (one loop per process), behaviour and milestones.
+- `docs/pg.md`: the PostgreSQL driver. Covers its scope, decisions (authentication, no TLS yet, errors) and milestones.
 - `docs/rt.md`: the frozen runtime. Covers how contracts 2–7 are realised, the simulator, and the M2 gate.
 - `docs/spikes.md`: measured facts. Covers threads, the Mojo runtime, callbacks, and the 10k-connection epoll spike.
