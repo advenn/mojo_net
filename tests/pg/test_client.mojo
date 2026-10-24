@@ -19,9 +19,10 @@ from std.testing import TestSuite, assert_equal, assert_false, assert_true
 from linux import ErrorKind, IoError
 from linux.time import Duration, Instant
 from pg import BINARY, FAILED_TRANSACTION, IDLE, IN_TRANSACTION, TEXT, AuthMethods, Params
-from pg.client import Client, PgError, Rows
+from pg.client import E_ROLLED_BACK, Client, PgError, Rows
 from pg.config import Config
 from pg.message import FIELD_CONSTRAINT
+from pg.pool import Pool
 from pg.types import Date
 from pg_server import PgServer, passwords, users
 
@@ -389,6 +390,158 @@ def _statement_cache(server: PgServer) raises:
     p^.close()
 
 
+def _count(mut db: Client, sql: StringSlice) raises -> Int:
+    return db.query(sql).int(0, 0)
+
+
+def _transactions(server: PgServer) raises:
+    var db = Client.connect(server.tcp("trusty"))
+    _ = db.execute("CREATE TEMP TABLE tx (a int)")
+    db.begin()
+    _ = db.execute("INSERT INTO tx VALUES (1)")
+    assert_equal(db.transaction_status(), IN_TRANSACTION)
+    db.commit()
+    assert_equal(db.transaction_status(), IDLE)
+    db.begin()
+    _ = db.execute("INSERT INTO tx VALUES (2)")
+    db.rollback()
+    assert_equal(_count(db, "SELECT count(*) FROM tx"), 1)
+    # one at a time
+    db.begin()
+    var nested = False
+    try:
+        db.begin()
+    except e:
+        nested = e.io.kind == ErrorKind.InvalidInput
+    assert_true(nested)
+    db.rollback()
+    # a failed transaction: COMMIT rolls it back, and says so
+    db.begin()
+    _ = db.execute("INSERT INTO tx VALUES (3)")
+    assert_equal(_query_error(db, "SELECT 1/0").code(), "22012")
+    var rolled_back = False
+    try:
+        db.commit()
+    except e:
+        rolled_back = String(e.io.op) == E_ROLLED_BACK
+    assert_true(rolled_back)
+    assert_equal(db.transaction_status(), IDLE)
+    assert_equal(_count(db, "SELECT count(*) FROM tx"), 1)
+    # savepoints, with a name that needs quoting
+    var name = 'a b"c'
+    db.begin()
+    _ = db.execute("INSERT INTO tx VALUES (4)")
+    db.savepoint(name)
+    _ = db.execute("INSERT INTO tx VALUES (5)")
+    assert_equal(_query_error(db, "SELECT 1/0").code(), "22012")
+    db.rollback_to(name)  # (the failed part only: the transaction goes on)
+    assert_equal(db.transaction_status(), IN_TRANSACTION)
+    _ = db.execute("INSERT INTO tx VALUES (6)")
+    db.release(name)
+    db.commit()
+    assert_equal(db.query("SELECT string_agg(a::text, ',' ORDER BY a) FROM tx").text(0, 0), "1,4,6")
+    db^.close()
+
+
+def _notifications(server: PgServer) raises:
+    var a = Client.connect(server.tcp("trusty"))
+    var b = Client.connect(server.unix("trusty"))
+    _ = a.execute("LISTEN jobs")
+    _ = b.execute("NOTIFY jobs, 'one'")
+    var n = a.wait_notification(Duration.from_secs(10))
+    assert_true(Bool(n))
+    assert_equal(n.value().channel, "jobs")
+    assert_equal(n.value().payload, "one")
+    assert_equal(n.value().pid, b.backend_key().value().pid)
+    # none within the time: None, and the session goes on
+    var t = Instant.now()
+    assert_false(Bool(a.wait_notification(Duration.from_millis(200))))
+    assert_true(t.elapsed() >= Duration.from_millis(150))
+    assert_true(a.is_usable())
+    assert_equal(a.query("SELECT 5").int(0, 0), 5)
+    # one that came during a query is kept for the next wait
+    _ = b.execute("NOTIFY jobs, 'two'")
+    var waited = Instant.now()
+    while waited.elapsed() < Duration.from_secs(5):
+        _ = a.query("SELECT 1")
+        if Bool(a.wait_notification(Duration.from_millis(50))):
+            break
+    assert_true(waited.elapsed() < Duration.from_secs(5))
+    a^.close()
+    b^.close()
+
+
+def _pool(server: PgServer) raises:
+    var pool = Pool(server.tcp("trusty"), max_idle=2)
+    var a = pool.acquire()
+    var b = pool.acquire()
+    assert_equal(pool.opened(), 2)
+    var pid_b = b.backend_key().value().pid
+    pool.release(a^)
+    pool.release(b^)
+    assert_equal(pool.idle(), 2)
+    var c = pool.acquire()  # (the last released)
+    assert_equal(c.backend_key().value().pid, pid_b)
+    assert_equal(pool.opened(), 2)
+    assert_equal(c.query("SELECT 2").int(0, 0), 2)
+    pool.release(c^)
+    # a session ended while it sat in the pool is replaced
+    var d = pool.acquire()
+    var pid_d = d.backend_key().value().pid
+    pool.release(d^)
+    var killer = Client.connect(server.unix("trusty"))
+    assert_true(killer.query("SELECT pg_terminate_backend($1)", pid_d).bool(0, 0))
+    var t = Instant.now()
+    while _count(killer, String("SELECT count(*) FROM pg_stat_activity WHERE pid = ", pid_d)) > 0:
+        assert_true(t.elapsed() < Duration.from_secs(10))
+    var e = pool.acquire()
+    assert_true(e.backend_key().value().pid != pid_d)
+    assert_equal(e.query("SELECT 3").int(0, 0), 3)
+    # a session in a transaction is not pooled, nor one past max_idle
+    e.begin()
+    var idle = pool.idle()
+    pool.release(e^)
+    assert_equal(pool.idle(), idle)
+    var f = pool.acquire()
+    var g = pool.acquire()
+    var h = pool.acquire()
+    pool.release(f^)
+    pool.release(g^)
+    pool.release(h^)
+    assert_equal(pool.idle(), 2)
+    pool.close()
+    assert_equal(pool.idle(), 0)
+    killer^.close()
+    # A backend killed outright sends nothing: its socket just closes. (The
+    # server then recovers from a crash, so reconnecting waits for that.)
+    var crash = Pool(server.tcp("trusty"), max_idle=2)
+    var victim = crash.acquire()
+    var pid = victim.backend_key().value().pid
+    crash.release(victim^)
+    _ = Python.import_module("os").kill(pid, 9)
+    var gone = Instant.now()
+    while gone.elapsed() < Duration.from_millis(300):
+        pass
+    var connected = False
+    var handed_out_dead = False
+    var start = Instant.now()
+    while not connected and start.elapsed() < Duration.from_secs(20):
+        var acquired = False
+        try:
+            var after = crash.acquire()  # (first the dead session, which check refuses)
+            acquired = True
+            var answered = after.query("SELECT 1").int(0, 0) == 1  # (first: a dead session fails here)
+            connected = answered and after.backend_key().value().pid != pid
+            after^.close()
+        except:
+            # Connecting may fail during recovery (57P03); a session that
+            # acquire handed out must not.
+            handed_out_dead = handed_out_dead or acquired
+    assert_true(connected)
+    assert_false(handed_out_dead)
+    crash.close()
+
+
 def _run(server: PgServer, which: Int) -> String:
     """Body `which` against `server`: "" or why it failed."""
     try:
@@ -416,8 +569,14 @@ def _run(server: PgServer, which: Int) -> String:
             _parameters(server)
         elif which == 11:
             _types(server)
-        else:
+        elif which == 12:
             _statement_cache(server)
+        elif which == 13:
+            _transactions(server)
+        elif which == 14:
+            _notifications(server)
+        else:
+            _pool(server)
     except e:
         return String(e)
     return ""
@@ -483,6 +642,18 @@ def test_types() raises:
 
 def test_statement_cache() raises:
     _with_server(12)
+
+
+def test_transactions() raises:
+    _with_server(13)
+
+
+def test_notifications() raises:
+    _with_server(14)
+
+
+def test_pool() raises:
+    _with_server(15)
 
 
 def test_connect_deadline() raises:

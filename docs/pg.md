@@ -7,9 +7,10 @@ A PostgreSQL client for Mojo on Linux, speaking the frontend/backend protocol (v
 - the sans-I/O codec for a session (`PgConnection`);
 - a blocking client (`pg.client`), tested against PostgreSQL 18;
 - the extended query protocol: parameters and prepared statements;
-- types: binary values for the common types, typed accessors, and a statement cache.
+- types: binary values for the common types, typed accessors, and a statement cache;
+- transactions, waiting for notifications, and a pool of sessions.
 
-Next is P6: transactions, a connection pool, and waiting for notifications.
+Next is P7: independent reviews, and polish.
 
 ## Scope
 **In scope:**
@@ -104,7 +105,15 @@ def main() raises:
   - When it passes, the query is cancelled. The client sends a CancelRequest on a new connection and waits until the server has taken it, as libpq does.
   - The session stays usable, and the error says `is_deadline()`, with the server's 57014 attached.
   - If the server does not end the query within `CANCEL_GRACE`, the connection is closed.
-- **On the side:** `take_notices()`, `take_notifications()` (after LISTEN), `parameter(name)`, `transaction_status()`, `cancel()`.
+- **Transactions:**
+  - `begin()`, `commit()` and `rollback()`. `commit()` raises when the server rolled a failed transaction back instead (`E_ROLLED_BACK`).
+  - `savepoint(name)`, `rollback_to(name)` and `release(name)`, the name quoted as an identifier. `transaction_status()` follows each.
+- **Notifications:** after `execute("LISTEN channel")`, `wait_notification(timeout)` returns the next one: one received during a query already, or the first to arrive. None when none came in time, and the session goes on.
+- **A pool** (`pg.pool.Pool`): `acquire()` hands out a session, and `release(db^)` takes it back.
+  - **Kept:** a session that is usable, idle outside a transaction, while there is room (`max_idle`). Anything else is closed.
+  - **Checked** before it is handed out again (`Client.check()`, without a round trip): one the server ended meanwhile is replaced.
+  - **Session state** (SET, temporary tables, LISTEN, prepared statements) stays with the session.
+- **On the side:** `take_notices()`, `take_notifications()`, `parameter(name)`, `cancel()`.
 
 ## Using the codec
 `PgConnection` runs one session and does no I/O. The driver sends what it hands out and feeds it what the socket reads. This is a blocking driver's loop, what `pg.client` will run (P3):
@@ -163,6 +172,7 @@ while True:
   - `PgEvent` and `EventKind` are the events.
 - **`config`:** `Config`, from code or a connection URI, with the settings a session needs.
 - **`client`:** the blocking `Client`, `Rows` and `PgError`. It is the only module that imports `net`, and is not re-exported from `pg`.
+- **`pool`:** `Pool`, sessions kept for reuse: `acquire`, `release`, `close`.
 - **`types`:** the OIDs of the built-in types, and which of them travel in binary form. It also holds their binary forms, the server's text for them, and parsers for the text forms of dates, timestamps and bytea. `Date` is a calendar date.
 
 ## Milestones
@@ -282,11 +292,20 @@ while True:
   - **Measured on the Unix socket:**
     - `query("SELECT 1")` runs at about 86,000 a second (11.5 µs), against pgbench's prepared mode at 92,900 and our P4 unnamed path at 59,000.
     - With a parameter, it runs at about 81,000 a second.
-- **P6: transactions, a pool, LISTEN/NOTIFY.**
-  - **Transactions:** a scope that rolls back on error.
-  - **Pool:** connections are health-checked and reset before reuse.
-  - **Notifications:** delivered between queries, and waited for with a deadline.
-  - **COPY**, if needed.
+- **P6: transactions, a pool, LISTEN/NOTIFY.** Done.
+  - **Transactions:** `begin`, `commit` (which raises when a failed transaction was rolled back instead, as pgx does), `rollback`, and savepoints with quoted names.
+  - **Notifications:** `wait_notification(timeout)` returns one queued during a query, or waits on the socket. When the time is up it returns None: nothing was in flight, so the session is intact.
+  - **Health:** `Client.check()` reads what an idle session received without a round trip. A FATAL error (a terminated backend, an idle timeout) or a closed socket ends the session.
+  - **`pg.pool.Pool`:** LIFO reuse of checked sessions, up to `max_idle`. Sessions in a transaction are not kept; queued notices and notifications are dropped on release.
+  - **Tests** against PostgreSQL:
+    - commit and rollback, and a nested `begin` refused;
+    - a failed transaction's COMMIT, and a savepoint that rescues one;
+    - notifications from a second session, a wait that times out, and one that came during a query;
+    - the pool's reuse order, `max_idle`, transactions kept out, and a pooled session terminated by `pg_terminate_backend` and replaced on `acquire`.
+  - **Planted bugs:** 12, of which the first run caught 10.
+    - One was equivalent: after a FATAL error the session has ended, so `check()` refuses it even without its explicit test for errors.
+    - One needed a stronger test. A backend killed outright sends nothing, and only its socket closes. The test kills one with SIGKILL (the cluster's `CHECKPOINT` after setup keeps its users through the crash recovery), and its retry loop no longer hides a dead session handed out.
+  - **Not done:** COPY, which stays refused (CopyFail), a lead for later. So is a scope that rolls back by itself on an error, which needs `with` support or function values that capture the client.
 - **P7: review and polish.**
   - Independent reviews, with a regression test for each finding.
   - Performance measured against libpq.

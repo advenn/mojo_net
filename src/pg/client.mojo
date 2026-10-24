@@ -45,7 +45,7 @@ from linux import ErrorKind, IoError
 from linux.random import fill_random
 from linux.time import Deadline, Duration
 from net.addr import UnixAddr
-from net.blocking import recv_with_deadline, send_all_with_deadline
+from net.blocking import IdleState, idle_state, recv_with_deadline, send_all_with_deadline
 from net.socket import Shutdown, Socket
 from net.tcp import TcpStream
 from net.unix import UnixStream
@@ -140,6 +140,8 @@ struct PgError(Copyable, Movable, Writable):
 
 
 comptime _SERVER_ERROR = "pg: the server reported an error"
+comptime E_ROLLED_BACK = "pg: the transaction had failed: COMMIT rolled it back"
+comptime E_IN_TRANSACTION = "pg: a transaction is already open"
 comptime _CLOSED_BY_SERVER = "pg: the server closed the connection"
 
 
@@ -709,6 +711,97 @@ struct Client(Movable):
     def backend_key(self) -> Optional[BackendKey]:
         return self._conn.backend_key()
 
+    # ---- transactions ---------------------------------------------------------
+
+    def begin(mut self, timeout: Duration = Duration.ZERO) raises PgError:
+        """Open a transaction (BEGIN). `InvalidInput` when one is open."""
+        if self._conn.transaction_status() != IDLE:
+            raise PgError(IoError.of_kind(E_IN_TRANSACTION, ErrorKind.InvalidInput))
+        _ = self.simple_query("BEGIN", timeout)
+
+    def commit(mut self, timeout: Duration = Duration.ZERO) raises PgError:
+        """End the transaction and keep its work (COMMIT). A transaction
+        that failed is rolled back by the server instead; then this raises
+        (`E_ROLLED_BACK`), with the session idle again."""
+        var r = self.simple_query("COMMIT", timeout)
+        if len(r) > 0 and r[0].tag == "ROLLBACK":
+            raise PgError(IoError.of_kind(E_ROLLED_BACK, ErrorKind.Other))
+
+    def rollback(mut self, timeout: Duration = Duration.ZERO) raises PgError:
+        """End the transaction and drop its work (ROLLBACK)."""
+        _ = self.simple_query("ROLLBACK", timeout)
+
+    def savepoint(mut self, name: StringSlice) raises PgError:
+        """SAVEPOINT `name` (quoted as an identifier: any name is safe)."""
+        _ = self.simple_query(String("SAVEPOINT ", quote_identifier(name)))
+
+    def rollback_to(mut self, name: StringSlice) raises PgError:
+        """ROLLBACK TO SAVEPOINT `name`: drop the work since it, and leave a
+        failed transaction usable again."""
+        _ = self.simple_query(String("ROLLBACK TO SAVEPOINT ", quote_identifier(name)))
+
+    def release(mut self, name: StringSlice) raises PgError:
+        """RELEASE SAVEPOINT `name`, keeping the work since it."""
+        _ = self.simple_query(String("RELEASE SAVEPOINT ", quote_identifier(name)))
+
+    # ---- notifications and health -------------------------------------------------
+
+    def wait_notification(mut self, timeout: Duration) raises PgError -> Optional[Notification]:
+        """The next notification on a channel this session LISTENs to: one
+        received already (during a query, say), or the first to arrive
+        within `timeout` (`Duration.ZERO`: no limit). None when none came:
+        the session is unharmed, since no query was in flight."""
+        if len(self._notifications) > 0:
+            return self._notifications.pop(0)
+        self._check_usable()
+        var deadline = _deadline(timeout)
+        while True:
+            var got: Bool
+            try:
+                got = self._next(deadline)
+            except e:
+                if e.is_deadline():
+                    return None
+                self._close_now()
+                raise PgError(e)
+            if not got:
+                self._close_now()
+                raise PgError(IoError.of_kind(_CLOSED_BY_SERVER, ErrorKind.ConnectionAborted))
+            if self._ev.kind == EventKind.NOTIFICATION:
+                return self._ev.notification()
+            if self._ev.kind == EventKind.ERROR:  # (FATAL: nothing else comes while idle)
+                var message = self._ev.server_message()
+                self._close_now()
+                raise PgError(IoError.of_kind(_SERVER_ERROR, ErrorKind.ConnectionAborted), message^)
+            self._other()
+
+    def check(mut self) -> Bool:
+        """Whether the session can still be used, told without a round
+        trip. The socket must still be open. Whatever the server sent
+        meanwhile (notifications, notices, parameter changes) is read and
+        kept. A FATAL error, a terminated backend say, ends the session.
+        (For a pool, before handing out a session that sat idle.)"""
+        if not self.is_usable():
+            return False
+        var state = idle_state(self._sock)
+        if state == IdleState.EMPTY:
+            return True
+        if state == IdleState.CLOSED:
+            self._close_now()
+            return False
+        try:  # (DATA: read what is there, without waiting)
+            var now = Deadline.after(Duration.ZERO)
+            while True:
+                if not self._next(now) or self._ev.kind == EventKind.ERROR:
+                    self._close_now()
+                    return False
+                self._other()
+        except e:
+            if not e.is_deadline():
+                self._close_now()
+                return False
+        return self.is_usable()
+
     def is_usable(self) -> Bool:
         """Whether the session can take a query: open, not failed."""
         return self._usable and self._conn.is_idle()
@@ -742,6 +835,17 @@ struct Client(Movable):
             except:
                 pass
         self._close_now()
+
+
+def quote_identifier(name: StringSlice) -> String:
+    """`name` as a quoted SQL identifier, for splicing a table, channel or
+    savepoint name into SQL: in double quotes, with each double quote
+    inside doubled. (Values go in parameters, never spliced.)"""
+    var out = String('"')
+    for c in name.codepoint_slices():
+        out += '""' if c == '"' else String(c)
+    out += '"'
+    return out^
 
 
 def _last(var all: List[Rows]) -> Rows:

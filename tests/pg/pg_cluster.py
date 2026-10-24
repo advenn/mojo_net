@@ -82,6 +82,9 @@ def start():
             "CREATE ROLE scram LOGIN PASSWORD 'pencil é'",
             "CREATE ROLE trusty LOGIN",
             "GRANT pg_signal_backend TO trusty",
+            # (on disk now: with synchronous_commit off, a crash restart
+            # would lose them, and tests crash a backend on purpose)
+            "CHECKPOINT",
         ]
         subprocess.run(
             ["psql", "-h", root, "-p", str(port), "-U", "postgres", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-q"],
