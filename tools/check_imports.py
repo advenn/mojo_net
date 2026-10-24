@@ -38,10 +38,11 @@ ALLOWED = {
     "server": {"linux", "bytes", "net", "http", "server"},
     "crypto": {"crypto"},
     "pg": {"linux", "bytes", "net", "crypto", "pg"},
+    "redis": {"linux", "bytes", "net", "redis"},
 }
 # Packages whose protocol logic is sans-I/O: in src/, only the listed
 # modules may import `net` (the rest only parse and build bytes).
-SANS_IO = {"http": {"client.mojo"}, "pg": {"client.mojo"}}
+SANS_IO = {"http": {"client.mojo"}, "pg": {"client.mojo"}, "redis": {"client.mojo"}}
 AREAS = ("src", "tests", "examples", "bench")
 FIXED = {"spikes": "net"}
 

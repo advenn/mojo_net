@@ -26,6 +26,7 @@ So a Mojo upgrade, or a change in a shared layer, lands in every package in one 
 | `http` | the HTTP/1.1 library (`docs/http.md`): message types, the header map, the sans-I/O head parser, body framing, server and client connection codecs, and a blocking client | H1–H6 done | `linux`, `bytes`; `net` only in `http.client` |
 | `server` | the HTTP/1.1 server (`docs/server.md`): one epoll loop per process over `ServerConnection`s, a `Handler` trait, timeouts, backpressure, streaming; SO_REUSEPORT for multi-core | S1–S5 done | `linux`, `bytes`, `net`, `http` |
 | `pg` | the PostgreSQL driver (`docs/pg.md`): a sans-I/O protocol 3.0 codec, authentication up to SCRAM-SHA-256, a blocking client | P1–P7 done (the codec, a blocking client, parameters, binary types, a statement cache, transactions, notifications, a pool; three independent reviews) | `linux`, `bytes`, `crypto`; `net` only in `pg.client` |
+| `redis` | the Redis client (`docs/redis.md`): a sans-I/O RESP2/RESP3 codec, typed replies, a blocking client | R1–R2 done (the codec, a blocking client) | `linux`, `bytes`; `net` only in `redis.client` |
 | `rt` | experimental completion-based event loop (`docs/rt.md`): epoll and simulator backends, timers, slab, mailbox, `rt.evented` connections | **frozen** until Mojo's async/await stabilizes | `linux`, `bytes`, `net` |
 
 - **Nothing outside `rt` imports `rt`.** `rt` builds on `net`, never the reverse.
@@ -107,5 +108,6 @@ Code comments cite these by number, so keep the numbering stable. Contracts 2, 3
 - `docs/http.md`: the HTTP/1.1 library. Covers its scope, the parser's strictness rules, and milestones.
 - `docs/server.md`: the HTTP server. Covers its model (one loop per process), behaviour and milestones.
 - `docs/pg.md`: the PostgreSQL driver. Covers its scope, decisions (authentication, no TLS yet, errors) and milestones.
+- `docs/redis.md`: the Redis client. Covers its scope, decisions (the flat reply tree, the resumable parser, RESP3 first, pub/sub on its own connection, deadlines) and milestones.
 - `docs/rt.md`: the frozen runtime. Covers how contracts 2–7 are realised, the simulator, and the M2 gate.
 - `docs/spikes.md`: measured facts. Covers threads, the Mojo runtime, callbacks, and the 10k-connection epoll spike.

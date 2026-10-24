@@ -58,6 +58,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tk-8.6.13-noxft_h1df4ec4_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tornado-6.5.10-py314h89acca1_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tzcode-2026e-hebe6cf0_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/valkey-server-9.1.2-haf69b54_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zeromq-4.3.5-h901266b_12.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_7.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/_python_abi3_support-1.0-hd8ed1ab_3.conda
@@ -125,6 +126,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/tk-8.6.13-noxft_hf03c496_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/tornado-6.5.10-py314h35c850b_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/tzcode-2026e-h29ee22c_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/valkey-server-9.1.2-h11cc495_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/zeromq-4.3.5-h3469ab9_12.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/zstd-1.5.7-h9d15635_7.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/_python_abi3_support-1.0-hd8ed1ab_3.conda
@@ -734,6 +736,20 @@ packages:
   run_exports: {}
   size: 71773
   timestamp: 1790780308556
+- conda: https://conda.anaconda.org/conda-forge/linux-64/valkey-server-9.1.2-haf69b54_0.conda
+  sha256: d713d97b1a6a21004e8e35beea1eaff659473abe01b26703a57678538570fed9
+  md5: 3e0d105d7ef5a55a6f38e38ccceeb87a
+  depends:
+  - libgcc >=15
+  - __glibc >=2.17,<3.0.a0
+  - openssl >=3.5.8,<4.0a0
+  constrains:
+  - redis-server <0.a0
+  license: BSD-3-Clause
+  license_family: BSD
+  run_exports: {}
+  size: 11536554
+  timestamp: 1788246025600
 - conda: https://conda.anaconda.org/conda-forge/linux-64/zeromq-4.3.5-h901266b_12.conda
   sha256: 37dc9a5ff564fdce07c5ad002ee572057cf41dedda274d7abc154e77094d981a
   md5: 292a05f1436b98e17055090b5ef07746
@@ -1314,6 +1330,19 @@ packages:
   run_exports: {}
   size: 74449
   timestamp: 1790780300146
+- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/valkey-server-9.1.2-h11cc495_0.conda
+  sha256: f80435cb930e1faac281f2bb41e2994e47ce8e028e5603d554d9aef077a00c5d
+  md5: 35cf710a4e5ba2f7e1c2da3b02722c00
+  depends:
+  - libgcc >=15
+  - openssl >=3.5.8,<4.0a0
+  constrains:
+  - redis-server <0.a0
+  license: BSD-3-Clause
+  license_family: BSD
+  run_exports: {}
+  size: 12738961
+  timestamp: 1788246034963
 - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/zeromq-4.3.5-h3469ab9_12.conda
   sha256: 7879b0ebe3c9b7e28af4a6229c31a3da71afca79457f3beaffde3c5dfe8b8081
   md5: 244179625859a7d7dc9943defddc7643

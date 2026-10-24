@@ -41,3 +41,6 @@ python = ">=3.12"
 # Test-only: a real PostgreSQL for tests/pg (initdb, pg_ctl, psql;
 # tests/pg/pg_cluster.py makes a throwaway cluster per test).
 postgresql = "18.*"
+# Test-only: a real server for tests/redis (Valkey: BSD-licensed, and it
+# speaks Redis's protocol, RESP2 and RESP3).
+valkey-server = "9.*"
