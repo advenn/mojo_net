@@ -18,7 +18,7 @@ from std.testing import TestSuite, assert_equal, assert_false, assert_true
 
 from linux import ErrorKind, IoError
 from linux.time import Duration, Instant
-from pg import FAILED_TRANSACTION, IDLE, IN_TRANSACTION, AuthMethods
+from pg import FAILED_TRANSACTION, IDLE, IN_TRANSACTION, AuthMethods, Params
 from pg.client import Client, PgError, Rows
 from pg.config import Config
 from pg.message import FIELD_CONSTRAINT
@@ -36,7 +36,15 @@ def _connect_error(config: Config) raises -> PgError:
 
 def _query_error(mut db: Client, sql: StringSlice, timeout: Duration = Duration.ZERO) raises -> PgError:
     try:
-        _ = db.query(sql, timeout)
+        _ = db.query(sql, timeout=timeout)
+    except e:
+        return e.copy()
+    raise Error(String("no error from ", sql))
+
+
+def _params_error(mut db: Client, sql: StringSlice, params: Params) raises -> PgError:
+    try:
+        _ = db.query_params(sql, params)
     except e:
         return e.copy()
     raise Error(String("no error from ", sql))
@@ -105,7 +113,8 @@ def _queries(server: PgServer) raises:
     assert_equal(db.execute("DELETE FROM t WHERE id = 1"), 1)
     assert_equal(db.execute("SELECT 1 WHERE false"), 0)
     assert_equal(db.execute("CREATE TEMP TABLE z (a int)"), 0)  # (a tag without a count)
-    assert_equal(db.query("SELECT 1; SELECT -2").int(0, 0), -2)  # the last statement's result
+    assert_equal(db.query("SELECT -2").int(0, 0), -2)
+    assert_equal(db.simple_query("SELECT 1; SELECT -3")[1].int(0, 0), -3)
     assert_equal(len(db.simple_query("")), 1)  # an empty query: one empty result
     var big = db.query("SELECT 99999999999999999999::numeric, 'x'")
     var refused = 0
@@ -184,7 +193,7 @@ def _deadline(server: PgServer) raises:
     assert_true(t.elapsed() < Duration.from_secs(5))
     assert_true(db.is_usable())
     assert_equal(db.query("SELECT 1").int(0, 0), 1)
-    assert_equal(len(db.query("SELECT pg_sleep(0.05)", Duration.from_secs(5))), 1)  # in time
+    assert_equal(len(db.query("SELECT pg_sleep(0.05)", timeout=Duration.from_secs(5))), 1)  # in time
     db.cancel()  # with nothing running: harmless
     assert_equal(db.query("SELECT 3").int(0, 0), 3)
     db^.close()
@@ -204,7 +213,13 @@ def _copy_and_parameters(server: PgServer) raises:
     assert_equal(db.query("SHOW search_path").text(0, 0), "pg_catalog")
     assert_equal(db.backend_key().value().pid, db.query("SELECT pg_backend_pid()").int(0, 0))
     _ = db.execute("CREATE TEMP TABLE c (x int)")
-    assert_equal(_query_error(db, "COPY c FROM STDIN").code(), "57014")
+    assert_equal(_query_error(db, "COPY c FROM STDIN", Duration.from_secs(20)).code(), "57014")
+    var refused = False
+    try:
+        _ = db.simple_query("COPY c FROM STDIN", Duration.from_secs(20))
+    except e:
+        refused = e.code() == "57014"
+    assert_true(refused)  # (the simple protocol too)
     assert_true(db.is_usable())
     db^.close()
 
@@ -224,6 +239,40 @@ def _server_stops(server: PgServer) raises:
     var e = _query_error(db, "SELECT 1")
     assert_false(db.is_usable())
     assert_false(e.is_deadline())
+
+
+def _parameters(server: PgServer) raises:
+    var db = Client.connect(server.tcp("trusty"))
+    assert_equal(db.query("SELECT $1::int + $2::int", 40, 2).int(0, 0), 42)
+    assert_equal(db.query("SELECT $1::float8 * 2", 1.25).text(0, 0), "2.5")
+    assert_false(db.query("SELECT NOT $1::bool", True).bool(0, 0))
+    var evil = "it's'; DROP TABLE pg_class; --"
+    assert_equal(db.query("SELECT $1", evil).text(0, 0), evil)  # a value, never SQL
+    assert_equal(db.query("SELECT $1 || '!'", "héllo €").text(0, 0), "héllo €!")
+    _ = db.execute("CREATE TEMP TABLE p (id int PRIMARY KEY, name text, data bytea)")
+    assert_equal(db.execute("INSERT INTO p (id, name) VALUES ($1, $2), ($3, $4)", 1, "a", 2, "b"), 2)
+    assert_equal(db.query("SELECT name FROM p WHERE id = $1", 2).text(0, 0), "b")
+    # NULL and bytes through Params
+    var params = Params()
+    params.add(3)
+    params.add_null()
+    var raw: List[UInt8] = [0, 1, 255]
+    params.add_binary(Span(raw), 17)  # bytea
+    assert_equal(db.query_params("INSERT INTO p VALUES ($1, $2, $3)", params).rows_affected().value(), 1)
+    var r = db.query("SELECT name IS NULL, encode(data, 'hex') FROM p WHERE id = 3")
+    assert_true(r.bool(0, 0))
+    assert_equal(r.text(0, 1), "0001ff")
+    # what the server refuses leaves the session usable
+    var one = Params()
+    one.add(1)
+    assert_equal(_params_error(db, "SELECT $1, $2", one).code(), "08P01")  # 1 value for 2
+    var abc = Params()
+    abc.add("abc")
+    assert_equal(_params_error(db, "SELECT $1::int", abc).code(), "22P02")
+    assert_equal(_query_error(db, "SELECT 1; SELECT 2").code(), "42601")  # one statement only
+    assert_true(db.is_usable())
+    assert_equal(db.query("SELECT count(*) FROM p").int(0, 0), 3)
+    db^.close()
 
 
 def _run(server: PgServer, which: Int) -> String:
@@ -247,8 +296,10 @@ def _run(server: PgServer, which: Int) -> String:
             _copy_and_parameters(server)
         elif which == 8:
             _ended_by_the_server(server)
-        else:
+        elif which == 9:
             _server_stops(server)
+        else:
+            _parameters(server)
     except e:
         return String(e)
     return ""
@@ -302,6 +353,10 @@ def test_the_server_ends_the_session() raises:
 
 def test_the_server_stops() raises:
     _with_server(9)
+
+
+def test_parameters() raises:
+    _with_server(10)
 
 
 def test_connect_deadline() raises:

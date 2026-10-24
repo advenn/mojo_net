@@ -6,12 +6,15 @@ over `net` is planned as `pg.client` (P3)."""
 from .auth import MAX_SCRAM_ITERATIONS, SCRAM_SHA_256, ScramClient, md5_password
 from .connection import DEFAULT_MAX_MESSAGE, AuthMethods, EventKind, PgConnection, PgEvent, Startup
 from .message import (
+    BINARY,
     FAILED_TRANSACTION,
     IDLE,
     IN_TRANSACTION,
+    TEXT,
     BackendKey,
     Column,
     Notification,
+    Params,
     ServerMessage,
     write_cancel_request,
 )

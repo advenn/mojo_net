@@ -2,7 +2,13 @@
 
 A PostgreSQL client for Mojo on Linux, speaking the frontend/backend protocol (version 3.0) natively, without libpq. It is the first of the roadmap's database drivers. Package rules and the shared contracts are in `docs/design.md`. The transport is `net` (`docs/net.md`), and the authentication primitives are `crypto`.
 
-**Status: P1–P3 done:** the cryptographic primitives, the sans-I/O codec for a session (`PgConnection`), and a blocking client (`pg.client`), tested against PostgreSQL 18. Next is P4: the extended protocol (parameters, prepared statements) and binary types.
+**Status: P1–P4 done:**
+- the cryptographic primitives;
+- the sans-I/O codec for a session (`PgConnection`);
+- a blocking client (`pg.client`), tested against PostgreSQL 18;
+- the extended query protocol: parameters and prepared statements.
+
+Next is P5: binary values for the common types, and a statement cache.
 
 ## Scope
 **In scope:**
@@ -56,12 +62,12 @@ from pg.config import Config
 
 def main() raises:
     var db = Client.connect(Config.parse("postgresql://app:secret@localhost/shop"))
-    var r = db.query("SELECT id, name, email FROM users ORDER BY id")
+    var r = db.query("SELECT id, name, email FROM users WHERE id > $1 ORDER BY id", 10)
     for i in range(len(r)):
         var email = "-" if r.is_null(i, 2) else r.text(i, 2)
         print(r.int(i, 0), r.text(i, 1), email)
     try:
-        _ = db.execute("INSERT INTO users (id, name) VALUES (1, 'again')")
+        _ = db.execute("INSERT INTO users (id, name) VALUES ($1, $2)", 1, "again")
     except e:
         if e.code() == "23505":  # unique_violation: the session goes on
             print("taken:", e.server().detail().or_else(""))
@@ -76,10 +82,13 @@ def main() raises:
   - `Config(user, host=, port=, password=, database=, ...)`, or `Config.parse` with a libpq-style URI (`pg.config`).
   - A `host` that is an absolute directory means the Unix socket in it.
   - `connect_timeout` bounds the whole opening: name resolution, connecting, authentication.
-- **Queries** use the simple protocol for now: no parameters, values in text form.
-  - `query(sql)` returns the last statement's `Rows`, and `simple_query(sql)` every statement's.
-  - `execute(sql)` returns the rows affected.
-  - `Rows` has `columns`, `tag`, and per value `is_null`, `text`, `int`, `bool`, and `value` for the bytes.
+- **Queries:**
+  - `query(sql, args...)` runs one statement through the extended protocol, with `$1`, `$2`, ... bound to the arguments. The values are sent apart from the SQL, so nothing can be injected through them.
+  - Each `Writable` argument goes in its text form, and the server reads it as the type the statement needs (`Int`, `Float64`, `Bool`, strings).
+  - `query_params(sql, params)` takes a `Params` for NULLs, raw bytes (`add_binary`, bytea) or declared types (`add_text(value, oid)`).
+  - `execute(sql, args...)` returns the rows affected.
+  - `simple_query(sql)` runs a script of several statements, without parameters, and returns each one's result.
+  - `Rows` has `columns`, `tag`, and per value `is_null`, `text`, `int`, `bool`, and `value` for the bytes. Values are in text form for now.
 - **Errors raise `PgError`.**
   - A server error (`is_server()`, the SQLSTATE in `code()`, every field in `server()`) leaves the session usable.
   - Anything else closes it: a transport or protocol error, or the server ending the session.
@@ -223,17 +232,37 @@ while True:
     - `SELECT 1` round trips run at about 55,000 a second (18 µs each). pgbench, using libpq's simple protocol, does the same.
     - A million rows (an integer and a 32-character text) arrive in about 1 s, as with psql. That is the server's time.
   - **Example:** `examples/pg/query.mojo` runs SQL from the command line and prints every result.
-- **P4: the extended protocol and types.**
-  - **Messages:** Parse, Bind, Describe, Execute and Sync.
-  - **Statements:** parameters (`$1`), and a statement cache per connection.
-  - **Binary results** for bool, the integers, the floats, text, bytea, uuid, date and the timestamps; numeric as text.
-  - **Pipelining:** several statements before one Sync.
-- **P5: transactions, a pool, LISTEN/NOTIFY.**
+- **P4: the extended query protocol.** Done.
+  - **Messages:** `pg.message` builds Parse, Bind (with each value in text or binary form, and the format codes as short as the mix allows), Describe, Execute, Close, Sync and Flush. `Params` holds the values and their declared types.
+  - **The codec's requests:**
+    - `execute(sql, params)` uses the unnamed statement: Parse, Bind, Describe, Execute and Sync, in one round trip.
+    - `prepare(name, ...)` makes a prepared statement and reports its parameter types and columns; `execute_prepared` and `close_statement` use and drop it.
+    - Each request is queued whole or not at all, and requests pipeline: one cycle per Sync.
+  - **The codec's events:** PARSE_COMPLETE, BIND_COMPLETE, CLOSE_COMPLETE, NO_DATA, PARAMETER_DESCRIPTION and PORTAL_SUSPENDED.
+    - The RowDescription of a prepared statement is told apart from a portal's: no rows follow it.
+    - An error skips to the cycle's Sync.
+  - **COPY FROM STDIN in an extended cycle:** the server skips Sync while in copy-in mode, so after our CopyFail it waits for another. The codec sends it, as libpq does. Without it the session hung; the real-server test found this, the oracle did not.
+  - **The client:**
+    - `query` and `execute` take `Writable` arguments and send them in text form; `query_params` takes a `Params`.
+    - They run one statement, with several refused by the server (42601).
+    - `simple_query` stays for scripts.
+  - **Tests:**
+    - 8 on the codec against the oracle: what is sent, each cycle's events, errors and pipelining, violations, requests refused whole, and `drive_chunked` over a prepared exchange.
+    - Against PostgreSQL: integers, floats, booleans and text through parameters; an injection attempt returned as a plain value; NULL and bytea through `Params`; and the server's refusals (08P01 for a missing value, 22P02, 42601), each leaving the session usable.
+    - **Planted bugs:** 27, all caught. The first run let one through: Parse's parameter limit. Only `prepare` depends on it, since Bind checks the same limit, and it now has a test.
+  - **Measured on a quiet machine** over the Unix socket:
+    - `SELECT 1` takes 13.4 µs through `simple_query` (pgbench's simple mode: 13.2), and 16.5 µs through `query` (pgbench's extended mode: 15.0).
+    - The extended path costs about 1 µs more client CPU than the simple one: 5.3–5.9 µs per query against 4.2–4.9, syscalls included.
+    - **Lead:** each receive first tries a `recv` that returns EAGAIN, since the answer to a just-sent query cannot be there yet.
+- **P5: types and a statement cache.**
+  - **Binary results** for bool, the integers, the floats, text, bytea, uuid, date and the timestamps, with numeric as text, and typed accessors for them.
+  - **A statement cache per connection:** prepare and describe once per SQL text. The parameters are then encoded for their types, and the results requested in binary where the type allows.
+- **P6: transactions, a pool, LISTEN/NOTIFY.**
   - **Transactions:** a scope that rolls back on error.
   - **Pool:** connections are health-checked and reset before reuse.
   - **Notifications:** delivered between queries, and waited for with a deadline.
   - **COPY**, if needed.
-- **P6: review and polish.**
+- **P7: review and polish.**
   - Independent reviews, with a regression test for each finding.
   - Performance measured against libpq.
   - Examples, and the guide.

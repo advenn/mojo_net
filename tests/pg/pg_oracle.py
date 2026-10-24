@@ -236,3 +236,96 @@ class ScramServer:
         ok = hashlib.sha256(client_key).digest() == self.stored_key and without_proof == b"c=biws,r=" + self.nonce
         server_signature = hmac.new(self.server_key, auth_message, "sha256").digest()
         return ("ok" if ok else "bad") + "|v=" + base64.b64encode(server_signature).decode()
+
+
+# ---- the extended query protocol -------------------------------------------
+
+
+def parse_complete():
+    return _msg("1")
+
+
+def bind_complete():
+    return _msg("2")
+
+
+def close_complete():
+    return _msg("3")
+
+
+def no_data():
+    return _msg("n")
+
+
+def parameter_description(*oids):
+    return _msg("t", struct.pack("!H", len(oids)) + b"".join(struct.pack("!I", o) for o in oids))
+
+
+def portal_suspended():
+    return _msg("s")
+
+
+def _cstrings(body, n):
+    """The first `n` NUL-terminated strings of `body`, and the rest."""
+    out = []
+    for _ in range(n):
+        end = body.index(b"\0")
+        out.append(body[:end].decode())
+        body = body[end + 1 :]
+    return out, body
+
+
+def frontend_text(data_hex):
+    """The typed messages in `data_hex`, decoded, joined by " | ":
+    "Q sql", "P name|sql|types", "B portal|statement|formats|values|results"
+    (values as t:text, b:hex or NULL), "D S name" / "D P name",
+    "E portal|max_rows", "C S name", "S", "H", "X", "f message"."""
+    out = []
+    for part in frontend(data_hex).split("|") if data_hex else []:
+        kind, body_hex = part.split(":", 1)
+        body = bytes.fromhex(body_hex)
+        if kind == "Q":
+            out.append("Q " + body[:-1].decode())
+        elif kind == "P":
+            (name, sql), rest = _cstrings(body, 2)
+            (n,) = struct.unpack("!H", rest[:2])
+            types = struct.unpack(f"!{n}I", rest[2 : 2 + 4 * n])
+            assert len(rest) == 2 + 4 * n
+            out.append(f"P {name}|{sql}|{','.join(map(str, types))}")
+        elif kind == "B":
+            (portal, stmt), rest = _cstrings(body, 2)
+            (nf,) = struct.unpack("!H", rest[:2])
+            formats = struct.unpack(f"!{nf}h", rest[2 : 2 + 2 * nf])
+            rest = rest[2 + 2 * nf :]
+            (nv,) = struct.unpack("!H", rest[:2])
+            rest = rest[2:]
+            values = []
+            for i in range(nv):
+                (length,) = struct.unpack("!i", rest[:4])
+                rest = rest[4:]
+                if length < 0:
+                    values.append("NULL")
+                    continue
+                v = rest[:length]
+                rest = rest[length:]
+                f = formats[0] if nf == 1 else (formats[i] if nf == nv else 0)
+                values.append("t:" + v.decode() if f == 0 else "b:" + v.hex())
+            (nr,) = struct.unpack("!H", rest[:2])
+            results = struct.unpack(f"!{nr}h", rest[2 : 2 + 2 * nr])
+            assert len(rest) == 2 + 2 * nr
+            out.append(
+                f"B {portal}|{stmt}|{','.join(map(str, formats))}|{','.join(values)}|{','.join(map(str, results))}"
+            )
+        elif kind in ("D", "C"):
+            assert body[-1] == 0
+            out.append(f"{kind} {chr(body[0])} {body[1:-1].decode()}")
+        elif kind == "E":
+            (portal,), rest = _cstrings(body, 1)
+            (max_rows,) = struct.unpack("!i", rest)
+            out.append(f"E {portal}|{max_rows}")
+        elif kind == "f":
+            out.append("f " + body[:-1].decode())
+        else:
+            assert body == b"", kind
+            out.append(kind)
+    return " | ".join(out)

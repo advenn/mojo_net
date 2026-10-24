@@ -3,14 +3,20 @@ socket, driving `PgConnection` with a deadline per operation. This is the
 only `pg` module that does I/O (`net`); not re-exported from `pg`.
 
     var db = Client.connect(Config("app", database="shop", password=pw))
-    var r = db.query("SELECT id, name FROM users ORDER BY id")
+    var r = db.query("SELECT id, name FROM users WHERE id > $1 ORDER BY id", 10)
     for i in range(len(r)):
         print(r.text(i, 0), r.text(i, 1))
-    _ = db.execute("UPDATE users SET seen = now() WHERE id = 1")
+    _ = db.execute("UPDATE users SET seen = now() WHERE id = $1", 1)
     db^.close()
 
-Queries use the simple protocol in this version: no parameters, every
-value in text form (`Rows.text`, `Rows.int`, `Rows.value` for the bytes).
+`query` and `execute` run one statement through the extended protocol,
+with its parameters sent as values, so they are never spliced into the
+SQL. Each `Writable` argument goes in its text form, and the server reads
+it as the type the statement needs; `query_params` takes a `Params` for
+NULLs, bytes or declared types. `simple_query` runs scripts of several
+statements, without parameters. Results come in text form (`Rows.text`,
+`Rows.int`, `Rows.bool`, `Rows.value` for the bytes).
+
 A server error raises `PgError` with the SQLSTATE (`e.code()`) and leaves
 the session usable; so does a query cancelled at its deadline.
 
@@ -43,7 +49,7 @@ from net.unix import UnixStream
 
 from .config import Config
 from .connection import EventKind, PgConnection, PgEvent
-from .message import BackendKey, Column, Notification, ServerMessage, rows_affected, write_cancel_request
+from .message import BackendKey, Column, Notification, Params, ServerMessage, rows_affected, write_cancel_request
 
 comptime CANCEL_GRACE = Duration.from_secs(5)
 """How long the server gets to end a cancelled query's cycle."""
@@ -313,16 +319,60 @@ struct Client(Movable):
 
     # ---- queries --------------------------------------------------------------
 
+    def query[*Ts: Writable](
+        mut self, sql: StringSlice, *args: *Ts, timeout: Duration = Duration.ZERO
+    ) raises PgError -> Rows:
+        """Run one statement with `$1`, `$2`, ... bound to `args`, and return
+        its rows. Each argument goes in its text form, and the server reads
+        it as the type the statement needs, so values are never spliced into
+        the SQL. For NULLs, bytes or declared types, fill a `Params` and call
+        `query_params`. `timeout`: `Duration.ZERO` for none."""
+        var params = Params()
+        comptime for i in range(args.__len__()):
+            params.add(args[i])
+        return self.query_params(sql, params, timeout)
+
+    def execute[*Ts: Writable](
+        mut self, sql: StringSlice, *args: *Ts, timeout: Duration = Duration.ZERO
+    ) raises PgError -> Int:
+        """`query`, returning the number of rows the statement affected (0
+        when its tag has no count)."""
+        var params = Params()
+        comptime for i in range(args.__len__()):
+            params.add(args[i])
+        return self.query_params(sql, params, timeout).rows_affected().or_else(0)
+
+    def query_params(mut self, sql: StringSlice, params: Params, timeout: Duration = Duration.ZERO) raises PgError -> Rows:
+        """Run one statement with `params`, through the extended protocol and
+        the unnamed statement: one round trip."""
+        self._check_usable()
+        try:
+            self._conn.execute(sql, params)
+        except e:
+            raise PgError(e)  # (InvalidInput: the session is unharmed)
+        var all = self._results(timeout)
+        if len(all) == 0:
+            return Rows()
+        return all.pop()
+
     def simple_query(mut self, sql: StringSlice, timeout: Duration = Duration.ZERO) raises PgError -> List[Rows]:
-        """Run one or more statements (separated by semicolons) and return
-        each one's result. A failing statement ends the rest and raises with
-        the server's error. `timeout`: `Duration.ZERO` for none."""
-        if not self.is_usable():
-            raise PgError(IoError.of_kind("pg: the connection is closed", ErrorKind.Closed))
+        """Run one or more statements, separated by semicolons, through the
+        simple protocol, and return each one's result. No parameters: this
+        is for scripts (migrations, several DDL statements). A failing
+        statement ends the rest and raises with the server's error."""
+        self._check_usable()
         try:
             self._conn.query(sql)
         except e:
             raise PgError(e)  # (a NUL in `sql`: the session is unharmed)
+        return self._results(timeout)
+
+    def _check_usable(self) raises PgError:
+        if not self.is_usable():
+            raise PgError(IoError.of_kind("pg: the connection is closed", ErrorKind.Closed))
+
+    def _results(mut self, timeout: Duration) raises PgError -> List[Rows]:
+        """Send what is queued and gather the results until READY."""
         var deadline = _deadline(timeout)
         var current = Rows()
         var results = List[Rows]()
@@ -362,18 +412,6 @@ struct Client(Movable):
         if len(error) > 0:
             raise PgError(e, error[0].copy())
         return results^  # it finished after all
-
-    def query(mut self, sql: StringSlice, timeout: Duration = Duration.ZERO) raises PgError -> Rows:
-        """Run `sql` and return the result of its last statement."""
-        var all = self.simple_query(sql, timeout)
-        if len(all) == 0:
-            return Rows()
-        return all.pop()
-
-    def execute(mut self, sql: StringSlice, timeout: Duration = Duration.ZERO) raises PgError -> Int:
-        """Run `sql` and return the number of rows its last statement
-        affected (0 when its tag has no count)."""
-        return self.query(sql, timeout).rows_affected().or_else(0)
 
     # ---- the session ------------------------------------------------------------
 

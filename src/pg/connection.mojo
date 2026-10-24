@@ -18,11 +18,24 @@ The rest comes out as events:
     The server then closes the connection, so EOF after it is no error.
 - **NOTIFICATION:** a NOTIFY on a channel the session listens to. It can
   arrive at any time, between queries too.
+- **The extended protocol's steps:** PARSE_COMPLETE, BIND_COMPLETE,
+  CLOSE_COMPLETE, NO_DATA (a statement or portal with no rows),
+  PARAMETER_DESCRIPTION (a prepared statement's parameter types) and
+  PORTAL_SUSPENDED.
 
-`query(sql)` queues a Query (the simple protocol) once the session is open.
-Queries may be pipelined: each gets its own cycle of events, ending with
-READY, in order. `terminate()` queues Terminate; EOF is then the expected
-end.
+Once the session is open, requests may be queued:
+- **`query(sql)`:** a Query (the simple protocol): one or more statements,
+  no parameters.
+- **`execute(sql, params)`:** one statement with its parameters, through
+  the extended protocol and the unnamed statement.
+- **`prepare(name, sql, ...)`, `execute_prepared(name, params)`,
+  `close_statement(name)`:** prepared statements, kept by the server for
+  the session.
+
+Requests pipeline. Each one is a cycle (a Query, or extended messages ending
+in our Sync), and each cycle's events end with its own READY, in order. A
+request that cannot be encoded raises `InvalidInput` and queues nothing.
+`terminate()` queues Terminate; EOF is then the expected end.
 
 What ends the connection with an error (rule 6):
 - **The server broke the protocol** (`InvalidData`): a malformed or
@@ -35,7 +48,8 @@ What ends the connection with an error (rule 6):
 - **A password request when no password was given** (`InvalidInput`).
 - **COPY TO STDOUT** (`Unsupported`, for now). COPY FROM STDIN is answered
   with CopyFail instead, so the server reports an error and the session
-  goes on.
+  goes on. In an extended cycle a Sync follows the CopyFail, as in libpq:
+  the server skipped our first one while in copy-in mode.
 - **EOF while the session is open** (`UnexpectedEof`).
 
 Time: the codec has no timers (`next_deadline` is None). Deadlines belong to
@@ -63,7 +77,9 @@ from .message import (
     AUTH_SSPI,
     AUTHENTICATION,
     BACKEND_KEY_DATA,
+    BIND_COMPLETE,
     BackendKey,
+    CLOSE_COMPLETE,
     COMMAND_COMPLETE,
     COPY_BOTH_RESPONSE,
     COPY_IN_RESPONSE,
@@ -77,31 +93,47 @@ from .message import (
     IDLE,
     IN_TRANSACTION,
     NEGOTIATE_PROTOCOL_VERSION,
+    NO_DATA,
     NOTICE_RESPONSE,
     NOTIFICATION_RESPONSE,
     Notification,
+    PARAMETER_DESCRIPTION,
     PARAMETER_STATUS,
+    PARSE_COMPLETE,
+    PORTAL,
+    PORTAL_SUSPENDED,
+    Params,
     READY_FOR_QUERY,
     ROW_DESCRIPTION,
+    STATEMENT,
     ServerMessage,
+    TEXT,
     be_i32,
     be_u32,
     check_fields,
     check_notification,
+    check_parameter_description,
     check_row_description,
     check_string,
     notification,
+    parameter_types,
     read_data_row,
     read_parameter_status,
     row_description,
     rows_affected,
     string_end,
+    write_bind,
+    write_close,
     write_copy_fail,
+    write_describe,
+    write_execute,
+    write_parse,
     write_password,
     write_query,
     write_sasl_initial_response,
     write_sasl_response,
     write_startup,
+    write_sync,
     write_terminate,
 )
 
@@ -241,6 +273,15 @@ struct EventKind(Equatable, TrivialRegisterPassable, Writable):
     comptime ERROR = EventKind(5)
     comptime NOTICE = EventKind(6)
     comptime NOTIFICATION = EventKind(7)
+    # The extended query protocol's steps:
+    comptime PARSE_COMPLETE = EventKind(8)
+    comptime BIND_COMPLETE = EventKind(9)
+    comptime CLOSE_COMPLETE = EventKind(10)
+    comptime NO_DATA = EventKind(11)
+    """The statement or portal described returns no rows."""
+    comptime PARAMETER_DESCRIPTION = EventKind(12)
+    """A prepared statement's parameter types (`ev.parameter_types()`)."""
+    comptime PORTAL_SUSPENDED = EventKind(13)
 
     @inline(.always)
     def __eq__(self, other: Self) -> Bool:
@@ -256,6 +297,12 @@ struct EventKind(Equatable, TrivialRegisterPassable, Writable):
             "ERROR",
             "NOTICE",
             "NOTIFICATION",
+            "PARSE_COMPLETE",
+            "BIND_COMPLETE",
+            "CLOSE_COMPLETE",
+            "NO_DATA",
+            "PARAMETER_DESCRIPTION",
+            "PORTAL_SUSPENDED",
         ]
         writer.write(names[Int(self._v)])
 
@@ -314,6 +361,10 @@ struct PgEvent(Movable, Writable):
         """NOTIFICATION: the channel, payload and sender."""
         return notification(Span(self.data))
 
+    def parameter_types(self) -> List[UInt32]:
+        """PARAMETER_DESCRIPTION: each parameter's type OID."""
+        return parameter_types(Span(self.data))
+
     def write_to(self, mut writer: Some[Writer]):
         writer.write(self.kind)
         if self.kind == EventKind.READY:
@@ -334,6 +385,10 @@ struct PgEvent(Movable, Writable):
             writer.write(" ", self.server_message())
         elif self.kind == EventKind.NOTIFICATION:
             writer.write(" ", self.notification())
+        elif self.kind == EventKind.PARAMETER_DESCRIPTION:
+            var types = self.parameter_types()
+            for i in range(len(types)):
+                writer.write(" ", types[i])
 
 
 @inline(.always)
@@ -348,6 +403,12 @@ def _is_event(kind: UInt8) -> Bool:
         or kind == ERROR_RESPONSE
         or kind == NOTICE_RESPONSE
         or kind == NOTIFICATION_RESPONSE
+        or kind == PARSE_COMPLETE
+        or kind == BIND_COMPLETE
+        or kind == CLOSE_COMPLETE
+        or kind == NO_DATA
+        or kind == PARAMETER_DESCRIPTION
+        or kind == PORTAL_SUSPENDED
     )
 
 
@@ -397,8 +458,14 @@ struct PgConnection(Codec, Copyable):
     var _auth: Int
     var _queries: Int
     """Queries sent whose cycle has not ended (no READY yet)."""
+    var _extended: List[Bool]
+    """Per cycle in flight, oldest first: whether it is an extended one
+    (ended by our Sync) rather than a simple Query."""
     var _columns: Int
     """The current statement's column count: -1 without a RowDescription."""
+    var _describing: Bool
+    """A ParameterDescription came: the RowDescription or NoData that
+    follows describes a prepared statement, and no rows come with it."""
     var _status: UInt8
     var _params: List[String]
     """ParameterStatus values: name, value, name, value..."""
@@ -408,6 +475,9 @@ struct PgConnection(Codec, Copyable):
     var _failed: Optional[IoError]
     var _scratch: List[UInt8]
     """The body of the message being handled, when it is no event."""
+    var _request: ByteBuffer
+    """Where a request is built before it joins `_tx`: whole, or not at
+    all (reused, so building allocates nothing once it has grown)."""
 
     def __init__(out self, startup: Startup, nonce: Span[UInt8, _]) raises IoError:
         """Queue the StartupMessage for `startup`. `nonce`: at least
@@ -449,7 +519,9 @@ struct PgConnection(Codec, Copyable):
         self._phase = _AUTHENTICATING
         self._auth = _SENT_NOTHING
         self._queries = 0
+        self._extended = List[Bool]()
         self._columns = -1
+        self._describing = False
         self._status = 0
         self._params = List[String]()
         self._key = None
@@ -457,6 +529,7 @@ struct PgConnection(Codec, Copyable):
         self._eof = False
         self._failed = None
         self._scratch = List[UInt8]()
+        self._request = ByteBuffer()
 
     # ---- the session --------------------------------------------------------
 
@@ -499,6 +572,72 @@ struct PgConnection(Codec, Copyable):
             raise IoError.of_kind(E_NO_SESSION, ErrorKind.InvalidInput)
         write_query(self._tx, sql)
         self._queries += 1
+        self._extended.append(False)
+
+    def execute(mut self, sql: StringSlice, params: Params, result_format: Int = TEXT) raises IoError:
+        """Queue one statement with its parameters through the extended
+        protocol and the unnamed statement: Parse, Bind, Describe (portal),
+        Execute, Sync. Its events are PARSE_COMPLETE, BIND_COMPLETE,
+        ROW_DESCRIPTION or NO_DATA, the rows, COMMAND_COMPLETE (or
+        EMPTY_QUERY), then READY; an error skips to READY. The rows come in
+        `result_format` (`TEXT` or `BINARY`). `InvalidInput`, without harm
+        to the session, when it is not open or the request cannot be
+        encoded (a NUL in `sql`, too many parameters)."""
+        if not self.is_open():
+            raise IoError.of_kind(E_NO_SESSION, ErrorKind.InvalidInput)
+        self._request.clear()
+        write_parse(self._request, "", sql, params)
+        write_bind(self._request, "", "", params, result_format)
+        write_describe(self._request, PORTAL, "")
+        write_execute(self._request, "")
+        write_sync(self._request)
+        self._tx.write_bytes(self._request.readable_span())
+        self._queries += 1
+        self._extended.append(True)
+
+    def prepare(mut self, name: StringSlice, sql: StringSlice, params: Params) raises IoError:
+        """Queue Parse of `sql` as the prepared statement `name`, a Describe
+        of it, and Sync. `params` declares parameter types (its values are
+        not used): OID 0 leaves a type to the server, and so does an empty
+        `params`. Events: PARSE_COMPLETE, PARAMETER_DESCRIPTION (the types
+        the server settled on), ROW_DESCRIPTION or NO_DATA (the columns; no
+        rows follow), READY."""
+        if not self.is_open():
+            raise IoError.of_kind(E_NO_SESSION, ErrorKind.InvalidInput)
+        self._request.clear()
+        write_parse(self._request, name, sql, params)
+        write_describe(self._request, STATEMENT, name)
+        write_sync(self._request)
+        self._tx.write_bytes(self._request.readable_span())
+        self._queries += 1
+        self._extended.append(True)
+
+    def execute_prepared(mut self, name: StringSlice, params: Params, result_format: Int = TEXT) raises IoError:
+        """Queue Bind of the prepared statement `name` to `params`, a
+        Describe of the portal, Execute and Sync. Events as for `execute`,
+        without PARSE_COMPLETE."""
+        if not self.is_open():
+            raise IoError.of_kind(E_NO_SESSION, ErrorKind.InvalidInput)
+        self._request.clear()
+        write_bind(self._request, "", name, params, result_format)
+        write_describe(self._request, PORTAL, "")
+        write_execute(self._request, "")
+        write_sync(self._request)
+        self._tx.write_bytes(self._request.readable_span())
+        self._queries += 1
+        self._extended.append(True)
+
+    def close_statement(mut self, name: StringSlice) raises IoError:
+        """Queue Close of the prepared statement `name`, and Sync. Events:
+        CLOSE_COMPLETE, READY."""
+        if not self.is_open():
+            raise IoError.of_kind(E_NO_SESSION, ErrorKind.InvalidInput)
+        self._request.clear()
+        write_close(self._request, STATEMENT, name)
+        write_sync(self._request)
+        self._tx.write_bytes(self._request.readable_span())
+        self._queries += 1
+        self._extended.append(True)
 
     def terminate(mut self) raises IoError:
         """Queue Terminate (once): the server closes the connection, and
@@ -603,6 +742,7 @@ struct PgConnection(Codec, Copyable):
             check_fields(Span(ev.data))
             ev.kind = EventKind.ERROR
             self._columns = -1
+            self._describing = False
             if self._phase != _OPEN or _is_fatal(Span(ev.data)):
                 self._phase = _ENDED
             return True
@@ -651,13 +791,18 @@ struct PgConnection(Codec, Copyable):
         if self._queries == 0:
             raise IoError.of_kind(E_UNEXPECTED, ErrorKind.InvalidData)
         if kind == READY_FOR_QUERY:
-            if self._columns >= 0:  # rows without their CommandComplete
+            if self._columns >= 0 or self._describing:  # (rows without their CommandComplete)
                 raise IoError.of_kind(E_UNEXPECTED, ErrorKind.InvalidData)
             self._ready(ev)
             self._queries -= 1
+            _ = self._extended.pop(0)
             return True
         if kind == ROW_DESCRIPTION:
-            self._columns = check_row_description(Span(ev.data))
+            var columns = check_row_description(Span(ev.data))
+            if self._describing:
+                self._describing = False  # a prepared statement's: no rows follow
+            else:
+                self._columns = columns
             ev.kind = EventKind.ROW_DESCRIPTION
             return True
         if kind == COMMAND_COMPLETE:
@@ -670,8 +815,38 @@ struct PgConnection(Codec, Copyable):
                 raise IoError.of_kind(E_UNEXPECTED, ErrorKind.InvalidData)
             ev.kind = EventKind.EMPTY_QUERY
             return True
+        if kind == PARSE_COMPLETE or kind == BIND_COMPLETE or kind == CLOSE_COMPLETE:
+            if len(ev.data) != 0:
+                raise IoError.of_kind(E_UNEXPECTED, ErrorKind.InvalidData)
+            ev.kind = (
+                EventKind.PARSE_COMPLETE
+                if kind == PARSE_COMPLETE
+                else (EventKind.BIND_COMPLETE if kind == BIND_COMPLETE else EventKind.CLOSE_COMPLETE)
+            )
+            return True
+        if kind == PARAMETER_DESCRIPTION:
+            _ = check_parameter_description(Span(ev.data))
+            self._describing = True
+            ev.kind = EventKind.PARAMETER_DESCRIPTION
+            return True
+        if kind == NO_DATA:
+            if len(ev.data) != 0:
+                raise IoError.of_kind(E_UNEXPECTED, ErrorKind.InvalidData)
+            self._describing = False
+            ev.kind = EventKind.NO_DATA
+            return True
+        if kind == PORTAL_SUSPENDED:  # (an Execute with a row limit: its portal stays open)
+            if len(ev.data) != 0:
+                raise IoError.of_kind(E_UNEXPECTED, ErrorKind.InvalidData)
+            self._columns = -1
+            ev.kind = EventKind.PORTAL_SUSPENDED
+            return True
         if kind == COPY_IN_RESPONSE:
             write_copy_fail(self._tx, _COPY_REFUSED)
+            if self._extended[0]:
+                # The server ignored our Sync while in copy-in mode, and
+                # after the CopyFail it waits for one (as libpq sends).
+                write_sync(self._tx)
             return False
         if kind == COPY_OUT_RESPONSE or kind == COPY_BOTH_RESPONSE:
             raise IoError.of_kind(E_COPY_OUT, ErrorKind.Unsupported)

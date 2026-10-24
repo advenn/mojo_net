@@ -41,6 +41,13 @@ comptime NEGOTIATE_PROTOCOL_VERSION: UInt8 = 118  # 'v'
 comptime COPY_IN_RESPONSE: UInt8 = 71  # 'G'
 comptime COPY_OUT_RESPONSE: UInt8 = 72  # 'H'
 comptime COPY_BOTH_RESPONSE: UInt8 = 87  # 'W'
+# ... and those of the extended query protocol.
+comptime PARSE_COMPLETE: UInt8 = 49  # '1'
+comptime BIND_COMPLETE: UInt8 = 50  # '2'
+comptime CLOSE_COMPLETE: UInt8 = 51  # '3'
+comptime NO_DATA: UInt8 = 110  # 'n'
+comptime PARAMETER_DESCRIPTION: UInt8 = 116  # 't'
+comptime PORTAL_SUSPENDED: UInt8 = 115  # 's'
 
 # Authentication requests: the Int32 that starts an 'R' body.
 comptime AUTH_OK = 0
@@ -84,6 +91,24 @@ comptime _QUERY: UInt8 = 81  # 'Q'
 comptime _PASSWORD: UInt8 = 112  # 'p', also SASLInitialResponse and SASLResponse
 comptime _TERMINATE: UInt8 = 88  # 'X'
 comptime _COPY_FAIL: UInt8 = 102  # 'f'
+comptime _PARSE: UInt8 = 80  # 'P'
+comptime _BIND: UInt8 = 66  # 'B'
+comptime _DESCRIBE: UInt8 = 68  # 'D'
+comptime _EXECUTE: UInt8 = 69  # 'E'
+comptime _SYNC: UInt8 = 83  # 'S'
+comptime _CLOSE: UInt8 = 67  # 'C'
+comptime _FLUSH: UInt8 = 72  # 'H'
+
+# What a Describe or Close names.
+comptime STATEMENT: UInt8 = 83  # 'S': a prepared statement
+comptime PORTAL: UInt8 = 80  # 'P': a portal (a bound statement)
+
+# Value formats.
+comptime TEXT = 0
+comptime BINARY = 1
+
+comptime MAX_PARAMS = 65535
+"""The most parameters a statement can have (Bind counts them in 16 bits)."""
 
 comptime _MAX_LENGTH = 0x7FFFFFFF
 """The largest Int32: no message can say it is longer."""
@@ -133,6 +158,7 @@ comptime E_DATA_ROW = "pg: malformed DataRow"
 comptime E_COMMAND_COMPLETE = "pg: malformed CommandComplete"
 comptime E_PARAMETER_STATUS = "pg: malformed ParameterStatus"
 comptime E_NOTIFICATION = "pg: malformed NotificationResponse"
+comptime E_PARAMETER_DESCRIPTION = "pg: malformed ParameterDescription"
 
 
 def check_fields(body: Span[UInt8, _]) raises IoError:
@@ -264,6 +290,26 @@ struct Notification(Copyable, Movable, Writable):
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write("notification on ", self.channel, " from ", self.pid, ": ", self.payload)
+
+
+def check_parameter_description(body: Span[UInt8, _]) raises IoError -> Int:
+    """Check a ParameterDescription body; returns its parameter count."""
+    if len(body) < 2:
+        raise IoError.of_kind(E_PARAMETER_DESCRIPTION, ErrorKind.InvalidData)
+    var n = Int((UInt16(body[0]) << 8) | UInt16(body[1]))  # (unsigned: up to MAX_PARAMS)
+    if len(body) != 2 + 4 * n:
+        raise IoError.of_kind(E_PARAMETER_DESCRIPTION, ErrorKind.InvalidData)
+    return n
+
+
+def parameter_types(body: Span[UInt8, _]) -> List[UInt32]:
+    """The type OIDs in a ParameterDescription body that
+    `check_parameter_description` accepted."""
+    var n = (len(body) - 2) // 4
+    var out = List[UInt32](capacity=n)
+    for i in range(n):
+        out.append(be_u32(body, 2 + 4 * i))
+    return out^
 
 
 def check_notification(body: Span[UInt8, _]) raises IoError:
@@ -479,6 +525,184 @@ def write_copy_fail(mut out: ByteBuffer, message: StringSlice) raises IoError:
 def write_terminate(mut out: ByteBuffer) raises IoError:
     """A Terminate: the session ends; the server closes the connection."""
     out.write_byte(_TERMINATE)
+    _put_i32(out, 4)
+
+
+struct Params(Copyable, Movable, Sized):
+    """The values of a statement's parameters (`$1`, `$2`, ...), in order.
+    Each is NULL, or bytes in text or binary form, with the type OID that
+    Parse declares for it. OID 0 lets the server infer the type, as for an
+    untyped literal, so a value in text form works for any type it can be
+    read as."""
+
+    var _data: List[UInt8]
+    var _at: List[Int]
+    """Per value: its start in `_data` and its length (-1: NULL)."""
+    var _formats: List[Int]
+    var _types: List[UInt32]
+
+    def __init__(out self):
+        self._data = List[UInt8]()
+        self._at = List[Int]()
+        self._formats = List[Int]()
+        self._types = List[UInt32]()
+
+    def __len__(self) -> Int:
+        return len(self._types)
+
+    def add_null(mut self, type_oid: UInt32 = 0):
+        self._at.append(len(self._data))
+        self._at.append(-1)
+        self._formats.append(TEXT)
+        self._types.append(type_oid)
+
+    def add_text(mut self, value: StringSlice, type_oid: UInt32 = 0):
+        """A value in text form, as the type's input function reads it."""
+        self._at.append(len(self._data))
+        self._at.append(value.byte_length())
+        self._data.extend(value.as_bytes())
+        self._formats.append(TEXT)
+        self._types.append(type_oid)
+
+    def add_binary(mut self, value: Span[UInt8, _], type_oid: UInt32):
+        """A value in the binary form of type `type_oid` (17, bytea: the
+        bytes themselves)."""
+        self._at.append(len(self._data))
+        self._at.append(len(value))
+        self._data.extend(value)
+        self._formats.append(BINARY)
+        self._types.append(type_oid)
+
+    def add[T: Writable](mut self, value: T):
+        """Any writable value, in its text form (an `Int`, a `Float64`, a
+        `Bool`, a string), with its type left to the server."""
+        self.add_text(String(value))
+
+    def type_oid(self, i: Int) -> UInt32:
+        return self._types[i]
+
+    def format(self, i: Int) -> Int:
+        return self._formats[i]
+
+    def is_null(self, i: Int) -> Bool:
+        return self._at[2 * i + 1] < 0
+
+    def value(self, i: Int) -> Span[UInt8, origin_of(self._data)]:
+        var start = self._at[2 * i]
+        return Span(self._data)[start : start + max(self._at[2 * i + 1], 0)]
+
+
+def _put_i16(mut out: ByteBuffer, v: Int) raises IoError:
+    out.write_byte(UInt8((v >> 8) & 0xFF))
+    out.write_byte(UInt8(v & 0xFF))
+
+
+def write_parse(mut out: ByteBuffer, name: StringSlice, sql: StringSlice, params: Params) raises IoError:
+    """A Parse: `sql` (one statement) as the prepared statement `name` (""
+    for the unnamed one), with the parameter types `params` declares."""
+    comptime op = "pg: invalid Parse"
+    var nb = name.as_bytes()
+    var qb = sql.as_bytes()
+    _check_string(nb, op)
+    _check_string(qb, "pg: NUL byte in a query")
+    if len(params) > MAX_PARAMS:
+        raise IoError.of_kind("pg: too many parameters", ErrorKind.InvalidInput)
+    _header(out, _PARSE, len(nb) + 1 + len(qb) + 1 + 2 + 4 * len(params), "pg: query too long")
+    _put_string(out, nb)
+    _put_string(out, qb)
+    _put_i16(out, len(params))
+    for i in range(len(params)):
+        _put_i32(out, Int(params.type_oid(i)))
+
+
+def write_bind(
+    mut out: ByteBuffer, portal: StringSlice, statement: StringSlice, params: Params, result_format: Int
+) raises IoError:
+    """A Bind: portal `portal` ("" for the unnamed one) from the prepared
+    statement `statement` with `params`; every result column in
+    `result_format` (`TEXT` or `BINARY`)."""
+    comptime op = "pg: invalid Bind"
+    var pb = portal.as_bytes()
+    var sb = statement.as_bytes()
+    _check_string(pb, op)
+    _check_string(sb, op)
+    var n = len(params)
+    if n > MAX_PARAMS or (result_format != TEXT and result_format != BINARY):
+        raise IoError.of_kind(op, ErrorKind.InvalidInput)
+    var binary = 0
+    for i in range(n):
+        binary += params.format(i)
+    # format codes: none when all are text, one when all are binary
+    var codes = 0 if binary == 0 else (1 if binary == n else n)
+    var size = len(pb) + 1 + len(sb) + 1 + 2 + 2 * codes + 2 + 2 + 2
+    for i in range(n):
+        size += 4 + len(params.value(i))
+    _header(out, _BIND, size, "pg: parameters too long")
+    _put_string(out, pb)
+    _put_string(out, sb)
+    _put_i16(out, codes)
+    if codes == 1:
+        _put_i16(out, BINARY)
+    elif codes == n:
+        for i in range(n):
+            _put_i16(out, params.format(i))
+    _put_i16(out, n)
+    for i in range(n):
+        if params.is_null(i):
+            _put_i32(out, -1)
+        else:
+            var v = params.value(i)
+            _put_i32(out, len(v))
+            out.write_bytes(v)
+    _put_i16(out, 1)
+    _put_i16(out, result_format)
+
+
+def write_describe(mut out: ByteBuffer, kind: UInt8, name: StringSlice) raises IoError:
+    """A Describe of a prepared statement (`STATEMENT`: ParameterDescription,
+    then RowDescription or NoData) or a portal (`PORTAL`: RowDescription or
+    NoData)."""
+    var nb = name.as_bytes()
+    _check_string(nb, "pg: invalid Describe")
+    if kind != STATEMENT and kind != PORTAL:
+        raise IoError.of_kind("pg: invalid Describe", ErrorKind.InvalidInput)
+    _header(out, _DESCRIBE, 1 + len(nb) + 1, "pg: invalid Describe")
+    out.write_byte(kind)
+    _put_string(out, nb)
+
+
+def write_execute(mut out: ByteBuffer, portal: StringSlice, max_rows: Int = 0) raises IoError:
+    """An Execute of `portal`: at most `max_rows` rows (0: all of them)."""
+    var pb = portal.as_bytes()
+    _check_string(pb, "pg: invalid Execute")
+    if max_rows < 0 or max_rows > 0x7FFFFFFF:
+        raise IoError.of_kind("pg: invalid Execute", ErrorKind.InvalidInput)
+    _header(out, _EXECUTE, len(pb) + 1 + 4, "pg: invalid Execute")
+    _put_string(out, pb)
+    _put_i32(out, max_rows)
+
+
+def write_close(mut out: ByteBuffer, kind: UInt8, name: StringSlice) raises IoError:
+    """A Close of a prepared statement (`STATEMENT`) or a portal (`PORTAL`)."""
+    var nb = name.as_bytes()
+    _check_string(nb, "pg: invalid Close")
+    if kind != STATEMENT and kind != PORTAL:
+        raise IoError.of_kind("pg: invalid Close", ErrorKind.InvalidInput)
+    _header(out, _CLOSE, 1 + len(nb) + 1, "pg: invalid Close")
+    out.write_byte(kind)
+    _put_string(out, nb)
+
+
+def write_sync(mut out: ByteBuffer) raises IoError:
+    """A Sync: ends an extended-protocol cycle (the server answers with
+    ReadyForQuery, after skipping to it on an error)."""
+    out.write_byte(_SYNC)
+    _put_i32(out, 4)
+
+
+def write_flush(mut out: ByteBuffer) raises IoError:
+    """A Flush: asks the server to send what it has, without ending the cycle."""
+    out.write_byte(_FLUSH)
     _put_i32(out, 4)
 
 
