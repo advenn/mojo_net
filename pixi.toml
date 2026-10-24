@@ -38,3 +38,6 @@ format = "mojo format src tests"
 mojo = "==1.2.0"
 # Test-only: differential oracles (ipaddress) and peer processes.
 python = ">=3.12"
+# Test-only: a real PostgreSQL for tests/pg (initdb, pg_ctl, psql;
+# tests/pg/pg_cluster.py makes a throwaway cluster per test).
+postgresql = "18.*"

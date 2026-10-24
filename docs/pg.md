@@ -2,7 +2,7 @@
 
 A PostgreSQL client for Mojo on Linux, speaking the frontend/backend protocol (version 3.0) natively, without libpq. It is the first of the roadmap's database drivers. Package rules and the shared contracts are in `docs/design.md`. The transport is `net` (`docs/net.md`), and the authentication primitives are `crypto`.
 
-**Status: P1–P2 done:** the cryptographic primitives, and the sans-I/O codec for a session (`PgConnection`). Next is P3, the blocking client, tested against a real PostgreSQL.
+**Status: P1–P3 done:** the cryptographic primitives, the sans-I/O codec for a session (`PgConnection`), and a blocking client (`pg.client`), tested against PostgreSQL 18. Next is P4: the extended protocol (parameters, prepared statements) and binary types.
 
 ## Scope
 **In scope:**
@@ -42,10 +42,52 @@ A PostgreSQL client for Mojo on Linux, speaking the frontend/backend protocol (v
 - **P2:** the Python oracle `tests/pg/pg_oracle.py`, written from the protocol documentation independently of `crypto` and `pg`.
   - It builds backend messages, parses what the client sent, and runs the server side of MD5 and SCRAM with hashlib and hmac.
   - Its transcripts are replayed in every split (`drive_chunked`), and mutated ones must end in events or an error, never a crash.
-- **From P3:** a real PostgreSQL.
-  - **Install:** `postgresql` from conda-forge becomes a pixi dependency.
-  - **Clusters:** each test file creates its own with `initdb` in a scratch directory. It listens on a Unix socket in that directory, and on a free TCP port where needed.
-  - **Users:** one for each authentication method in `pg_hba.conf`.
+- **From P3:** a real PostgreSQL, `postgresql` from conda-forge (a pixi dependency, test-only like Python).
+  - **Clusters:** `tests/pg/pg_cluster.py` makes a throwaway one per test, in under a second: `initdb` in a temp directory, durability off, a Unix socket in that directory and a free port on 127.0.0.1. `tests/pg/pg_server.mojo` starts and stops it; a test stops it whatever happens.
+  - **Users:** one per authentication method in `pg_hba.conf`, over both transports: `trusty` (trust), `plain` (password), `md5user` (md5, its password stored as MD5) and `scram` (scram-sha-256, a non-ASCII password).
+  - **Without a server** (no `initdb`, or running as root, which initdb refuses), these tests are skipped; `MOJO_NET_REQUIRE_PG=1` makes that an error.
+
+## Using the client
+```mojo
+from linux.time import Duration
+from pg.client import Client, PgError
+from pg.config import Config
+
+
+def main() raises:
+    var db = Client.connect(Config.parse("postgresql://app:secret@localhost/shop"))
+    var r = db.query("SELECT id, name, email FROM users ORDER BY id")
+    for i in range(len(r)):
+        var email = "-" if r.is_null(i, 2) else r.text(i, 2)
+        print(r.int(i, 0), r.text(i, 1), email)
+    try:
+        _ = db.execute("INSERT INTO users (id, name) VALUES (1, 'again')")
+    except e:
+        if e.code() == "23505":  # unique_violation: the session goes on
+            print("taken:", e.server().detail().or_else(""))
+    try:
+        _ = db.query("SELECT pg_sleep(10)", timeout=Duration.from_millis(200))
+    except e:
+        print("cancelled:", e.is_deadline())  # True; the session goes on
+    db^.close()
+```
+
+- **Connecting:**
+  - `Config(user, host=, port=, password=, database=, ...)`, or `Config.parse` with a libpq-style URI (`pg.config`).
+  - A `host` that is an absolute directory means the Unix socket in it.
+  - `connect_timeout` bounds the whole opening: name resolution, connecting, authentication.
+- **Queries** use the simple protocol for now: no parameters, values in text form.
+  - `query(sql)` returns the last statement's `Rows`, and `simple_query(sql)` every statement's.
+  - `execute(sql)` returns the rows affected.
+  - `Rows` has `columns`, `tag`, and per value `is_null`, `text`, `int`, `bool`, and `value` for the bytes.
+- **Errors raise `PgError`.**
+  - A server error (`is_server()`, the SQLSTATE in `code()`, every field in `server()`) leaves the session usable.
+  - Anything else closes it: a transport or protocol error, or the server ending the session.
+- **A query's `timeout`:**
+  - When it passes, the query is cancelled. The client sends a CancelRequest on a new connection and waits until the server has taken it, as libpq does.
+  - The session stays usable, and the error says `is_deadline()`, with the server's 57014 attached.
+  - If the server does not end the query within `CANCEL_GRACE`, the connection is closed.
+- **On the side:** `take_notices()`, `take_notifications()` (after LISTEN), `parameter(name)`, `transaction_status()`, `cancel()`.
 
 ## Using the codec
 `PgConnection` runs one session and does no I/O. The driver sends what it hands out and feeds it what the socket reads. This is a blocking driver's loop, what `pg.client` will run (P3):
@@ -102,10 +144,9 @@ while True:
   - `PgConnection` is the `Codec` for one session: startup and authentication, the simple query flow, and the session's state.
   - `Startup` holds the settings, and `AuthMethods` the methods a server may ask for.
   - `PgEvent` and `EventKind` are the events.
-- **Planned:**
-  - `config`: connection parameters, from code or a `postgresql://` URL (P3).
-  - `client`: the blocking `Client` over `net`, the only module that imports `net` (P3).
-  - `types`: values in binary and text form (P4).
+- **`config`:** `Config`, from code or a connection URI, with the settings a session needs.
+- **`client`:** the blocking `Client`, `Rows` and `PgError`. It is the only module that imports `net`, and is not re-exported from `pg`.
+- **Planned:** `types`, values in binary and text form (P4).
 
 ## Milestones
 - **P1: cryptographic primitives.** Done.
@@ -156,16 +197,32 @@ while True:
   - **Measured on a quiet core of an i5-1145G7:** a DataRow of three small values (35 bytes) takes about 70 ns end to end, about 14 M rows/s or 500 MB/s.
     - Checking a row's values takes 15–20 ns.
     - Copying the body into the reused event takes about 10 ns: `List.extend` is a memcpy.
-- **P3: the blocking client.**
-  - **API:** `Client.connect(config)`, and `query(sql)` returning results whose rows hold text values.
-  - **Transports:** TCP (`net.dial`) and Unix sockets.
-  - **Deadlines:** one per operation. When it passes during a query, the client sends a CancelRequest on a new connection, then drains the connection to ReadyForQuery or closes it.
-  - **Tests** against a real PostgreSQL:
-    - every authentication method;
-    - errors with their SQLSTATE, and notices;
-    - large results;
-    - cancellation;
-    - a server that goes away.
+- **P3: the blocking client.** Done.
+  - **`pg.config`:** `Config`, and `Config.parse` for libpq-style URIs.
+    - It reads the parts and parameters libpq does, percent-decoded.
+    - It refuses what it cannot honour: TLS requirements and host lists (`Unsupported`), unknown parameters and malformed parts (`InvalidInput`), as libpq refuses them.
+  - **`pg.client`:** `Client` over `net`, with TCP by name (Happy Eyeballs) or the Unix socket.
+    - **Calls:** `connect`, `query`, `simple_query`, `execute`, `cancel`, `close`.
+    - **Results:** `Rows` keeps every row's body in one buffer, plus offsets.
+    - **Errors:** `PgError` carries the transport's `IoError`, the server's error, or both (a cancelled query).
+  - **Deadlines:**
+    - `connect_timeout` covers the opening.
+    - A query's `timeout` ends with a cancel. The client waits for the server to close the cancel connection, so a cancel arriving late cannot hit the next query, then drains to ReadyForQuery.
+  - **Tests:** 11 against PostgreSQL 18.6 (`tests/pg/test_client.mojo`), plus 4 on URIs.
+    - Every authentication method over TCP and the Unix socket, each with `allow` limited to that method, so the exchange really is MD5 or SCRAM.
+    - The refusals: a wrong password, a method not allowed, no password, no such database or user.
+    - Values, NULLs, several statements, row counts, and server errors with their fields (position, constraint), all of which keep the session.
+    - The transaction status through a failed transaction, notices, LISTEN and NOTIFY.
+    - 100,000 rows; a deadline that cancels `pg_sleep(30)` within 300 ms.
+    - COPY FROM STDIN refused; application_name and run-time parameters.
+    - A session ended by `pg_terminate_backend`, a server that stops, and a connect deadline against a listener that never answers.
+  - **Planted bugs:** 32, all caught. The first run let one through, a URI with no scheme, which now has a test.
+    - In URI parsing: the scheme, a second `@`, ports, escapes, NULs, UTF-8, TLS settings, `require_auth`, host lists.
+    - In the client: the cancel, value offsets, integers and booleans, the last statement's result, row counts, the Unix socket, server errors at startup and in queries, notices, a closed connection, empty queries.
+  - **Measured** over the Unix socket, with client and server on one laptop:
+    - `SELECT 1` round trips run at about 55,000 a second (18 µs each). pgbench, using libpq's simple protocol, does the same.
+    - A million rows (an integer and a 32-character text) arrive in about 1 s, as with psql. That is the server's time.
+  - **Example:** `examples/pg/query.mojo` runs SQL from the command line and prints every result.
 - **P4: the extended protocol and types.**
   - **Messages:** Parse, Bind, Describe, Execute and Sync.
   - **Statements:** parameters (`$1`), and a statement cache per connection.

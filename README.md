@@ -14,7 +14,7 @@ Native Mojo networking libraries for Linux (x86_64 and aarch64, kernel 5.15+):
 | `net` | the TCP/UDP library: addresses, every socket option, TCP/Unix streams with deadlines, connect by name, buffered frame reads, UDP sockets (blocking, nonblocking, batched, multicast) ([docs/net.md](docs/net.md)) | TCP client and UDP stable |
 | `http` | HTTP/1.1: a sans-I/O head parser, body framing and connection codecs for both sides, and a blocking client with a keep-alive pool ([docs/http.md](docs/http.md)) | done |
 | `server` | an HTTP/1.1 server: one epoll loop per process, a `Handler` trait, timeouts and backpressure, streamed bodies and server-sent events, graceful shutdown on SIGTERM; supervised worker processes on one port with SO_REUSEPORT; a router and static files ([docs/server.md](docs/server.md)) | done through S5 |
-| `pg` | a PostgreSQL driver: a sans-I/O protocol codec, authentication up to SCRAM-SHA-256, a blocking client ([docs/pg.md](docs/pg.md)) | in progress: the codec is done (P2 of 6) |
+| `pg` | a PostgreSQL driver: a sans-I/O protocol codec, authentication up to SCRAM-SHA-256, a blocking client ([docs/pg.md](docs/pg.md)) | in progress: the codec and a blocking client are done (P3 of 6) |
 | `rt` | an experimental completion-based event loop ([docs/rt.md](docs/rt.md)) | frozen |
 
 Imports point downward only (`linux` ← `bytes` ← `net` ← `rt`, and `net` ← `http` ← `server`; `crypto` imports only the standard library, and `pg` builds on it and `net`), and only `rt` may import `rt`. The protocol code of `http` and `pg` is sans-I/O: only their client modules import `net`. CI checks these rules. Design, package rules and shared contracts: [docs/design.md](docs/design.md).
@@ -44,6 +44,8 @@ More in `examples/net/`:
 - a Redis `PING`, with sans-I/O RESP encoding and parsing;
 - a readiness-loop echo server: edge-triggered epoll and `try_read` / `try_write`, with no runtime;
 - a UDP echo server (blocking, or an epoll loop with batched `recvmmsg` / `sendmmsg`) and a UDP ping client.
+
+In `examples/pg/`: `query`, which runs SQL against PostgreSQL from a `postgresql://` URI and prints each result.
 
 And in `examples/http/`: `http_get`, a small `curl` built on `http.client.Client`; `hello_server`, an epoll server driving one `ServerConnection` per connection (over 1M pipelined requests per second on one core). In `examples/server/`: `hello`, the same on `server.Server`; `workers`, one supervised worker process per CPU on one port, stopped gracefully by SIGTERM or Ctrl-C; `files`, a static file server.
 
