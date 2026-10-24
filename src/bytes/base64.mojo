@@ -50,7 +50,12 @@ def base64_decode(text: StringSlice) raises -> List[UInt8]:
     """The bytes `text` encodes. Strict: a length that is a multiple of 4,
     only the alphabet, and padding only at the end; raises otherwise. (Like
     Python's `b64decode(validate=True)`, unused low bits need not be 0.)"""
-    var t = text.as_bytes()
+    return base64_decode(text.as_bytes())
+
+
+def base64_decode(t: Span[UInt8, _]) raises -> List[UInt8]:
+    """The same, for text given as bytes (which need not be UTF-8: anything
+    outside the alphabet is refused)."""
     var n = len(t)
     if n % 4 != 0:
         raise Error("base64: length not a multiple of 4")

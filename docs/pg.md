@@ -2,7 +2,7 @@
 
 A PostgreSQL client for Mojo on Linux, speaking the frontend/backend protocol (version 3.0) natively, without libpq. It is the first of the roadmap's database drivers. Package rules and the shared contracts are in `docs/design.md`. The transport is `net` (`docs/net.md`), and the authentication primitives are `crypto`.
 
-**Status: P1 done** (the cryptographic primitives). Next is P2, the sans-I/O protocol codec.
+**Status: P1–P2 done:** the cryptographic primitives, and the sans-I/O codec for a session (`PgConnection`). Next is P3, the blocking client, tested against a real PostgreSQL.
 
 ## Scope
 **In scope:**
@@ -26,7 +26,7 @@ A PostgreSQL client for Mojo on Linux, speaking the frontend/backend protocol (v
 - **No silent downgrade.** `sslmode` values `disable`, `allow` and `prefer` connect in cleartext; none of them guarantees encryption. `require`, `verify-ca`, `verify-full` and `channel_binding=require` are refused with `Unsupported`, not ignored.
 - **Authentication.**
   - **SCRAM-SHA-256** (RFC 5802, RFC 7677) has been PostgreSQL's default since version 14. The client checks the server's final signature, in constant time, so a server that does not know the password cannot pass as authenticated. It also checks that the server's nonce extends the client's.
-  - **Restricting methods.** A `require_auth`-style option (as in libpq 16) limits the methods a server may ask for. By default every method above is accepted, as in libpq.
+  - **Restricting methods.** `Startup.allow` (`AuthMethods`, like libpq 16's `require_auth`) limits the methods a server may ask for, and a refused method fails before any password leaves the client. By default every method above is accepted, as in libpq.
   - **MD5** is supported for old setups only. MD5 is broken as a hash, and the exchange protects no password against an eavesdropper.
 - **SASLprep (RFC 4013).**
   - **What PostgreSQL does:** it normalizes a SCRAM password when the password is set, and uses the raw bytes when the password is not valid for SASLprep.
@@ -39,21 +39,73 @@ A PostgreSQL client for Mojo on Linux, speaking the frontend/backend protocol (v
 - **Encoding.** The startup message asks for `client_encoding=UTF8`.
 
 ## Testing
-- **P2:** captured exchanges replayed in every split, and a fake backend in Python whose SCRAM side is computed with hashlib, independently of `crypto`.
+- **P2:** the Python oracle `tests/pg/pg_oracle.py`, written from the protocol documentation independently of `crypto` and `pg`.
+  - It builds backend messages, parses what the client sent, and runs the server side of MD5 and SCRAM with hashlib and hmac.
+  - Its transcripts are replayed in every split (`drive_chunked`), and mutated ones must end in events or an error, never a crash.
 - **From P3:** a real PostgreSQL.
   - **Install:** `postgresql` from conda-forge becomes a pixi dependency.
   - **Clusters:** each test file creates its own with `initdb` in a scratch directory. It listens on a Unix socket in that directory, and on a free TCP port where needed.
   - **Users:** one for each authentication method in `pg_hba.conf`.
 
-## Modules (planned)
-- `message`: the wire format.
-  - Frontend messages are built into a `ByteBuffer`. Backend messages are split and parsed: a type byte, then an Int32 length that counts itself. The startup packet has no type byte.
-  - Everything a server sends is length-limited.
-- `auth`: the MD5 and SCRAM-SHA-256 client exchanges.
-- `connection`: `PgConnection`, the `Codec` for one connection. It covers startup, authentication, ParameterStatus and BackendKeyData, the query flows, and the transaction status from ReadyForQuery.
-- `config`: connection parameters, from code or a `postgresql://` URL.
-- `client`: the blocking `Client` over `net`, the only module that imports `net`.
-- `types` (P4): values in binary and text form.
+## Using the codec
+`PgConnection` runs one session and does no I/O. The driver sends what it hands out and feeds it what the socket reads. This is a blocking driver's loop, what `pg.client` will run (P3):
+
+```mojo
+var nonce = List[UInt8](length=18, fill=0)
+fill_random(Span(nonce))  # linux.random: fresh for every connection
+var conn = PgConnection(Startup("alice", database="shop", password=secret), Span(nonce))
+var ev = PgEvent()  # reused: its buffers are refilled
+var out = ByteBuffer()
+var asked = False
+while True:
+    while conn.poll(ev):  # raises IoError when the connection is unusable
+        if ev.kind == EventKind.READY:
+            if not asked:  # the first READY: the session is open
+                conn.query("SELECT id, name FROM users")
+                asked = True
+            else:  # the query's cycle is over
+                conn.terminate()
+        elif ev.kind == EventKind.DATA_ROW:
+            print(String(from_utf8_lossy=ev.value(1)))  # text values; ev.is_null(i)
+        elif ev.kind == EventKind.ERROR:
+            print(ev.server_message())  # SQLSTATE and message; READY follows
+    while conn.poll_transmit(out) > 0:
+        stream.write_all(out.readable_span())
+        out.clear()
+    var n = stream.read(Span(buf)[0 : min(len(buf), conn.feed_capacity())])
+    if n == 0:
+        conn.feed_eof()
+        _ = conn.poll(ev)  # raises, unless the session ended (terminate(), a FATAL error)
+        break
+    conn.feed(Span(buf)[0:n])
+```
+
+- **Authentication runs inside the codec.**
+  - It answers whatever the server asks, from the `Startup` (password, `allow`).
+  - Its SCRAM rounds run in `poll`: about 2 ms for PostgreSQL's 4096.
+- **Results come as events, in order.**
+  - `query` may be called again before READY: the queries are pipelined, and each one's events end with its own READY.
+  - `ev.columns()` describes the rows that follow. `ev.tag()` and `ev.rows_affected()` give the command's outcome.
+- **Server errors are events.** `poll` raises only when the connection can no longer be used: the server broke the protocol, authentication was refused, or EOF came while the session was open. EOF after `terminate()` or after a FATAL error is the normal end.
+- **The session's state:**
+  - `is_idle()`;
+  - `transaction_status()` (`IDLE`, `IN_TRANSACTION`, `FAILED_TRANSACTION`);
+  - `parameter(name)`, the values from ParameterStatus;
+  - `backend_key()`, for a CancelRequest on a new connection (`write_cancel_request`).
+
+## Modules
+- **`message`:** the wire format.
+  - Frontend messages are built into a `ByteBuffer`. They refuse NUL bytes, and keep the startup packet under the server's 10000-byte limit.
+  - Backend bodies are checked once, when they arrive. `ServerMessage` reads the fields of an error or notice, `Column` those of a RowDescription.
+- **`auth`:** the MD5 answer, and `ScramClient`, the client side of SCRAM-SHA-256.
+- **`connection`:**
+  - `PgConnection` is the `Codec` for one session: startup and authentication, the simple query flow, and the session's state.
+  - `Startup` holds the settings, and `AuthMethods` the methods a server may ask for.
+  - `PgEvent` and `EventKind` are the events.
+- **Planned:**
+  - `config`: connection parameters, from code or a `postgresql://` URL (P3).
+  - `client`: the blocking `Client` over `net`, the only module that imports `net` (P3).
+  - `types`: values in binary and text form (P4).
 
 ## Milestones
 - **P1: cryptographic primitives.** Done.
@@ -74,14 +126,36 @@ A PostgreSQL client for Mojo on Linux, speaking the frontend/backend protocol (v
   - **Leads:**
     - the hardware SHA-256 instructions (x86 SHA-NI, the Armv8 SHA-2 extension);
     - a pool that keeps the derived SCRAM keys per salt and round count, so only its first connection pays for PBKDF2 (P5).
-- **P2: the protocol codec.**
-  - **Framing** both ways, with a configurable limit on a backend message's length.
-  - **Startup:** the StartupMessage (user, database, application name, options), authentication (trust, cleartext, MD5, SCRAM-SHA-256 with the server signature checked), ParameterStatus, BackendKeyData, NegotiateProtocolVersion and ReadyForQuery.
-  - **Simple query:** RowDescription, DataRow, CommandComplete (with the row count), EmptyQueryResponse, ErrorResponse, NoticeResponse and NotificationResponse. Several statements in one query, and an error in the middle of them.
-  - **Tests:**
-    - captured exchanges replayed in every split;
-    - the Python fake backend, for authentication success and each failure: a wrong password, a bad server signature, a nonce that does not extend ours, unsupported methods;
-    - malformed messages.
+- **P2: the protocol codec.** Done.
+  - **`pg.message`:** the wire format.
+    - The builders refuse NULs and a startup packet over the server's limit.
+    - Backend bodies are checked once, on arrival.
+  - **`pg.auth`:** the MD5 answer, and `ScramClient`.
+    - It checks that the server's nonce extends the client's, and checks the final signature in constant time.
+    - It refuses unknown mandatory extensions, and more than `MAX_SCRAM_ITERATIONS` rounds.
+  - **`pg.connection`:** `PgConnection`, `Startup`, `AuthMethods`, `PgEvent`.
+    - **Startup:** the settings are checked (reserved or repeated parameters, NULs, a short nonce).
+    - **Authentication:** whatever the server asks, within `Startup.allow`.
+    - **The session's reports:** ParameterStatus, BackendKeyData, NegotiateProtocolVersion.
+    - **Simple queries:** pipelined, with server errors and notices as events.
+    - **COPY FROM STDIN:** refused with CopyFail, and the session goes on.
+    - **The ends:** after a FATAL error or Terminate, EOF is the normal end.
+    - **Protocol violations** poison the codec (rule 6).
+  - **Refused, because a hostile or broken server could exploit them:**
+    - AuthenticationOk before the SCRAM proof, which libpq also guards against;
+    - a method the caller did not allow, refused before any password is sent;
+    - a second authentication request;
+    - rows without a RowDescription, or after their statement's end;
+    - a ReadyForQuery that ends rows without their CommandComplete;
+    - any message after the session's end;
+    - messages over `max_message`, refused from the length field alone.
+  - **Tests** (33 across three files) are written against the Python oracle, and the SCRAM client also against RFC 7677's example.
+    - `drive_chunked` replays whole sessions in every split: a startup with notices, pipelined results with errors, a SCRAM exchange.
+    - 3000 mutated transcripts each end in events or an `IoError`, never a crash.
+    - **Planted bugs:** 59 across the three modules, all caught. The first run let 3 through: a forged NegotiateProtocolVersion, a repeated parameter whose case differs, and a NULL length loosened to -2. Each now has a test.
+  - **Measured on a quiet core of an i5-1145G7:** a DataRow of three small values (35 bytes) takes about 70 ns end to end, about 14 M rows/s or 500 MB/s.
+    - Checking a row's values takes 15–20 ns.
+    - Copying the body into the reused event takes about 10 ns: `List.extend` is a memcpy.
 - **P3: the blocking client.**
   - **API:** `Client.connect(config)`, and `query(sql)` returning results whose rows hold text values.
   - **Transports:** TCP (`net.dial`) and Unix sockets.

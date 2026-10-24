@@ -30,7 +30,8 @@ no staging buffer is needed, and a codec that serializes straight into
 Rules every `Codec` follows:
 1. **No I/O.** No syscalls, no `rt`, no socket modules. Codec modules import
    only `std`, `linux` (for `IoError`/`Instant`), `bytes.buffer` (for
-   `ByteBuffer`, which does no I/O) and other codecs.
+   `ByteBuffer`, which does no I/O), pure computation (`crypto`, for
+   `pg`'s authentication) and other codecs.
 2. **No clocks.** Time enters only through `handle_timeout(now)`. A codec
    never calls `Instant.now()`; `next_deadline()` is computed from instants
    it was given.
