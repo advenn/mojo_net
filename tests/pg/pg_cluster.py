@@ -1,8 +1,12 @@
 """A throwaway PostgreSQL cluster for the tests/pg files that need a real
 server (started through `pg_server.mojo`).
 
-    python tests/pg/pg_cluster.py start   prints "port|dir" once it serves
-    python tests/pg/pg_cluster.py stop DIR   stops it at once, removes DIR
+    python tests/pg/pg_cluster.py start [PID]   prints "port|dir" once it serves
+    python tests/pg/pg_cluster.py stop DIR      stops it at once, removes DIR
+
+With PID (the test process, as `pg_server.mojo` passes it), a detached
+watcher also stops the cluster once that process has ended: a test that
+crashes, or is killed at its timeout, cannot stop the cluster itself.
 
 The cluster lives in a fresh temp directory (under /tmp when $TMPDIR is too
 long for a socket path): data, log, and the Unix socket
@@ -24,6 +28,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 
 _SOCKET_NAME = "/.s.PGSQL.65535"
 _SUN_PATH = 107  # bytes of sun_path before the terminating NUL
@@ -45,7 +50,7 @@ def _free_port():
     return port
 
 
-def start():
+def start(watch_pid=None):
     root = _scratch()
     data = os.path.join(root, "data")
     log = os.path.join(root, "log")
@@ -93,10 +98,40 @@ def start():
             check=True,
             capture_output=True,
         )
+        if watch_pid is not None:
+            with open(os.path.join(root, "watch.log"), "w") as errors:
+                subprocess.Popen(  # (none of our pipes, or the caller would wait for it)
+                    [sys.executable, os.path.abspath(__file__), "watch", root, str(watch_pid)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=errors,
+                    start_new_session=True,
+                )
     except BaseException:
         stop(root)
         raise
     print(f"{port}|{root}", flush=True)
+
+
+def _ended(pid):
+    """Whether process `pid` has ended: gone, or a zombie not reaped yet.
+    (Polled: this Python has no os.pidfd_open.)"""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            state = f.read().rsplit(")", 1)[1].split()[0]  # (after the name, which may hold anything)
+    except (OSError, IndexError):
+        return True
+    return state in ("Z", "X")
+
+
+def watch(root, pid):
+    """Stop the cluster at `root` once process `pid` has ended; return
+    early when the cluster is stopped (`root` removed) first."""
+    while os.path.isdir(root):
+        if _ended(pid):
+            stop(root)
+            return
+        time.sleep(0.5)
 
 
 def stop(root):
@@ -119,6 +154,8 @@ def stop(root):
 
 if __name__ == "__main__":
     if sys.argv[1] == "start":
-        start()
+        start(int(sys.argv[2]) if len(sys.argv) > 2 else None)
+    elif sys.argv[1] == "watch":
+        watch(sys.argv[2], int(sys.argv[3]))
     else:
         stop(sys.argv[2])

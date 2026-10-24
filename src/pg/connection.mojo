@@ -34,22 +34,38 @@ Once the session is open, requests may be queued:
 
 Requests pipeline. Each one is a cycle (a Query, or extended messages ending
 in our Sync), and each cycle's events end with its own READY, in order. A
-request that cannot be encoded raises `InvalidInput` and queues nothing.
-`terminate()` queues Terminate; EOF is then the expected end.
+request that cannot be encoded raises `InvalidInput` and queues nothing:
+a NUL in a string, or a message longer than the server reads
+(`pg.message.MAX_MESSAGE_LENGTH`, about 1 GiB; a statement name of more
+than 9994 bytes). `terminate()` queues Terminate; EOF is then the expected
+end, once every cycle queued before it has ended.
 
 What ends the connection with an error (rule 6):
-- **The server broke the protocol** (`InvalidData`): a malformed or
-  unexpected message, a message over `Startup.max_message`, AuthenticationOk
-  before the SCRAM exchange finished, a wrong SCRAM server signature.
+- **The server broke the protocol** (`InvalidData`):
+  - a malformed or unexpected message, or any message after the session's
+    end (a FATAL error);
+  - a message over `Startup.max_message`, or before AuthenticationOk one
+    over libpq's bounds there (2000 bytes; 30000 for an error);
+  - NegotiateProtocolVersion: this client asks for 3.0 with no options;
+  - AuthenticationOk before the SCRAM exchange finished, a wrong SCRAM
+    server signature;
+  - more than `MAX_REPORTED_PARAMETERS` distinct ParameterStatus names.
 - **Authentication the caller did not allow** (`PermissionDenied`, see
   `AuthMethods`).
 - **Authentication this client cannot do** (`Unsupported`): Kerberos,
   GSSAPI, SSPI, or SASL without SCRAM-SHA-256.
 - **A password request when no password was given** (`InvalidInput`).
+- **A client_encoding other than UTF8** (`Unsupported`): the strings here
+  are UTF-8, so a session the server converts to another encoding (`SET
+  client_encoding`) would garble every text value.
 - **COPY TO STDOUT** (`Unsupported`, for now). COPY FROM STDIN is answered
   with CopyFail instead, so the server reports an error and the session
-  goes on. In an extended cycle a Sync follows the CopyFail, as in libpq:
-  the server skipped our first one while in copy-in mode.
+  goes on, provided nothing was pipelined behind the COPY (the server
+  would read it as copy data and end the session). In an extended cycle a
+  Sync follows the CopyFail, as in libpq, since the server skips our first
+  one in copy-in mode. A COPY that fails before reading (into a view, say)
+  leaves copy-in mode at once: our first Sync ends its cycle, and the
+  ReadyForQuery the extra one draws is dropped.
 - **EOF while the session is open** (`UnexpectedEof`).
 
 Time: the codec has no timers (`next_deadline` is None). Deadlines belong to
@@ -143,6 +159,10 @@ comptime DEFAULT_MAX_MESSAGE = 1 << 30
 stop there."""
 comptime MIN_NONCE = 16
 """Random bytes a connection needs for its SCRAM nonce, at least."""
+comptime _MAX_QUEUED = 4 << 30
+"""The requests queued and not yet sent, at most (`OutOfMemory` past it):
+room for the largest cycle the server reads (a Parse and a Bind of 1 GiB
+each), and then some."""
 
 comptime E_LENGTH = "pg: message length out of bounds"
 comptime E_UNEXPECTED = "pg: unexpected message from the server"
@@ -155,14 +175,34 @@ comptime E_AUTH_UNSUPPORTED = "pg: the server asks for unsupported authenticatio
 comptime E_NO_SCRAM = "pg: the server offers no SCRAM-SHA-256"
 comptime E_BACKEND_KEY = "pg: malformed BackendKeyData"
 comptime E_READY = "pg: malformed ReadyForQuery"
-comptime E_NEGOTIATE = "pg: the server cannot speak protocol 3.0 as asked"
+comptime E_NEGOTIATE = "pg: NegotiateProtocolVersion, though nothing was negotiated"
+comptime E_ENCODING = "pg: the server switched client_encoding from UTF8"
+comptime E_PARAMETERS = "pg: too many parameters reported"
 comptime E_COPY_OUT = "pg: COPY TO STDOUT is not supported"
 comptime E_EOF = "pg: the server closed the connection"
 comptime E_FEED = "pg: fed past feed_capacity()"
 comptime E_NO_SESSION = "pg: no open session"
 comptime E_STARTUP = "pg: invalid startup settings"
 
+comptime MAX_REPORTED_PARAMETERS = 256
+"""Distinct ParameterStatus names a session keeps (a server reports some
+20)."""
+
 comptime _COPY_REFUSED = "COPY FROM STDIN is not supported by this client"
+
+# Before AuthenticationOk, the longest messages taken, length field included
+# (libpq's bounds): an error, and anything else.
+comptime _AUTH_ERROR_LIMIT = 30000
+comptime _AUTH_LIMIT = 2000
+
+# What each entry of the line of cycles in flight is.
+comptime _SIMPLE = 0
+"""A Query."""
+comptime _EXTENDED = 1
+"""Extended messages ending in our Sync."""
+comptime _EXTRA_SYNC = 2
+"""The Sync sent after a CopyFail in an extended cycle: it draws a
+ReadyForQuery of its own only when the COPY failed before reading."""
 
 # Phases of the session.
 comptime _AUTHENTICATING = 0
@@ -231,7 +271,8 @@ struct Startup(Copyable, Movable):
     """Shown in `pg_stat_activity`; empty to send none."""
     var allow: AuthMethods
     var max_message: Int
-    """The longest backend message accepted, length field included."""
+    """The longest backend message accepted once authenticated, length
+    field included."""
     var _params: List[String]
 
     def __init__(
@@ -255,7 +296,8 @@ struct Startup(Copyable, Movable):
     def set(mut self, name: String, value: String):
         """A run-time parameter for the session: "search_path",
         "TimeZone", "statement_timeout", or "options" for command-line
-        switches (`-c name=value`). `client_encoding` is always UTF8."""
+        switches (`-c name=value`). `client_encoding` is always UTF8, and
+        protocol options (`_pq_.`) are refused."""
         self._params.append(name)
         self._params.append(value)
 
@@ -423,6 +465,20 @@ def _lower(s: StringSlice) -> String:
     return String(s).lower()
 
 
+def _is_utf8(encoding: StringSlice) -> Bool:
+    var e = _lower(encoding)
+    return e == "utf8" or e == "utf-8" or e == "unicode"
+
+
+def _blank(mut ev: PgEvent):
+    """What `poll` leaves in `ev` when it filled no event: READY with no
+    status, and no body."""
+    ev.kind = EventKind.READY
+    ev.status = 0
+    ev.data.clear()
+    ev._at.clear()
+
+
 def _offers_scram(body: Span[UInt8, _]) raises IoError -> Bool:
     """Whether AuthenticationSASL's mechanism list (from offset 4: strings,
     then an empty one) names SCRAM-SHA-256."""
@@ -459,9 +515,11 @@ struct PgConnection(Codec, Copyable):
     var _auth: Int
     var _queries: Int
     """Queries sent whose cycle has not ended (no READY yet)."""
-    var _extended: List[Bool]
-    """Per cycle in flight, oldest first: whether it is an extended one
-    (ended by our Sync) rather than a simple Query."""
+    var _cycles: List[UInt8]
+    """The line of cycles in flight, oldest first, as sent: `_SIMPLE`,
+    `_EXTENDED`, or `_EXTRA_SYNC` (not counted in `_queries`)."""
+    var _copy_in: Bool
+    """A CopyInResponse came in the current cycle."""
     var _columns: Int
     """The current statement's column count: -1 without a RowDescription."""
     var _describing: Bool
@@ -486,10 +544,14 @@ struct PgConnection(Codec, Copyable):
         each connection; SCRAM's client nonce is made from them.
         `InvalidInput` for a short nonce, an empty user, a parameter set
         twice or reserved (user, database, client_encoding, replication,
-        application_name: those have their own settings), a NUL in any
-        setting, or `max_message` under 1024."""
+        application_name: those have their own settings; `_pq_.` protocol
+        options), a NUL in any setting or the password, or `max_message`
+        under 1024."""
         if len(nonce) < MIN_NONCE or startup.user.byte_length() == 0 or startup.max_message < 1024:
             raise IoError.of_kind(E_STARTUP, ErrorKind.InvalidInput)
+        for b in startup.password.as_bytes():
+            if b == 0:
+                raise IoError.of_kind(E_STARTUP, ErrorKind.InvalidInput)
         var params: List[String] = ["user", startup.user]
         if startup.database.byte_length() > 0:
             params.append("database")
@@ -501,15 +563,13 @@ struct PgConnection(Codec, Copyable):
         params.append("UTF8")
         for i in range(0, len(startup._params), 2):
             var name = _lower(startup._params[i])
-            if name == "replication" or name == "application_name" or name == "database":
+            if name == "replication" or name == "application_name" or name == "database" or name.startswith("_pq_."):
                 raise IoError.of_kind(E_STARTUP, ErrorKind.InvalidInput)
             for k in range(0, len(params), 2):
                 if _lower(params[k]) == name:
                     raise IoError.of_kind(E_STARTUP, ErrorKind.InvalidInput)
             params.append(startup._params[i])
             params.append(startup._params[i + 1])
-        self._tx = ByteBuffer()
-        write_startup(self._tx, params)
         self._rx = ByteBuffer(max_size=startup.max_message + 1)
         self._user = startup.user
         self._password = startup.password
@@ -520,7 +580,8 @@ struct PgConnection(Codec, Copyable):
         self._phase = _AUTHENTICATING
         self._auth = _SENT_NOTHING
         self._queries = 0
-        self._extended = List[Bool]()
+        self._cycles = List[UInt8]()
+        self._copy_in = False
         self._columns = -1
         self._describing = False
         self._status = 0
@@ -530,14 +591,31 @@ struct PgConnection(Codec, Copyable):
         self._eof = False
         self._failed = None
         self._scratch = List[UInt8]()
-        self._request = ByteBuffer()
+        self._request = ByteBuffer(max_size=_MAX_QUEUED)
+        self._tx = ByteBuffer(max_size=_MAX_QUEUED)
+        write_startup(self._tx, params)
 
     # ---- the session --------------------------------------------------------
 
     def is_open(self) -> Bool:
-        """Whether the session is open (startup done, not ended or
-        terminated), so `query` may be called."""
-        return self._phase == _OPEN and not self._terminated
+        """Whether the session is open (startup done, not ended, terminated
+        or failed), so `query` may be called."""
+        return self._phase == _OPEN and not self._terminated and not self._failed and not self._eof
+
+    def _check_open(self) raises IoError:
+        """Refuse a request: with the error that ended the codec, or
+        `InvalidInput` when the session is not open."""
+        if self._failed:
+            raise self._failed.value()
+        if not self.is_open():
+            raise IoError.of_kind(E_NO_SESSION, ErrorKind.InvalidInput)
+
+    def _queue(mut self, kind: UInt8) raises IoError:
+        """Move the request built in `_request` (several messages) to `_tx`,
+        whole or not at all, as a cycle of `kind`."""
+        self._tx.write_bytes(self._request.readable_span())
+        self._queries += 1
+        self._cycles.append(kind)
 
     def is_idle(self) -> Bool:
         """Whether the session is open with no query in flight."""
@@ -569,11 +647,10 @@ struct PgConnection(Codec, Copyable):
         """Queue a Query: one or more statements, run in order, whose
         results come as events ending with READY. `InvalidInput`, without
         harm to the session, when it is not open or `sql` holds a NUL."""
-        if not self.is_open():
-            raise IoError.of_kind(E_NO_SESSION, ErrorKind.InvalidInput)
-        write_query(self._tx, sql)
+        self._check_open()
+        write_query(self._tx, sql)  # (whole, or not at all)
         self._queries += 1
-        self._extended.append(False)
+        self._cycles.append(_SIMPLE)
 
     def execute(mut self, sql: StringSlice, params: Params, result_format: Int = TEXT) raises IoError:
         """Queue one statement with its parameters through the extended
@@ -584,8 +661,7 @@ struct PgConnection(Codec, Copyable):
         `result_format` (`TEXT` or `BINARY`). `InvalidInput`, without harm
         to the session, when it is not open or the request cannot be
         encoded (a NUL in `sql`, too many parameters)."""
-        if not self.is_open():
-            raise IoError.of_kind(E_NO_SESSION, ErrorKind.InvalidInput)
+        self._check_open()
         self._request.clear()
         write_parse(self._request, "", sql, params)
         if result_format != TEXT and result_format != BINARY:
@@ -595,9 +671,7 @@ struct PgConnection(Codec, Copyable):
         write_describe(self._request, PORTAL, "")
         write_execute(self._request, "")
         write_sync(self._request)
-        self._tx.write_bytes(self._request.readable_span())
-        self._queries += 1
-        self._extended.append(True)
+        self._queue(_EXTENDED)
 
     def prepare(mut self, name: StringSlice, sql: StringSlice, params: Params) raises IoError:
         """Queue Parse of `sql` as the prepared statement `name`, a Describe
@@ -606,31 +680,25 @@ struct PgConnection(Codec, Copyable):
         `params`. Events: PARSE_COMPLETE, PARAMETER_DESCRIPTION (the types
         the server settled on), ROW_DESCRIPTION or NO_DATA (the columns; no
         rows follow), READY."""
-        if not self.is_open():
-            raise IoError.of_kind(E_NO_SESSION, ErrorKind.InvalidInput)
+        self._check_open()
         self._request.clear()
         write_parse(self._request, name, sql, params)
         write_describe(self._request, STATEMENT, name)
         write_sync(self._request)
-        self._tx.write_bytes(self._request.readable_span())
-        self._queries += 1
-        self._extended.append(True)
+        self._queue(_EXTENDED)
 
     def execute_prepared(mut self, name: StringSlice, params: Params, result_formats: Span[Int, _]) raises IoError:
         """Queue Bind of the prepared statement `name` to `params`, a
         Describe of the portal, Execute and Sync. `result_formats`: one
         format per result column (`TEXT` or `BINARY`), one for all, or none
         for text. Events as for `execute`, without PARSE_COMPLETE."""
-        if not self.is_open():
-            raise IoError.of_kind(E_NO_SESSION, ErrorKind.InvalidInput)
+        self._check_open()
         self._request.clear()
         write_bind(self._request, "", name, params, result_formats)
         write_describe(self._request, PORTAL, "")
         write_execute(self._request, "")
         write_sync(self._request)
-        self._tx.write_bytes(self._request.readable_span())
-        self._queries += 1
-        self._extended.append(True)
+        self._queue(_EXTENDED)
 
     def execute_prepared(mut self, name: StringSlice, params: Params) raises IoError:
         """`execute_prepared` with every result column in text form."""
@@ -640,18 +708,16 @@ struct PgConnection(Codec, Copyable):
     def close_statement(mut self, name: StringSlice) raises IoError:
         """Queue Close of the prepared statement `name`, and Sync. Events:
         CLOSE_COMPLETE, READY."""
-        if not self.is_open():
-            raise IoError.of_kind(E_NO_SESSION, ErrorKind.InvalidInput)
+        self._check_open()
         self._request.clear()
         write_close(self._request, STATEMENT, name)
         write_sync(self._request)
-        self._tx.write_bytes(self._request.readable_span())
-        self._queries += 1
-        self._extended.append(True)
+        self._queue(_EXTENDED)
 
     def terminate(mut self) raises IoError:
         """Queue Terminate (once): the server closes the connection, and
-        EOF is then the expected end. Queries queued before it still run."""
+        EOF is then the expected end. Queries queued before it still run
+        (EOF before their READY is `UnexpectedEof`)."""
         if self._terminated:
             return
         write_terminate(self._tx)
@@ -697,13 +763,16 @@ struct PgConnection(Codec, Copyable):
             var have = self._rx.readable()
             if have < 5:
                 if self._eof:
-                    if have == 0 and (self._phase == _ENDED or self._terminated):
+                    if have == 0 and (self._phase == _ENDED or (self._terminated and self._queries == 0)):
                         return False
                     raise self._poison(IoError.of_kind(E_EOF, ErrorKind.UnexpectedEof))
                 return False
             var kind = self._rx.readable_span()[0]
             var length = be_i32(self._rx.readable_span(), 1)
-            if length < 4 or length > self._max_message:
+            var limit = self._max_message
+            if self._phase == _AUTHENTICATING:  # (and never past what `_rx` holds)
+                limit = min(limit, _AUTH_ERROR_LIMIT if kind == ERROR_RESPONSE else _AUTH_LIMIT)
+            if length < 4 or length > limit:
                 raise self._poison(IoError.of_kind(E_LENGTH, ErrorKind.InvalidData))
             if have <= length:
                 if self._eof:
@@ -720,6 +789,7 @@ struct PgConnection(Codec, Copyable):
             try:
                 produced = self._handle(kind, ev)
             except e:
+                _blank(ev)  # (its body was not checked for its kind)
                 raise self._poison(e)
             if produced:
                 return True
@@ -748,6 +818,8 @@ struct PgConnection(Codec, Copyable):
             read_data_row(Span(ev.data), self._columns, ev._at)
             ev.kind = EventKind.DATA_ROW
             return True
+        if self._phase == _ENDED:  # (the server closes after a FATAL error)
+            raise IoError.of_kind(E_UNEXPECTED, ErrorKind.InvalidData)
         if kind == ERROR_RESPONSE:
             check_fields(Span(ev.data))
             ev.kind = EventKind.ERROR
@@ -755,29 +827,32 @@ struct PgConnection(Codec, Copyable):
             self._describing = False
             if self._phase != _OPEN or _is_fatal(Span(ev.data)):
                 self._phase = _ENDED
+            else:
+                self._next_cycle()
             return True
+        if self._phase == _AUTHENTICATING:  # (no notices yet: libpq refuses them too)
+            if kind == AUTHENTICATION:
+                self._authenticate()
+                return False
+            if kind == NEGOTIATE_PROTOCOL_VERSION:  # (none is due: 3.0 and no options asked)
+                raise IoError.of_kind(E_NEGOTIATE, ErrorKind.InvalidData)
+            raise IoError.of_kind(E_UNEXPECTED, ErrorKind.InvalidData)
         if kind == NOTICE_RESPONSE:
             check_fields(Span(ev.data))
             ev.kind = EventKind.NOTICE
             return True
-        if self._phase == _AUTHENTICATING:
-            if kind == AUTHENTICATION:
-                self._authenticate()
-                return False
-            if kind == NEGOTIATE_PROTOCOL_VERSION and self._auth == _SENT_NOTHING:
-                self._negotiate()
-                return False
-            raise IoError.of_kind(E_UNEXPECTED, ErrorKind.InvalidData)
-        if self._phase == _ENDED:
-            raise IoError.of_kind(E_UNEXPECTED, ErrorKind.InvalidData)
         if kind == PARAMETER_STATUS:
             var name = String()
             var value = String()
             read_parameter_status(Span(self._scratch), name, value)
+            if name == "client_encoding" and not _is_utf8(value):
+                raise IoError.of_kind(E_ENCODING, ErrorKind.Unsupported)
             for i in range(0, len(self._params), 2):
                 if self._params[i] == name:
                     self._params[i + 1] = value^
                     return False
+            if len(self._params) >= 2 * MAX_REPORTED_PARAMETERS:
+                raise IoError.of_kind(E_PARAMETERS, ErrorKind.InvalidData)
             self._params.append(name^)
             self._params.append(value^)
             return False
@@ -798,6 +873,13 @@ struct PgConnection(Codec, Copyable):
                 return True
             raise IoError.of_kind(E_UNEXPECTED, ErrorKind.InvalidData)
         # _OPEN: the results of queries in flight.
+        if len(self._cycles) > 0 and self._cycles[0] == _EXTRA_SYNC:
+            if kind == READY_FOR_QUERY:  # (the extra Sync's own: dropped)
+                _ = self._cycles.pop(0)
+                self._ready(ev)
+                _blank(ev)
+                return False
+            self._next_cycle()
         if self._queries == 0:
             raise IoError.of_kind(E_UNEXPECTED, ErrorKind.InvalidData)
         if kind == READY_FOR_QUERY:
@@ -805,10 +887,13 @@ struct PgConnection(Codec, Copyable):
                 raise IoError.of_kind(E_UNEXPECTED, ErrorKind.InvalidData)
             self._ready(ev)
             self._queries -= 1
-            _ = self._extended.pop(0)
+            _ = self._cycles.pop(0)
+            self._copy_in = False
             return True
         if kind == ROW_DESCRIPTION:
             var columns = check_row_description(Span(ev.data))
+            if self._columns >= 0:  # (the last statement's rows had no CommandComplete)
+                raise IoError.of_kind(E_UNEXPECTED, ErrorKind.InvalidData)
             if self._describing:
                 self._describing = False  # a prepared statement's: no rows follow
             else:
@@ -852,11 +937,19 @@ struct PgConnection(Codec, Copyable):
             ev.kind = EventKind.PORTAL_SUSPENDED
             return True
         if kind == COPY_IN_RESPONSE:
+            if self._copy_in:  # (our CopyFail ends the cycle's statements)
+                raise IoError.of_kind(E_UNEXPECTED, ErrorKind.InvalidData)
+            self._copy_in = True
             write_copy_fail(self._tx, _COPY_REFUSED)
-            if self._extended[0]:
-                # The server ignored our Sync while in copy-in mode, and
-                # after the CopyFail it waits for one (as libpq sends).
+            if self._cycles[0] == _EXTENDED:
+                # In copy-in mode the server skips our Sync, and after the
+                # CopyFail it waits for one (as libpq sends). A COPY that
+                # fails before reading leaves copy-in mode at once instead:
+                # our first Sync ends the cycle, and this one draws a READY
+                # of its own. Its place in the line tells that READY apart:
+                # every cycle has a message before its READY.
                 write_sync(self._tx)
+                self._cycles.append(_EXTRA_SYNC)
             return False
         if kind == COPY_OUT_RESPONSE or kind == COPY_BOTH_RESPONSE:
             raise IoError.of_kind(E_COPY_OUT, ErrorKind.Unsupported)
@@ -872,13 +965,11 @@ struct PgConnection(Codec, Copyable):
         ev.kind = EventKind.READY
         ev.status = status
 
-    def _negotiate(mut self) raises IoError:
-        """NegotiateProtocolVersion: the server's newest minor version and
-        the protocol options it did not recognize. This client asks for 3.0
-        and sends no options, so only an empty list can be accepted."""
-        var body = Span(self._scratch)
-        if len(body) != 8 or be_i32(body, 0) < 0 or be_i32(body, 4) != 0:
-            raise IoError.of_kind(E_NEGOTIATE, ErrorKind.Unsupported)
+    def _next_cycle(mut self):
+        """A message of the next cycle came: the extra Syncs at the head of
+        the line drew no READY of their own."""
+        while len(self._cycles) > 0 and self._cycles[0] == _EXTRA_SYNC:
+            _ = self._cycles.pop(0)
 
     def _require(self, method: AuthMethods) raises IoError:
         if not self._allow.allows(method):

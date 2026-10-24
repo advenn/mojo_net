@@ -8,7 +8,10 @@ that counts itself and the body (not the type byte), then the body. The
 startup packets (StartupMessage, CancelRequest) have no type byte.
 Integers are big-endian. Strings end with a NUL, so none may hold one: the
 builders refuse it (`InvalidInput`), and a body whose parts do not add up
-to its length raises `InvalidData` (the op names the message).
+to its length raises `InvalidData` (the op names the message). A builder
+writes its message whole or not at all: one longer than the server reads
+raises `InvalidInput`, and one that does not fit the buffer `OutOfMemory`,
+with nothing written.
 
 `pg.connection` frames the backend stream and checks each body once, when
 it arrives (`check_*`, `read_*`). The accessors that read a checked body
@@ -107,11 +110,21 @@ comptime PORTAL: UInt8 = 80  # 'P': a portal (a bound statement)
 comptime TEXT = 0
 comptime BINARY = 1
 
+comptime E_NAME_TOO_LONG = "pg: statement or portal name too long"
+
 comptime MAX_PARAMS = 65535
 """The most parameters a statement can have (Bind counts them in 16 bits)."""
 
-comptime _MAX_LENGTH = 0x7FFFFFFF
-"""The largest Int32: no message can say it is longer."""
+comptime MAX_MESSAGE_LENGTH = 0x3FFFFFFE
+"""The longest Query, Parse or Bind a server reads, length field included
+(its PQ_LARGE_MESSAGE_LIMIT). Past a server's limit it closes the
+connection without an error, so the builders refuse such a message
+(`InvalidInput`)."""
+comptime MAX_SMALL_MESSAGE_LENGTH = 10000
+"""The same for Describe, Close, Execute, Sync, Flush, CopyFail and
+Terminate (PQ_SMALL_MESSAGE_LIMIT): a statement name stays under it."""
+comptime MAX_AUTH_MESSAGE_LENGTH = 65535
+"""The same for a password or SASL message (PG_MAX_AUTH_TOKEN_LENGTH)."""
 
 
 # ---- reading -----------------------------------------------------------------
@@ -463,6 +476,7 @@ def write_startup(mut out: ByteBuffer, params: List[String]) raises IoError:
         n += len(b) + 1
     if n > MAX_STARTUP_LENGTH:
         raise IoError.of_kind("pg: startup parameters too long", ErrorKind.InvalidInput)
+    out.ensure_writable(n)
     _put_i32(out, n)
     _put_i32(out, PROTOCOL_VERSION)
     for i in range(len(params)):
@@ -470,9 +484,15 @@ def write_startup(mut out: ByteBuffer, params: List[String]) raises IoError:
     out.write_byte(0)
 
 
-def _header(mut out: ByteBuffer, kind: UInt8, body: Int, op: StaticString) raises IoError:
-    if body > _MAX_LENGTH - 4:
-        raise IoError.of_kind(op, ErrorKind.InvalidInput)
+def _header(
+    mut out: ByteBuffer, kind: UInt8, body: Int, too_long: StaticString, limit: Int = MAX_MESSAGE_LENGTH
+) raises IoError:
+    """Start a message of `body` bytes, with room made for all of it, so
+    that what follows cannot fail (whole or nothing). `limit`: what the
+    server reads of this message, length field included."""
+    if body > limit - 4:
+        raise IoError.of_kind(too_long, ErrorKind.InvalidInput)
+    out.ensure_writable(1 + 4 + body)
     out.write_byte(kind)
     _put_i32(out, 4 + body)
 
@@ -482,7 +502,7 @@ def write_password(mut out: ByteBuffer, password: StringSlice) raises IoError:
     comptime op = "pg: invalid password"
     var b = password.as_bytes()
     _check_string(b, op)
-    _header(out, _PASSWORD, len(b) + 1, op)
+    _header(out, _PASSWORD, len(b) + 1, op, MAX_AUTH_MESSAGE_LENGTH)
     _put_string(out, b)
 
 
@@ -491,7 +511,7 @@ def write_sasl_initial_response(mut out: ByteBuffer, mechanism: StringSlice, dat
     comptime op = "pg: invalid SASL message"
     var m = mechanism.as_bytes()
     _check_string(m, op)
-    _header(out, _PASSWORD, len(m) + 1 + 4 + len(data), op)
+    _header(out, _PASSWORD, len(m) + 1 + 4 + len(data), op, MAX_AUTH_MESSAGE_LENGTH)
     _put_string(out, m)
     _put_i32(out, len(data))
     out.write_bytes(data)
@@ -499,7 +519,7 @@ def write_sasl_initial_response(mut out: ByteBuffer, mechanism: StringSlice, dat
 
 def write_sasl_response(mut out: ByteBuffer, data: Span[UInt8, _]) raises IoError:
     """A SASLResponse: the next message of the exchange."""
-    _header(out, _PASSWORD, len(data), "pg: invalid SASL message")
+    _header(out, _PASSWORD, len(data), "pg: invalid SASL message", MAX_AUTH_MESSAGE_LENGTH)
     out.write_bytes(data)
 
 
@@ -518,14 +538,13 @@ def write_copy_fail(mut out: ByteBuffer, message: StringSlice) raises IoError:
     comptime op = "pg: invalid CopyFail message"
     var b = message.as_bytes()
     _check_string(b, op)
-    _header(out, _COPY_FAIL, len(b) + 1, op)
+    _header(out, _COPY_FAIL, len(b) + 1, op, MAX_SMALL_MESSAGE_LENGTH)
     _put_string(out, b)
 
 
 def write_terminate(mut out: ByteBuffer) raises IoError:
     """A Terminate: the session ends; the server closes the connection."""
-    out.write_byte(_TERMINATE)
-    _put_i32(out, 4)
+    _header(out, _TERMINATE, 0, "pg: Terminate")
 
 
 struct Params(Copyable, Movable, Sized):
@@ -683,7 +702,7 @@ def write_describe(mut out: ByteBuffer, kind: UInt8, name: StringSlice) raises I
     _check_string(nb, "pg: invalid Describe")
     if kind != STATEMENT and kind != PORTAL:
         raise IoError.of_kind("pg: invalid Describe", ErrorKind.InvalidInput)
-    _header(out, _DESCRIBE, 1 + len(nb) + 1, "pg: invalid Describe")
+    _header(out, _DESCRIBE, 1 + len(nb) + 1, E_NAME_TOO_LONG, MAX_SMALL_MESSAGE_LENGTH)
     out.write_byte(kind)
     _put_string(out, nb)
 
@@ -694,7 +713,7 @@ def write_execute(mut out: ByteBuffer, portal: StringSlice, max_rows: Int = 0) r
     _check_string(pb, "pg: invalid Execute")
     if max_rows < 0 or max_rows > 0x7FFFFFFF:
         raise IoError.of_kind("pg: invalid Execute", ErrorKind.InvalidInput)
-    _header(out, _EXECUTE, len(pb) + 1 + 4, "pg: invalid Execute")
+    _header(out, _EXECUTE, len(pb) + 1 + 4, E_NAME_TOO_LONG, MAX_SMALL_MESSAGE_LENGTH)
     _put_string(out, pb)
     _put_i32(out, max_rows)
 
@@ -705,7 +724,7 @@ def write_close(mut out: ByteBuffer, kind: UInt8, name: StringSlice) raises IoEr
     _check_string(nb, "pg: invalid Close")
     if kind != STATEMENT and kind != PORTAL:
         raise IoError.of_kind("pg: invalid Close", ErrorKind.InvalidInput)
-    _header(out, _CLOSE, 1 + len(nb) + 1, "pg: invalid Close")
+    _header(out, _CLOSE, 1 + len(nb) + 1, E_NAME_TOO_LONG, MAX_SMALL_MESSAGE_LENGTH)
     out.write_byte(kind)
     _put_string(out, nb)
 
@@ -713,14 +732,12 @@ def write_close(mut out: ByteBuffer, kind: UInt8, name: StringSlice) raises IoEr
 def write_sync(mut out: ByteBuffer) raises IoError:
     """A Sync: ends an extended-protocol cycle (the server answers with
     ReadyForQuery, after skipping to it on an error)."""
-    out.write_byte(_SYNC)
-    _put_i32(out, 4)
+    _header(out, _SYNC, 0, "pg: Sync")
 
 
 def write_flush(mut out: ByteBuffer) raises IoError:
     """A Flush: asks the server to send what it has, without ending the cycle."""
-    out.write_byte(_FLUSH)
-    _put_i32(out, 4)
+    _header(out, _FLUSH, 0, "pg: Flush")
 
 
 @fieldwise_init
@@ -742,6 +759,7 @@ def write_cancel_request(mut out: ByteBuffer, key: BackendKey) raises IoError:
     """A CancelRequest, the whole of what is sent on a new connection to
     cancel the query `key`'s session is running (the server answers
     nothing and closes)."""
+    out.ensure_writable(16)
     _put_i32(out, 16)
     _put_i32(out, CANCEL_REQUEST_CODE)
     _put_i32(out, key.pid)

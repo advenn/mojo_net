@@ -23,12 +23,33 @@ def test_a_full_uri() raises:
     assert_equal(c.application_name, "tests")
     assert_true(c.connect_timeout == Duration.from_secs(7))
     assert_false(c.is_unix())
-    # what the session's startup message carries
+    # what the session's startup message carries: with the settings the
+    # client's readers rely on
     var conn = PgConnection(c.startup(), Span(nonce()))
     assert_equal(
         String(oracle().startup(sent(conn))),
-        "196608|user=alice|database=shop|application_name=tests|client_encoding=UTF8|options=-c search_path=app#",
+        "196608|user=alice|database=shop|application_name=tests|client_encoding=UTF8|options=-c search_path=app"
+        + "|DateStyle=ISO|extra_float_digits=3|bytea_output=hex#",
     )
+    # ... unless the caller set them (once, in any case)
+    var own = Config("alice")
+    own.set("datestyle", "ISO, DMY")
+    own.set("extra_float_digits", "1")
+    own.set("DateStyle", "iso, mdy")
+    var mine = PgConnection(own.startup(), Span(nonce()))
+    assert_equal(
+        String(oracle().startup(sent(mine))),
+        "196608|user=alice|client_encoding=UTF8|datestyle=iso, mdy|extra_float_digits=1|bytea_output=hex#",
+    )
+    # and a DateStyle whose output is not ISO is refused before connecting
+    var german = Config("alice")
+    german.set("DateStyle", "German")
+    var refused = False
+    try:
+        _ = german.startup()
+    except e:
+        refused = e.kind == ErrorKind.InvalidInput
+    assert_true(refused)
 
 
 def test_hosts_ports_and_sockets() raises:

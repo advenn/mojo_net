@@ -526,18 +526,17 @@ def test_protocol_violations() raises:
     # during startup
     assert_equal(_first_request(Startup("a"), _s(o.data_row("1"))), unexpected)
     assert_equal(_first_request(Startup("a"), _s(o.ready("I"))), unexpected)
-    assert_equal(
-        _first_request(Startup("a"), _s(o.negotiate(0, "_pq_.x"))),
-        "error Unsupported: pg: the server cannot speak protocol 3.0 as asked",
-    )
+    # NegotiateProtocolVersion: none is due, since this client asks for 3.0
+    # and no protocol options (test_pg_regressions has more)
+    var negotiated = "error InvalidData: pg: NegotiateProtocolVersion, though nothing was negotiated"
+    assert_equal(_first_request(Startup("a"), _s(o.negotiate(196608, "_pq_.x"))), negotiated)
     assert_equal(  # one option said, none there
-        _first_request(Startup("a"), String(hex("v"), "0000000c", "00000000", "00000001")),
-        "error Unsupported: pg: the server cannot speak protocol 3.0 as asked",
+        _first_request(Startup("a"), String(hex("v"), "0000000c", "00030000", "00000001")), negotiated
     )
-    assert_equal(_first_request(Startup("a"), _s(o.negotiate(0)) + _s(o.auth_ok()) + _s(o.session())), "READY I")
-    assert_equal(  # only before authentication starts
-        _first_request(Startup("a", password="p"), _s(o.auth_cleartext()) + _s(o.negotiate(0))),
-        "error InvalidData: pg: unexpected message from the server+sent",
+    assert_equal(_first_request(Startup("a"), _s(o.negotiate(196608)) + _s(o.auth_ok()) + _s(o.session())), negotiated)
+    assert_equal(
+        _first_request(Startup("a", password="p"), _s(o.auth_cleartext()) + _s(o.negotiate(196608))),
+        String(negotiated, "+sent"),
     )
 
 

@@ -2,15 +2,16 @@
 
 A PostgreSQL client for Mojo on Linux, speaking the frontend/backend protocol (version 3.0) natively, without libpq. It is the first of the roadmap's database drivers. Package rules and the shared contracts are in `docs/design.md`. The transport is `net` (`docs/net.md`), and the authentication primitives are `crypto`.
 
-**Status: P1–P4 done:**
+**Status: P1–P7 done:**
 - the cryptographic primitives;
 - the sans-I/O codec for a session (`PgConnection`);
 - a blocking client (`pg.client`), tested against PostgreSQL 18;
 - the extended query protocol: parameters and prepared statements;
 - types: binary values for the common types, typed accessors, and a statement cache;
-- transactions, waiting for notifications, and a pool of sessions.
+- transactions, waiting for notifications, and a pool of sessions;
+- three independent reviews, with every finding fixed and a regression test for each.
 
-Next is P7: independent reviews, and polish.
+Leads: COPY (refused with CopyFail for now), TLS once `net` has it, protocol 3.2, full SASLprep.
 
 ## Scope
 **In scope:**
@@ -30,7 +31,7 @@ Next is P7: independent reviews, and polish.
 ## Decisions
 - **Sans-I/O.** The protocol logic is a `Codec` (design contract 1). It parses and builds messages, runs the startup and authentication exchange, and tracks the query flow, but never touches a socket or a clock. Only `pg.client` imports `net` (`SANS_IO` in `tools/check_imports.py`).
 - **The caller supplies randomness.** The SCRAM client nonce is given to the codec; the blocking client reads it from getrandom. So codec tests replay exact exchanges (contract 7).
-- **Protocol 3.0.** Every supported server speaks it. Protocol 3.2 (PostgreSQL 18, longer cancel keys) can come later. A NegotiateProtocolVersion answer is handled.
+- **Protocol 3.0.** Every supported server speaks it. Protocol 3.2 (PostgreSQL 18, longer cancel keys) can come later. The client asks for 3.0 and sends no protocol options (`_pq_.` parameters are refused), so a server has nothing to negotiate: a NegotiateProtocolVersion is refused (`InvalidData`), as libpq refuses one that asks for no change.
 - **No silent downgrade.** `sslmode` values `disable`, `allow` and `prefer` connect in cleartext; none of them guarantees encryption. `require`, `verify-ca`, `verify-full` and `channel_binding=require` are refused with `Unsupported`, not ignored.
 - **Authentication.**
   - **SCRAM-SHA-256** (RFC 5802, RFC 7677) has been PostgreSQL's default since version 14. The client checks the server's final signature, in constant time, so a server that does not know the password cannot pass as authenticated. It also checks that the server's nonce extends the client's.
@@ -44,14 +45,15 @@ Next is P7: independent reviews, and polish.
   - **In the codec:** ErrorResponse and NoticeResponse are events carrying every field: severity, SQLSTATE, message, detail, hint, position, and so on.
   - **In the blocking client:** it raises `PgError`, which holds either the transport's `IoError` or the server's error with its SQLSTATE. So a caller can tell a unique violation from a lost connection.
   - **Below `pg`:** contract 8 still holds. `IoError` is register-passable with a static op name and cannot carry a server's message.
-- **Encoding.** The startup message asks for `client_encoding=UTF8`.
+- **The session's settings.** The client's strings are UTF-8, and it reads the text forms of dates, floats and bytea, which depend on the session. So the startup message asks for `client_encoding=UTF8`, and `Config.startup` adds `DateStyle=ISO`, `extra_float_digits=3` (a float's text keeps every bit) and `bytea_output=hex` unless the caller set them. A role's or the server's defaults (`ALTER ROLE ... SET datestyle`) cannot change them then. A DateStyle whose output is not ISO is refused, and a session switched to another client_encoding (`SET client_encoding`) is ended (`Unsupported`), since every text value would be garbled both ways.
+- **Bounds on what a server sends.** Messages are refused from their length field alone: past `max_message` (1 GiB) once authenticated, and before that past libpq's bounds (2000 bytes; 30000 for an error), since a server, or anything between before TLS, could otherwise make the client allocate without limit. More than 256 distinct ParameterStatus names are refused too, and past `MAX_NOTICES` (1024) the oldest notices kept are dropped.
 
 ## Testing
 - **P2:** the Python oracle `tests/pg/pg_oracle.py`, written from the protocol documentation independently of `crypto` and `pg`.
   - It builds backend messages, parses what the client sent, and runs the server side of MD5 and SCRAM with hashlib and hmac.
   - Its transcripts are replayed in every split (`drive_chunked`), and mutated ones must end in events or an error, never a crash.
 - **From P3:** a real PostgreSQL, `postgresql` from conda-forge (a pixi dependency, test-only like Python).
-  - **Clusters:** `tests/pg/pg_cluster.py` makes a throwaway one per test, in under a second: `initdb` in a temp directory, durability off, a Unix socket in that directory and a free port on 127.0.0.1. `tests/pg/pg_server.mojo` starts and stops it; a test stops it whatever happens.
+  - **Clusters:** `tests/pg/pg_cluster.py` makes a throwaway one per test, in under a second: `initdb` in a temp directory, durability off, a Unix socket in that directory and a free port on 127.0.0.1. `tests/pg/pg_server.mojo` starts and stops it; a test stops it whatever happens, and a watcher process stops it once the test process has ended without doing so (a crash, a timeout).
   - **Users:** one per authentication method in `pg_hba.conf`, over both transports: `trusty` (trust), `plain` (password), `md5user` (md5, its password stored as MD5) and `scram` (scram-sha-256, a non-ASCII password).
   - **Without a server** (no `initdb`, or running as root, which initdb refuses), these tests are skipped; `MOJO_NET_REQUIRE_PG=1` makes that an error.
 
@@ -90,21 +92,25 @@ def main() raises:
   - `query_params(sql, params)` takes a `Params` for NULLs, raw bytes (`add_binary`, bytea) or declared types (`add_text(value, oid)`).
   - `execute(sql, args...)` returns the rows affected.
   - `simple_query(sql)` runs a script of several statements, without parameters, and returns each one's result.
-  - `Rows` has `columns`, `tag`, and per value `is_null`, `value` (the bytes as they came) and the typed accessors.
+  - `Rows` has `columns`, `tag`, and per value `is_null`, `value` (the bytes as they came) and the typed accessors. A row or column out of range raises `InvalidInput`.
     - **The accessors:** `text`, `int`, `float`, `bool`, `bytes` (bytea), `date` (`pg.types.Date`), and `timestamp` (microseconds since 1970, UTC for timestamptz).
     - **Either form:** they read the binary or the text form alike, and `text` gives the server's own text for either.
+    - **Each reads its own types:** `int` integers (and numerics or text holding one; not floats), `float` floats, integers and numerics (one past a float's range raises, as the server's cast does), `bool` booleans, `bytes` bytea.
 - **The statement cache** (`Config.statement_cache`, 256 by default; `statement_cache_capacity` in a URI):
   - The first run of a SQL text prepares it, which costs one extra round trip and tells the column types. Every later run is one round trip without the server's parse, with binary results where `pg.types` reads them (`SELECT 1` takes 11.5 µs, against 13.5 µs through the simple protocol).
+  - The key is the SQL text with the parameter types `Params` declares, which the prepare sends; types left at 0 go to the server.
   - The least recently used statement goes first when the cache is full, closed on the server too.
-  - When a cached plan's result type changes (after `ALTER TABLE`: 0A000), the statement is prepared afresh and run once more, outside a transaction.
+  - **A statement gone stale is prepared afresh and run once more, outside a transaction,** since nothing ran: when a cached plan's result type changed (after `ALTER TABLE`: 0A000 from `RevalidateCachedQuery`; another 0A000 is raised as is), or when the server dropped the statement (26000, after a `DEALLOCATE`). `DISCARD ALL` and `DEALLOCATE ALL` empty the cache.
+  - Statement names are "mojo_", random hex and a counter, so they meet no statement the session had already (`PREPARE`, a pooler's).
   - 0 turns the cache off: each query then uses the unnamed statement, with text results, as PgBouncer's transaction pooling needs.
 - **Errors raise `PgError`.**
   - A server error (`is_server()`, the SQLSTATE in `code()`, every field in `server()`) leaves the session usable.
   - Anything else closes it: a transport or protocol error, or the server ending the session.
-- **A query's `timeout`:**
-  - When it passes, the query is cancelled. The client sends a CancelRequest on a new connection and waits until the server has taken it, as libpq does.
+- **A query's `timeout`** bounds it, rows still coming included:
+  - When it passes, the query is cancelled. The client sends a CancelRequest on a new connection, to the address the session is connected to (not the host name resolved again), and waits until the server has taken it, as libpq does.
   - The session stays usable, and the error says `is_deadline()`, with the server's 57014 attached.
-  - If the server does not end the query within `CANCEL_GRACE`, the connection is closed.
+  - The cancel and the query's end share `CANCEL_GRACE`. If the query has not ended by then, or a cancel went out but was not seen through (it could land on the next statement), the connection is closed.
+- **TCP keepalive** is on (`Config.keepalive`): probes after 30 s of silence and a user timeout, so a server that vanished is noticed within about a minute.
 - **Transactions:**
   - `begin()`, `commit()` and `rollback()`. `commit()` raises when the server rolled a failed transaction back instead (`E_ROLLED_BACK`).
   - `savepoint(name)`, `rollback_to(name)` and `release(name)`, the name quoted as an identifier. `transaction_status()` follows each.
@@ -154,7 +160,7 @@ while True:
 - **Results come as events, in order.**
   - `query` may be called again before READY: the queries are pipelined, and each one's events end with its own READY.
   - `ev.columns()` describes the rows that follow. `ev.tag()` and `ev.rows_affected()` give the command's outcome.
-- **Server errors are events.** `poll` raises only when the connection can no longer be used: the server broke the protocol, authentication was refused, or EOF came while the session was open. EOF after `terminate()` or after a FATAL error is the normal end.
+- **Server errors are events.** `poll` raises only when the connection can no longer be used: the server broke the protocol, authentication was refused, or EOF came while the session was open. EOF after a FATAL error, or after `terminate()` once the queries queued before it were answered, is the normal end. Once `poll` raised, `is_open()` is false and requests raise the same error.
 - **The session's state:**
   - `is_idle()`;
   - `transaction_status()` (`IDLE`, `IN_TRANSACTION`, `FAILED_TRANSACTION`);
@@ -163,7 +169,7 @@ while True:
 
 ## Modules
 - **`message`:** the wire format.
-  - Frontend messages are built into a `ByteBuffer`. They refuse NUL bytes, and keep the startup packet under the server's 10000-byte limit.
+  - Frontend messages are built into a `ByteBuffer`, whole or not at all. They refuse NUL bytes, and messages longer than the server reads (the startup packet's 10000 bytes; Query, Parse and Bind up to 1 GiB; Describe and Close up to 10000 bytes, which bounds statement names).
   - Backend bodies are checked once, when they arrive. `ServerMessage` reads the fields of an error or notice, `Column` those of a RowDescription.
 - **`auth`:** the MD5 answer, and `ScramClient`, the client side of SCRAM-SHA-256.
 - **`connection`:**
@@ -306,7 +312,29 @@ while True:
     - One was equivalent: after a FATAL error the session has ended, so `check()` refuses it even without its explicit test for errors.
     - One needed a stronger test. A backend killed outright sends nothing, and only its socket closes. The test kills one with SIGKILL (the cluster's `CHECKPOINT` after setup keeps its users through the crash recovery), and its retry loop no longer hides a dead session handed out.
   - **Not done:** COPY, which stays refused (CopyFail), a lead for later. So is a scope that rolls back by itself on an error, which needs `with` support or function values that capture the client.
-- **P7: review and polish.**
-  - Independent reviews, with a regression test for each finding.
-  - Performance measured against libpq.
-  - Examples, and the guide.
+- **P7: reviews and polish.** Done.
+  - **Three independent reviews,** each by an agent that had not written the code: values and types; the client, its configuration and the pool; the wire protocol, the session codec and authentication. Each finding has a regression test that failed before its fix: `tests/pg/test_pg_regressions.mojo` (no server needed) and `tests/pg/test_pg_regressions_client.mojo` (against PostgreSQL).
+  - **The serious ones:**
+    - **Results one query behind.** A COPY FROM STDIN that fails before it reads (into a view, with FREEZE, from a statement trigger) leaves copy-in mode at once. Our first Sync then ends its cycle, and the Sync sent after the CopyFail draws a second ReadyForQuery. That one ended the next cycle, so every later query got the previous one's rows, while the session looked healthy and went back to a pool. The codec now keeps that Sync in its line of cycles. A ReadyForQuery that comes while it is at the head is its own and is dropped; any other message shows it drew none, since every cycle has a message before its ReadyForQuery.
+    - **Settings from the role.** The text forms the client reads depend on DateStyle, extra_float_digits and bytea_output, which a role or the server may set. `ALTER ROLE app SET datestyle = 'SQL, DMY'` broke every date, and `extra_float_digits = 0` dropped float bits. The client now sets all three at startup (see the decisions above), and ends a session switched to another client_encoding.
+    - **Cancels.** A cancel went to the host name resolved again, maybe to another server. One that was not seen through left the session open, where it could cancel the next statement. Cancels now go to the session's address, and one sent but unconfirmed closes the session.
+    - **A deadline that rows outran.** A receive waits, and so checks the deadline, only when nothing is queued: a query whose rows kept coming was never stopped. The client checks the deadline before each receive.
+    - **Memory before authentication.** A server, or anything between (there is no TLS), could send 1 GiB messages before AuthenticationOk, and SCRAM's parsing took 16 bytes per comma of one: tens of GiB. libpq's bounds now apply, and ScramClient reads only the attributes it needs.
+    - **A half-written request.** A request that did not fit the transmit buffer (64 MiB) left its type byte and length queued, and the next request went out as the rest of its body: the session hung. Every builder now writes its message whole or not at all, refuses one longer than the server reads (`InvalidInput`, where the server would close the connection without a word), and the codec queues requests up to the server's 1 GiB.
+  - **The rest:**
+    - **Values:** timestamps past what microseconds since 1970 hold (PostgreSQL goes to 294276) wrapped, or landed on the infinity sentinels; impossible dates (February 30, year 0) and hours (24:30) were taken; offsets of three-digit hours (POSIX time zones) were refused; bytea in escape form was refused; `"char"` in binary form was not written as the server writes it, and now comes in text form; `int()` refused int8's extremes in text, and took floats; `bool()` took any byte; `float()` refused binary integers, read float4 text as a float8, and made numerics past a float's range into infinities; a result with no columns had no rows; an index past the end read another row.
+    - **The cache:** declared parameter types were neither sent nor part of the key; `DISCARD ALL` and `DEALLOCATE` left it naming statements the server no longer had; any 0A000 ran the statement a second time, a function's own error after its side effects included.
+    - **The session:** keepalive was off; notices piled up without bound; statement names could meet ones made with `PREPARE`; `begin()` on an ended session said a transaction was open; `Pool.opened()` counted connects that failed.
+    - **URIs,** now read as libpq reads them: `[]` is no host, an empty `host=` the default, a repeated parameter its last value; `gssencmode`, `client_encoding` (UTF8 only) and `ssl=true` (`Unsupported`) are known.
+    - **The codec:** a second RowDescription before CommandComplete was taken; ParameterStatus names had no bound; a failed `poll` left the event's new body under its old kind; `is_open()` stayed true after a failure; messages after a FATAL error were taken, and EOF after Terminate was clean with queries unanswered; a NUL in the password was found only when the server asked for it; statement names too long for the server's Describe and Close were sent; NegotiateProtocolVersion was taken, though nothing was asked; SCRAM user names were written as Latin-1.
+  - **Not changed:** a server may choose a SCRAM iteration count of 1, which makes guessing the password from a captured exchange cheap. libpq and PostgreSQL accept any count too; a minimum is a lead, with TLS.
+  - **A bug in the fixes:** re-reading them turned up one more. Before authentication, a `max_message` under libpq's 2000 bytes was not honoured, so such a message could never fit the receive buffer. It has a test too.
+  - **Planted bugs:** 66, one per fix undone. The first run caught 61, but four of those counted for nothing: they were credited to a test file that failed without any mutation (`test_config.mojo`, whose expected startup message predated the new settings). Updated, with each test file now checked to pass before any mutant is judged by it, it catches all four.
+    - Two were equivalent, and showed code to remove. Once each message reserves its whole room, building a Query apart before it joins the queue changed nothing. And a cancel not seen through spends the whole grace, so the collect after it already closes the session.
+    - Three needed tests: a bytea escape with two octal digits; `DISCARD ALL`, whose tag the 26000 retry hid (now also checked through `DEALLOCATE ALL` in a transaction, where nothing is retried); and `check()` on an idle session with a notification waiting.
+    - A second run of 8 caught all: those three, the reworked cancel, and the bug in the fixes.
+    - The mutants that crashed a server test left its cluster running. `pg_cluster.py` now starts a watcher with each cluster, which stops it once the test process has ended.
+  - **Measured** on the Unix socket, with client and server on one laptop. The code before and after the fixes was built side by side and run in turns against one server (medians of 8 runs):
+    - `SELECT 1` takes 12.0 µs with the cache (pgbench's prepared mode: 10.5) and 13.5 µs through `simple_query` (pgbench's simple mode: 13.1).
+    - The fixes cost up to 0.14 µs of client CPU per query: 5.30 µs became 5.44 for `SELECT 1` through the cache, 4.57 became 4.61 through `simple_query`.
+    - A million rows of four columns take about 0.9 s, the server's time. The client's CPU is about 200 ns a row with binary results and 220 ns with text, the same as before the fixes.

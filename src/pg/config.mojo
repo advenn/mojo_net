@@ -18,14 +18,19 @@ Parameters known here:
 - `options`, the server's command-line switches, such as
   `-c search_path=app`;
 - `sslmode`: `disable`, `allow` or `prefer`, which all connect in cleartext
-  here. The values that require TLS are refused with `Unsupported`;
-- `channel_binding`: `disable` or `prefer`;
+  here. The values that require TLS are refused with `Unsupported`, and so
+  is `ssl=true` (libpq's name for `sslmode=require` in JDBC-style URIs);
+- `channel_binding`: `disable` or `prefer`; `gssencmode`: `disable`,
+  `allow` or `prefer` (`require`: `Unsupported`);
+- `client_encoding`: UTF8 only, which the session always uses;
 - `require_auth`: comma-separated methods (`password`, `md5`,
   `scram-sha-256`, `none`), or the same list with each method prefixed by
   `!` to exclude it.
 
-Anything else is refused (`InvalidInput`), as libpq refuses it, rather than
-ignored. So is a list of hosts, which libpq would try in turn.
+Anything else is refused (`InvalidInput`) rather than ignored, and so is a
+list of hosts (`Unsupported`), which libpq would try in turn. As in libpq,
+a parameter given twice takes its last value, and an empty `host=` means
+the default.
 
 What libpq does that is not done here: environment variables (PGHOST and
 the others), the password file, and service files.
@@ -67,6 +72,10 @@ struct Config(Copyable, Movable):
     """How many prepared statements the client keeps per connection (the
     least recently used goes first); 0 for none, as PgBouncer's
     transaction pooling needs."""
+    var keepalive: Bool
+    """For TCP: keepalive probes and a user timeout, so that a server that
+    vanished (power loss, a NAT or load balancer dropping the flow) is
+    noticed in about a minute (`net.blocking.detect_dead_peers`)."""
     var _params: List[String]
 
     def __init__(
@@ -82,6 +91,7 @@ struct Config(Copyable, Movable):
         allow: AuthMethods = AuthMethods.ALL,
         max_message: Int = DEFAULT_MAX_MESSAGE,
         statement_cache: Int = DEFAULT_STATEMENT_CACHE,
+        keepalive: Bool = True,
     ):
         self.host = host
         self.port = port
@@ -93,13 +103,25 @@ struct Config(Copyable, Movable):
         self.allow = allow
         self.max_message = max_message
         self.statement_cache = statement_cache
+        self.keepalive = keepalive
         self._params = List[String]()
 
     def set(mut self, name: String, value: String):
         """A run-time parameter for the session, sent in the startup
-        message (see `Startup.set`)."""
+        message (see `Startup.set`); a second `set` of the same name
+        (in any case) replaces the first."""
+        for i in range(0, len(self._params), 2):
+            if self._params[i].lower() == name.lower():
+                self._params[i + 1] = value
+                return
         self._params.append(name)
         self._params.append(value)
+
+    def _has(self, name: StringSlice) -> Bool:
+        for i in range(0, len(self._params), 2):
+            if self._params[i].lower() == String(name).lower():
+                return True
+        return False
 
     def is_unix(self) -> Bool:
         """Whether `host` names a Unix socket directory."""
@@ -109,8 +131,18 @@ struct Config(Copyable, Movable):
         """The Unix socket's path, for a `host` that is a directory."""
         return String(self.host, "/.s.PGSQL.", self.port)
 
-    def startup(self) -> Startup:
-        """The codec's settings for a session with this configuration."""
+    def startup(self) raises IoError -> Startup:
+        """The codec's settings for a session with this configuration.
+
+        Three run-time parameters are added unless the caller set them,
+        since the client's reading of values depends on them, whatever the
+        role or the server would choose: `DateStyle=ISO` (the text of
+        dates and timestamps), `extra_float_digits=3` (floats in text keep
+        every bit) and `bytea_output=hex`. A DateStyle whose output format
+        is not ISO raises `InvalidInput`."""
+        for i in range(0, len(self._params), 2):
+            if self._params[i].lower() == "datestyle" and not self._params[i + 1].upper().startswith("ISO"):
+                raise IoError.of_kind("pg: DateStyle must start with ISO", ErrorKind.InvalidInput)
         var s = Startup(
             self.user,
             database=self.database,
@@ -121,6 +153,12 @@ struct Config(Copyable, Movable):
         )
         for i in range(0, len(self._params), 2):
             s.set(self._params[i], self._params[i + 1])
+        if not self._has("DateStyle"):
+            s.set("DateStyle", "ISO")
+        if not self._has("extra_float_digits"):
+            s.set("extra_float_digits", "3")
+        if not self._has("bytea_output"):
+            s.set("bytea_output", "hex")
         return s^
 
     @staticmethod
@@ -165,6 +203,8 @@ struct Config(Copyable, Movable):
             if close < 0:
                 raise IoError.of_kind(E_URI, ErrorKind.InvalidInput)
             c.host = _decode(b[host_start + 1 : close])
+            if c.host.byte_length() == 0:  # ("[]": no address)
+                raise IoError.of_kind(E_URI, ErrorKind.InvalidInput)
             if close + 1 < authority_end:
                 if Int(b[close + 1]) != ord(":"):
                     raise IoError.of_kind(E_URI, ErrorKind.InvalidInput)
@@ -199,7 +239,7 @@ struct Config(Copyable, Movable):
         if name == "host":
             if value.find(",") >= 0:
                 raise IoError.of_kind(E_HOSTS, ErrorKind.Unsupported)
-            self.host = value
+            self.host = value if value.byte_length() > 0 else String("localhost")  # (empty: the default)
         elif name == "port":
             self.port = _port(value.as_bytes())
         elif name == "user":
@@ -221,6 +261,19 @@ struct Config(Copyable, Movable):
         elif name == "channel_binding":
             if not (value == "disable" or value == "prefer"):
                 raise IoError.of_kind(E_TLS, ErrorKind.Unsupported)
+        elif name == "gssencmode":
+            if value == "require":
+                raise IoError.of_kind("pg: GSSAPI encryption is not supported", ErrorKind.Unsupported)
+            if not (value == "disable" or value == "allow" or value == "prefer"):
+                raise IoError.of_kind(E_URI, ErrorKind.InvalidInput)
+        elif name == "client_encoding":  # (always UTF8 here)
+            var v = value.lower()
+            if not (v == "utf8" or v == "utf-8" or v == "unicode"):
+                raise IoError.of_kind("pg: client_encoding is always UTF8", ErrorKind.Unsupported)
+        elif name == "ssl":  # (libpq: ssl=true is sslmode=require, for JDBC URIs)
+            if value == "true":
+                raise IoError.of_kind(E_TLS, ErrorKind.Unsupported)
+            raise IoError.of_kind(E_URI, ErrorKind.InvalidInput)
         elif name == "require_auth":
             self.allow = _require_auth(value)
         elif name == "statement_cache_capacity":  # (pgx's name)

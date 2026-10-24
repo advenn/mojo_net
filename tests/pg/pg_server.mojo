@@ -6,7 +6,8 @@ port and a Unix socket).
 missing, or this is root, which initdb refuses. With
 MOJO_NET_REQUIRE_PG=1 that is an error instead. Stop the server
 explicitly, whatever happens in the test (`server.stop()`, which can be
-called more than once): it is another process, which outlives the value."""
+called more than once): it is another process, which outlives the value.
+(If the test process crashes, the cluster's watcher stops it.)"""
 
 from std.os import getenv
 from std.python import Python, PythonObject
@@ -46,8 +47,9 @@ struct PgServer(Movable):
             return None
         var subprocess = Python.import_module("subprocess")
         var sys = Python.import_module("sys")
+        var me = String(Int(py=os.getpid()))  # (watched: a crash cannot leave the cluster running)
         var r = subprocess.run(
-            Python.list(sys.executable, "tests/pg/pg_cluster.py", "start"), capture_output=True, text=True
+            Python.list(sys.executable, "tests/pg/pg_cluster.py", "start", me), capture_output=True, text=True
         )
         if Int(py=r.returncode) != 0:
             raise Error(String("pg_cluster.py start failed: ", String(py=r.stderr)))

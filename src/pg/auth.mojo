@@ -69,17 +69,21 @@ def md5_password(user: StringSlice, password: StringSlice, salt: Span[UInt8, _])
     return String("md5", _hex(md5(Span(outer))))
 
 
-def _attributes(data: Span[UInt8, _]) -> List[Int]:
-    """Where each comma-separated attribute starts and ends."""
-    var out = List[Int]()
+def _attributes(data: Span[UInt8, _], most: Int) -> List[Int]:
+    """Where each of the first `most` comma-separated attributes starts and
+    ends (the rest is not looked at: it stays in the AuthMessage as is)."""
+    var out = List[Int](capacity=2 * most)
     var start = 0
-    for i in range(len(data)):
+    var i = 0
+    while i < len(data) and len(out) < 2 * most:
         if data[i] == _COMMA:
             out.append(start)
             out.append(i)
             start = i + 1
-    out.append(start)
-    out.append(len(data))
+        i += 1
+    if len(out) < 2 * most:
+        out.append(start)
+        out.append(len(data))
     return out^
 
 
@@ -92,15 +96,16 @@ def _is(data: Span[UInt8, _], at: List[Int], k: Int, name: UInt8) -> Bool:
 
 
 def _saslname(user: StringSlice) -> String:
-    """RFC 5802's escaping of a user name: "=" as "=3D", "," as "=2C"."""
+    """RFC 5802's escaping of a user name (UTF-8): "=" as "=3D", "," as
+    "=2C"."""
     var out = String()
-    for b in user.as_bytes():
-        if b == _EQUALS:
+    for c in user.codepoint_slices():
+        if c == "=":
             out += "=3D"
-        elif b == _COMMA:
+        elif c == ",":
             out += "=2C"
         else:
-            out += chr(Int(b))
+            out += c
     return out^
 
 
@@ -145,7 +150,7 @@ struct ScramClient(Copyable, Movable):
         message (`r=nonce,s=salt,i=iterations`, maybe more)."""
         if self._state != 0:
             raise IoError.of_kind(E_SCRAM_ORDER, ErrorKind.InvalidInput)
-        var at = _attributes(server_first)
+        var at = _attributes(server_first, 3)
         if _is(server_first, at, 0, _M):
             raise IoError.of_kind(E_SCRAM_EXTENSION, ErrorKind.Unsupported)
         if not (_is(server_first, at, 0, _R) and _is(server_first, at, 1, _S) and _is(server_first, at, 2, _I)):
@@ -206,7 +211,7 @@ struct ScramClient(Copyable, Movable):
         """Check the server-final-message (`v=signature`)."""
         if self._state != 1:
             raise IoError.of_kind(E_SCRAM_ORDER, ErrorKind.InvalidInput)
-        var at = _attributes(server_final)
+        var at = _attributes(server_final, 1)
         if _is(server_final, at, 0, _E):
             raise IoError.of_kind(E_SCRAM_REFUSED, ErrorKind.PermissionDenied)
         if not _is(server_final, at, 0, _V):

@@ -25,7 +25,7 @@ from pg.types import (
     binary_date,
     binary_int,
     binary_timestamp_us,
-    parse_bytea_hex,
+    parse_bytea,
     parse_date,
     parse_timestamp_us,
     wants_binary,
@@ -190,15 +190,15 @@ def test_timestamptz_text_and_offsets() raises:
 
 
 def test_bytea_text_form() raises:
-    var b = parse_bytea_hex("\\x00ff10AB".as_bytes())
+    var b = parse_bytea("\\x00ff10AB".as_bytes())
     assert_equal(len(b), 4)
     assert_equal(b[1], 255)
     assert_equal(b[3], 0xAB)
-    assert_equal(len(parse_bytea_hex("\\x".as_bytes())), 0)
-    for bad in ["00ff", "\\x0", "\\xzz", "\\001"]:
+    assert_equal(len(parse_bytea("\\x".as_bytes())), 0)
+    for bad in ["\\x0", "\\xzz", "\\x0g"]:  # (escape format: test_pg_regressions)
         var refused = False
         try:
-            _ = parse_bytea_hex(String(bad).as_bytes())
+            _ = parse_bytea(String(bad).as_bytes())
         except e:
             refused = True
         assert_true(refused, bad)

@@ -9,12 +9,14 @@ server would, so `Rows.text` reads the same in either form:
 - uuid;
 - date, time and timestamp (ISO, as `DateStyle = ISO`, the default; BC
   years and infinities included);
-- text, varchar, bpchar, name and "char".
+- text, varchar, bpchar and name.
 
 The rest stays in text form: the floats (PostgreSQL 12 and later print
 them shortest and exact, so parsing them loses nothing), timestamptz (whose
 text depends on the session's TimeZone), numeric, interval, json, arrays,
-and every type this list does not name.
+and every type this list does not name ("char" too: the server writes its
+high bytes as octal escapes, which `write_binary_as_text` also does for a
+caller who asks for binary).
 """
 
 from linux import ErrorKind, IoError
@@ -70,13 +72,12 @@ def wants_binary(oid: UInt32) -> Bool:
         or oid == BPCHAR
         or oid == OID
         or oid == TIME
-        or oid == CHAR
     )
 
 
 def is_text_like(oid: UInt32) -> Bool:
     """Types whose binary form is their text: UTF-8 bytes."""
-    return oid == TEXT_TYPE or oid == VARCHAR or oid == BPCHAR or oid == NAME or oid == CHAR
+    return oid == TEXT_TYPE or oid == VARCHAR or oid == BPCHAR or oid == NAME
 
 
 @inline(.always)
@@ -255,6 +256,13 @@ def write_binary_as_text(mut writer: Some[Writer], oid: UInt32, v: Span[UInt8, _
         writer.write(String(from_utf8_lossy=v))
     elif oid == INT4 or oid == INT8 or oid == INT2 or oid == OID:
         writer.write(binary_int(oid, v))
+    elif oid == CHAR:  # (as charout writes it: NUL as nothing, high bytes in octal)
+        if len(v) != 1:
+            raise IoError.of_kind(E_VALUE, ErrorKind.InvalidData)
+        if v[0] >= 0x80:
+            writer.write("\\", Int(v[0] >> 6), Int((v[0] >> 3) & 7), Int(v[0] & 7))
+        elif v[0] != 0:
+            writer.write(chr(Int(v[0])))
     elif oid == BOOL:
         if len(v) != 1:
             raise IoError.of_kind(E_VALUE, ErrorKind.InvalidData)
@@ -326,8 +334,23 @@ def _expect(t: Span[UInt8, _], mut at: Int, c: UInt8) raises IoError:
     at += 1
 
 
+def _days_in_month(year: Int, month: Int) -> Int:
+    """For an astronomical year (1 BC is year 0, a leap year)."""
+    if month == 2:
+        return 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28
+    if month == 4 or month == 6 or month == 9 or month == 11:
+        return 30
+    return 31
+
+
+def _check_day(d: Date) raises IoError:
+    if d.day > _days_in_month(d.year, d.month):
+        raise IoError.of_kind(E_TEXT, ErrorKind.InvalidData)
+
+
 def _ymd(t: Span[UInt8, _], mut at: Int) raises IoError -> Date:
-    """YYYY-MM-DD, the year with 4 or more digits."""
+    """YYYY-MM-DD, the year with 4 or more digits (and from 1: the text
+    counts years BC from 1 too)."""
     var start = at
     while at < len(t) and t[at] >= 48 and t[at] <= 57:
         at += 1
@@ -340,7 +363,7 @@ def _ymd(t: Span[UInt8, _], mut at: Int) raises IoError -> Date:
     var month = _digits(t, at, 2)
     _expect(t, at, _DASH)
     var day = _digits(t, at, 2)
-    if month < 1 or month > 12 or day < 1 or day > 31:
+    if year < 1 or month < 1 or month > 12 or day < 1 or day > 31:
         raise IoError.of_kind(E_TEXT, ErrorKind.InvalidData)
     return Date(year, month, day, 0)
 
@@ -374,6 +397,7 @@ def parse_date(t: Span[UInt8, _]) raises IoError -> Date:
     _bc(t, at, d)
     if at != len(t):
         raise IoError.of_kind(E_TEXT, ErrorKind.InvalidData)
+    _check_day(d)
     return d
 
 
@@ -409,7 +433,8 @@ def parse_timestamp_us(t: Span[UInt8, _]) raises IoError -> Int:
     if at < len(t) and (t[at] == _PLUS or t[at] == _DASH):
         var sign = 1 if t[at] == _PLUS else -1
         at += 1
-        offset = _digits(t, at, 2) * 3600
+        var three = at + 2 < len(t) and t[at + 2] >= 48 and t[at + 2] <= 57  # (POSIX zones reach 167 hours)
+        offset = _digits(t, at, 3 if three else 2) * 3600
         if at < len(t) and t[at] == _COLON:
             at += 1
             offset += _digits(t, at, 2) * 60
@@ -418,23 +443,55 @@ def parse_timestamp_us(t: Span[UInt8, _]) raises IoError -> Int:
                 offset += _digits(t, at, 2)
         offset *= sign
     _bc(t, at, d)
-    if at != len(t) or h > 24 or m > 59 or s > 60:
+    if at != len(t) or h > 23 or m > 59 or s > 59:
         raise IoError.of_kind(E_TEXT, ErrorKind.InvalidData)
-    return (d.days_since_1970() * 86400 + h * 3600 + m * 60 + s - offset) * 1000000 + us
+    _check_day(d)
+    var secs = d.days_since_1970() * 86400 + h * 3600 + m * 60 + s - offset
+    # Past what microseconds since 1970 can hold (PostgreSQL goes 29 years
+    # beyond), and never onto the infinity sentinels.
+    if secs > (Int.MAX - 1 - us) // 1000000 or secs < -(Int.MAX // 1000000 - 1):
+        raise IoError.of_kind("pg: timestamp out of range for microseconds since 1970", ErrorKind.InvalidData)
+    return secs * 1000000 + us
 
 
-def parse_bytea_hex(t: Span[UInt8, _]) raises IoError -> List[UInt8]:
-    """A bytea in the server's text form with `bytea_output = hex`: "\\x"
-    then two hex digits per byte."""
-    if len(t) < 2 or t[0] != _BACKSLASH or t[1] != _X or len(t) % 2 != 0:
-        raise IoError.of_kind(E_TEXT, ErrorKind.InvalidData)
-    var out = List[UInt8](capacity=(len(t) - 2) // 2)
-    for i in range(2, len(t), 2):
-        var hi = _hex(t[i])
-        var lo = _hex(t[i + 1])
-        if hi < 0 or lo < 0:
+def parse_bytea(t: Span[UInt8, _]) raises IoError -> List[UInt8]:
+    """A bytea in the server's text form: hex ("\\x" then two hex digits
+    per byte, `bytea_output = hex`, the default) or escape ("\\\\" for a
+    backslash, a backslash and three octal digits for a byte, the other
+    bytes as they are)."""
+    if len(t) >= 2 and t[0] == _BACKSLASH and t[1] == _X:
+        if len(t) % 2 != 0:
             raise IoError.of_kind(E_TEXT, ErrorKind.InvalidData)
-        out.append(UInt8(hi * 16 + lo))
+        var out = List[UInt8](capacity=(len(t) - 2) // 2)
+        for i in range(2, len(t), 2):
+            var hi = _hex(t[i])
+            var lo = _hex(t[i + 1])
+            if hi < 0 or lo < 0:
+                raise IoError.of_kind(E_TEXT, ErrorKind.InvalidData)
+            out.append(UInt8(hi * 16 + lo))
+        return out^
+    var out = List[UInt8](capacity=len(t))
+    var i = 0
+    while i < len(t):
+        if t[i] != _BACKSLASH:
+            out.append(t[i])
+            i += 1
+        elif i + 1 < len(t) and t[i + 1] == _BACKSLASH:
+            out.append(_BACKSLASH)
+            i += 2
+        else:
+            if i + 3 >= len(t):  # (three octal digits must follow)
+                raise IoError.of_kind(E_TEXT, ErrorKind.InvalidData)
+            var v = 0
+            for k in range(1, 4):
+                var c = t[i + k]
+                if c < 48 or c > 55:
+                    raise IoError.of_kind(E_TEXT, ErrorKind.InvalidData)
+                v = v * 8 + Int(c) - 48
+            if v > 255:
+                raise IoError.of_kind(E_TEXT, ErrorKind.InvalidData)
+            out.append(UInt8(v))
+            i += 4
     return out^
 
 

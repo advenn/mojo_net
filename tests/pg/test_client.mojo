@@ -289,8 +289,8 @@ def _types(server: PgServer) raises:
         "'-infinity'::date", "'00:00:00'::time", "'23:59:59.999999'::time", "'12:00:00.5'::time",
         "'2024-02-29 13:45:00.123'::timestamp", "'0001-01-01 00:00:00 BC'::timestamp",
         "'294276-12-31 23:59:59.999999'::timestamp", "'infinity'::timestamp", "'-infinity'::timestamp",
-        "'héllo'::text", "'abc'::varchar(5)", "'ab'::char(4)", "'x'::\"char\"", "'n'::name",
-    ]
+        "'héllo'::text", "'abc'::varchar(5)", "'ab'::char(4)", "'n'::name",
+    ]  # ("char" comes in text form: test_pg_regressions_client)
     for i in range(len(values)):
         var sql = String("SELECT ", values[i])
         var r = db.query(sql)

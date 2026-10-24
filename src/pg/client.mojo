@@ -14,8 +14,19 @@ with its parameters sent as values, so they are never spliced into the
 SQL. Each `Writable` argument goes in its text form, and the server reads
 it as the type the statement needs; `query_params` takes a `Params` for
 NULLs, bytes or declared types. `simple_query` runs scripts of several
-statements, without parameters. Results come in text form (`Rows.text`,
-`Rows.int`, `Rows.bool`, `Rows.value` for the bytes).
+statements, without parameters.
+
+Results: with the statement cache (`Config.statement_cache`), the types
+`pg.types` reads in binary form (integers, bool, bytea, uuid, date,
+timestamp, ...) come that way, and the rest in text form; without it, or
+through `simple_query`, all in text form. `Rows.text` gives the server's
+text either way, and the typed accessors (`int`, `float`, `bool`, `bytes`,
+`date`, `timestamp`) read both.
+
+The session is opened with the settings these forms rely on: DateStyle
+ISO, extra_float_digits 3 (floats keep every bit) and bytea_output hex
+(`Config.startup`). A role or server default cannot change them, and a
+session switched to another client_encoding is ended (`Unsupported`).
 
 A server error raises `PgError` with the SQLSTATE (`e.code()`) and leaves
 the session usable; so does a query cancelled at its deadline.
@@ -23,14 +34,16 @@ the session usable; so does a query cancelled at its deadline.
 Deadlines:
 - `Config.connect_timeout` bounds `connect`: name resolution, the
   connection, startup and authentication.
-- A query's `timeout` bounds it. When it passes, the client sends a
-  CancelRequest on a new connection and waits for the server to close
+- A query's `timeout` bounds it, rows still coming included. When it
+  passes, the client sends a CancelRequest on a new connection, to the
+  address the session is connected to, and waits for the server to close
   that connection, as libpq does, so a late cancel cannot hit the next
-  query. It then gives the server `CANCEL_GRACE` to end the query's
-  cycle. A query that still finished is returned. Otherwise the client
-  raises a deadline error (`e.is_deadline()`), with the server's 57014
-  error attached when it sent one. If the server does not answer in time,
-  the client closes the connection: the next call raises `Closed`.
+  query. The server gets `CANCEL_GRACE`, the cancel included, to end the
+  query's cycle. A query that still finished is returned. Otherwise the
+  client raises a deadline error (`e.is_deadline()`), with the server's
+  57014 error attached when it sent one. If the server does not answer in
+  time, or a cancel went out but was not seen through, the client closes
+  the connection: the next call raises `Closed`.
 
 Anything else that goes wrong closes the connection: a transport error,
 the server breaking the protocol, or a FATAL error such as an
@@ -38,14 +51,23 @@ administrator's shutdown (57P01).
 """
 
 from std.collections import Dict
+from std.math import isinf
 from std.memory import bitcast
 
 from bytes.buffer import ByteBuffer
 from linux import ErrorKind, IoError
 from linux.random import fill_random
 from linux.time import Deadline, Duration
-from net.addr import UnixAddr
-from net.blocking import IdleState, idle_state, recv_with_deadline, send_all_with_deadline
+from net.addr import SocketAddr, UnixAddr
+from net.blocking import (
+    DEAD_PEER_KEEPALIVE,
+    IdleState,
+    detect_dead_peers,
+    idle_state,
+    recv_with_deadline,
+    send_all_with_deadline,
+    try_recv,
+)
 from net.socket import Shutdown, Socket
 from net.tcp import TcpStream
 from net.unix import UnixStream
@@ -54,6 +76,7 @@ from .config import Config
 from .connection import EventKind, PgConnection, PgEvent
 from .message import (
     BINARY,
+    FIELD_ROUTINE,
     be_u32,
     IDLE,
     TEXT,
@@ -66,6 +89,7 @@ from .message import (
     write_cancel_request,
 )
 from .types import (
+    BOOL,
     BYTEA,
     DATE,
     FLOAT4,
@@ -76,7 +100,7 @@ from .types import (
     binary_int,
     binary_timestamp_us,
     is_text_like,
-    parse_bytea_hex,
+    parse_bytea,
     parse_date,
     parse_timestamp_us,
     wants_binary,
@@ -85,6 +109,9 @@ from .types import (
 
 comptime CANCEL_GRACE = Duration.from_secs(5)
 """How long the server gets to end a cancelled query's cycle."""
+
+comptime MAX_NOTICES = 1024
+"""Notices kept until `take_notices`; past it, the oldest are dropped."""
 
 comptime _RECEIVE = 64 * 1024
 
@@ -146,8 +173,12 @@ comptime _CLOSED_BY_SERVER = "pg: the server closed the connection"
 
 
 struct Rows(Movable, Sized):
-    """The result of one statement: its columns, its rows (values in text
-    form, unless the column is binary), and its command tag."""
+    """The result of one statement: its columns, its rows, and its command
+    tag. Each column's values come in the form `columns[c].format` says:
+    binary for the types `pg.types` reads that way (when the statement
+    cache asked for them), text otherwise. The typed accessors read either
+    form; `value` gives the bytes as they came. A row or column out of
+    range raises `InvalidInput`."""
 
     var columns: List[Column]
     var tag: String
@@ -157,6 +188,8 @@ struct Rows(Movable, Sized):
     var _at: List[Int]
     """Per value: its start in `_data` and its length (-1: NULL)."""
     var _width: Int
+    var _rows: Int
+    """(Counted apart: a statement can return rows with no columns.)"""
 
     def __init__(out self):
         self.columns = List[Column]()
@@ -164,12 +197,11 @@ struct Rows(Movable, Sized):
         self._data = List[UInt8]()
         self._at = List[Int]()
         self._width = 0
+        self._rows = 0
 
     def __len__(self) -> Int:
         """How many rows."""
-        if self._width == 0:
-            return 0
-        return len(self._at) // (2 * self._width)
+        return self._rows
 
     def width(self) -> Int:
         """How many values per row."""
@@ -188,29 +220,49 @@ struct Rows(Movable, Sized):
         for i in range(ev.values()):
             self._at.append(base + ev._at[2 * i])
             self._at.append(ev._at[2 * i + 1])
+        self._rows += 1
 
-    def is_null(self, row: Int, col: Int) -> Bool:
-        return self._at[2 * (row * self._width + col) + 1] < 0
+    def _index(self, row: Int, col: Int) raises IoError -> Int:
+        """Where value (`row`, `col`) is in `_at`, both checked."""
+        if row < 0 or row >= self._rows or col < 0 or col >= self._width:
+            raise IoError.of_kind("pg: row or column out of range", ErrorKind.InvalidInput)
+        return 2 * (row * self._width + col)
 
-    def value(self, row: Int, col: Int) -> Span[UInt8, origin_of(self._data)]:
-        """The bytes of a value (empty for NULL)."""
-        var k = 2 * (row * self._width + col)
+    def _span(self, k: Int) -> Span[UInt8, origin_of(self._data)]:
         var start = self._at[k]
         return Span(self._data)[start : start + max(self._at[k + 1], 0)]
+
+    def is_null(self, row: Int, col: Int) raises PgError -> Bool:
+        try:
+            return self._at[self._index(row, col) + 1] < 0
+        except e:
+            raise PgError(e)
+
+    def value(self, row: Int, col: Int) raises PgError -> Span[UInt8, origin_of(self._data)]:
+        """The bytes of a value as they came, in the column's form (empty
+        for NULL)."""
+        try:
+            return self._span(self._index(row, col))
+        except e:
+            raise PgError(e)
 
     def _binary(self, col: Int) -> Bool:
         """Whether the column's values need binary decoding (a text-like
         type's binary form is its text)."""
         return self.columns[col].format == BINARY and not is_text_like(self.columns[col].type_oid)
 
-    def _not_null(self, row: Int, col: Int, what: StaticString) raises IoError:
-        if self.is_null(row, col):
+    def _present(self, row: Int, col: Int, what: StaticString) raises IoError -> Int:
+        """The value's index, checked, and not NULL."""
+        var k = self._index(row, col)
+        if self._at[k + 1] < 0:
             raise IoError.of_kind(what, ErrorKind.InvalidData)
+        return k
 
     def _text(self, row: Int, col: Int) raises IoError -> String:
-        var v = self.value(row, col)
-        if self.is_null(row, col):
+        var k = self._index(row, col)
+        if self._at[k + 1] < 0:
             return String()
+        var v = self._span(k)
         if self._binary(col):
             var out = String()
             write_binary_as_text(out, self.columns[col].type_oid, v)
@@ -219,47 +271,41 @@ struct Rows(Movable, Sized):
 
     def _int(self, row: Int, col: Int) raises IoError -> Int:
         comptime op = "pg: not an integer value"
-        self._not_null(row, col, op)
-        var b = self.value(row, col)
+        var b = self._span(self._present(row, col, op))
+        var oid = self.columns[col].type_oid
         if self._binary(col):
-            return binary_int(self.columns[col].type_oid, b)
-        if len(b) == 0 or len(b) > 20:
+            return binary_int(oid, b)
+        if oid == FLOAT4 or oid == FLOAT8:  # (a float is no integer, whatever its value)
             raise IoError.of_kind(op, ErrorKind.InvalidData)
-        var neg = Int(b[0]) == ord("-")
-        var i = 1 if neg else 0
-        if i == len(b):
-            raise IoError.of_kind(op, ErrorKind.InvalidData)
-        var n = 0
-        while i < len(b):
-            var c = b[i]
-            if c < 48 or c > 57 or n > (Int.MAX - 9) // 10:
-                raise IoError.of_kind(op, ErrorKind.InvalidData)
-            n = n * 10 + Int(c) - 48
-            i += 1
-        return -n if neg else n
+        return _decimal(b, op)
 
     def _float(self, row: Int, col: Int) raises IoError -> Float64:
         comptime op = "pg: not a number"
-        self._not_null(row, col, op)
-        var b = self.value(row, col)
+        var b = self._span(self._present(row, col, op))
+        var oid = self.columns[col].type_oid
         if self._binary(col):
-            var oid = self.columns[col].type_oid
             if oid == FLOAT8 and len(b) == 8:
                 return bitcast[DType.float64]((UInt64(be_u32(b, 0)) << 32) | UInt64(be_u32(b, 4)))
             if oid == FLOAT4 and len(b) == 4:
                 return Float64(bitcast[DType.float32](be_u32(b, 0)))
-            raise IoError.of_kind(op, ErrorKind.InvalidData)
+            return Float64(binary_int(oid, b))  # (the integer types; others raise)
+        var t = String(from_utf8_lossy=b)
+        var x: Float64
         try:
-            return atof(String(from_utf8_lossy=b))  # (NaN and the infinities too)
+            x = atof(t)  # (NaN and the infinities too)
         except:
             raise IoError.of_kind(op, ErrorKind.InvalidData)
+        if oid == FLOAT4:
+            x = Float64(Float32(x))  # (the text is the shortest that reads back as this float4)
+        if (isinf(x) or x == 0) and _nonzero_mantissa(b):  # (a numeric past a float's range)
+            raise IoError.of_kind("pg: number out of range for a float", ErrorKind.InvalidData)
+        return x
 
     def _bool(self, row: Int, col: Int) raises IoError -> Bool:
         comptime op = "pg: not a boolean value"
-        self._not_null(row, col, op)
-        var b = self.value(row, col)
+        var b = self._span(self._present(row, col, op))
         if self._binary(col):
-            if len(b) != 1:
+            if self.columns[col].type_oid != BOOL or len(b) != 1:
                 raise IoError.of_kind(op, ErrorKind.InvalidData)
             return b[0] != 0
         if len(b) != 1 or (Int(b[0]) != ord("t") and Int(b[0]) != ord("f")):
@@ -268,30 +314,30 @@ struct Rows(Movable, Sized):
 
     def _bytes(self, row: Int, col: Int) raises IoError -> List[UInt8]:
         comptime op = "pg: not a bytea value"
-        self._not_null(row, col, op)
+        var b = self._span(self._present(row, col, op))
         if self._binary(col):
             if self.columns[col].type_oid != BYTEA:
                 raise IoError.of_kind(op, ErrorKind.InvalidData)
-            return List[UInt8](self.value(row, col))
-        return parse_bytea_hex(self.value(row, col))
+            return List[UInt8](b)
+        return parse_bytea(b)
 
     def _date(self, row: Int, col: Int) raises IoError -> Date:
         comptime op = "pg: not a date value"
-        self._not_null(row, col, op)
+        var b = self._span(self._present(row, col, op))
         if self._binary(col):
             if self.columns[col].type_oid != DATE:
                 raise IoError.of_kind(op, ErrorKind.InvalidData)
-            return binary_date(self.value(row, col))
-        return parse_date(self.value(row, col))
+            return binary_date(b)
+        return parse_date(b)
 
     def _timestamp(self, row: Int, col: Int) raises IoError -> Int:
         comptime op = "pg: not a timestamp value"
-        self._not_null(row, col, op)
+        var b = self._span(self._present(row, col, op))
         if self._binary(col):
             if self.columns[col].type_oid != TIMESTAMP:
                 raise IoError.of_kind(op, ErrorKind.InvalidData)
-            return binary_timestamp_us(self.value(row, col))
-        return parse_timestamp_us(self.value(row, col))
+            return binary_timestamp_us(b)
+        return parse_timestamp_us(b)
 
     def text(self, row: Int, col: Int) raises PgError -> String:
         """A value in the server's text form ("" for NULL), whichever form
@@ -302,16 +348,18 @@ struct Rows(Movable, Sized):
             raise PgError(e)
 
     def int(self, row: Int, col: Int) raises PgError -> Int:
-        """A value of an integer column (or a decimal integer in text form).
-        `InvalidData` for NULL or anything else."""
+        """A value of an integer column, or of a numeric or text column
+        holding a decimal integer. `InvalidData` for NULL, a float column,
+        or anything else."""
         try:
             return self._int(row, col)
         except e:
             raise PgError(e)
 
     def float(self, row: Int, col: Int) raises PgError -> Float64:
-        """A value of a float4, float8 or numeric column (or any number in
-        text form), "NaN" and the infinities included."""
+        """A value of a float, integer or numeric column (or any number in
+        text form), "NaN" and the infinities included. A numeric beyond a
+        float's range raises, as the server's own cast does."""
         try:
             return self._float(row, col)
         except e:
@@ -358,7 +406,8 @@ struct _Statement(Copyable, Movable):
     """A statement the client prepared (an empty name: a free slot)."""
 
     var name: String
-    var sql: String
+    var key: String
+    """Its key in `_by_sql`: the SQL, and the parameter types declared."""
     var formats: List[Int]
     """Per result column: `BINARY` where `pg.types` reads that form."""
     var used: Int
@@ -380,11 +429,25 @@ struct Client(Movable):
     var _notifications: List[Notification]
     var _statements: List[_Statement]
     var _by_sql: Dict[String, Int]
-    """The slot in `_statements` of each prepared SQL text."""
+    """The slot in `_statements` of each prepared SQL text (with its
+    declared parameter types, when it has any: `_cache_key`)."""
     var _clock: Int
     var _named: Int
+    var _prefix: String
+    """Of this session's statement names: "mojo_", then random hex, so that
+    they meet no statement prepared already (`PREPARE`, a pooler's)."""
+    var _cancel_to: Optional[SocketAddr]
+    """Where cancels go: the address the session is connected to (None
+    for a Unix socket, whose path is used)."""
 
-    def __init__(out self, var sock: Socket, var conn: PgConnection, config: Config):
+    def __init__(
+        out self,
+        var sock: Socket,
+        var conn: PgConnection,
+        config: Config,
+        cancel_to: Optional[SocketAddr],
+        prefix: String,
+    ):
         self._sock = sock^
         self._conn = conn^
         self._ev = PgEvent()
@@ -398,6 +461,8 @@ struct Client(Movable):
         self._by_sql = Dict[String, Int]()
         self._clock = 0
         self._named = 0
+        self._prefix = prefix
+        self._cancel_to = cancel_to
 
     @staticmethod
     def connect(config: Config) raises PgError -> Client:
@@ -406,12 +471,18 @@ struct Client(Movable):
         (a wrong password: 28P01, no such database: 3D000) raises with its
         SQLSTATE."""
         var deadline = _deadline(config.connect_timeout)
-        var nonce = List[UInt8](length=18, fill=0)
+        var random = List[UInt8](length=18 + 4, fill=0)  # (the SCRAM nonce, the names)
         var c: Client
         try:
-            fill_random(Span(nonce))
-            var conn = PgConnection(config.startup(), Span(nonce))
-            c = Client(_dial(config, deadline), conn^, config)
+            fill_random(Span(random))
+            var conn = PgConnection(config.startup(), Span(random)[:18])
+            var sock = _dial(config, deadline)
+            var cancel_to = Optional[SocketAddr](None)
+            if not config.is_unix():
+                cancel_to = sock.peer_addr()  # (not the name resolved again: maybe another server)
+                if config.keepalive:
+                    detect_dead_peers(sock, DEAD_PEER_KEEPALIVE)
+            c = Client(sock^, conn^, config, cancel_to, _name_prefix(Span(random)[18:]))
         except e:
             raise PgError(e)
         c._open(deadline)
@@ -447,6 +518,8 @@ struct Client(Movable):
             if self._conn.poll(self._ev):
                 return True
             self._flush(deadline)  # (answers to authentication, CopyFail)
+            if deadline.is_expired():  # (rows that keep coming never make recv wait)
+                raise IoError.of_kind("pg: receive", ErrorKind.TimedOut)
             var room = min(len(self._rx), self._conn.feed_capacity())
             var n = recv_with_deadline(self._sock, Span(self._rx)[:room], 0, deadline, "pg: receive")
             if n == 0:
@@ -457,6 +530,8 @@ struct Client(Movable):
     def _other(mut self):
         """Keep the event, a notice or a notification, for the caller."""
         if self._ev.kind == EventKind.NOTICE:
+            if len(self._notices) >= MAX_NOTICES:
+                _ = self._notices.pop(0)
             self._notices.append(self._ev.server_message())
         elif self._ev.kind == EventKind.NOTIFICATION:
             self._notifications.append(self._ev.notification())
@@ -478,6 +553,8 @@ struct Client(Movable):
                 current._describe(self._ev)
             elif kind == EventKind.COMMAND_COMPLETE:
                 current._complete(self._ev)
+                if current.tag == "DISCARD ALL" or current.tag == "DEALLOCATE ALL":
+                    self._drop_cache()  # (the server dropped every prepared statement)
                 results.append(current^)
                 current = Rows()
             elif kind == EventKind.EMPTY_QUERY:
@@ -535,16 +612,23 @@ struct Client(Movable):
                 raise PgError(e)  # (InvalidInput: the session is unharmed)
             var current = Rows()
             return _last(self._cycle(deadline, current))
-        var slot = self._statement(sql, deadline)
+        var slot = self._statement(sql, params, deadline)
         try:
             return self._run(slot, params, deadline)
         except e:
-            # 0A000: the result type changed under the cached plan (DDL).
-            # Outside a transaction, prepare it afresh and run once more.
-            if e.code() != "0A000" or self.transaction_status() != IDLE or not self.is_usable():
+            # The cached statement went stale, and nothing ran: the server
+            # dropped it (26000: a DEALLOCATE behind the cache's back), or
+            # the result type changed under its plan (0A000 from
+            # RevalidateCachedQuery: DDL). Outside a transaction, prepare
+            # it afresh and run once more.
+            var code = e.code()
+            var stale = code == "26000" or (
+                code == "0A000" and e.server().field(FIELD_ROUTINE).or_else("") == "RevalidateCachedQuery"
+            )
+            if not stale or self.transaction_status() != IDLE or not self.is_usable():
                 raise e.copy()
         self._forget(slot, deadline)
-        slot = self._statement(sql, deadline)
+        slot = self._statement(sql, params, deadline)
         return self._run(slot, params, deadline)
 
     def _run(mut self, slot: Int, params: Params, deadline: Deadline) raises PgError -> Rows:
@@ -555,20 +639,25 @@ struct Client(Movable):
         var current = Rows()
         return _last(self._cycle(deadline, current))
 
-    def _statement(mut self, sql: StringSlice, deadline: Deadline) raises PgError -> Int:
-        """The slot of `sql`'s prepared statement, prepared now if it is not
-        cached (a round trip; the server's error, a syntax error say, is
-        raised and nothing is cached)."""
-        var key = String(sql)
+    def _statement(mut self, sql: StringSlice, params: Params, deadline: Deadline) raises PgError -> Int:
+        """The slot of `sql`'s prepared statement for the types `params`
+        declares, prepared now if it is not cached (a round trip; the
+        server's error, a syntax error say, is raised and nothing is
+        cached)."""
+        var declared = _declares_types(params)
+        var key = _cache_key(sql, params, declared)
         self._clock += 1
         var found = self._by_sql.get(key)
         if found:
             self._statements[found.value()].used = self._clock
             return found.value()
         self._named += 1
-        var name = String("mojo_", self._named)
+        var name = String(self._prefix, self._named)
         try:
-            self._conn.prepare(name, sql, Params())
+            if declared:
+                self._conn.prepare(name, sql, params)
+            else:  # (each type left to the server, whatever the count)
+                self._conn.prepare(name, sql, Params())
         except e:
             raise PgError(e)
         var described = Rows()
@@ -603,17 +692,22 @@ struct Client(Movable):
         trip)."""
         var name = self._statements[slot].name
         try:
-            _ = self._by_sql.pop(self._statements[slot].sql)
+            _ = self._by_sql.pop(self._statements[slot].key)
         except:
             pass
         self._statements[slot].name = String()
-        self._statements[slot].sql = String()
+        self._statements[slot].key = String()
         try:
             self._conn.close_statement(name)
         except e:
             raise PgError(e)
         var none = Rows()
         _ = self._cycle(deadline, none)
+
+    def _drop_cache(mut self):
+        """Forget every cached statement, which the server no longer has."""
+        self._statements.clear()
+        self._by_sql = Dict[String, Int]()
 
     def cached_statements(self) -> Int:
         """How many prepared statements the cache holds."""
@@ -662,13 +756,17 @@ struct Client(Movable):
         mut self, e: IoError, mut current: Rows, var results: List[Rows], var error: List[ServerMessage]
     ) raises PgError -> List[Rows]:
         """The query's deadline passed after it was sent: cancel it, give the
-        server `CANCEL_GRACE` to end its cycle, and report."""
+        server until `CANCEL_GRACE` from now (the cancel included) to end
+        its cycle, and report. A cancel that went out but was not seen
+        through could still land, on whatever runs next: waiting for it
+        spends the whole grace, so the session is closed below."""
+        var grace = Deadline.after(CANCEL_GRACE)
         try:
-            self.cancel()
+            self._send_cancel(grace)
         except:
-            pass  # (no cancel: the grace below decides)
+            pass  # (none sent, or not seen through: the grace decides)
         try:
-            self._collect(Deadline.after(CANCEL_GRACE), current, results, error)
+            self._collect(grace, current, results, error)
         except:
             self._close_now()
             if len(error) > 0:
@@ -682,22 +780,39 @@ struct Client(Movable):
 
     def cancel(self) raises PgError:
         """Ask the server to cancel what this session is running, on a new
-        connection, and wait until the server has taken the request (it
-        closes that connection). Harmless if nothing runs."""
+        connection to the address the session is connected to, and wait
+        until the server has taken the request: it closes that connection.
+        Harmless if nothing runs. Raises when the request could not be
+        sent, or was not seen through within `CANCEL_GRACE`."""
+        try:
+            self._send_cancel(Deadline.after(CANCEL_GRACE))
+        except e:
+            raise PgError(e)
+
+    def _send_cancel(self, deadline: Deadline) raises IoError:
+        """Send a CancelRequest and wait until the server closes that
+        connection, or `deadline` passes (`TimedOut`: then the request may
+        still land). A send that fails sent nothing: the server acts only
+        on all 16 bytes."""
         var key = self._conn.backend_key()
         if not key:
-            raise PgError(IoError.of_kind("pg: the server sent no cancellation key", ErrorKind.Unsupported))
-        var deadline = Deadline.after(CANCEL_GRACE)
+            raise IoError.of_kind("pg: the server sent no cancellation key", ErrorKind.Unsupported)
+        var sock: Socket
+        if self._cancel_to:
+            sock = TcpStream.connect_deadline(self._cancel_to.value(), deadline).into_socket()
+        else:
+            sock = _dial(self._config, deadline)  # (a Unix socket: its path)
+        var out = ByteBuffer()
+        write_cancel_request(out, key.value())
+        send_all_with_deadline(sock, out.readable_span(), deadline, "pg: cancel")
+        var buf = List[UInt8](length=64, fill=0)
         try:
-            var sock = _dial(self._config, deadline)
-            var out = ByteBuffer()
-            write_cancel_request(out, key.value())
-            send_all_with_deadline(sock, out.readable_span(), deadline, "pg: cancel")
-            var buf = List[UInt8](length=64, fill=0)
             while recv_with_deadline(sock, Span(buf), 0, deadline, "pg: cancel") > 0:
                 pass
         except e:
-            raise PgError(e)
+            if e.is_deadline():
+                raise e
+            # (a reset is an end too: the server is done with it, as libpq takes it)
 
     def parameter(self, name: StringSlice) -> Optional[String]:
         """What the server reported for a parameter ("server_version",
@@ -715,6 +830,7 @@ struct Client(Movable):
 
     def begin(mut self, timeout: Duration = Duration.ZERO) raises PgError:
         """Open a transaction (BEGIN). `InvalidInput` when one is open."""
+        self._check_usable()
         if self._conn.transaction_status() != IDLE:
             raise PgError(IoError.of_kind(E_IN_TRANSACTION, ErrorKind.InvalidInput))
         _ = self.simple_query("BEGIN", timeout)
@@ -790,16 +906,23 @@ struct Client(Movable):
             self._close_now()
             return False
         try:  # (DATA: read what is there, without waiting)
-            var now = Deadline.after(Duration.ZERO)
             while True:
-                if not self._next(now) or self._ev.kind == EventKind.ERROR:
+                while self._conn.poll(self._ev):
+                    if self._ev.kind == EventKind.ERROR:  # (FATAL: nothing else comes while idle)
+                        self._close_now()
+                        return False
+                    self._other()
+                var room = min(len(self._rx), self._conn.feed_capacity())
+                var got = try_recv(self._sock, Span(self._rx)[:room], "pg: receive")
+                if not got:
+                    break  # (all of it read)
+                if got.value() == 0:  # (EOF)
                     self._close_now()
                     return False
-                self._other()
-        except e:
-            if not e.is_deadline():
-                self._close_now()
-                return False
+                self._conn.feed(Span(self._rx)[: got.value()])
+        except:
+            self._close_now()
+            return False
         return self.is_usable()
 
     def is_usable(self) -> Bool:
@@ -846,6 +969,68 @@ def quote_identifier(name: StringSlice) -> String:
         out += '""' if c == '"' else String(c)
     out += '"'
     return out^
+
+
+def _decimal(b: Span[UInt8, _], op: StaticString) raises IoError -> Int:
+    """A decimal integer that fits an Int (int8's range: both ends)."""
+    var neg = len(b) > 0 and Int(b[0]) == ord("-")
+    var i = 1 if neg else 0
+    if i >= len(b):
+        raise IoError.of_kind(op, ErrorKind.InvalidData)
+    var limit: UInt64 = (UInt64(1) << 63) if neg else UInt64(Int.MAX)
+    var n: UInt64 = 0
+    while i < len(b):
+        var c = b[i]
+        if c < 48 or c > 57:
+            raise IoError.of_kind(op, ErrorKind.InvalidData)
+        var d = UInt64(c - 48)
+        if n > (limit - d) // 10:
+            raise IoError.of_kind(op, ErrorKind.InvalidData)
+        n = n * 10 + d
+        i += 1
+    if neg:
+        return Int.MIN if n == (UInt64(1) << 63) else -Int(n)
+    return Int(n)
+
+
+def _nonzero_mantissa(b: Span[UInt8, _]) -> Bool:
+    """Whether a number's text has a non-zero digit before any exponent
+    (so it is no zero, and no "Infinity")."""
+    for c in b:
+        if c == 101 or c == 69:  # (e, E)
+            return False
+        if c >= 49 and c <= 57:
+            return True
+    return False
+
+
+def _declares_types(params: Params) -> Bool:
+    for i in range(len(params)):
+        if params.type_oid(i) != 0:
+            return True
+    return False
+
+
+def _cache_key(sql: StringSlice, params: Params, declared: Bool) -> String:
+    """The statement cache's key: the SQL, then (when any is declared) a
+    NUL and the parameter types, which no SQL text holds."""
+    var key = String(sql)
+    if declared:
+        key += "\x00"
+        for i in range(len(params)):
+            key.write(params.type_oid(i), ",")
+    return key^
+
+
+def _name_prefix(random: Span[UInt8, _]) -> String:
+    var digits = "0123456789abcdef".as_bytes()
+    var out = List[UInt8]()
+    out.extend("mojo_".as_bytes())
+    for b in random:
+        out.append(digits[Int(b >> 4)])
+        out.append(digits[Int(b & 15)])
+    out.append(UInt8(ord("_")))
+    return String(unsafe_from_utf8=Span(out))
 
 
 def _last(var all: List[Rows]) -> Rows:

@@ -53,8 +53,9 @@ struct Pool(Movable):
             if db.check():
                 return db^
             db^.close()
-        self._opened += 1
-        return Client.connect(self._config)
+        var fresh = Client.connect(self._config)
+        self._opened += 1  # (only once it opened)
+        return fresh^
 
     def release(mut self, var db: Client):
         """Take a session back: kept for the next `acquire` if it is usable,
