@@ -238,10 +238,12 @@ struct Headers(Copyable, Defaultable, Movable, Sized, Writable):
         self._garbage = 0
 
     def __init__(out self, *, capacity: Int):
-        """Room for `capacity` fields of average size without regrowing."""
-        self._data = List[UInt8](unsafe_uninit_length=max(capacity, 0) * 32)
+        """Room for `capacity` fields of average size without regrowing
+        (clamped to 0..65536: a hint, never an error)."""
+        var n = min(max(capacity, 0), 65536)
+        self._data = List[UInt8](unsafe_uninit_length=n * 32)
         self._used = 0
-        self._fields = List[_Field](capacity=capacity)
+        self._fields = List[_Field](capacity=n)
         self._garbage = 0
 
     def __init__(out self, *, copy: Self):

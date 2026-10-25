@@ -21,8 +21,10 @@ Strictness (docs/http.md, "Strictness"). Requests are parsed strictly:
 Responses follow the same rules with the two leniencies RFC 9112 allows and
 old servers need: a bare LF ends a line (2.2), and obs-fold is replaced by
 a single SP (5.2). Leading empty lines before either start line are skipped
-(2.2). A status code must be 100..599; the reason phrase may be empty or
-missing, and is decoded lossily (it carries no meaning).
+(2.2). A status code is three digits from 100; 600..999 are invalid codes
+that a client SHOULD treat as 5xx (RFC 9110 15), so they are kept as sent
+(`http.types.is_server_error` counts them). The reason phrase may be empty
+or missing, and is decoded lossily (it carries no meaning).
 
 Limits (`Limits`) bound the start line, the whole head (leading empty lines
 included) and the number of field lines, and are checked as bytes arrive,
@@ -316,7 +318,7 @@ def _first[
     if n < _SCAN:
         while i < hi and not stop_b(p[unsafe_offset=i]):
             i += 1
-        return i
+        return min(i, hi)  # (`hi` for an empty range, as the vector path)
     while i < hi:
         var base = min(i, n - _SCAN)
         var bits = pack_bits[DType.uint32](
@@ -470,7 +472,13 @@ struct HeadParser(Copyable, Movable):
         checked in order, each against `max_head` first (the only limit
         that can be decided before a line is complete, and decided
         identically then), then its line ending, then the start-line or
-        field-count limit."""
+        field-count limit.
+
+        Each call's input must extend the last one's (the bytes already
+        scanned are not looked at again) until a head completes or `reset`:
+        a shorter input raises `InvalidInput` instead of reading past it."""
+        if self._scanned > len(data):
+            raise IoError.of_kind("HeadParser: input shorter than what was scanned", ErrorKind.InvalidInput)
         var p = data.unsafe_ptr()
         var n = len(data)
         var lim = self._limits
@@ -599,8 +607,10 @@ struct HeadParser(Copyable, Movable):
             if not _is_digit(b):
                 raise self._fail(400, E_STATUS_LINE)
             status = status * 10 + Int(b) - 48
-        if status < 100 or status > 599:
+        if status < 100:
             raise self._fail(400, E_STATUS_LINE)
+        # (600..999 are invalid codes that clients SHOULD treat as 5xx, RFC
+        # 9110 15: kept as sent, a final response)
         var r = start + 12
         if r < end:
             if p[unsafe_offset=r] != _SP or _value_class(data, r + 1, end) < 0:

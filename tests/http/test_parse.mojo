@@ -405,11 +405,12 @@ def test_status_lines() raises:
     assert_equal(_resp("HTTP/1.1 204\r\n\r\n").reason, "")  # SP missing: tolerated
     assert_equal(_resp("HTTP/1.1 200 Fine  thanks \r\n\r\n").reason, "Fine  thanks ")
     assert_equal(_resp("HTTP/1.1 599 x\r\n\r\n").status, 599)
+    assert_equal(_resp("HTTP/1.1 600 x\r\n\r\n").status, 600)  # (invalid: a client treats it as 5xx)
+    assert_equal(_resp("HTTP/1.1 999 x\r\n\r\n").status, 999)
     assert_equal(_resp("HTTP/1.1 100 Continue\r\n\r\n").status, 100)
     assert_equal(_resp("HTTP/1.1 200 \xe9t\xe9\r\n\r\n").reason, "�t�")  # lossy
     var bad = [
         "HTTP/1.1 099 x",
-        "HTTP/1.1 600 x",
         "HTTP/1.1 20 x",
         "HTTP/1.1 2000 x",
         "HTTP/1.1 2x0 x",

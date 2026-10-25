@@ -8,7 +8,7 @@ response split."""
 from std.testing import TestSuite, assert_equal, assert_false, assert_true
 
 from bytes.buffer import ByteBuffer
-from http.connection import E_BAD_101, E_NO_RESPONSE, E_UNSOLICITED, ClientConnection, ClientEvent, EventKind
+from http.connection import E_BAD_101, E_NO_RESPONSE, ClientConnection, ClientEvent, EventKind
 from http.headers import Headers
 from http.parse import RequestHead, ResponseHead
 from http.types import Version
@@ -302,9 +302,12 @@ def test_end_of_input() raises:
 
 
 def test_protocol_errors() raises:
+    # A response nobody asked for is not taken as one: the connection
+    # closes, quietly, whether it came alone or after a response (rule 4).
     var u = ClientConnection()
     _feed(u, "HTTP/1.1 200 OK\r\n\r\n")
-    assert_equal(_error(u), String("InvalidData ", E_UNSOLICITED))
+    assert_equal(_events(u), "")
+    assert_true(u.should_close())
     var bad = _asked()
     _feed(bad, "HTTP/1.1 200 OK\r\nContent-Length: 5, 6\r\n\r\n")
     assert_equal(_error(bad), "InvalidData http: bad Content-Length")

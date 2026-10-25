@@ -64,7 +64,9 @@ def is_client_error(status: Int) -> Bool:
 
 @inline(.always)
 def is_server_error(status: Int) -> Bool:
-    return status >= 500 and status < 600
+    """5xx, and the invalid codes 600..999 a response may carry, which a
+    client treats as 5xx (RFC 9110 15)."""
+    return status >= 500 and status < 1000
 
 
 def check_status(status: Int, op: StaticString) raises IoError:

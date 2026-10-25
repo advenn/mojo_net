@@ -113,10 +113,11 @@ from .types import Version, check_status, reason
 comptime E_VERSION = "http: unsupported HTTP version"
 comptime E_HOST = "http: missing or repeated Host"
 comptime E_NO_RESPONSE = "http: connection closed before a response"
-comptime E_UNSOLICITED = "http: response without a request"
 comptime E_BAD_101 = "http: 101 without an upgrade request"
 comptime E_PARTIAL = "http: connection closed in a message head"
 comptime E_CONNECT_BODY = "http: CONNECT with a body"
+comptime E_TARGET = "http: request target not allowed for this method"
+comptime E_EARLY_SWITCH = "http: protocol switch before the request was sent"
 
 comptime _DRAIN_LIMIT = 256 * 1024
 """The request body a server keeps reading after an early response
@@ -383,6 +384,60 @@ def _summarize(headers: Headers) -> _Summary:
     return s
 
 
+def _limits_ok(limits: Limits) -> Bool:
+    """Head limits a connection can work with: a head of at least one byte,
+    and no negative bound (a `max_head` of 0 failed every request)."""
+    return limits.max_head >= 1 and limits.max_start_line >= 0 and limits.max_fields >= 0
+
+
+def _valid_target(method: StringSlice, target: StringSlice) -> Bool:
+    """A request target in a form RFC 9112 3.2 allows for `method`:
+    origin-form (`/path?query`); `*` for OPTIONS only; authority-form
+    (`host:port`) for CONNECT only, and only it; absolute-form for http and
+    https, with a host, no user info (RFC 9110 4.2.4), and the authority
+    checked as Host is. No fragment anywhere (`#`, RFC 9112 3.2)."""
+    var t = target.as_bytes()
+    var n = len(t)
+    for b in t:
+        if b == 35:  # "#"
+            return False
+    if method == "CONNECT":
+        var colon = -1
+        for i in range(n):
+            if t[i] == 58:
+                colon = i
+            elif t[i] == 93:  # "]": a colon before it is in an IPv6 literal
+                colon = -1
+        return (
+            n > 0
+            and t[0] != 47
+            and t[0] != 58
+            and colon > 0
+            and colon < n - 1
+            and _valid_host(t)
+        )
+    if n > 0 and t[0] == 47:  # "/"
+        return True
+    if n == 1 and t[0] == 42:  # "*"
+        return method == "OPTIONS"
+    # absolute-form: "http" or "https", "://", the authority, then a path or
+    # query or nothing.
+    var at = 0
+    while at < n and t[at] != 58:
+        at += 1
+    var scheme = t[0:at]
+    if not (eq_ignore_case(scheme, "http".as_bytes()) or eq_ignore_case(scheme, "https".as_bytes())):
+        return False
+    if at + 3 > n or t[at + 1] != 47 or t[at + 2] != 47:
+        return False
+    var a = at + 3
+    var e = a
+    while e < n and t[e] != 47 and t[e] != 63:  # to "/" or "?"
+        e += 1
+    var authority = t[a:e]
+    return len(authority) > 0 and authority[0] != 58 and _valid_host(authority)
+
+
 def _valid_host(v: Span[UInt8, _]) -> Bool:
     """A Host field value (RFC 9112 3.2, RFC 3986 3.2.2): empty, or
     uri-host [ ":" port ], where uri-host is an IP literal in brackets or a
@@ -562,6 +617,10 @@ struct ServerConnection(Codec, Copyable):
     """`close_gracefully()` was called: no request after the current one."""
     var _unread: Bool
     """The connection closed with input left unread (`input_pending()`)."""
+    var _blank: Int
+    """How many received bytes, from the first, are known to be only line
+    ends: extended as bytes arrive, reset when bytes are consumed, so
+    telling whether a head has begun never rescans (`head_begun`)."""
 
     def __init__(
         out self,
@@ -577,7 +636,7 @@ struct ServerConnection(Codec, Copyable):
             max_buffered < limits.max_head
             or max_buffered < body_limits.max_trailers
             or max_buffered - 2 < body_limits.max_chunk_line
-        ):
+        ) or not _limits_ok(limits):
             raise IoError.of_kind("ServerConnection.__init__", ErrorKind.InvalidInput)
         self._rx = ByteBuffer(max_size=max_buffered)
         self._tx = ByteBuffer()
@@ -604,8 +663,22 @@ struct ServerConnection(Codec, Copyable):
         self._closing = False
         self._draining = False
         self._unread = False
+        self._blank = 0
 
     # ---- receive ---------------------------------------------------------
+
+    def _note_blank(mut self):
+        """Extend `_blank` over the line ends that follow it."""
+        var s = self._rx.readable_span()
+        var i = self._blank
+        while i < len(s) and (s[i] == _CR or s[i] == _LF):
+            i += 1
+        self._blank = i
+
+    def _consumed(mut self, n: Int) raises IoError:
+        """Consume `n` received bytes (and start `_blank` over)."""
+        self._rx.consume(n)
+        self._blank = 0
 
     def _poison(mut self, e: IoError, status: Int) -> IoError:
         """Fail the input side (rule 6) and return the error to raise."""
@@ -619,10 +692,16 @@ struct ServerConnection(Codec, Copyable):
         if self._eof:
             raise IoError.of_kind("ServerConnection.feed", ErrorKind.InvalidInput)
         if self._in == _CLOSED:
-            return  # no more requests are read
+            # No more requests are read, but the client is still sending:
+            # `input_pending()` says so, as it does for bytes that came in
+            # one read earlier.
+            if not _only_line_ends(data):
+                self._unread = True
+            return
         if len(data) > self._rx.max_writable():
             raise self._poison(IoError.of_kind("ServerConnection.feed", ErrorKind.OutOfMemory), 0)
         self._rx.write_bytes(data)
+        self._note_blank()
 
     def feed_capacity(self) -> Int:
         """The room left in the receive buffer (unbounded once input is
@@ -674,15 +753,18 @@ struct ServerConnection(Codec, Copyable):
         except e:
             raise self._poison(e, self._parser.error_status())
         if not got:
+            self._note_blank()
             if self._eof:
-                if _only_line_ends(self._rx.readable_span()):
+                if self._blank == len(self._rx):
                     self._in = _CLOSED  # closed between requests
                     return False
                 raise self._poison(IoError.of_kind(E_PARTIAL, ErrorKind.UnexpectedEof), 400)
             return False
-        self._rx.consume(got.value())
+        self._consumed(got.value())
         if head.version.major != 1:
             raise self._poison(IoError.of_kind(E_VERSION, ErrorKind.InvalidData), 505)
+        if not _valid_target(head.method, head.target):
+            raise self._poison(IoError.of_kind(E_TARGET, ErrorKind.InvalidData), 400)
         var sum = _summarize(head.headers)
         if sum.hosts > 1 or (sum.hosts == 0 and head.version.at_least_1_1()):
             raise self._poison(IoError.of_kind(E_HOST, ErrorKind.InvalidData), 400)
@@ -713,6 +795,7 @@ struct ServerConnection(Codec, Copyable):
         self._in = _BODY
         ev.kind = EventKind.HEAD
         ev.framing = framing
+        ev.data.clear()  # (no stale bytes from the last DATA event)
         return True
 
     def _poll_body(mut self, mut ev: ServerEvent) raises IoError -> Bool:
@@ -728,9 +811,9 @@ struct ServerConnection(Codec, Copyable):
                 ev.kind = EventKind.DATA
                 ev.data.clear()
                 ev.data.extend(self._rx.readable_span()[piece.start : piece.start + piece.len])
-                self._rx.consume(piece.consumed)
+                self._consumed(piece.consumed)
                 return True
-            self._rx.consume(piece.consumed)
+            self._consumed(piece.consumed)
             if self._body.is_done():
                 # One request at a time: wait for its response to end, unless
                 # it already has.
@@ -739,10 +822,13 @@ struct ServerConnection(Codec, Copyable):
                     self._unread = len(self._rx) > 0
                     self._in = _CLOSED
                     self._rx.clear()
+                    self._blank = 0
                 else:
                     self._in = _HEAD if self._answered else _WAIT
                 self._answered = False
+                self._note_blank()  # (bytes after this request: a next head?)
                 ev.kind = EventKind.END
+                ev.data.clear()
                 if len(ev._trailers) == 0:
                     ev._trailers.append(Headers())
                 swap(ev._trailers[0], self._trailers)
@@ -845,6 +931,12 @@ struct ServerConnection(Codec, Copyable):
             or kind == BodyKind.CLOSE
             or sum.conn_close
             or not self._can_drain()
+            or Bool(self._failed)  # (the input ended badly: nothing follows)
+            # A refused tunnel or upgrade closes: what the client sent after
+            # its head is not HTTP (a proxy that took the switch for granted
+            # would otherwise smuggle it through as the next request).
+            or self._method == "CONNECT"
+            or self._upgrade
         ) and not switch
         var add_close = close and not sum.conn_close
         var add_keep = (
@@ -932,6 +1024,7 @@ struct ServerConnection(Codec, Copyable):
             self._unread = self._in != _WAIT or len(self._rx) > 0
             self._in = _CLOSED
             self._rx.clear()
+            self._blank = 0
         elif self._in == _WAIT:
             self._in = _HEAD
         else:
@@ -946,7 +1039,9 @@ struct ServerConnection(Codec, Copyable):
         sends one, RFC 9110 6.6.1); the connection then closes.
         `InvalidInput` for another status, a `date` that is no field value,
         or while a response is being sent."""
-        if self._out == _OUT_BODY or status < 400 or status > 599:
+        if self._out == _OUT_BODY or self._answered or status < 400 or status > 599:
+            # (answered: its response went out, and a second one would
+            # answer the client's next request)
             raise self._misuse("ServerConnection.send_error")
         for b in date.as_bytes():
             if not is_field_byte(b):
@@ -962,6 +1057,7 @@ struct ServerConnection(Codec, Copyable):
         self._unread = True  # what the client sends is not followed
         self._in = _CLOSED
         self._rx.clear()
+        self._blank = 0
 
     def poll_transmit(mut self, mut out: ByteBuffer) raises IoError -> Int:
         var n = min(len(self._tx), out.max_writable())
@@ -996,16 +1092,17 @@ struct ServerConnection(Codec, Copyable):
         elif (
             self._out == _OUT_NONE
             and self._in == _HEAD
-            and _only_line_ends(self._rx.readable_span())
+            and self._blank == len(self._rx)
         ):
             self._closing = True
             self._in = _CLOSED
             self._rx.clear()
+            self._blank = 0
 
     def head_begun(self) -> Bool:
         """Bytes of a next request head have arrived: more than the line
         ends a server ignores before a request line (RFC 9112 2.2)."""
-        return self._in == _HEAD and not _only_line_ends(self._rx.readable_span())
+        return self._in == _HEAD and self._blank < len(self._rx)
 
     def trim(mut self, keep: Int) raises IoError:
         """Give back empty buffers that grew past `keep` bytes (an idle
@@ -1039,9 +1136,13 @@ struct ServerConnection(Codec, Copyable):
 
     def take_remaining(mut self) -> List[UInt8]:
         """The received bytes not consumed as HTTP (after an upgrade: the
-        start of the new protocol). Empties the receive buffer."""
+        start of the new protocol). Empties the receive buffer, and starts
+        the parsers over, since what they had scanned is gone."""
         var out = List[UInt8](self._rx.readable_span())
         self._rx.clear()
+        self._blank = 0
+        self._parser.reset()
+        self._body.restart(Framing.none())
         return out^
 
     # ---- time ------------------------------------------------------------
@@ -1108,6 +1209,9 @@ struct ClientConnection(Codec, Copyable):
     var _resp_keep: Bool
     var _seen: Bool
     """Bytes of the awaited response have arrived."""
+    var _blank: Int
+    """Received bytes, from the first, known to be only line ends (as in
+    `ServerConnection`): `_seen` never rescans."""
     var _out: Int
     var _req_kind: BodyKind
     var _req_left: Int
@@ -1126,6 +1230,7 @@ struct ClientConnection(Codec, Copyable):
             or max_buffered < body_limits.max_trailers
             or max_buffered - 2 < body_limits.max_chunk_line
             or max_in_flight < 1
+            or not _limits_ok(limits)
         ):
             raise IoError.of_kind("ClientConnection.__init__", ErrorKind.InvalidInput)
         self._rx = ByteBuffer(max_size=max_buffered)
@@ -1142,6 +1247,7 @@ struct ClientConnection(Codec, Copyable):
         self._max_in_flight = max_in_flight
         self._resp_keep = True
         self._seen = False
+        self._blank = 0
         self._out = _OUT_NONE
         self._req_kind = BodyKind.NONE
         self._req_left = 0
@@ -1161,8 +1267,6 @@ struct ClientConnection(Codec, Copyable):
         than `chunked` or together with Content-Length, or a bad method or
         target."""
         comptime op = "ClientConnection.send_request"
-        if len(self._flight) == 0 and len(self._rx) > 0:
-            self._discard_strays()
         if (
             self._closing
             or self._failed
@@ -1172,7 +1276,11 @@ struct ClientConnection(Codec, Copyable):
             or self._out != _OUT_NONE
             or len(self._flight) >= self._max_in_flight
         ):
-            raise self._misuse(op)
+            raise self._misuse(op)  # (before anything received is dropped)
+        if len(self._flight) == 0 and len(self._rx) > 0:
+            self._discard_strays()
+            if self._closing:
+                raise self._misuse(op)  # (stray bytes: the connection is out of step)
         var v = head.version
         if v.major != 1 or v.minor > 1:
             raise self._misuse(op)
@@ -1262,6 +1370,7 @@ struct ClientConnection(Codec, Copyable):
         if len(data) > self._rx.max_writable():
             raise self._poison(IoError.of_kind("ClientConnection.feed", ErrorKind.OutOfMemory))
         self._rx.write_bytes(data)
+        self._note_blank()
 
     def feed_capacity(self) -> Int:
         if self._in == _CLOSED:
@@ -1298,28 +1407,40 @@ struct ClientConnection(Codec, Copyable):
                 continue
             return False  # _UPGRADED, _CLOSED
 
+    def _note_blank(mut self):
+        """Extend `_blank` over the line ends that follow it."""
+        var s = self._rx.readable_span()
+        var i = self._blank
+        while i < len(s) and (s[i] == _CR or s[i] == _LF):
+            i += 1
+        self._blank = i
+
+    def _consumed(mut self, n: Int) raises IoError:
+        self._rx.consume(n)
+        self._blank = 0
+
     def _discard_strays(mut self):
         """Bytes received with no request in flight: line ends are dropped
         (some servers end a message with an extra CRLF); anything else means
         the connection is out of step, so it closes (RFC 9112 6.3: such data
-        is never taken as a response)."""
-        if _only_line_ends(self._rx.readable_span()):
-            self._rx.clear()
-        else:
-            self._rx.clear()
+        is never taken as a response). The same whether the bytes came with
+        the last response or later (rule 4)."""
+        self._note_blank()
+        if self._blank < len(self._rx):
             self._closing = True
             self._in = _CLOSED
+        self._rx.clear()
+        self._blank = 0
 
     def _poll_head(mut self, mut ev: ClientEvent) raises IoError -> Bool:
         if len(self._flight) == 0:
             if len(self._rx) > 0:
-                if not _only_line_ends(self._rx.readable_span()):
-                    raise self._poison(IoError.of_kind(E_UNSOLICITED, ErrorKind.InvalidData))
-                self._rx.clear()
+                self._discard_strays()
             if self._eof:
                 self._in = _CLOSED
             return False
-        if not self._seen and len(self._rx) > 0 and not _only_line_ends(self._rx.readable_span()):
+        self._note_blank()
+        if not self._seen and self._blank < len(self._rx):
             self._seen = True  # (stray line ends do not start a response)
         if len(ev._head) == 0:
             ev._head.append(ResponseHead())
@@ -1335,17 +1456,25 @@ struct ClientConnection(Codec, Copyable):
                     raise self._poison(IoError.of_kind(E_NO_RESPONSE, ErrorKind.UnexpectedEof))
                 raise self._poison(IoError.of_kind(E_PARTIAL, ErrorKind.UnexpectedEof))
             return False
-        self._rx.consume(got.value())
+        self._consumed(got.value())
+        if head.version.major != 1:  # (an HTTP/2.0 status line, say)
+            raise self._poison(IoError.of_kind(E_VERSION, ErrorKind.InvalidData))
+        ev.data.clear()  # (no stale bytes from the last DATA event)
         var status = head.status
         if status >= 100 and status < 200 and status != 101:
             ev.kind = EventKind.INFORMATIONAL
+            ev.framing = Framing.none()
             return True
         ref sent = self._flight[0]
         if status == 101:
             if not sent.upgrade:
                 raise self._poison(IoError.of_kind(E_BAD_101, ErrorKind.InvalidData))
+            if self._out == _OUT_BODY:
+                # The rest of the request body would go to the new protocol.
+                raise self._poison(IoError.of_kind(E_EARLY_SWITCH, ErrorKind.InvalidData))
             self._upgraded()
             ev.kind = EventKind.UPGRADE
+            ev.framing = Framing.none()
             return True
         var framing: Framing
         try:
@@ -1353,8 +1482,11 @@ struct ClientConnection(Codec, Copyable):
         except e:
             raise self._poison(e)
         if framing.kind == BodyKind.TUNNEL:
+            if self._out == _OUT_BODY:
+                raise self._poison(IoError.of_kind(E_EARLY_SWITCH, ErrorKind.InvalidData))
             self._upgraded()
             ev.kind = EventKind.UPGRADE
+            ev.framing = Framing.none()
             return True
         var sum = _summarize(head.headers)
         self._resp_keep = (
@@ -1389,9 +1521,9 @@ struct ClientConnection(Codec, Copyable):
                 ev.kind = EventKind.DATA
                 ev.data.clear()
                 ev.data.extend(self._rx.readable_span()[piece.start : piece.start + piece.len])
-                self._rx.consume(piece.consumed)
+                self._consumed(piece.consumed)
                 return True
-            self._rx.consume(piece.consumed)
+            self._consumed(piece.consumed)
             if self._body.is_done():
                 _ = self._flight.pop(0)
                 self._seen = False
@@ -1403,7 +1535,9 @@ struct ClientConnection(Codec, Copyable):
                     self._closing = True
                     self._in = _CLOSED
                     self._rx.clear()
+                    self._blank = 0
                 ev.kind = EventKind.END
+                ev.data.clear()
                 if len(ev._trailers) == 0:
                     ev._trailers.append(Headers())
                 swap(ev._trailers[0], self._trailers)
@@ -1448,9 +1582,13 @@ struct ClientConnection(Codec, Copyable):
 
     def take_remaining(mut self) -> List[UInt8]:
         """The received bytes not consumed as HTTP (after an upgrade: the
-        start of the new protocol). Empties the receive buffer."""
+        start of the new protocol). Empties the receive buffer, and starts
+        the parsers over, since what they had scanned is gone."""
         var out = List[UInt8](self._rx.readable_span())
         self._rx.clear()
+        self._blank = 0
+        self._parser.reset()
+        self._body.restart(Framing.none())
         return out^
 
     # ---- time ------------------------------------------------------------

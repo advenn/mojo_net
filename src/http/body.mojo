@@ -145,6 +145,8 @@ def content_length(headers: Headers) raises IoError -> Optional[Int]:
     var at = i.value()
     while True:
         var v = headers.value_bytes(at)
+        if _has_empty_element(v):  # (`5,` or `,5`: refused, as hyper does)
+            raise IoError.of_kind(E_CONTENT_LENGTH, ErrorKind.InvalidData)
         var pos = 0
         var any = False
         while True:
@@ -172,6 +174,33 @@ def content_length(headers: Headers) raises IoError -> Optional[Int]:
         at = nxt.value()
 
 
+def _has_empty_element(v: Span[UInt8, _]) -> Bool:
+    """Whether the comma-separated list `v` has an empty element (or is
+    empty): what RFC 9110 5.6.1 lets a recipient skip in general, but the
+    framing fields refuse. Commas inside quoted strings do not split."""
+    var content = False
+    var quoted = False
+    var k = 0
+    while k < len(v):
+        var b = v[k]
+        if quoted:
+            if b == 92:  # backslash: a quoted-pair
+                k += 1
+            elif b == 34:
+                quoted = False
+        elif b == 34:
+            quoted = True
+            content = True
+        elif b == 44:  # ","
+            if not content:
+                return True
+            content = False
+        elif b != 32 and b != 9:
+            content = True
+        k += 1
+    return not content
+
+
 @fieldwise_init
 struct _Codings(TrivialRegisterPassable):
     var count: Int
@@ -192,6 +221,10 @@ def _transfer_codings(headers: Headers) raises IoError -> Optional[_Codings]:
     var at = i.value()
     while True:
         var v = headers.value_bytes(at)
+        if _has_empty_element(v):
+            # An empty line (or `chunked,`) beside the others: a front end
+            # reading only the last line would frame the message otherwise.
+            raise IoError.of_kind(E_TE_CODINGS, ErrorKind.InvalidData)
         var pos = 0
         while True:
             var e = next_element(v, pos)

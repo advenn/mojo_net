@@ -305,9 +305,11 @@ def test_an_early_413_is_the_only_response() raises:
 
 def test_a_wrong_length_or_a_101_gets_a_500() raises:
     var r = _run("bad-length")
+    # The 101 refused, the connection closes (the second http review, C2):
+    # what follows an upgrade request is not served as the next request.
     assert_equal(
         r.out,
-        "HTTP/1.1 500 Internal Server Error then 1 answered|HTTP/1.1 500 Internal Server Error then 1 answered",
+        "HTTP/1.1 500 Internal Server Error then 1 answered|HTTP/1.1 500 Internal Server Error then 0 answered",
     )
 
 

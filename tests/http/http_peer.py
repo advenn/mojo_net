@@ -24,16 +24,33 @@ Routes:
     HEAD /head0            a HEAD response followed by a stray last chunk "0\r\n\r\n"
     GET  /1xx              a stream of 100 Continue responses for 5 s, then "late"
     GET  /drip             Content-Length 50, one byte every 100 ms
+    PUT  /rst-closedelim   reads 2 MiB of the body, answers "PARTIAL" delimited by
+                           the close, keeps reading 50 ms, then resets (RST)
+    PUT  /rst-framed       the same with a whole 413 (Content-Length 4, "full")
+    PUT  /early-ok         answers 200 "ok" (keep-alive) at once, then reads the body
+    GET  /early-got        how many body bytes the last /early-ok read (once it is done)
+    PUT  /flood            a 200 delimited by the close, then "x" without end; never reads
+    *    /stale408         "ok" to the first request on a connection; a later one gets
+                           408 with Connection: close (an idle timeout racing it)
 """
 
 import http.server
 import itertools
 import socket
+import struct
 import sys
 import threading
 import time
 
 _ids = itertools.count(1)
+_early_done = threading.Event()
+_early_got = [0]
+
+
+def _reset(sock):
+    """Close `sock` with an RST (SO_LINGER 0)."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    sock.close()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -155,6 +172,61 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 time.sleep(0.1)
                 self.wfile.write(b"x")
                 self.wfile.flush()
+        elif path in ("/rst-closedelim", "/rst-framed"):
+            got = 0
+            while got < 2 * 1024 * 1024:
+                d = self.rfile.read1(65536)
+                if not d:
+                    break
+                got += len(d)
+            if path == "/rst-closedelim":
+                self.wfile.write(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nPARTIAL")
+            else:
+                self.wfile.write(b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 4\r\n\r\nfull")
+            self.wfile.flush()
+            sock = self.connection
+            sock.setblocking(False)
+            buf = bytearray(1 << 20)
+            end = time.time() + 0.05
+            while time.time() < end:  # (busy: the client is mid-send at the reset)
+                try:
+                    sock.recv_into(buf)
+                except BlockingIOError:
+                    pass
+            self.close_connection = True
+            _reset(sock)
+        elif path == "/early-ok":
+            _early_done.clear()
+            want = int(self.headers.get("Content-Length", "0"))
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            self.wfile.flush()
+            got = 0
+            while got < want:
+                d = self.rfile.read1(min(1 << 20, want - got))
+                if not d:
+                    self.close_connection = True
+                    break
+                got += len(d)
+            _early_got[0] = got
+            _early_done.set()
+        elif path == "/early-got":
+            _early_done.wait(5)
+            self._send(200, str(_early_got[0]).encode())
+        elif path == "/flood":
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+            blob = b"x" * (1 << 20)
+            try:
+                while True:
+                    self.wfile.write(blob)
+            except OSError:
+                pass
+            self.close_connection = True
+        elif path == "/stale408":
+            if self.served > 1:
+                self.wfile.write(b"HTTP/1.1 408 Request Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                self.close_connection = True
+                return
+            self._send(200, b"ok")
         else:
             self._send(404, b"not found")
 

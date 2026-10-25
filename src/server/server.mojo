@@ -614,7 +614,10 @@ struct _Conn(Movable):
                 self.cut_body(handler)
                 if not self.rejected:  # (else it was answered already)
                     var status = self.http.error_status()
-                    self.http.send_error(status if status >= 400 else 400, date.current())
+                    try:
+                        self.http.send_error(status if status >= 400 else 400, date.current())
+                    except:
+                        pass  # (its response went out already: the codec closes after it)
                 return True  # the codec now closes, after what it sends
             if not got:
                 return False

@@ -38,10 +38,16 @@ The parser is strict where leniency enables request smuggling or response splitt
   - Values may hold no control bytes. CR, LF and NUL are refused, never replaced.
   - obs-fold: refused in requests; replaced by SP in responses (RFC 9112 5.2).
   - Whitespace before the first field line is refused.
+- **Request targets (RFC 9112 3.2)**, checked by form:
+  - origin-form (`/path?query`) for every method;
+  - absolute-form only for `http` and `https`, with a host and no user info, its authority checked as a Host value is;
+  - authority-form (`host:port`) only for CONNECT, and `*` only for OPTIONS;
+  - a fragment (`#`) is refused in any form. Anything else is a 400.
 - **Framing (RFC 9112 6).**
   - A request with both `Transfer-Encoding` and `Content-Length` is refused.
   - A request whose transfer codings do not end in `chunked` is refused (501 for an unknown coding, 400 otherwise).
   - `Content-Length` values that differ are refused. Identical repeats (`42, 42`) collapse to one.
+  - A framing field with an empty list element (`42,`, `chunked, ,`, an empty `Transfer-Encoding` line) is refused.
   - `Transfer-Encoding` in an HTTP/1.0 message makes its framing faulty: a request is refused, and a response is read to close.
 - **Limits** (configurable): the whole head, the number of fields, chunk-size digits, chunk extensions and trailers are bounded, so a peer cannot make a parser buffer without end.
 
@@ -74,7 +80,9 @@ def main() raises:
   - otherwise the transport's error, for example `ConnectionRefused`.
 - **Status codes are not errors:** a 404 is a `Response` with `status == 404`.
 - **What the client sends:** it sets Host, User-Agent and Content-Length. It refuses a caller's Content-Length or Transfer-Encoding, because it frames the body itself.
-- **Retries:** if a reused connection was closed before any byte of the response, an idempotent request (GET, HEAD, OPTIONS, TRACE, PUT, DELETE) is sent again on a new connection, once. Other methods raise, because the server may have acted on them.
+- **Retries:** if a reused connection was closed before any byte of the response, or answered 408 (its idle timeout raced the request), an idempotent request (GET, HEAD, OPTIONS, TRACE, PUT, DELETE) is sent again on a new connection, once. Other methods raise, or get the 408, because the server may have acted on them.
+- **Early responses** (RFC 9112 9.5): a response that arrives while the body is still being sent stops the body if it is 300 or more, or closes the connection. Below 300 and keeping the connection, the body is sent to the end first. If sending fails (the server reset the connection), a response is returned only when it is complete by its own framing; a response delimited by the close raises the send error, since a reset may have cut it short.
+- **The pool:** at most `max_idle_per_host` idle connections per host and port, and `max_idle_conns` (32) in all, the oldest going first.
 
 ## Using the server codec
 `ServerConnection` does HTTP for one connection and no I/O. The driver feeds it what the socket reads and sends what it hands out. This is the loop of `examples/http/hello_server.mojo` (edge-triggered epoll) without the epoll part:
@@ -113,7 +121,8 @@ while True:
   - It adds `Connection: close` when the connection will close.
 - **One request at a time:** the next request's events come after `end_response`.
 - **`poll(ev)` or `next_event()`:** `poll` reuses one event, so a hot loop allocates almost nothing per request. `next_event()` returns a new one (the `Codec` interface).
-- **Errors:** after a malformed request, `send_error(conn.error_status())` answers 400, 414, 431, 501 or 505 and the connection closes.
+- **Errors:** after a malformed request, `send_error(conn.error_status())` answers 400, 414, 431, 501 or 505 and the connection closes. It is refused once the request has been answered: one request never gets two responses.
+- **No protocol switch is refused quietly:** a response to CONNECT that is not a 2xx, or to an Upgrade request that is not a 101, closes the connection. What the client sent after that head is not served as the next request, since a proxy that took the switch for granted would have passed it through.
 - **Closing well** (added for the server's S3):
   - `close_gracefully()` stops taking requests, for a server shutting down. The request in progress gets the last response, which says `Connection: close` if its head has not gone out yet, and an idle connection closes at once.
   - When `should_close()` and `input_pending()` are both true, the client may still be sending. Close in stages (RFC 9112 9.6): shut down the write side, read and drop input until the client's end or a timeout, then close. Closing at once can reset the connection before the client reads the response.
@@ -192,4 +201,31 @@ while True:
       | 50 keep-alive connections | ~141k req/s | ~6.8 µs vs ~6.1 µs |
       | 16 pipelined per connection | over 1M req/s | ~0.97 µs vs ~0.46 µs |
   - **Interop:** the client against Python's `http.server`, the server codec against Python's `http.client` and its response parser; the guide above; the examples `http_get` and `hello_server`.
+- **Second review (2026-10-25)**, by three independent reviewers (parsing, headers and types; the connection codecs and framing; the client). Nothing critical or high. Every finding was reproduced, then fixed under a regression test that fails on the old code (`tests/http/test_http_codec_regressions.mojo`, `test_http_client_regressions2.mojo`). Differential runs found no smuggling or desync: 30,000 mutated heads against llhttp 9.3.1 and Go 1.26 (identical parses wherever both accept), and 60,000 more against `head_oracle.py`, whole and a byte at a time. The findings:
+  - **Request targets** were not checked by form, so an absolute-form authority reached the server's `host()` without the Host checks (`http://evil.example#@good.example/`), and fragments were kept. See "Strictness" above.
+  - **A buffer of nothing but line ends** was rescanned from its first byte on every read, on both sides: 9.7 s of CPU for 256 KiB of CRLFs. The codecs now remember how many leading bytes are known to be line ends.
+  - **Refused switches:** a refused CONNECT or Upgrade kept the connection, and the bytes after its head became the next request. A client 101 that arrived while the request body was still being sent switched anyway (now `InvalidData`).
+  - **The client:**
+    - a reset during an upload turned a cut close-delimited response into a success;
+    - an early 200 stopped the upload silently;
+    - a flood read during an upload ran past the deadline up to `max_body`;
+    - idle connections piled up one per host (now `max_idle_conns`);
+    - `[127.0.0.1]` passed for an IPv6 literal;
+    - a request with `Upgrade` was sent although the docs said `InvalidInput`;
+    - a 408 on a reused connection was not retried.
+  - **Codec state:**
+    - `take_remaining` left the parsers pointing into discarded bytes (a crash);
+    - client leftovers were a quiet close or `InvalidData` depending on the split;
+    - `send_error` after an answer sent a second response;
+    - input arriving after the close was decided did not count as `input_pending()`;
+    - a refused `send_request` after an upgrade dropped the new protocol's bytes;
+    - a response after the input failed lacked `Connection: close`;
+    - reused events kept the previous event's data.
+  - **Framing and parsing:**
+    - empty elements in Content-Length and Transfer-Encoding are refused;
+    - a response whose major version is not 1 is refused;
+    - status codes 600..999 are read as server errors (RFC 9110 15), where they were refused;
+    - a `HeadParser` given less input than it already scanned raises instead of reading past it;
+    - unworkable `Limits` are refused when the connection is made;
+    - `Headers(capacity=-1)` no longer aborts.
 - **Later:** a streaming response API on the client, redirects, content codings, TLS (with `net`).

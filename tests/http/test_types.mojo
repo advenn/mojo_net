@@ -57,7 +57,7 @@ def test_status_classes_at_the_boundaries() raises:
             + Int(is_client_error(s))
             + Int(is_server_error(s))
         )
-        assert_equal(classes, 1 if s >= 100 and s <= 599 else 0)
+        assert_equal(classes, 1 if s >= 100 else 0)  # (600..999 count as 5xx)
         var ok = True
         try:
             check_status(s, "test")

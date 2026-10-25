@@ -16,7 +16,14 @@ small pool. It drives `http.connection.ClientConnection` over a
 - Request bodies of any size are streamed to the socket in pieces while
   the connection is watched for the response (RFC 9112 9.5), so a server
   that answers early (a 413) is heard and a full-duplex one cannot
-  deadlock the request.
+  deadlock the request. An early response below 300 that keeps the
+  connection does not stop the body: it is sent to the end first. One that
+  closes, or a 3xx/4xx/5xx, stops it; its status says the body was not
+  taken.
+- When sending fails (the server reset the connection), a response it
+  sent before is returned only if it is complete by its own framing
+  (Content-Length or chunked): a response delimited by the close cannot be
+  told from one the reset cut short, so the send error is raised.
 - Responses are read whole, up to `max_body` bytes (default 16 MiB);
   `InvalidData` beyond, and the connection is dropped. At most 32 1xx
   responses may come before the final one.
@@ -26,14 +33,17 @@ small pool. It drives `http.connection.ClientConnection` over a
   in order. A caller's Content-Length or Transfer-Encoding is refused
   (`InvalidInput`): the client frames the body.
 - Connections are kept per host and port, at most `max_idle_per_host` of
-  them, and reused only after `max_idle` at most, if `idle_state()` still
-  says EMPTY and the codec holds nothing unread; connections idle longer
-  are closed whichever host they are for. A reused connection can still turn out closed by the server
-  (a race no check avoids). If that happens before any byte of the
-  response, an idempotent request (GET, HEAD, OPTIONS, TRACE, PUT, DELETE)
-  is sent again, once, on a new connection.
+  them and `max_idle_conns` in all (the oldest goes first), and reused only
+  after `max_idle` at most, if `idle_state()` still says EMPTY and the
+  codec holds nothing unread; connections idle longer are closed whichever
+  host they are for. A reused connection can still turn out closed by the
+  server (a race no check avoids). If that happens before any byte of the
+  response, or the server answers 408 (it timed the idle connection out
+  as the request arrived), an idempotent request (GET, HEAD, OPTIONS,
+  TRACE, PUT, DELETE) is sent again, once, on a new connection.
 - Not done: redirects (a 3xx is returned as is), cookies, content codings,
-  CONNECT and upgrades (`InvalidInput`), proxies.
+  CONNECT and upgrades (a request with an `Upgrade` field: `InvalidInput`),
+  proxies.
 """
 
 from bytes.buffer import ByteBuffer
@@ -41,6 +51,7 @@ from linux import ErrorKind, IoError
 from linux.consts import POLLERR, POLLHUP, POLLIN, POLLOUT
 from linux.poll import wait_ready
 from linux.time import Deadline, Duration, Instant
+from net.addr import IpAddr
 from net.blocking import IdleState
 from net.resolver import Resolver
 from net.tcp import TcpStream
@@ -118,6 +129,16 @@ struct Url(Copyable, Movable, Writable):
                 var c = b[i]
                 if not (_is_hex(c) or c == 58 or c == 46):  # hex, ":", "." (v4-mapped)
                     raise IoError.of_kind(op, ErrorKind.InvalidInput)
+            # ... and an IPv6 address: `[127.0.0.1]` or `[1234]` would
+            # otherwise reach the resolver, or connect over IPv4, while a
+            # URL check elsewhere saw an IPv6 literal.
+            var v6 = False
+            try:
+                v6 = IpAddr.parse(StringSlice(unsafe_from_utf8=b[host_lo:host_hi])).is_ipv6()
+            except:
+                v6 = False
+            if not v6:
+                raise IoError.of_kind(op, ErrorKind.InvalidInput)
             if close + 1 < e:
                 if b[close + 1] != 58:
                     raise IoError.of_kind(op, ErrorKind.InvalidInput)
@@ -277,6 +298,8 @@ struct Client(Movable):
     """The deadline for each whole request."""
     var max_body: Int
     var max_idle_per_host: Int
+    var max_idle_conns: Int
+    """Idle connections kept in all, whatever their host."""
     var max_idle: Duration
     """How long a pooled connection may sit idle and still be reused."""
     var user_agent: String
@@ -292,15 +315,17 @@ struct Client(Movable):
         timeout: Duration = Duration.from_secs(30),
         max_body: Int = 16 * 1024 * 1024,
         max_idle_per_host: Int = 4,
+        max_idle_conns: Int = 32,
         max_idle: Duration = Duration.from_secs(60),
         user_agent: StringSlice = "mojo-net",
     ) raises IoError:
         """`InvalidInput` for a zero timeout or a negative limit."""
-        if not (Duration.ZERO < timeout) or max_body < 0 or max_idle_per_host < 0:
+        if not (Duration.ZERO < timeout) or max_body < 0 or max_idle_per_host < 0 or max_idle_conns < 0:
             raise IoError.of_kind("Client.__init__", ErrorKind.InvalidInput)
         self.timeout = timeout
         self.max_body = max_body
         self.max_idle_per_host = max_idle_per_host
+        self.max_idle_conns = max_idle_conns
         self.max_idle = max_idle
         self.user_agent = String(user_agent)
         self._resolver = Resolver.system()
@@ -339,6 +364,7 @@ struct Client(Movable):
         if (
             not is_token(method.as_bytes())
             or method == "CONNECT"
+            or headers.contains("upgrade")  # (the docs promise it: no protocol switch)
             or headers.contains("content-length")
             or headers.contains("transfer-encoding")
             or headers.count("host") > 1
@@ -372,6 +398,11 @@ struct Client(Movable):
             var started = False
             try:
                 var r = self._exchange(c, head, body, deadline, started)
+                if reused and r.status == 408 and not retried and _idempotent(method):
+                    # The server timed the idle connection out as the
+                    # request arrived (it never ran it): once more, anew.
+                    retried = True
+                    continue
                 if c.codec.is_idle():
                     self._checkin(c^)
                 return r^
@@ -406,6 +437,7 @@ struct Client(Movable):
         var ended = False
         var informational = 0
         var r = Response()
+        var answered = False  # (an early 2xx that keeps the connection)
         while True:
             if deadline.is_expired():
                 raise IoError.of_kind("Client.request", ErrorKind.TimedOut)
@@ -425,18 +457,29 @@ struct Client(Movable):
             try:
                 wrote = c.stream.try_write(out.readable_span())
             except e:
+                if answered:
+                    raise e  # (the body was cut short after all)
                 # The server may have answered, then closed (an early 413):
                 # what it sent before is still readable.
-                if self._read_ready(c, r, started, informational, at_eof=True):
+                if self._after_write_error(c, r, started, informational, deadline):
                     return r^
                 raise e
             if wrote:
                 out.consume(wrote.value())
                 continue
-            var rev = wait_ready(c.stream, Int16(POLLIN | POLLOUT), deadline, "Client.request")
-            if rev & Int16(POLLIN | POLLHUP | POLLERR):
-                if self._read_ready(c, r, started, informational, at_eof=False):
+            var events = POLLOUT if answered else (POLLIN | POLLOUT)
+            var rev = wait_ready(c.stream, Int16(events), deadline, "Client.request")
+            if not answered and rev & Int16(POLLIN | POLLHUP | POLLERR):
+                if self._read_ready(c, r, started, informational, deadline):
+                    if r.status < 300 and not c.codec.should_close():
+                        # The server took the request and keeps the
+                        # connection: send it the rest of the body (RFC 9112
+                        # 9.5 stops only for a server that is closing).
+                        answered = True
+                        continue
                     return r^
+        if answered:
+            return r^
         while True:
             if self._absorb(c, r, informational):
                 return r^
@@ -458,24 +501,16 @@ struct Client(Movable):
         mut r: Response,
         mut started: Bool,
         mut informational: Int,
-        *,
-        at_eof: Bool,
+        deadline: Deadline,
     ) raises IoError -> Bool:
         """Read what has arrived without waiting, into `r`: True once the
-        response is complete. With `at_eof`, the write side failed, so the
-        end of what can be read ends the input."""
+        response is complete. The deadline is checked on every pass, so a
+        response that keeps coming during the upload cannot outlast it."""
         while True:
-            var got: Optional[Int]
-            try:
-                got = c.stream.try_read(Span(self._buf)[0 : min(_READ_SIZE, c.codec.feed_capacity())])
-            except e:
-                if at_eof:
-                    return False  # nothing more to learn: the caller raises
-                raise e
+            if deadline.is_expired():
+                raise IoError.of_kind("Client.request", ErrorKind.TimedOut)
+            var got = c.stream.try_read(Span(self._buf)[0 : min(_READ_SIZE, c.codec.feed_capacity())])
             if not got:
-                if at_eof:
-                    c.codec.feed_eof()
-                    return self._absorb(c, r, informational)
                 return self._absorb(c, r, informational)
             if got.value() == 0:
                 c.codec.feed_eof()
@@ -484,6 +519,39 @@ struct Client(Movable):
             c.codec.feed(Span(self._buf)[0 : got.value()])
             if self._absorb(c, r, informational):
                 return True
+
+    def _after_write_error(
+        mut self,
+        mut c: _Conn,
+        mut r: Response,
+        mut started: Bool,
+        mut informational: Int,
+        deadline: Deadline,
+    ) raises IoError -> Bool:
+        """After sending failed: read what the server sent before (waiting
+        for it, up to the deadline), into `r`. True only for a response that
+        completes by its own framing; the end of the input is not taken as
+        the end of a response, since a reset may have cut it short."""
+        while True:
+            if self._absorb(c, r, informational):
+                return True
+            if deadline.is_expired():
+                return False
+            var got: Optional[Int]
+            try:
+                got = c.stream.try_read(Span(self._buf)[0 : min(_READ_SIZE, c.codec.feed_capacity())])
+            except:
+                return False  # (the reset itself: nothing more to read)
+            if not got:
+                try:
+                    _ = wait_ready(c.stream, Int16(POLLIN), deadline, "Client.request")
+                except:
+                    return False
+                continue
+            if got.value() == 0:
+                return False
+            started = True
+            c.codec.feed(Span(self._buf)[0 : got.value()])
 
     def _absorb(
         mut self, mut c: _Conn, mut r: Response, mut informational: Int
@@ -538,8 +606,10 @@ struct Client(Movable):
         for i in range(len(self._pool)):
             if self._pool[i].key == c.key:
                 same += 1
-        if same >= self.max_idle_per_host:
+        if same >= self.max_idle_per_host or self.max_idle_conns == 0:
             return  # dropped: closed
+        while len(self._pool) >= self.max_idle_conns:
+            _ = self._pool.pop(0)  # (the longest idle: closed)
         c.idle_since = Instant.now()
         self._pool.append(c^)
 

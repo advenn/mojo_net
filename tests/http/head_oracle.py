@@ -85,7 +85,7 @@ def parse(data, request, max_head, max_start_line, max_fields, fields_only=False
             return ("err", 400, E_STATUS_LINE)
         code = int(m[3])
         reason = m[4] or b""
-        if not 100 <= code <= 599 or not FIELD_BYTES.match(reason):
+        if not 100 <= code <= 999 or not FIELD_BYTES.match(reason):  # (600..999: treated as 5xx)
             return ("err", 400, E_STATUS_LINE)
         st = ("S", int(m[1]), int(m[2]), code, reason)
 
@@ -145,7 +145,7 @@ TARGETS = [
     b"/search?q=" + b"abcdefghij" * 7,  # long enough for the SIMD scans
 ]
 VERSIONS = [b"1.1", b"1.1", b"1.0", b"0.9", b"2.0"]
-STATUSES = [b"100", b"101", b"200", b"204", b"301", b"404", b"500", b"599"]
+STATUSES = [b"100", b"101", b"200", b"204", b"301", b"404", b"500", b"599", b"600", b"999"]
 REASONS = [b" OK", b" ", b"", b" Not Found", b" caf\xc3\xa9", b" \xe9t\xe9", b" a\tb"]
 FIELDS = [
     (b"Host", b"example.com"),

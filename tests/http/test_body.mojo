@@ -140,11 +140,11 @@ def test_request_framing() raises:
 
 
 def test_content_length_values() raises:
-    for bad in ["+42", "-1", "4 2", "0x10", "", ",", "1e3", "42, 43", "42,,43", "1234567890123456789", "4.0", "٢"]:
+    for bad in ["+42", "-1", "4 2", "0x10", "", ",", "1e3", "42, 43", "42,,43", "1234567890123456789", "4.0", "٢", "42, , 42", "42,", ",42"]:
         assert_equal(_req_framing([String("Content-Length: ", bad)]), _invalid(E_CONTENT_LENGTH), bad)
     assert_equal(_req_framing(["Content-Length: 42", "Content-Length: 43"]), _invalid(E_CONTENT_LENGTH))
     assert_equal(_req_framing(["Content-Length: 123456789012345678"]), "LENGTH(123456789012345678)")
-    assert_equal(_req_framing(["Content-Length: 42, , 42"]), "LENGTH(42)")  # empty elements skipped
+    assert_equal(_req_framing(["Content-Length: 42, 42"]), "LENGTH(42)")  # (empty elements are refused)
     var h = Headers()
     assert_false(content_length(h))
     h.add("Content-Length", "10")
