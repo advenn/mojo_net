@@ -155,14 +155,24 @@ def test_emfile_pauses_accepting_without_spinning() raises:
     var clients = List[TcpStream]()
     for _ in range(N):
         clients.append(TcpStream.connect(addr))
-    # Room for about 10 more fds (holes in the fd numbers count too).
+    # Room for about 10 more fds: the lowest limit with 10 free numbers
+    # below it, since a new fd takes the lowest free number. (Holes count:
+    # a CI runner leaves high fds open, so "highest fd + 10" left room for
+    # all N.) The listing's own fd, closed again, is one more.
     var nums = _fd_numbers()
     var maxfd = 0
     for i in range(len(nums)):
         maxfd = max(maxfd, nums[i])
-    var open_now = len(nums) - 1  # minus the listing's own fd
-    var limit = maxfd + 1 + 10
-    var room = limit - open_now
+    var used = List[Bool](length=maxfd + 1, fill=False)
+    for i in range(len(nums)):
+        used[nums[i]] = True
+    var limit = 0
+    var free = 0
+    while free < 10:
+        if limit > maxfd or not used[limit]:
+            free += 1
+        limit += 1
+    var room = free + 1
     var first = 0
     var second = 0
     var iters = 0

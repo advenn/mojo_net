@@ -4,14 +4,19 @@ worker processes on one port under a supervisor.
 
 Signals are read from a signalfd, never handled: the library installs no
 handlers. For that every thread must block them, and the Mojo runtime
-starts its threads before `main` with the mask the process was started
-with. So `Stop.on_signals` and `run_workers` block SIGTERM and SIGINT and,
-unless every thread already blocks them, execute the program again
-(/proc/self/exe, same arguments and environment), whose threads then start
-with them blocked (docs/spikes.md). Call them first in `main`: what comes
-before runs twice, and under `mojo run` the program is compiled again. It
-runs again at most once: if some thread still does not block them after
-that (something unblocks them), a warning says so on stderr.
+starts its threads with the mask the process was started with. So
+`Stop.on_signals` and `run_workers` block SIGTERM and SIGINT and, unless
+the process was started with them blocked and every thread blocks them,
+execute the program again (/proc/self/exe, same arguments and
+environment), whose threads then start with them blocked
+(docs/spikes.md). The mask it was started with decides, not a look at the
+threads alone: on GitHub's aarch64 runners every thread seemed to block
+them while one did not (a SIGTERM then ended the process), presumably
+because the runtime was still starting its threads when `main` ran.
+Call them first in `main`: what comes before runs twice, and under
+`mojo run` the program is compiled again. It runs again at most once: if
+some thread still does not block them after that (something unblocks
+them), a warning says so on stderr.
 
 Before anything else they open /dev/null on whichever of fds 0, 1 and 2
 is closed, so that no socket of the server can land there and receive
@@ -96,15 +101,16 @@ def _ensure_stdio():
 
 
 def _ensure_blocked(set: SignalSet) raises IoError:
-    """Block `set` in this thread; if some thread still does not block it,
-    run the program again with it blocked (does not return then), once:
-    after that a warning goes to stderr instead."""
+    """Block `set` in this thread. Unless the process started with it
+    blocked and every thread blocks it, run the program again with it
+    blocked (does not return then), once: after that a warning goes to
+    stderr instead (module docs)."""
     _ensure_stdio()
-    _ = block(set)
+    var started = block(set)  # (the mask this thread had: the exec-time one)
     var again = getenv(_REEXEC_ENV).byte_length() > 0
     if again:
         _ = unsetenv(_REEXEC_ENV)  # (not for the processes this one starts)
-    if all_threads_block(set):
+    if started.includes(set) and all_threads_block(set):
         return
     if again:
         _log("a thread does not block SIGTERM/SIGINT even after running again: a stop signal may end the process at once")

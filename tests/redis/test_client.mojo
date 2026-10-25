@@ -6,6 +6,7 @@ deadlines that close it, pushes kept aside, and connection URIs."""
 
 from std.python import Python
 from std.testing import TestSuite, assert_equal, assert_false, assert_true
+from std.time import sleep
 
 from linux import ErrorKind, IoError
 from linux.time import Duration, Instant
@@ -233,13 +234,15 @@ def _pushes_and_check(server: RedisServer) raises:
     var writer = Client.connect(server.tcp())
     _ = writer.command("SET", "tracked", "2")
     writer^.close()
-    # check() reads the push without a round trip, and keeps it
-    var waited = 0
+    # check() reads the push without a round trip, and keeps it. (The server
+    # may flush it to the watcher after the writer's reply: wait for it.)
+    var t = Instant.now()
     var pushes = List[Value]()
-    while len(pushes) == 0 and waited < 100:
+    while len(pushes) == 0 and t.elapsed() < Duration.from_secs(5):
         assert_true(watcher.check())
         pushes = watcher.take_pushes()
-        waited += 1
+        if len(pushes) == 0:
+            sleep(0.005)
     assert_equal(len(pushes), 1)
     assert_equal(String(pushes[0]), '>["invalidate" *["tracked"]]')
     assert_equal(watcher.command("GET", "tracked").text(), "2")

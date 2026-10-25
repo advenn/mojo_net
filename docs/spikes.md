@@ -203,6 +203,7 @@ A process-directed signal goes to any thread that does not block it. Blocking SI
 - **The signal mask survives `execve`.** The runtime's threads, created before `main`, take the mask of the thread that starts them. Blocking first and then re-executing the program is the only way found for library code to get a mask that every thread has.
 - **While starting,** a runtime thread briefly blocks every signal (`SigBlk: fffffffffffbfeff`), then takes the inherited mask.
 - **Reading the signalfd directly** in a blocking `read`, with nothing blocked anywhere, also survived in the first spike. The thread in the read is the one woken, and it dequeues the signal before a handler can run. This does not hold in an epoll loop, which returns to user space first, so it is no basis for a design.
+- **On GitHub's aarch64 runners** (2026-10-25) a look at every thread's mask from `main` (`all_threads_block`) said all of them blocked SIGTERM while one did not, and a SIGTERM ended the process. Presumably the runtime was still starting threads; it was not reproduced here. So `server.process` decides from the mask the process started with (blocked: every thread the runtime starts takes it) and keeps the look at the threads only as a second check.
 - **Under `mojo run`** the re-exec compiles the program again. Workers and services should be built binaries.
 
 ---
