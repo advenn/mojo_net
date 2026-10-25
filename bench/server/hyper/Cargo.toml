@@ -1,0 +1,22 @@
+# hyper for bench/server/run.py: GET /plaintext answers "Hello, World!", as
+# bench/server/plaintext.mojo does. WORKERS threads, each with its own
+# tokio current_thread runtime and SO_REUSEPORT listener (the per-core model
+# of bench/server/plaintext.mojo's workers and of nginx).
+[package]
+name = "hyper_plaintext"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+socket2 = { version = "0.6", features = ["all"] }
+tokio = { version = "1", features = ["rt", "net"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

@@ -42,6 +42,7 @@ pixi run nolibc-check              # no libc socket/poll/epoll symbols on the I/
 pixi run gen                       # regenerate src/linux/{nr,consts,errno}.mojo from headers
 pixi run spikes                    # re-run the M1 spikes
 pixi run bench build               # rt benchmarks (bench/rt/README.md)
+pixi run -e bench bench-server run  # HTTP server vs nginx, Go, hyper under wrk (bench/server/README.md)
 ```
 
 **Stability and packaging** (`docs/design.md`):

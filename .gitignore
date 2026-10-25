@@ -16,3 +16,6 @@ __pycache__/
 
 # conda packages built by `pixi run package`
 output/
+# HTTP server benchmark outputs: rebuilt by bench/server/run.py build; only result JSONs are kept.
+bench/server/out/*
+!bench/server/out/*.json

@@ -346,6 +346,11 @@ The `Handler` hooks beyond `handle` all have defaults, so a handler that buffers
     - keep-alive: 103k req/s, and the median round trip is about 19 ms, which is 2,000 requests in flight queued on one core;
     - 4 pipelined per connection: 293k req/s;
     - after each run the process is back to 5 open descriptors, at 27–29 MB RSS.
+  - **Against nginx, Go and hyper** (`bench/server/README.md`: wrk, TechEmpower's plaintext test, every process pinned, the median of 3 runs on a shared laptop):
+    - one CPU, 64 keep-alive connections: mojo 152k req/s, nginx 142k, hyper 163k, Go 75k; 6.1–6.9 µs of CPU a request for the first three, mostly the kernel's loopback TCP;
+    - one CPU, 16 pipelined: hyper 918k, mojo 614k (1.62 µs a request against hyper's 1.07), nginx 159k, Go 86k;
+    - four CPUs (two cores), 16 pipelined: hyper 1.78M, mojo 1.34M, nginx 406k, Go 164k; without pipelining, wrk was the limit at about 285k;
+    - **Lead:** mojo's gap to hyper is user time, 0.4–0.7 µs a request: the server layer above the codec.
   - **The independent review:** three reviewers, one each for protocol and security, resources and the loop, and processes and signals. They reported 35 distinct findings and found no request smuggling, desync, client-driven header injection or path escape. Every finding that could be reproduced was, first by a regression test failing on the old code:
     - `tests/server/test_server_regressions.mojo`;
     - `tests/server/test_static_regressions.mojo`;
