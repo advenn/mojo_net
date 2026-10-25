@@ -1,7 +1,8 @@
 """`RespConnection`: the sans-I/O codec for one connection to a Redis
 server (design contract 1).
 
-Commands are queued with `command(args)` and pipeline: each reply pairs
+Commands are queued with `command(args)`, or several at once with
+`commands(batch)` (whole or not at all), and pipeline: each reply pairs
 with the oldest command still waiting for one. Events:
 - **REPLY:** a command's reply (`ev.value`), errors included: an error
   reply is a value like any other, and the connection goes on.
@@ -39,6 +40,24 @@ comptime E_FEED = "redis: fed past feed_capacity()"
 comptime E_CLOSED = "redis: the connection is closed"
 comptime E_SUBSCRIBE = "redis: subscribing needs a connection of its own (a Subscriber)"
 comptime E_REPLIES = "redis: commands that stop replies pairing with commands are refused"
+
+def _check_pairs(args: Args) raises IoError:
+    """Refuse the commands whose replies would not pair with them one for
+    one (see the module docs)."""
+    if (
+        args.is_named(0, "SUBSCRIBE")
+        or args.is_named(0, "PSUBSCRIBE")
+        or args.is_named(0, "SSUBSCRIBE")
+        or args.is_named(0, "UNSUBSCRIBE")
+        or args.is_named(0, "PUNSUBSCRIBE")
+        or args.is_named(0, "SUNSUBSCRIBE")
+    ):
+        raise IoError.of_kind(E_SUBSCRIBE, ErrorKind.InvalidInput)
+    if args.is_named(0, "MONITOR") or (
+        args.is_named(0, "CLIENT") and args.is_named(1, "REPLY") and (args.is_named(2, "OFF") or args.is_named(2, "SKIP"))
+    ):
+        raise IoError.of_kind(E_REPLIES, ErrorKind.InvalidInput)
+
 
 comptime _MAX_QUEUED = 4 << 30
 """The commands queued and not yet sent, at most (`OutOfMemory` past it)."""
@@ -83,6 +102,8 @@ struct RespConnection(Codec, Copyable):
 
     var _rx: ByteBuffer
     var _tx: ByteBuffer
+    var _request: ByteBuffer
+    """Where a batch of commands is built before it joins `_tx`."""
     var _parser: RespParser
     var _pending: Int
     """Commands sent whose reply has not come."""
@@ -99,6 +120,7 @@ struct RespConnection(Codec, Copyable):
         # unfinished line at most, so this much room always takes more)
         self._rx = ByteBuffer(max_size=limits.max_line + 64 * 1024)
         self._tx = ByteBuffer(max_size=_MAX_QUEUED)
+        self._request = ByteBuffer(max_size=_MAX_QUEUED)
         self._parser = RespParser(limits)
         self._pending = 0
         self._quit = False
@@ -126,30 +148,34 @@ struct RespConnection(Codec, Copyable):
         before it. `InvalidInput`, with nothing queued, for a command
         refused here (see the module docs) or when the connection is not
         open; the error that ended it, once it has failed."""
-        if self._failed:
-            raise self._failed.value()
-        if not self.is_open():
-            raise IoError.of_kind(E_CLOSED, ErrorKind.InvalidInput)
-        if len(args) > 0:
-            if (
-                args.is_named(0, "SUBSCRIBE")
-                or args.is_named(0, "PSUBSCRIBE")
-                or args.is_named(0, "SSUBSCRIBE")
-                or args.is_named(0, "UNSUBSCRIBE")
-                or args.is_named(0, "PUNSUBSCRIBE")
-                or args.is_named(0, "SUNSUBSCRIBE")
-            ):
-                raise IoError.of_kind(E_SUBSCRIBE, ErrorKind.InvalidInput)
-            if args.is_named(0, "MONITOR") or (
-                args.is_named(0, "CLIENT")
-                and args.is_named(1, "REPLY")
-                and (args.is_named(2, "OFF") or args.is_named(2, "SKIP"))
-            ):
-                raise IoError.of_kind(E_REPLIES, ErrorKind.InvalidInput)
+        self._check_open()
+        _check_pairs(args)
         write_command(self._tx, args)
         self._pending += 1
         if args.is_named(0, "QUIT"):
             self._quit = True
+
+    def commands(mut self, batch: List[Args]) raises IoError:
+        """Queue several commands as one, whole or not at all: refused, as
+        `command` refuses one, if any of them is, with nothing queued.
+        Their replies come in their order."""
+        self._check_open()
+        for i in range(len(batch)):
+            _check_pairs(batch[i])
+        self._request.clear()
+        for i in range(len(batch)):
+            write_command(self._request, batch[i])
+        self._tx.write_bytes(self._request.readable_span())
+        self._pending += len(batch)
+        for i in range(len(batch)):
+            if batch[i].is_named(0, "QUIT"):
+                self._quit = True
+
+    def _check_open(self) raises IoError:
+        if self._failed:
+            raise self._failed.value()
+        if not self.is_open():
+            raise IoError.of_kind(E_CLOSED, ErrorKind.InvalidInput)
 
     # ---- the Codec interface ---------------------------------------------------
 

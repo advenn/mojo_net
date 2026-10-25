@@ -2,7 +2,7 @@
 
 A client for Redis and the servers that speak its protocol (Valkey, and others), in native Mojo on Linux, speaking RESP2 and RESP3 without hiredis. It is the second of the roadmap's database drivers, after `pg` (`docs/pg.md`). Package rules and the shared contracts are in `docs/design.md`; the transport is `net` (`docs/net.md`).
 
-**Status: R1–R2 done:** the sans-I/O RESP codec, and a blocking client tested against Valkey 9.1. Next is R3: pipelines and transactions.
+**Status: R1–R3 done:** the sans-I/O RESP codec, a blocking client tested against Valkey 9.1, pipelines, transactions and typed helpers. Next is R4: pub/sub.
 
 ## Scope
 **In scope:**
@@ -78,7 +78,23 @@ A client for Redis and the servers that speak its protocol (Valkey, and others),
     - Each costs about 4 µs of client CPU, system calls included.
     - `valkey-benchmark` (hiredis) with one connection and no pipelining does 107,000, 102,000 and 93,000 to 103,000 a second.
     - **Lead:** each call builds its `Args` anew (0.2 µs).
-- **R3: pipelines and transactions.** Many commands in one round trip, each reply or error in its place; MULTI/EXEC with WATCH; typed helpers for the common commands.
+- **R3: pipelines, transactions and typed helpers.** Done.
+  - **Pipelines:** `Client.run(Pipeline)` sends every command in one write and returns their replies in order. An error reply is a value in its place, since the commands after it ran too. The codec queues the batch whole or not at all (`RespConnection.commands`): one refused command refuses it, with nothing sent. A deadline closes the connection, as for one command.
+  - **Transactions:** `Client.transaction(Pipeline)` sends MULTI, the commands and EXEC in one round trip.
+    - It returns EXEC's results, as values of their own (`Value.part`), with an error met running a command in its place.
+    - It returns None when a key WATCHed before changed, so nothing ran.
+    - A command the server refuses while queuing aborts the transaction, and that command's error raises (as redis-py raises it), rather than EXEC's EXECABORT, which does not say which.
+  - **Typed helpers** read each reply in either protocol: `get`, `set` (with an expiry, NX, XX), `delete`, `exists`, `incr`, `expire`, `ttl`, `hset`, `hget`, `hgetall` (a map in RESP3, a flat array in RESP2), `hdel`, `lpush`, `rpush`, `lpop`, `rpop`, `lrange`, `sadd`, `srem`, `smembers`, `sismember`, `zadd`, `zscore` (a double, or a bulk string), `zrange`, `publish`.
+  - `examples/redis/transfer.mojo`: WATCH, read, MULTI/EXEC, and a retry when another client got there first.
+  - **Tests:** 1 more on the codec (batches whole or not at all), and 2 more against Valkey, each over both protocols:
+    - pipelines with errors in place, a push among the replies, a refusal that sends nothing, and a deadline;
+    - transactions: their results, an aggregate among them, an error met running, an abort while queuing, WATCH both ways;
+    - every helper.
+  - **Planted bugs:** 24, all caught on the first run. Three of the tests were added when the bugs were written, before the run, for the gaps they would have shown: an aggregate among a transaction's results, a push inside a pipeline, and a deadline during one.
+  - **Measured** on the Unix socket, the client pinned to one core, with the machine busy (load 3.6):
+    - SET in pipelines of 10: 340,000 to 470,000 a second, against `valkey-benchmark -P 10`'s 433,000.
+    - In pipelines of 100: 580,000 to 680,000 a second, with 550 to 660 ns of client CPU each, against `valkey-benchmark -P 100`'s 952,000. Here the client is the bottleneck.
+    - **Lead (R5):** each reply is a `Value` of its own, which costs a few allocations; one tree for all of a pipeline's replies would remove them.
 - **R4: pub/sub.** `Subscriber`: SUBSCRIBE, PSUBSCRIBE, SSUBSCRIBE and their opposites, messages with a timeout, over RESP3 or RESP2.
 - **R5: a pool, examples, and measurements** against `valkey-benchmark`.
 - **R6: reviews and polish.** Independent reviews, a regression test for each finding, planted bugs.

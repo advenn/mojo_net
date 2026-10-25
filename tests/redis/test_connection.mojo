@@ -60,6 +60,37 @@ def test_commands_that_would_break_the_pairing_are_refused() raises:
     assert_equal(_refused(Args()), "InvalidInput  0")
 
 
+def test_batches_are_queued_whole() raises:
+    var o = oracle()
+    var c = RespConnection()
+    var batch = List[Args]()
+    batch.append(Args("SET", "a", 1))
+    batch.append(Args("SUBSCRIBE", "ch"))  # (refused: so is the batch)
+    var kinds = List[String]()
+    try:
+        c.commands(batch)
+    except e:
+        kinds.append(String(e.kind))
+    batch = List[Args]()
+    batch.append(Args("SET", "a", 1))
+    batch.append(Args())  # (no name: the encoder refuses it)
+    try:
+        c.commands(batch)
+    except e:
+        kinds.append(String(e.kind))
+    assert_equal(String(",").join(kinds), "InvalidInput,InvalidInput")
+    assert_equal(sent(c), "")
+    assert_equal(c.pending(), 0)
+    batch = List[Args]()
+    batch.append(Args("SET", "a", 1))
+    batch.append(Args("GET", "a"))
+    batch.append(Args("QUIT"))
+    c.commands(batch)
+    assert_equal(c.pending(), 3)
+    assert_false(c.is_open())  # (QUIT among them)
+    assert_equal(s(o.commands(sent(c))), "SET a 1|GET a|QUIT")
+
+
 def test_quit_and_the_ends_of_a_connection() raises:
     var o = oracle()
     # QUIT: nothing more is queued, and EOF after its reply is the end

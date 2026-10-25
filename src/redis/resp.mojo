@@ -315,6 +315,27 @@ struct Value(Copyable, Movable, Writable):
             c += self._size(c)
         return None
 
+    def part(self, n: Int) raises IoError -> Value:
+        """Node `n` and everything in it, as a value of its own (a copy, its
+        nodes numbered from 0)."""
+        self._check(n)
+        var end = n + self._size(n)
+        var out = Value()
+        var base = -1
+        var stop = 0
+        for i in range(n, end):
+            if _has_bytes(self._kind[i]):
+                if base < 0:
+                    base = self._x[i]
+                stop = self._x[i] + self._y[i]
+        if base < 0:
+            base = 0
+        for i in range(n, end):
+            var k = self._kind[i]
+            out._add(k, self._x[i] - base if _has_bytes(k) else self._x[i], self._y[i])
+        out._data.extend(Span(self._data)[base:stop])
+        return out^
+
     def _text_span(self, n: Int) -> Span[UInt8, origin_of(self._data)]:
         """A string node's bytes (a verbatim string's without its format)."""
         var s = self._span(n)

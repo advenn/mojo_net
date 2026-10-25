@@ -10,7 +10,7 @@ from std.testing import TestSuite, assert_equal, assert_false, assert_true
 from linux import ErrorKind, IoError
 from linux.time import Duration, Instant
 from redis import Args, Kind, Value
-from redis.client import MAX_PUSHES, Client, RedisError
+from redis.client import MAX_PUSHES, Client, Pipeline, RedisError
 from redis.config import Config
 from redis_server import RedisServer
 
@@ -337,6 +337,169 @@ def _endless(port: Int) raises:
     r^.close()
 
 
+def _run_error(mut r: Client, p: Pipeline, transaction: Bool) raises -> RedisError:
+    try:
+        if transaction:
+            _ = r.transaction(p)
+        else:
+            _ = r.run(p)
+    except e:
+        return e.copy()
+    raise Error("no error")
+
+
+def _pipelines(server: RedisServer) raises:
+    for protocol in [3, 2]:
+        var config = server.tcp()
+        config.protocol = protocol
+        var r = Client.connect(config)
+        _ = r.command("FLUSHDB")
+        # one write, every reply in its place, errors included
+        var p = Pipeline()
+        for i in range(100):
+            p.add("SET", String("k", i), i)
+        p.add("LPUSH", "k0", "x")
+        p.add("INCR", "k99")
+        var replies = r.run(p)
+        assert_equal(len(replies), 102)
+        assert_equal(String(replies[0]), "+OK")
+        assert_equal(replies[100].error_code(), "WRONGTYPE")
+        assert_equal(replies[101].int(), 100)
+        # a push among the replies is kept aside
+        if protocol == 3:
+            var pushed = Pipeline()
+            pushed.add("DEBUG", "PROTOCOL", "push")
+            pushed.add("PING")
+            assert_equal(len(r.run(pushed)), 2)
+            assert_equal(len(r.take_pushes()), 1)
+        # refused whole, before anything is sent
+        var bad = Pipeline()
+        bad.add("SET", "x", 1)
+        bad.add("SUBSCRIBE", "ch")
+        assert_true(_run_error(r, bad, False).io.kind == ErrorKind.InvalidInput)
+        assert_false(Bool(r.get("x")))
+        assert_true(r.is_usable())
+        # a transaction: all at once, in one round trip
+        var t = Pipeline()
+        t.add("INCR", "n")
+        t.add("INCR", "n")
+        t.add("GET", "n")
+        _ = r.rpush("list", "a", "b")
+        t.add("LRANGE", "list", 0, -1)  # (an aggregate among the results)
+        t.add("GET", "n")
+        var got = r.transaction(t)
+        var done = got.take()
+        assert_equal(len(done), 5)
+        assert_equal(done[2].text(), "2")
+        assert_equal(String(done[3]), '*["a" "b"]')
+        assert_equal(done[4].text(), "2")
+        var empty = r.transaction(Pipeline())
+        assert_equal(len(empty.take()), 0)
+        # an error met running one is a value, and the others ran
+        t = Pipeline()
+        t.add("INCR", "k0")
+        t.add("LPUSH", "k1", "x")
+        t.add("INCR", "k2")
+        var ran = r.transaction(t)
+        var mixed = ran.take()
+        assert_equal(mixed[0].int(), 1)
+        assert_equal(mixed[1].error_code(), "WRONGTYPE")
+        assert_equal(mixed[2].int(), 3)
+        # one refused while queuing aborts it: that error raises, and nothing ran
+        t = Pipeline()
+        t.add("SET", "never", 1)
+        t.add("NOSUCHCOMMAND")
+        var aborted = _run_error(r, t, True)
+        assert_true(aborted.is_server())
+        assert_equal(aborted.code(), "ERR")
+        assert_false(Bool(r.get("never")))
+        # WATCH: a key another client changed, and nothing ran
+        _ = r.command("WATCH", "w")
+        var other = Client.connect(config)
+        _ = other.set("w", "theirs")
+        other^.close()
+        t = Pipeline()
+        t.add("SET", "w", "mine")
+        assert_false(Bool(r.transaction(t)))
+        assert_equal(r.get("w").value(), "theirs")
+        _ = r.command("WATCH", "w")
+        assert_true(Bool(r.transaction(t)))
+        assert_equal(r.get("w").value(), "mine")
+        # a deadline that passes closes the connection, as for one command
+        var slow = Pipeline()
+        slow.add("PING")
+        slow.add("BLPOP", "nothing", 0)
+        var timed_out = False
+        try:
+            _ = r.run(slow, Duration.from_millis(100))
+        except e:
+            timed_out = e.is_deadline()
+        assert_true(timed_out)
+        assert_true(_error(r, Args("PING")).io.kind == ErrorKind.Closed)
+        r^.close()
+
+
+def test_pipelines_and_transactions() raises:
+    _with_server(6)
+
+
+def _helpers(server: RedisServer) raises:
+    for protocol in [3, 2]:
+        var config = server.unix()
+        config.protocol = protocol
+        var r = Client.connect(config)
+        _ = r.command("FLUSHDB")
+        assert_true(r.set("s", "v"))
+        assert_equal(r.get("s").value(), "v")
+        assert_false(Bool(r.get("none")))
+        assert_false(r.set("s", "x", nx=True))  # (present)
+        assert_false(r.set("new", "y", xx=True))  # (absent)
+        assert_true(r.set("e", 1, expire=Duration.from_secs(100)))
+        assert_true(r.ttl("e").value() > Duration.from_secs(99))
+        assert_false(Bool(r.ttl("s")))  # (no expiry)
+        assert_true(r.expire("s", Duration.from_secs(50)))
+        assert_true(r.ttl("s").value() <= Duration.from_secs(50))
+        var raw: List[UInt8] = [0, 13, 10, 255]
+        assert_true(r.set_bytes("b", Span(raw)))
+        assert_equal(len(r.get_bytes("b").value()), 4)
+        assert_equal(r.exists("s", "s", "none"), 2)
+        assert_equal(r.delete("s", "e", "none"), 2)
+        assert_equal(r.incr("c"), 1)
+        assert_equal(r.incr("c", 10), 11)
+        assert_true(r.hset("h", "a", 1))
+        assert_false(r.hset("h", "a", 2))
+        assert_equal(r.hget("h", "a").value(), "2")
+        assert_false(Bool(r.hget("h", "zz")))
+        _ = r.hset("h", "b", "x y")
+        var all = r.hgetall("h")
+        assert_equal(len(all), 2)
+        assert_equal(all["b"], "x y")
+        assert_equal(r.hdel("h", "a", "zz"), 1)
+        assert_equal(r.lpush("l", "a", "b"), 2)
+        assert_equal(r.rpush("l", "c"), 3)
+        assert_equal(String(",").join(r.lrange("l", 0, -1)), "b,a,c")
+        assert_equal(r.lpop("l").value(), "b")
+        assert_equal(r.rpop("l").value(), "c")
+        assert_false(Bool(r.lpop("none")))
+        assert_equal(r.sadd("set", "x", "y", "x"), 2)
+        assert_true(r.sismember("set", "x"))
+        assert_false(r.sismember("set", "z"))
+        assert_equal(len(r.smembers("set")), 2)
+        assert_equal(r.srem("set", "x"), 1)
+        assert_true(r.zadd("z", 2.5, "m"))
+        assert_true(r.zadd("z", 1.0, "n"))
+        assert_false(r.zadd("z", 3.0, "m"))  # (updated, not new)
+        assert_equal(r.zscore("z", "m").value(), 3.0)
+        assert_false(Bool(r.zscore("z", "none")))
+        assert_equal(String(",").join(r.zrange("z", 0, -1)), "n,m")
+        assert_equal(r.publish("ch", "hi"), 0)  # (no subscriber)
+        r^.close()
+
+
+def test_typed_helpers() raises:
+    _with_server(7)
+
+
 def test_uris() raises:
     var c = Config.parse("redis://alice:p%40ss@cache.example.com:6380/4?client_name=web&protocol=2&connect_timeout=3")
     assert_equal(c.user, "alice")
@@ -407,8 +570,12 @@ def _run(server: RedisServer, which: Int) -> String:
             _values(server)
         elif which == 4:
             _errors_and_deadlines(server)
-        else:
+        elif which == 5:
             _pushes_and_check(server)
+        elif which == 6:
+            _pipelines(server)
+        else:
+            _helpers(server)
     except e:
         return String(e)
     return ""
