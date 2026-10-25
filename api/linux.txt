@@ -1,0 +1,999 @@
+# The public API of `linux`, rendered from `mojo doc` by tools/check_api.py.
+# Stable: change it only as docs/design.md ("Stability") allows, then run
+# `pixi run api-update` and say why in the commit.
+
+# linux.abi
+comptime CMSG_DATA_OFFSET = cmsg_align(size_of[Cmsghdr]())
+comptime UNIX_PATH_MAX = 108
+comptime UTS_LEN = 65
+def cmsg_align(n: Int) -> Int
+def cmsg_len(n: Int) -> Int
+def cmsg_space(n: Int) -> Int
+def hton16(v: UInt16) -> UInt16
+def hton32(v: UInt32) -> UInt32
+def ntoh16(v: UInt16) -> UInt16
+def ntoh32(v: UInt32) -> UInt32
+struct CloneArgs(Copyable, Deinitable, Movable)
+    var cgroup: UInt64
+    var child_tid: UInt64
+    var exit_signal: UInt64
+    var flags: UInt64
+    var parent_tid: UInt64
+    var pidfd: UInt64
+    var set_tid: UInt64
+    var set_tid_size: UInt64
+    var stack: UInt64
+    var stack_size: UInt64
+    var tls: UInt64
+    def __init__(out self)
+struct Cmsghdr(Copyable, Deinitable, Movable)
+    var len: UInt
+    var level: Int32
+    var type: Int32
+struct EpollEvent(Copyable, Deinitable, Movable)
+    def __init__(out self, events: UInt32, data: UInt64)
+    def data(self) -> UInt64
+    def events(self) -> UInt32
+    def set_data(mut self, data: UInt64)
+struct Ifreq(Copyable, Deinitable, Movable)
+    var ifindex: Int32
+    var name: Array[UInt8, Int(16)]
+    def __init__(out self)
+struct Iovec(Copyable, Deinitable, Movable)
+    var base: Int
+    var len: UInt
+struct IpMreqn(Copyable, Deinitable, Movable)
+    var address: UInt32
+    var ifindex: Int32
+    var multiaddr: UInt32
+struct Ipv6Mreq(Copyable, Deinitable, Movable)
+    var interface: UInt32
+    var multiaddr: Array[UInt8, Int(16)]
+struct Linger(Copyable, Deinitable, Movable)
+    var linger: Int32
+    var onoff: Int32
+struct Mmsghdr(Copyable, Deinitable, Movable)
+    var hdr: Msghdr
+    var len: UInt32
+struct Msghdr(Copyable, Deinitable, Movable)
+    var control: Int
+    var controllen: UInt
+    var flags: Int32
+    var iov: Int
+    var iovlen: UInt
+    var name: Int
+    var namelen: UInt32
+struct OpenHow(Copyable, Deinitable, Movable)
+    var flags: UInt64
+    var mode: UInt64
+    var resolve: UInt64
+struct Pollfd(Copyable, Deinitable, Movable)
+    var events: Int16
+    var fd: Int32
+    var revents: Int16
+struct RawSockaddr(Copyable, Deinitable, Movable)
+    var len: UInt32
+    var storage: SockaddrStorage
+    def __init__(out self)
+    def __init__(out self, *, var storage: SockaddrStorage, len: UInt32)
+    static def capacity() -> Int
+    def family(self) -> Int
+    def reset(mut self)
+    def socklen(self) -> Int
+struct Rlimit(Copyable, Deinitable, ImplicitlyCopyable, Movable, RegisterPassable, TrivialRegisterPassable, Writable)
+    var cur: UInt64
+    var max: UInt64
+    def write_to(self, mut writer: T)
+struct Siginfo(Copyable, Deinitable, Movable)
+    var code: Int32
+    var errno: Int32
+    var pid: Int32
+    var signo: Int32
+    var status: Int32
+    var uid: UInt32
+    def __init__(out self)
+struct SignalfdSiginfo(Copyable, Deinitable, Movable)
+    var code: Int32
+    var errno: Int32
+    var pid: UInt32
+    var signo: UInt32
+    var uid: UInt32
+    def __init__(out self)
+struct SockaddrIn(Copyable, Deinitable, Movable)
+    var addr: UInt32
+    var family: UInt16
+    var port: UInt16
+    var zero: Array[UInt8, Int(8)]
+struct SockaddrIn6(Copyable, Deinitable, Movable)
+    var addr: Array[UInt8, Int(16)]
+    var family: UInt16
+    var flowinfo: UInt32
+    var port: UInt16
+    var scope_id: UInt32
+struct SockaddrStorage(Copyable, Deinitable, Movable)
+    var family: UInt16
+    static def zeroed() -> Self
+struct SockaddrUn(Copyable, Deinitable, Movable)
+    var family: UInt16
+    var path: Array[UInt8, Int(108)]
+struct Statx(Copyable, Deinitable, Movable)
+    var attributes: UInt64
+    var blksize: UInt32
+    var blocks: UInt64
+    var gid: UInt32
+    var ino: UInt64
+    var mask: UInt32
+    var mode: UInt16
+    var mtime_nsec: UInt32
+    var mtime_sec: Int64
+    var nlink: UInt32
+    var size: UInt64
+    var uid: UInt32
+    def __init__(out self)
+struct Timespec(Copyable, Deinitable, Movable)
+    var nsec: Int
+    var sec: Int
+struct Timeval(Copyable, Deinitable, Movable)
+    var sec: Int
+    var usec: Int
+struct Ucred(Copyable, Deinitable, Movable)
+    var gid: UInt32
+    var pid: Int32
+    var uid: UInt32
+struct Utsname(Copyable, Deinitable, Movable)
+    var domainname: Array[UInt8, Int(65)]
+    var machine: Array[UInt8, Int(65)]
+    var nodename: Array[UInt8, Int(65)]
+    var release: Array[UInt8, Int(65)]
+    var sysname: Array[UInt8, Int(65)]
+    var version: Array[UInt8, Int(65)]
+    static def zeroed() -> Self
+
+# linux.consts
+comptime AF_INET = Int(2)
+comptime AF_INET6 = Int(10)
+comptime AF_UNIX = Int(1)
+comptime AF_UNSPEC = Int(0)
+comptime AT_EGID = Int(14)
+comptime AT_EMPTY_PATH = Int(4096)
+comptime AT_EUID = Int(12)
+comptime AT_FDCWD = Int(-100)
+comptime AT_GID = Int(13)
+comptime AT_NULL = Int(0)
+comptime AT_PAGESZ = Int(6)
+comptime AT_SYSINFO_EHDR = Int(33)
+comptime AT_UID = Int(11)
+comptime CLD_DUMPED = Int(3)
+comptime CLD_EXITED = Int(1)
+comptime CLD_KILLED = Int(2)
+comptime CLOCK_BOOTTIME = Int(7)
+comptime CLOCK_MONOTONIC = Int(1)
+comptime CLOCK_MONOTONIC_RAW = Int(4)
+comptime CLOCK_REALTIME = Int(0)
+comptime CLONE_PIDFD = Int(4096)
+comptime EFD_CLOEXEC = Int(524288)
+comptime EFD_NONBLOCK = Int(2048)
+comptime EFD_SEMAPHORE = Int(1)
+comptime EPOLLERR = Int(8)
+comptime EPOLLET = Int(2147483648)
+comptime EPOLLEXCLUSIVE = Int(268435456)
+comptime EPOLLHUP = Int(16)
+comptime EPOLLIN = Int(1)
+comptime EPOLLONESHOT = Int(1073741824)
+comptime EPOLLOUT = Int(4)
+comptime EPOLLPRI = Int(2)
+comptime EPOLLRDHUP = Int(8192)
+comptime EPOLLWAKEUP = Int(536870912)
+comptime EPOLL_CLOEXEC = Int(524288)
+comptime EPOLL_CTL_ADD = Int(1)
+comptime EPOLL_CTL_DEL = Int(2)
+comptime EPOLL_CTL_MOD = Int(3)
+comptime FD_CLOEXEC = Int(1)
+comptime FIONBIO = Int(21537)
+comptime FIONREAD = Int(21531)
+comptime F_DUPFD_CLOEXEC = Int(1030)
+comptime F_GETFD = Int(1)
+comptime F_GETFL = Int(3)
+comptime F_SETFD = Int(2)
+comptime F_SETFL = Int(4)
+comptime GRND_NONBLOCK = Int(1)
+comptime GRND_RANDOM = Int(2)
+comptime IF_NAMESIZE = Int(16)
+comptime IOV_MAX = Int(1024)
+comptime IPPROTO_ICMP = Int(1)
+comptime IPPROTO_ICMPV6 = Int(58)
+comptime IPPROTO_IP = Int(0)
+comptime IPPROTO_IPV6 = Int(41)
+comptime IPPROTO_TCP = Int(6)
+comptime IPPROTO_UDP = Int(17)
+comptime IPPROTO_UDPLITE = Int(136)
+comptime IPV6_ADD_MEMBERSHIP = Int(20)
+comptime IPV6_DROP_MEMBERSHIP = Int(21)
+comptime IPV6_MULTICAST_ALL = Int(29)
+comptime IPV6_MULTICAST_HOPS = Int(18)
+comptime IPV6_MULTICAST_IF = Int(17)
+comptime IPV6_MULTICAST_LOOP = Int(19)
+comptime IPV6_TCLASS = Int(67)
+comptime IPV6_UNICAST_HOPS = Int(16)
+comptime IPV6_V6ONLY = Int(26)
+comptime IP_ADD_MEMBERSHIP = Int(35)
+comptime IP_DROP_MEMBERSHIP = Int(36)
+comptime IP_MULTICAST_ALL = Int(49)
+comptime IP_MULTICAST_IF = Int(32)
+comptime IP_MULTICAST_LOOP = Int(34)
+comptime IP_MULTICAST_TTL = Int(33)
+comptime IP_TOS = Int(1)
+comptime IP_TTL = Int(2)
+comptime MAP_ANONYMOUS = Int(32)
+comptime MAP_POPULATE = Int(32768)
+comptime MAP_PRIVATE = Int(2)
+comptime MAP_SHARED = Int(1)
+comptime MSG_CMSG_CLOEXEC = Int(1073741824)
+comptime MSG_CTRUNC = Int(8)
+comptime MSG_DONTWAIT = Int(64)
+comptime MSG_ERRQUEUE = Int(8192)
+comptime MSG_MORE = Int(32768)
+comptime MSG_NOSIGNAL = Int(16384)
+comptime MSG_OOB = Int(1)
+comptime MSG_PEEK = Int(2)
+comptime MSG_TRUNC = Int(32)
+comptime MSG_WAITALL = Int(256)
+comptime MSG_ZEROCOPY = Int(67108864)
+comptime O_CLOEXEC = Int(524288)
+comptime O_NONBLOCK = Int(2048)
+comptime O_PATH = Int(2097152)
+comptime O_RDONLY = Int(0)
+comptime O_RDWR = Int(2)
+comptime O_WRONLY = Int(1)
+comptime POLLERR = Int(8)
+comptime POLLHUP = Int(16)
+comptime POLLIN = Int(1)
+comptime POLLNVAL = Int(32)
+comptime POLLOUT = Int(4)
+comptime POLLPRI = Int(2)
+comptime POLLRDHUP = Int(8192)
+comptime PROT_NONE = Int(0)
+comptime PROT_READ = Int(1)
+comptime PROT_WRITE = Int(2)
+comptime P_ALL = Int(0)
+comptime P_PID = Int(1)
+comptime P_PIDFD = Int(3)
+comptime RESOLVE_BENEATH = Int(8)
+comptime RESOLVE_NO_MAGICLINKS = Int(2)
+comptime RESOLVE_NO_SYMLINKS = Int(4)
+comptime RLIMIT_NOFILE = Int(7)
+comptime SCM_CREDENTIALS = Int(2)
+comptime SCM_RIGHTS = Int(1)
+comptime SFD_CLOEXEC = Int(524288)
+comptime SFD_NONBLOCK = Int(2048)
+comptime SHUT_RD = Int(0)
+comptime SHUT_RDWR = Int(2)
+comptime SHUT_WR = Int(1)
+comptime SIGALRM = Int(14)
+comptime SIGCHLD = Int(17)
+comptime SIGEV_THREAD_ID = Int(4)
+comptime SIGHUP = Int(1)
+comptime SIGINT = Int(2)
+comptime SIGKILL = Int(9)
+comptime SIGPIPE = Int(13)
+comptime SIGTERM = Int(15)
+comptime SIGUSR1 = Int(10)
+comptime SIGUSR2 = Int(12)
+comptime SIG_BLOCK = Int(0)
+comptime SIG_SETMASK = Int(2)
+comptime SIG_UNBLOCK = Int(1)
+comptime SIOCGIFINDEX = Int(35123)
+comptime SIOCINQ = Int(21531)
+comptime SIOCOUTQ = Int(21521)
+comptime SOCK_CLOEXEC = Int(524288)
+comptime SOCK_DGRAM = Int(2)
+comptime SOCK_NONBLOCK = Int(2048)
+comptime SOCK_RAW = Int(3)
+comptime SOCK_SEQPACKET = Int(5)
+comptime SOCK_STREAM = Int(1)
+comptime SOL_SOCKET = Int(1)
+comptime SO_ACCEPTCONN = Int(30)
+comptime SO_ATTACH_REUSEPORT_CBPF = Int(51)
+comptime SO_BINDTODEVICE = Int(25)
+comptime SO_BROADCAST = Int(6)
+comptime SO_BUSY_POLL = Int(46)
+comptime SO_DOMAIN = Int(39)
+comptime SO_ERROR = Int(4)
+comptime SO_INCOMING_CPU = Int(49)
+comptime SO_KEEPALIVE = Int(9)
+comptime SO_LINGER = Int(13)
+comptime SO_MARK = Int(36)
+comptime SO_PEERCRED = Int(17)
+comptime SO_PROTOCOL = Int(38)
+comptime SO_RCVBUF = Int(8)
+comptime SO_RCVLOWAT = Int(18)
+comptime SO_RCVTIMEO = Int(20)
+comptime SO_REUSEADDR = Int(2)
+comptime SO_REUSEPORT = Int(15)
+comptime SO_SNDBUF = Int(7)
+comptime SO_SNDLOWAT = Int(19)
+comptime SO_SNDTIMEO = Int(21)
+comptime SO_TYPE = Int(3)
+comptime SO_ZEROCOPY = Int(60)
+comptime STATX_BASIC_STATS = Int(2047)
+comptime S_IFDIR = Int(16384)
+comptime S_IFMT = Int(61440)
+comptime S_IFREG = Int(32768)
+comptime TCPI_BITS_DELIVERY_RATE_APP_LIMITED = Int(1)
+comptime TCPI_BITS_FASTOPEN_CLIENT_FAIL = Int(2)
+comptime TCPI_BITS_RCV_WSCALE = Int(4)
+comptime TCPI_BITS_SND_WSCALE = Int(4)
+comptime TCPI_OFF_ADVMSS = Int(84)
+comptime TCPI_OFF_ATO = Int(12)
+comptime TCPI_OFF_BACKOFF = Int(4)
+comptime TCPI_OFF_BUSY_TIME = Int(168)
+comptime TCPI_OFF_BYTES_ACKED = Int(120)
+comptime TCPI_OFF_BYTES_RECEIVED = Int(128)
+comptime TCPI_OFF_BYTES_RETRANS = Int(208)
+comptime TCPI_OFF_BYTES_SENT = Int(200)
+comptime TCPI_OFF_CA_STATE = Int(1)
+comptime TCPI_OFF_DATA_SEGS_IN = Int(152)
+comptime TCPI_OFF_DATA_SEGS_OUT = Int(156)
+comptime TCPI_OFF_DELIVERED = Int(192)
+comptime TCPI_OFF_DELIVERED_CE = Int(196)
+comptime TCPI_OFF_DELIVERY_RATE = Int(160)
+comptime TCPI_OFF_DELIVERY_RATE_APP_LIMITED = Int(7)
+comptime TCPI_OFF_DSACK_DUPS = Int(216)
+comptime TCPI_OFF_FACKETS = Int(40)
+comptime TCPI_OFF_FASTOPEN_CLIENT_FAIL = Int(7)
+comptime TCPI_OFF_LAST_ACK_RECV = Int(56)
+comptime TCPI_OFF_LAST_ACK_SENT = Int(48)
+comptime TCPI_OFF_LAST_DATA_RECV = Int(52)
+comptime TCPI_OFF_LAST_DATA_SENT = Int(44)
+comptime TCPI_OFF_LOST = Int(32)
+comptime TCPI_OFF_MAX_PACING_RATE = Int(112)
+comptime TCPI_OFF_MIN_RTT = Int(148)
+comptime TCPI_OFF_NOTSENT_BYTES = Int(144)
+comptime TCPI_OFF_OPTIONS = Int(5)
+comptime TCPI_OFF_PACING_RATE = Int(104)
+comptime TCPI_OFF_PMTU = Int(60)
+comptime TCPI_OFF_PROBES = Int(3)
+comptime TCPI_OFF_RCV_MSS = Int(20)
+comptime TCPI_OFF_RCV_OOOPACK = Int(224)
+comptime TCPI_OFF_RCV_RTT = Int(92)
+comptime TCPI_OFF_RCV_SPACE = Int(96)
+comptime TCPI_OFF_RCV_SSTHRESH = Int(64)
+comptime TCPI_OFF_RCV_WSCALE = Int(6)
+comptime TCPI_OFF_REORDERING = Int(88)
+comptime TCPI_OFF_REORD_SEEN = Int(220)
+comptime TCPI_OFF_RETRANS = Int(36)
+comptime TCPI_OFF_RETRANSMITS = Int(2)
+comptime TCPI_OFF_RTO = Int(8)
+comptime TCPI_OFF_RTT = Int(68)
+comptime TCPI_OFF_RTTVAR = Int(72)
+comptime TCPI_OFF_RWND_LIMITED = Int(176)
+comptime TCPI_OFF_SACKED = Int(28)
+comptime TCPI_OFF_SEGS_IN = Int(140)
+comptime TCPI_OFF_SEGS_OUT = Int(136)
+comptime TCPI_OFF_SNDBUF_LIMITED = Int(184)
+comptime TCPI_OFF_SND_CWND = Int(80)
+comptime TCPI_OFF_SND_MSS = Int(16)
+comptime TCPI_OFF_SND_SSTHRESH = Int(76)
+comptime TCPI_OFF_SND_WND = Int(228)
+comptime TCPI_OFF_SND_WSCALE = Int(6)
+comptime TCPI_OFF_STATE = Int(0)
+comptime TCPI_OFF_TOTAL_RETRANS = Int(100)
+comptime TCPI_OFF_UNACKED = Int(24)
+comptime TCPI_SHIFT_DELIVERY_RATE_APP_LIMITED = Int(0)
+comptime TCPI_SHIFT_FASTOPEN_CLIENT_FAIL = Int(1)
+comptime TCPI_SHIFT_RCV_WSCALE = Int(4)
+comptime TCPI_SHIFT_SND_WSCALE = Int(0)
+comptime TCP_CA_CWR = Int(2)
+comptime TCP_CA_Disorder = Int(1)
+comptime TCP_CA_Loss = Int(4)
+comptime TCP_CA_Open = Int(0)
+comptime TCP_CA_Recovery = Int(3)
+comptime TCP_CLOSE = Int(7)
+comptime TCP_CLOSE_WAIT = Int(8)
+comptime TCP_CLOSING = Int(11)
+comptime TCP_CONGESTION = Int(13)
+comptime TCP_CORK = Int(3)
+comptime TCP_DEFER_ACCEPT = Int(9)
+comptime TCP_ESTABLISHED = Int(1)
+comptime TCP_FASTOPEN = Int(23)
+comptime TCP_FASTOPEN_CONNECT = Int(30)
+comptime TCP_FIN_WAIT1 = Int(4)
+comptime TCP_FIN_WAIT2 = Int(5)
+comptime TCP_INFO = Int(11)
+comptime TCP_KEEPCNT = Int(6)
+comptime TCP_KEEPIDLE = Int(4)
+comptime TCP_KEEPINTVL = Int(5)
+comptime TCP_LAST_ACK = Int(9)
+comptime TCP_LINGER2 = Int(8)
+comptime TCP_LISTEN = Int(10)
+comptime TCP_MAXSEG = Int(2)
+comptime TCP_NODELAY = Int(1)
+comptime TCP_NOTSENT_LOWAT = Int(25)
+comptime TCP_QUICKACK = Int(12)
+comptime TCP_SYNCNT = Int(7)
+comptime TCP_SYN_RECV = Int(3)
+comptime TCP_SYN_SENT = Int(2)
+comptime TCP_TIME_WAIT = Int(6)
+comptime TCP_ULP = Int(31)
+comptime TCP_USER_TIMEOUT = Int(18)
+comptime TFD_CLOEXEC = Int(524288)
+comptime TFD_NONBLOCK = Int(2048)
+comptime TFD_TIMER_ABSTIME = Int(1)
+comptime TIMER_ABSTIME = Int(1)
+comptime WEXITED = Int(4)
+comptime WNOHANG = Int(1)
+comptime WNOWAIT = Int(16777216)
+
+# linux.epoll
+comptime EP_MAX_EVENTS = (Int(2147483647) // size_of[EpollEvent]())
+comptime MAX_TIMEOUT_MS = 2147483647
+def epoll_create1(flags: Int) -> Int
+def epoll_ctl[E: AsFd, F: AsFd](epfd: E, op: Int, fd: F, ref event: EpollEvent) -> Int
+def epoll_pwait[E: AsFd](epfd: E, events: Span[EpollEvent], timeout_ms: Int) -> Int
+def epoll_pwait2[E: AsFd](epfd: E, events: Span[EpollEvent], timeout_ns: Int) -> Int
+def epoll_timeout_ms(timeout_ns: Int) -> Int
+struct Epoll(AsFd, Deinitable, Movable, Writable)
+    def __init__(out self, var fd: OwnedFd)
+    def add[F: AsFd](self, fd: F, events: UInt32, data: UInt64) raises
+    def close(deinit self) raises
+    def delete[F: AsFd](self, fd: F) raises
+    def disable_pwait2(mut self)
+    def into_fd(deinit self) -> OwnedFd
+    def modify[F: AsFd](self, fd: F, events: UInt32, data: UInt64) raises
+    static def new() raises -> Self
+    def raw_fd(self) -> Int32
+    def uses_pwait2(self) -> Bool
+    def wait(mut self, mut events: List[EpollEvent], deadline: Deadline) raises -> Int
+    def wait(mut self, mut events: List[EpollEvent], deadline: Deadline, now: Instant) raises -> Int
+    def wait(mut self, mut events: List[EpollEvent], timeout: Optional[Duration]) raises -> Int
+    def wait(mut self, mut events: List[EpollEvent], timeout_ns: Int) raises -> Int  # deprecated: signed-ns timeouts turn a missed deadline (deadline_ns - now_ns < 0) into an infinite wait; use wait(events, Optional[Duration]) (None = forever) or wait(events, deadline, now)
+    def write_to(self, mut writer: T)
+
+# linux.errno
+struct Errno(Copyable, Deinitable, Equatable, ImplicitlyCopyable, Movable, RegisterPassable, TrivialRegisterPassable, Writable)
+    comptime E2BIG = Errno(Int32(7))
+    comptime EACCES = Errno(Int32(13))
+    comptime EADDRINUSE = Errno(Int32(98))
+    comptime EADDRNOTAVAIL = Errno(Int32(99))
+    comptime EADV = Errno(Int32(68))
+    comptime EAFNOSUPPORT = Errno(Int32(97))
+    comptime EAGAIN = Errno(Int32(11))
+    comptime EALREADY = Errno(Int32(114))
+    comptime EBADE = Errno(Int32(52))
+    comptime EBADF = Errno(Int32(9))
+    comptime EBADFD = Errno(Int32(77))
+    comptime EBADMSG = Errno(Int32(74))
+    comptime EBADR = Errno(Int32(53))
+    comptime EBADRQC = Errno(Int32(56))
+    comptime EBADSLT = Errno(Int32(57))
+    comptime EBFONT = Errno(Int32(59))
+    comptime EBUSY = Errno(Int32(16))
+    comptime ECANCELED = Errno(Int32(125))
+    comptime ECHILD = Errno(Int32(10))
+    comptime ECHRNG = Errno(Int32(44))
+    comptime ECOMM = Errno(Int32(70))
+    comptime ECONNABORTED = Errno(Int32(103))
+    comptime ECONNREFUSED = Errno(Int32(111))
+    comptime ECONNRESET = Errno(Int32(104))
+    comptime EDEADLK = Errno(Int32(35))
+    comptime EDEADLOCK = Errno(Int32(35))
+    comptime EDESTADDRREQ = Errno(Int32(89))
+    comptime EDOM = Errno(Int32(33))
+    comptime EDOTDOT = Errno(Int32(73))
+    comptime EDQUOT = Errno(Int32(122))
+    comptime EEXIST = Errno(Int32(17))
+    comptime EFAULT = Errno(Int32(14))
+    comptime EFBIG = Errno(Int32(27))
+    comptime EHOSTDOWN = Errno(Int32(112))
+    comptime EHOSTUNREACH = Errno(Int32(113))
+    comptime EHWPOISON = Errno(Int32(133))
+    comptime EIDRM = Errno(Int32(43))
+    comptime EILSEQ = Errno(Int32(84))
+    comptime EINPROGRESS = Errno(Int32(115))
+    comptime EINTR = Errno(Int32(4))
+    comptime EINVAL = Errno(Int32(22))
+    comptime EIO = Errno(Int32(5))
+    comptime EISCONN = Errno(Int32(106))
+    comptime EISDIR = Errno(Int32(21))
+    comptime EISNAM = Errno(Int32(120))
+    comptime EKEYEXPIRED = Errno(Int32(127))
+    comptime EKEYREJECTED = Errno(Int32(129))
+    comptime EKEYREVOKED = Errno(Int32(128))
+    comptime EL2HLT = Errno(Int32(51))
+    comptime EL2NSYNC = Errno(Int32(45))
+    comptime EL3HLT = Errno(Int32(46))
+    comptime EL3RST = Errno(Int32(47))
+    comptime ELIBACC = Errno(Int32(79))
+    comptime ELIBBAD = Errno(Int32(80))
+    comptime ELIBEXEC = Errno(Int32(83))
+    comptime ELIBMAX = Errno(Int32(82))
+    comptime ELIBSCN = Errno(Int32(81))
+    comptime ELNRNG = Errno(Int32(48))
+    comptime ELOOP = Errno(Int32(40))
+    comptime EMEDIUMTYPE = Errno(Int32(124))
+    comptime EMFILE = Errno(Int32(24))
+    comptime EMLINK = Errno(Int32(31))
+    comptime EMSGSIZE = Errno(Int32(90))
+    comptime EMULTIHOP = Errno(Int32(72))
+    comptime ENAMETOOLONG = Errno(Int32(36))
+    comptime ENAVAIL = Errno(Int32(119))
+    comptime ENETDOWN = Errno(Int32(100))
+    comptime ENETRESET = Errno(Int32(102))
+    comptime ENETUNREACH = Errno(Int32(101))
+    comptime ENFILE = Errno(Int32(23))
+    comptime ENOANO = Errno(Int32(55))
+    comptime ENOBUFS = Errno(Int32(105))
+    comptime ENOCSI = Errno(Int32(50))
+    comptime ENODATA = Errno(Int32(61))
+    comptime ENODEV = Errno(Int32(19))
+    comptime ENOENT = Errno(Int32(2))
+    comptime ENOEXEC = Errno(Int32(8))
+    comptime ENOKEY = Errno(Int32(126))
+    comptime ENOLCK = Errno(Int32(37))
+    comptime ENOLINK = Errno(Int32(67))
+    comptime ENOMEDIUM = Errno(Int32(123))
+    comptime ENOMEM = Errno(Int32(12))
+    comptime ENOMSG = Errno(Int32(42))
+    comptime ENONET = Errno(Int32(64))
+    comptime ENOPKG = Errno(Int32(65))
+    comptime ENOPROTOOPT = Errno(Int32(92))
+    comptime ENOSPC = Errno(Int32(28))
+    comptime ENOSR = Errno(Int32(63))
+    comptime ENOSTR = Errno(Int32(60))
+    comptime ENOSYS = Errno(Int32(38))
+    comptime ENOTBLK = Errno(Int32(15))
+    comptime ENOTCONN = Errno(Int32(107))
+    comptime ENOTDIR = Errno(Int32(20))
+    comptime ENOTEMPTY = Errno(Int32(39))
+    comptime ENOTNAM = Errno(Int32(118))
+    comptime ENOTRECOVERABLE = Errno(Int32(131))
+    comptime ENOTSOCK = Errno(Int32(88))
+    comptime ENOTSUP = Errno(Int32(95))
+    comptime ENOTTY = Errno(Int32(25))
+    comptime ENOTUNIQ = Errno(Int32(76))
+    comptime ENXIO = Errno(Int32(6))
+    comptime EOPNOTSUPP = Errno(Int32(95))
+    comptime EOVERFLOW = Errno(Int32(75))
+    comptime EOWNERDEAD = Errno(Int32(130))
+    comptime EPERM = Errno(Int32(1))
+    comptime EPFNOSUPPORT = Errno(Int32(96))
+    comptime EPIPE = Errno(Int32(32))
+    comptime EPROTO = Errno(Int32(71))
+    comptime EPROTONOSUPPORT = Errno(Int32(93))
+    comptime EPROTOTYPE = Errno(Int32(91))
+    comptime ERANGE = Errno(Int32(34))
+    comptime EREMCHG = Errno(Int32(78))
+    comptime EREMOTE = Errno(Int32(66))
+    comptime EREMOTEIO = Errno(Int32(121))
+    comptime ERESTART = Errno(Int32(85))
+    comptime ERFKILL = Errno(Int32(132))
+    comptime EROFS = Errno(Int32(30))
+    comptime ESHUTDOWN = Errno(Int32(108))
+    comptime ESOCKTNOSUPPORT = Errno(Int32(94))
+    comptime ESPIPE = Errno(Int32(29))
+    comptime ESRCH = Errno(Int32(3))
+    comptime ESRMNT = Errno(Int32(69))
+    comptime ESTALE = Errno(Int32(116))
+    comptime ESTRPIPE = Errno(Int32(86))
+    comptime ETIME = Errno(Int32(62))
+    comptime ETIMEDOUT = Errno(Int32(110))
+    comptime ETOOMANYREFS = Errno(Int32(109))
+    comptime ETXTBSY = Errno(Int32(26))
+    comptime EUCLEAN = Errno(Int32(117))
+    comptime EUNATCH = Errno(Int32(49))
+    comptime EUSERS = Errno(Int32(87))
+    comptime EWOULDBLOCK = Errno(Int32(11))
+    comptime EXDEV = Errno(Int32(18))
+    comptime EXFULL = Errno(Int32(54))
+    var value: Int32
+    def __eq__(self, other: Self) -> Bool
+    def name(self) -> StaticString
+    def write_to(self, mut writer: T)
+
+# linux.error
+def check(op: StringSpan[ImmStaticOrigin], ret: Int) raises -> Int
+struct ErrorKind(Copyable, Deinitable, Equatable, ImplicitlyCopyable, Movable, RegisterPassable, TrivialRegisterPassable, Writable)
+    comptime AddrInUse = ErrorKind(UInt8(11))
+    comptime AddrNotAvailable = ErrorKind(UInt8(12))
+    comptime AlreadyConnected = ErrorKind(UInt8(9))
+    comptime BrokenPipe = ErrorKind(UInt8(7))
+    comptime Canceled = ErrorKind(UInt8(24))
+    comptime Closed = ErrorKind(UInt8(25))
+    comptime ConnectionAborted = ErrorKind(UInt8(6))
+    comptime ConnectionRefused = ErrorKind(UInt8(4))
+    comptime ConnectionReset = ErrorKind(UInt8(5))
+    comptime HostUnreachable = ErrorKind(UInt8(15))
+    comptime InProgress = ErrorKind(UInt8(10))
+    comptime Interrupted = ErrorKind(UInt8(2))
+    comptime InvalidData = ErrorKind(UInt8(26))
+    comptime InvalidInput = ErrorKind(UInt8(16))
+    comptime NetworkDown = ErrorKind(UInt8(14))
+    comptime NetworkUnreachable = ErrorKind(UInt8(13))
+    comptime NotConnected = ErrorKind(UInt8(8))
+    comptime NotFound = ErrorKind(UInt8(18))
+    comptime Other = ErrorKind(UInt8(0))
+    comptime OutOfMemory = ErrorKind(UInt8(20))
+    comptime PermissionDenied = ErrorKind(UInt8(17))
+    comptime TimedOut = ErrorKind(UInt8(3))
+    comptime TooManyFiles = ErrorKind(UInt8(19))
+    comptime UnexpectedEof = ErrorKind(UInt8(22))
+    comptime Unsupported = ErrorKind(UInt8(21))
+    comptime WouldBlock = ErrorKind(UInt8(1))
+    comptime WriteZero = ErrorKind(UInt8(23))
+    def __eq__(self, other: Self) -> Bool
+    def name(self) -> StaticString
+    static def of(e: Errno) -> Self
+    def write_to(self, mut writer: T)
+struct IoError(Copyable, Deinitable, ImplicitlyCopyable, Movable, RegisterPassable, TrivialRegisterPassable, Writable)
+    var errno: Errno
+    var kind: ErrorKind
+    var op: StaticString
+    static def from_errno(op: StringSpan[ImmStaticOrigin], e: Errno) -> Self
+    def is_deadline(self) -> Bool
+    static def of_kind(op: StringSpan[ImmStaticOrigin], kind: ErrorKind) -> Self
+    def write_to(self, mut writer: T)
+
+# linux.eventfd
+comptime EVENTFD_MAX = UInt64(18446744073709551614)
+def eventfd2(initval: UInt32, flags: Int) -> Int
+def eventfd_read[F: AsFd](fd: F, mut value: UInt64) -> Int
+def eventfd_write[F: AsFd](fd: F, value: UInt64) -> Int
+struct EventFd(AsFd, Deinitable, Movable, Writable)
+    def __init__(out self, var fd: OwnedFd)
+    def add(self, value: UInt64) raises -> Bool
+    def close(deinit self) raises
+    def drain(self) raises -> UInt64
+    def into_fd(deinit self) -> OwnedFd
+    static def new(nonblocking: Bool = True, semaphore: Bool = False) raises -> Self
+    def raw_fd(self) -> Int32
+    def signal(self) raises
+    def write_to(self, mut writer: T)
+
+# linux.fd
+trait AsFd
+    def raw_fd(self) -> Int32
+struct OwnedFd(AsFd, Deinitable, Movable, Writable)
+    def __deinit__(deinit self)
+    def __init__(out self, *, unsafe_from_raw: Int32)
+    def close(deinit self) raises
+    def into_raw(deinit self) -> Int32
+    def is_cloexec(self) raises -> Bool
+    def is_nonblocking(self) raises -> Bool
+    def raw_fd(self) -> Int32
+    def set_nonblocking(self, on: Bool) raises
+    def try_clone(self) raises -> Self
+    def write_to(self, mut writer: T)
+struct RawFd(AsFd, Copyable, Deinitable, ImplicitlyCopyable, Movable, RegisterPassable, TrivialRegisterPassable, Writable)
+    var fd: Int32
+    def raw_fd(self) -> Int32
+    def write_to(self, mut writer: T)
+
+# linux.fs
+comptime DEFAULT_MAX_FILE = 16777216
+def is_dir(st: Statx) -> Bool
+def is_regular(st: Statx) -> Bool
+def open_beneath[F: AsFd](dir: F, path: StringSpan) raises -> OwnedFd
+def open_dir(path: StringSpan) raises -> OwnedFd
+def pread[F: AsFd](fd: F, buf: Span[UInt8], offset: Int) raises -> Int
+def read_file(path: StringSpan, op: StringSpan[ImmStaticOrigin], max_bytes: Int = Int(16777216)) raises -> List[UInt8]
+def stat_fd[F: AsFd](fd: F) raises -> Statx
+
+# linux.nr
+comptime SYS_accept4 = Int(288) if CompilationTarget.is_x86() else Int(242)
+comptime SYS_bind = Int(49) if CompilationTarget.is_x86() else Int(200)
+comptime SYS_clock_gettime = Int(228) if CompilationTarget.is_x86() else Int(113)
+comptime SYS_clock_nanosleep = Int(230) if CompilationTarget.is_x86() else Int(115)
+comptime SYS_clone = Int(56) if CompilationTarget.is_x86() else Int(220)
+comptime SYS_clone3 = Int(435)
+comptime SYS_close = Int(3) if CompilationTarget.is_x86() else Int(57)
+comptime SYS_connect = Int(42) if CompilationTarget.is_x86() else Int(203)
+comptime SYS_dup3 = Int(292) if CompilationTarget.is_x86() else Int(24)
+comptime SYS_epoll_create1 = Int(291) if CompilationTarget.is_x86() else Int(20)
+comptime SYS_epoll_ctl = Int(233) if CompilationTarget.is_x86() else Int(21)
+comptime SYS_epoll_pwait = Int(281) if CompilationTarget.is_x86() else Int(22)
+comptime SYS_epoll_pwait2 = Int(441)
+comptime SYS_eventfd2 = Int(290) if CompilationTarget.is_x86() else Int(19)
+comptime SYS_execve = Int(59) if CompilationTarget.is_x86() else Int(221)
+comptime SYS_exit_group = Int(231) if CompilationTarget.is_x86() else Int(94)
+comptime SYS_fcntl = Int(72) if CompilationTarget.is_x86() else Int(25)
+comptime SYS_fstat = Int(5) if CompilationTarget.is_x86() else Int(80)
+comptime SYS_futex = Int(202) if CompilationTarget.is_x86() else Int(98)
+comptime SYS_getcpu = Int(309) if CompilationTarget.is_x86() else Int(168)
+comptime SYS_getdents64 = Int(217) if CompilationTarget.is_x86() else Int(61)
+comptime SYS_getegid = Int(108) if CompilationTarget.is_x86() else Int(177)
+comptime SYS_geteuid = Int(107) if CompilationTarget.is_x86() else Int(175)
+comptime SYS_getgid = Int(104) if CompilationTarget.is_x86() else Int(176)
+comptime SYS_getpeername = Int(52) if CompilationTarget.is_x86() else Int(205)
+comptime SYS_getpid = Int(39) if CompilationTarget.is_x86() else Int(172)
+comptime SYS_getrandom = Int(318) if CompilationTarget.is_x86() else Int(278)
+comptime SYS_getsockname = Int(51) if CompilationTarget.is_x86() else Int(204)
+comptime SYS_getsockopt = Int(55) if CompilationTarget.is_x86() else Int(209)
+comptime SYS_gettid = Int(186) if CompilationTarget.is_x86() else Int(178)
+comptime SYS_getuid = Int(102) if CompilationTarget.is_x86() else Int(174)
+comptime SYS_io_uring_enter = Int(426)
+comptime SYS_io_uring_register = Int(427)
+comptime SYS_io_uring_setup = Int(425)
+comptime SYS_ioctl = Int(16) if CompilationTarget.is_x86() else Int(29)
+comptime SYS_kill = Int(62) if CompilationTarget.is_x86() else Int(129)
+comptime SYS_listen = Int(50) if CompilationTarget.is_x86() else Int(201)
+comptime SYS_madvise = Int(28) if CompilationTarget.is_x86() else Int(233)
+comptime SYS_mmap = Int(9) if CompilationTarget.is_x86() else Int(222)
+comptime SYS_mprotect = Int(10) if CompilationTarget.is_x86() else Int(226)
+comptime SYS_munmap = Int(11) if CompilationTarget.is_x86() else Int(215)
+comptime SYS_openat = Int(257) if CompilationTarget.is_x86() else Int(56)
+comptime SYS_openat2 = Int(437)
+comptime SYS_pidfd_send_signal = Int(424)
+comptime SYS_pipe2 = Int(293) if CompilationTarget.is_x86() else Int(59)
+comptime SYS_ppoll = Int(271) if CompilationTarget.is_x86() else Int(73)
+comptime SYS_pread64 = Int(17) if CompilationTarget.is_x86() else Int(67)
+comptime SYS_prlimit64 = Int(302) if CompilationTarget.is_x86() else Int(261)
+comptime SYS_read = Int(0) if CompilationTarget.is_x86() else Int(63)
+comptime SYS_readv = Int(19) if CompilationTarget.is_x86() else Int(65)
+comptime SYS_recvfrom = Int(45) if CompilationTarget.is_x86() else Int(207)
+comptime SYS_recvmmsg = Int(299) if CompilationTarget.is_x86() else Int(243)
+comptime SYS_recvmsg = Int(47) if CompilationTarget.is_x86() else Int(212)
+comptime SYS_rt_sigaction = Int(13) if CompilationTarget.is_x86() else Int(134)
+comptime SYS_rt_sigprocmask = Int(14) if CompilationTarget.is_x86() else Int(135)
+comptime SYS_sched_getaffinity = Int(204) if CompilationTarget.is_x86() else Int(123)
+comptime SYS_sched_setaffinity = Int(203) if CompilationTarget.is_x86() else Int(122)
+comptime SYS_sched_yield = Int(24) if CompilationTarget.is_x86() else Int(124)
+comptime SYS_sendfile = Int(40) if CompilationTarget.is_x86() else Int(71)
+comptime SYS_sendmmsg = Int(307) if CompilationTarget.is_x86() else Int(269)
+comptime SYS_sendmsg = Int(46) if CompilationTarget.is_x86() else Int(211)
+comptime SYS_sendto = Int(44) if CompilationTarget.is_x86() else Int(206)
+comptime SYS_setsockopt = Int(54) if CompilationTarget.is_x86() else Int(208)
+comptime SYS_shutdown = Int(48) if CompilationTarget.is_x86() else Int(210)
+comptime SYS_signalfd4 = Int(289) if CompilationTarget.is_x86() else Int(74)
+comptime SYS_socket = Int(41) if CompilationTarget.is_x86() else Int(198)
+comptime SYS_socketpair = Int(53) if CompilationTarget.is_x86() else Int(199)
+comptime SYS_splice = Int(275) if CompilationTarget.is_x86() else Int(76)
+comptime SYS_statx = Int(332) if CompilationTarget.is_x86() else Int(291)
+comptime SYS_tgkill = Int(234) if CompilationTarget.is_x86() else Int(131)
+comptime SYS_timer_create = Int(222) if CompilationTarget.is_x86() else Int(107)
+comptime SYS_timer_delete = Int(226) if CompilationTarget.is_x86() else Int(111)
+comptime SYS_timer_settime = Int(223) if CompilationTarget.is_x86() else Int(110)
+comptime SYS_timerfd_create = Int(283) if CompilationTarget.is_x86() else Int(85)
+comptime SYS_timerfd_settime = Int(286) if CompilationTarget.is_x86() else Int(86)
+comptime SYS_uname = Int(63) if CompilationTarget.is_x86() else Int(160)
+comptime SYS_waitid = Int(247) if CompilationTarget.is_x86() else Int(95)
+comptime SYS_write = Int(1) if CompilationTarget.is_x86() else Int(64)
+comptime SYS_writev = Int(20) if CompilationTarget.is_x86() else Int(66)
+
+# linux.poll
+def poll_until(fds: Span[Pollfd], deadline: Deadline, op: StringSpan[ImmStaticOrigin]) raises -> Int
+def ppoll(fds: Span[Pollfd], timeout: Optional[Duration]) -> Int
+def wait_ready[F: AsFd](fd: F, events: Int16, deadline: Deadline, op: StringSpan[ImmStaticOrigin]) raises -> Int16
+
+# linux.probe
+comptime MIN_KERNEL = KernelVersion(Int(5), Int(15), Int(0))
+comptime RLIM_INFINITY = UInt64(18446744073709551615)
+comptime SECCOMP_MODE_DISABLED = Int(0)
+comptime SECCOMP_MODE_FILTER = Int(2)
+comptime SECCOMP_MODE_STRICT = Int(1)
+def auxv_lookup(key: UInt64) raises -> Optional[UInt64]
+def cpu_count() raises -> Int
+def cpu_quota() -> Optional[Int]
+def get_rlimit(resource: Int) raises -> Rlimit
+def has_epoll_pwait2() -> Bool
+def io_uring_setup_probe() -> Int
+def kernel_version() raises -> KernelVersion
+def nofile_limit() raises -> Rlimit
+def page_size() raises -> Int
+def pregrow_fd_table[F: AsFd](fd: F, max_fds: Int = Int(65536)) -> Int
+def probe_io_uring() -> IoUringSupport
+def raise_nofile_limit() raises -> Int
+def raise_nofile_limit(target: UInt64) raises -> UInt64
+def require_kernel(minimum: KernelVersion) raises
+def seccomp_mode() raises -> Int
+def seccomp_mode_of_status(status: Span[UInt8]) -> Int
+def set_rlimit(resource: Int, lim: Rlimit) raises
+def uname() raises -> Utsname
+def uts_string(ref field: Array[UInt8, Int(65)]) -> String
+struct Capabilities(Copyable, Deinitable, ImplicitlyCopyable, Movable, RegisterPassable, TrivialRegisterPassable, Writable)
+    var cpus: Int
+    var epoll_pwait2: Bool
+    var io_uring: IoUringSupport
+    var kernel: KernelVersion
+    var nofile: Rlimit
+    var page_size: Int
+    static def detect(policy: ProbePolicy = ProbePolicy.Auto) raises -> Self
+    def io_uring_usable(self) -> Bool
+    def write_to(self, mut writer: T)
+struct IoUringSupport(Copyable, Deinitable, Equatable, ImplicitlyCopyable, Movable, RegisterPassable, TrivialRegisterPassable, Writable)
+    comptime Available = IoUringSupport(UInt8(0))
+    comptime Disabled = IoUringSupport(UInt8(2))
+    comptime NotCompiled = IoUringSupport(UInt8(1))
+    comptime NotProbed = IoUringSupport(UInt8(3))
+    def __eq__(self, rhs: Self) -> Bool
+    def name(self) -> StaticString
+    def write_to(self, mut writer: T)
+struct KernelVersion(Comparable, Copyable, Deinitable, Equatable, ImplicitlyCopyable, Movable, RegisterPassable, TrivialRegisterPassable, Writable)
+    var major: Int
+    var minor: Int
+    var patch: Int
+    def __eq__(self, rhs: Self) -> Bool
+    def __lt__(self, rhs: Self) -> Bool
+    def at_least(self, major: Int, minor: Int, patch: Int = Int(0)) -> Bool
+    static def parse(s: String) raises -> Self
+    static def parse_bytes(b: Span[UInt8]) raises -> Self
+    def write_to(self, mut writer: T)
+struct ProbePolicy(Copyable, Deinitable, Equatable, ImplicitlyCopyable, Movable, RegisterPassable, TrivialRegisterPassable, Writable)
+    comptime Always = ProbePolicy(UInt8(1))
+    comptime Auto = ProbePolicy(UInt8(0))
+    comptime Never = ProbePolicy(UInt8(2))
+    def __eq__(self, rhs: Self) -> Bool
+    def allows_probes(self) -> Bool
+    def name(self) -> StaticString
+    def write_to(self, mut writer: T)
+
+# linux.process
+def all_threads_block(set: SignalSet) raises -> Bool
+def allowed_cpus() raises -> List[Int]
+def reap_others(known: List[Int]) raises -> Int
+def set_allowed_cpus(cpus: List[Int]) raises
+def spawn(mut program: Exec, *, keep: Int32 = Int32(-1), cpu: Int = Int(-1), signal_mask: Optional[SignalSet] = None) raises -> Child
+def threads() raises -> List[Int]
+struct Child(AsFd, Deinitable, Movable, Writable)
+    var pid: Int
+    def __init__(out self, pid: Int, var pidfd: OwnedFd)
+    def raw_fd(self) -> Int32
+    def signal(self, sig: Int) raises
+    def try_wait(self) raises -> Optional[ExitStatus]
+    def wait(self) raises -> ExitStatus
+    def write_to(self, mut writer: T)
+struct Exec(Deinitable, Movable)
+    var args: List[List[UInt8]]
+    var env: List[List[UInt8]]
+    var path: List[UInt8]
+    def __init__(out self, path: StringSpan, args: List[String], env: List[String] = List())
+    def exec(mut self) raises
+    def get_env(self, name: StringSpan) -> Optional[String]
+    def remove_env(mut self, name: StringSpan)
+    def set_env(mut self, name: StringSpan, value: StringSpan)
+    static def this_program() raises -> Self
+struct ExitStatus(Copyable, Deinitable, Equatable, ImplicitlyCopyable, Movable, RegisterPassable, TrivialRegisterPassable, Writable)
+    var code: Int
+    var signal: Int
+    def __eq__(self, other: Self) -> Bool
+    def success(self) -> Bool
+    def write_to(self, mut writer: T)
+
+# linux.random
+def fill_random(buf: Span[UInt8]) raises
+def random_u64() raises -> UInt64
+
+# linux.signal
+def block(set: SignalSet) raises -> SignalSet
+def blocked() raises -> SignalSet
+def set_mask(set: SignalSet) raises -> SignalSet
+def unblock(set: SignalSet) raises -> SignalSet
+struct SignalFd(AsFd, Deinitable, Movable, Writable)
+    def __init__(out self, var fd: OwnedFd)
+    static def new(set: SignalSet) raises -> Self
+    def raw_fd(self) -> Int32
+    def take(self) raises -> Int
+    def write_to(self, mut writer: T)
+struct SignalSet(Copyable, Deinitable, Equatable, ImplicitlyCopyable, Movable, RegisterPassable, TrivialRegisterPassable, Writable)
+    var bits: UInt64
+    def __eq__(self, other: Self) -> Bool
+    def contains(self, sig: Int) -> Bool
+    static def empty() -> Self
+    def includes(self, other: Self) -> Bool
+    static def of(*signals: Int) -> Self
+    def with_signal(self, sig: Int) -> Self
+    def write_to(self, mut writer: T)
+
+# linux.sys
+def accept4[F: AsFd](fd: F, mut addr: SockaddrStorage, mut addrlen: UInt32, flags: Int) -> Int
+def bind[F: AsFd, T: AnyType](fd: F, ref addr: T, addrlen: Int) -> Int
+def close(fd: Int32) -> Int
+def connect[F: AsFd, T: AnyType](fd: F, ref addr: T, addrlen: Int) -> Int
+def dup3[F: AsFd](oldfd: F, newfd: Int32, flags: Int) -> Int
+def fcntl[F: AsFd](fd: F, cmd: Int, arg: Int = Int(0)) -> Int
+def getpeername[F: AsFd](fd: F, mut addr: SockaddrStorage, mut addrlen: UInt32) -> Int
+def getsockname[F: AsFd](fd: F, mut addr: SockaddrStorage, mut addrlen: UInt32) -> Int
+def getsockopt[F: AsFd, T: AnyType](fd: F, level: Int, name: Int, mut value: T, mut optlen: UInt32) -> Int
+def ioctl_int[F: AsFd](fd: F, request: Int, mut value: Int32) -> Int
+def ioctl_ref[F: AsFd, T: AnyType](fd: F, request: Int, mut arg: T) -> Int
+def keep_alive[T: AnyType](ref x: T)
+def listen[F: AsFd](fd: F, backlog: Int) -> Int
+def pipe2(mut fds: Array[Int32, Int(2)], flags: Int) -> Int
+def read[F: AsFd](fd: F, buf: Span[UInt8]) -> Int
+def recv[F: AsFd](fd: F, buf: Span[UInt8], flags: Int) -> Int
+def recvfrom[F: AsFd](fd: F, buf: Span[UInt8], flags: Int, mut addr: SockaddrStorage, mut addrlen: UInt32) -> Int
+def recvmmsg[F: AsFd](fd: F, msgs: Span[Mmsghdr], flags: Int) -> Int
+def recvmsg[F: AsFd](fd: F, mut msg: Msghdr, flags: Int) -> Int
+def send[F: AsFd](fd: F, buf: Span[UInt8], flags: Int) -> Int
+def sendmmsg[F: AsFd](fd: F, msgs: Span[Mmsghdr], flags: Int) -> Int
+def sendmsg[F: AsFd](fd: F, ref msg: Msghdr, flags: Int) -> Int
+def sendto[F: AsFd, T: AnyType](fd: F, buf: Span[UInt8], flags: Int, ref addr: T, addrlen: Int) -> Int
+def setsockopt[F: AsFd, T: AnyType](fd: F, level: Int, name: Int, ref value: T, optlen: Int) -> Int
+def shutdown[F: AsFd](fd: F, how: Int) -> Int
+def socket(domain: Int, type_: Int, protocol: Int) -> Int
+def socketpair(domain: Int, type_: Int, protocol: Int, mut fds: Array[Int32, Int(2)]) -> Int
+def write[F: AsFd](fd: F, buf: Span[UInt8]) -> Int
+
+# linux.syscall
+comptime MAX_ERRNO = 4095
+comptime SUPPORTED_TARGET = CompilationTarget.is_linux() and CompilationTarget.is_x86() or CompilationTarget.is_arm() and is_64bit() and (Endian.native() == Endian.little)
+def assert_supported_target()
+def err_of(ret: Int) -> Int32
+def is_err(ret: Int) -> Bool
+def syscall0(nr: Int) -> Int
+def syscall1(nr: Int, a1: Int) -> Int
+def syscall2(nr: Int, a1: Int, a2: Int) -> Int
+def syscall3(nr: Int, a1: Int, a2: Int, a3: Int) -> Int
+def syscall4(nr: Int, a1: Int, a2: Int, a3: Int, a4: Int) -> Int
+def syscall5(nr: Int, a1: Int, a2: Int, a3: Int, a4: Int, a5: Int) -> Int
+def syscall6(nr: Int, a1: Int, a2: Int, a3: Int, a4: Int, a5: Int, a6: Int) -> Int
+
+# linux.time
+comptime NANOS_PER_MICRO = 1000
+comptime NANOS_PER_MILLI = 1000000
+comptime NANOS_PER_SEC = 1000000000
+def clock_gettime(clock: Int, mut ts: Timespec) -> Int
+def clock_nanosleep(clock: Int, flags: Int, ref req: Timespec) -> Int
+def sleep(d: Duration) raises
+def sleep_until(t: Instant) raises
+def unix_time_ns() -> Int
+trait Clock
+    def now(self) -> Instant
+struct Deadline(Copyable, Deinitable, Equatable, ImplicitlyCopyable, Movable, RegisterPassable, TrivialRegisterPassable, Writable)
+    def __eq__(self, rhs: Self) -> Bool
+    def __init__(*, at_nanos: Int, finite: Bool) -> Self
+    static def after(d: Duration) -> Self
+    static def after[C: Clock](clock: C, d: Duration) -> Self
+    static def after_from(now: Instant, d: Duration) -> Self
+    static def at(t: Instant) -> Self
+    def earliest(self, other: Self) -> Self
+    def instant(self) -> Optional[Instant]
+    def is_expired(self) -> Bool
+    def is_expired(self, now: Instant) -> Bool
+    def is_none(self) -> Bool
+    static def none() -> Self
+    def remaining(self) -> Optional[Duration]
+    def remaining(self, now: Instant) -> Optional[Duration]
+    def write_to(self, mut writer: T)
+struct Duration(Comparable, Copyable, Deinitable, Equatable, ImplicitlyCopyable, Movable, RegisterPassable, TrivialRegisterPassable, Writable)
+    comptime MAX = Duration(nanos=Int.MAX)
+    comptime ZERO = Duration(nanos=Int(0))
+    def __add__(self, rhs: Self) -> Self
+    def __eq__(self, rhs: Self) -> Bool
+    def __iadd__(mut self, rhs: Self)
+    def __init__(*, nanos: Int) -> Self
+    def __isub__(mut self, rhs: Self)
+    def __lt__(self, rhs: Self) -> Bool
+    def __mul__(self, k: Int) -> Self
+    def __sub__(self, rhs: Self) -> Self
+    def as_micros(self) -> Int
+    def as_millis(self) -> Int
+    def as_millis_ceil(self) -> Int
+    def as_nanos(self) -> Int
+    def as_secs(self) -> Int
+    def as_secs_f64(self) -> Float64
+    def as_timespec(self) -> Timespec
+    static def from_micros(us: Int) -> Self
+    static def from_millis(ms: Int) -> Self
+    static def from_nanos(ns: Int) -> Self
+    static def from_secs(s: Int) -> Self
+    static def from_timespec(ts: Timespec) -> Self
+    def is_zero(self) -> Bool
+    def subsec_nanos(self) -> Int
+    def write_to(self, mut writer: T)
+struct Instant(Comparable, Copyable, Deinitable, Equatable, ImplicitlyCopyable, Movable, RegisterPassable, TrivialRegisterPassable, Writable)
+    def __add__(self, d: Duration) -> Self
+    def __eq__(self, rhs: Self) -> Bool
+    def __iadd__(mut self, d: Duration)
+    def __init__(*, nanos: Int) -> Self
+    def __isub__(mut self, d: Duration)
+    def __lt__(self, rhs: Self) -> Bool
+    def __sub__(self, d: Duration) -> Self
+    def __sub__(self, earlier: Self) -> Duration
+    def as_nanos(self) -> Int
+    def as_timespec(self) -> Timespec
+    def duration_since(self, earlier: Self) -> Duration
+    def elapsed(self) -> Duration
+    static def now() -> Self
+    def write_to(self, mut writer: T)
+struct MonotonicClock(Clock, Copyable, Defaultable, Deinitable, ImplicitlyCopyable, Movable, RegisterPassable, TrivialRegisterPassable)
+    def now(self) -> Instant

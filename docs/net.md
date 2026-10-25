@@ -188,10 +188,11 @@ These names and their documented behavior are stable for v1.
        - an independent review of the client code, with all findings fixed under regression tests;
        - fault-seam and descriptor-leak tests;
        - every test and example cross-compiles for aarch64 (`pixi run aarch64-check`);
-       - Mojo 1.2.0 GA.
+       - Mojo 1.2.0 GA;
+       - the conda package (`pixi run package`, a rattler-build recipe), and the API frozen under `pixi run api-check` (docs/design.md, "Packaging" and "Stability").
      - **Left:**
-       - a rattler-build recipe (modular-community);
-       - running the suite on a real aarch64 host.
+       - running the suite on a real aarch64 host (GitHub CI);
+       - publishing to modular-community, which needs a licence and a public repository.
 - **M3: UDP**, in two modes like TCP:
   - sync: blocking `send_to` / `recv_from` with deadlines;
   - async: nonblocking `try_*` calls for readiness loops (`linux.Epoll`), which a future runtime can build on.

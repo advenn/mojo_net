@@ -21,7 +21,19 @@ Native Mojo networking libraries for Linux (x86_64 and aarch64, kernel 5.15+):
 Imports point downward only (`linux` ← `bytes` ← `net` ← `rt`, and `net` ← `http` ← `server`; `crypto` imports only the standard library, `pg` builds on it and `net`, and `redis` on `net`), and only `rt` may import `rt`. The protocol code of `http`, `pg` and `redis` is sans-I/O: only their client modules import `net`. CI checks these rules. Design, package rules and shared contracts: [docs/design.md](docs/design.md).
 
 ## Use
-There is no published package yet. Pin the same Mojo as `pixi.toml`, and put `src/` on the include path (`mojo run -I src ...`).
+The libraries (all but `rt`) are one conda package, `mojo-net`, which is not published yet. Build it with `pixi run package`; `output/` is then a conda channel that another pixi project can install it from:
+
+```toml
+[workspace]
+channels = ["file:///path/to/mojo_net/output", "https://conda.modular.com/max", "conda-forge"]
+platforms = ["linux-64", "linux-aarch64"]
+
+[dependencies]
+mojo = ">=1.2,<1.3"
+mojo-net = "0.1.*"
+```
+
+The package holds sources, which the compiler finds with no `-I`. CI also keeps each build as a workflow artifact. Without the package, put `src/` on the include path instead (`mojo run -I src ...`). The APIs of `linux`, `bytes` and `net` are stable (`api/*.txt`; see "Stability" in `docs/design.md`).
 
 ```mojo
 from linux.time import Deadline, Duration
@@ -56,7 +68,10 @@ Everything runs through [pixi](https://pixi.sh):
 ```bash
 pixi run test             # every tests/**/test_*.mojo, plus the ABI layout check
 pixi run test net/        # only files whose path contains "net/"
-pixi run ci               # import rules + tests + no-libc check + example builds
+pixi run ci               # import rules + stable API + tests + no-libc check + example builds
+pixi run package          # the conda package, built and tested in a fresh environment
 ```
+
+GitHub CI runs `ci` and `package` on x86_64 and on a real aarch64 machine.
 
 `CLAUDE.md` lists the repository rules and the Mojo 1.2 pitfalls found so far.

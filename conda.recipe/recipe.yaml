@@ -1,0 +1,56 @@
+# The conda package of mojo_net's libraries (docs/design.md, "Packaging").
+# Build it with `pixi run package` (tools/build_package.sh); it lands in
+# output/noarch/. Not published yet: see docs/design.md for what publishing
+# still needs (a licence, a public repository, a git source).
+#
+# It holds the sources of every library but the frozen `rt`, installed in
+# $PREFIX/lib/mojo/<pkg>/, where the Mojo compiler finds them with no -I.
+# Sources, not .mojoc files: a precompiled package loads only on the
+# compiler that built it, while sources build on any Mojo 1.2.x. Each
+# library is precompiled during the build all the same, as a check.
+
+context:
+  version: "0.1.0"
+
+package:
+  name: mojo-net
+  version: ${{ version }}
+
+source:
+  path: ../src
+  target_directory: src
+
+build:
+  number: 0
+  noarch: generic
+  script:
+    - mkdir -p "$PREFIX/lib/mojo" check
+    - for pkg in linux bytes crypto net http server pg redis; do mojo precompile -I src "src/$pkg" -o "check/$pkg.mojoc" || exit 1; cp -R "src/$pkg" "$PREFIX/lib/mojo/$pkg"; done
+    - find "$PREFIX/lib/mojo" -name __pycache__ -prune -exec rm -rf {} +
+
+requirements:
+  build:
+    - mojo-compiler >=1.2,<1.3
+  run:
+    - mojo-compiler >=1.2,<1.3
+    # (raw Linux syscalls: x86_64 or aarch64, kernel 5.15 or newer)
+    - __linux
+
+tests:
+  - script:
+      - mojo run test_package.mojo
+    files:
+      recipe:
+        - test_package.mojo
+
+about:
+  homepage: https://github.com/advenn/mojo_net
+  repository: https://github.com/advenn/mojo_net
+  summary: Native Mojo networking for Linux, with no libc on the I/O path
+  description: |
+    Raw Linux syscalls (linux), byte buffers and the sans-I/O codec contract
+    (bytes), TCP/Unix/UDP sockets with deadlines, DNS and Happy Eyeballs
+    (net), HTTP/1.1 (http) and an HTTP/1.1 server (server), a PostgreSQL
+    driver (pg), a Redis client (redis), and the hashes they authenticate
+    with (crypto). Linux only, x86_64 and aarch64.
+  # (no licence chosen yet; one is required before publishing)

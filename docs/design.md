@@ -22,7 +22,7 @@ So a Mojo upgrade, or a change in a shared layer, lands in every package in one 
 | `linux` | raw syscalls, ABI mirrors, errno, `IoError`, fds, clock, poll/epoll/eventfd wrappers, probing (including fd-table pre-growth) | stable (M1) | `std` only |
 | `bytes` | `ByteBuffer`, base64, and the sans-I/O `Codec` contract (contract 1) with the reference `LineCodec` | stable (M1) | `linux` |
 | `crypto` | hashes and MACs for authentication protocols: SHA-256, MD5, HMAC-SHA-256, PBKDF2, constant-time comparison (no ciphers) | done for `pg` (P1) | `std` only |
-| `net` | the TCP/UDP library (`docs/net.md`): addresses, socket options (L1), blocking TCP/Unix with deadlines and nonblocking `try_*` calls (L2), buffered frame reads (`BufReader`), DNS and connect-by-name (Happy Eyeballs), UDP | TCP client (M2) and UDP (M3) done; packaging left | `linux`, `bytes` |
+| `net` | the TCP/UDP library (`docs/net.md`): addresses, socket options (L1), blocking TCP/Unix with deadlines and nonblocking `try_*` calls (L2), buffered frame reads (`BufReader`), DNS and connect-by-name (Happy Eyeballs), UDP | TCP client (M2) and UDP (M3) done; API stable (see "Stability") | `linux`, `bytes` |
 | `http` | the HTTP/1.1 library (`docs/http.md`): message types, the header map, the sans-I/O head parser, body framing, server and client connection codecs, and a blocking client | H1–H6 done | `linux`, `bytes`; `net` only in `http.client` |
 | `server` | the HTTP/1.1 server (`docs/server.md`): one epoll loop per process over `ServerConnection`s, a `Handler` trait, timeouts, backpressure, streaming; SO_REUSEPORT for multi-core | S1–S5 done | `linux`, `bytes`, `net`, `http` |
 | `pg` | the PostgreSQL driver (`docs/pg.md`): a sans-I/O protocol 3.0 codec, authentication up to SCRAM-SHA-256, a blocking client | P1–P7 done (the codec, a blocking client, parameters, binary types, a statement cache, transactions, notifications, a pool; three independent reviews) | `linux`, `bytes`, `crypto`; `net` only in `pg.client` |
@@ -44,7 +44,7 @@ So a Mojo upgrade, or a change in a shared layer, lands in every package in one 
   - `pixi run nolibc-check` enforces it.
 - **Toolchain:**
   - Mojo is pinned exactly: `1.2.0`, from Modular's stable channel (`https://conda.modular.com/max`).
-  - Packages ship as source, with the constraint `>=1.2,<1.3`.
+  - Packages ship as source, with the constraint `>=1.2,<1.3` (see "Packaging").
   - No private or underscore stdlib APIs (the test-only `linux.fault` is the one exception), and no nightly-only spellings.
 - **Signals are data, not handlers.** The library installs no signal handlers.
   - A program that wants a signal blocks it and reads it from a signalfd (`linux.signal`).
@@ -53,6 +53,20 @@ So a Mojo upgrade, or a change in a shared layer, lands in every package in one 
 - **No async/await yet.** Mojo marks it unstable.
   - The libraries expose blocking APIs, plus nonblocking building blocks for callers that run their own readiness loop.
   - An async runtime waits for Mojo's async design ("the compiler generates coroutines, the library schedules them"), which will shape its API. That is why `rt` is frozen.
+
+## Stability
+- **Stable packages:** `linux`, `bytes` and `net`. Their public API is the snapshot in `api/<pkg>.txt`, as `mojo doc` reads it: every public module, struct, trait, field, method, function and comptime value, with its signature.
+- **Changes are additive.** New names and overloads are fine. A name is removed, renamed or given another signature only after its replacement has shipped beside it, and the old name has warned as deprecated for a release, as `Epoll.wait(timeout_ns)` did.
+- **CI enforces it.** `pixi run api-check` (part of `ci`) fails on any difference from the snapshot and prints it. A deliberate change runs `pixi run api-update` and says why in its commit, so every change to the surface shows as a diff of `api/*.txt`.
+- **Not covered:** names with a leading `_`, and `linux.fault` (the test-only seam). Nor does the check see which error type a call raises: `mojo doc` records only that it raises, so `raises IoError` must not turn into a plain `raises` (contract 8).
+- **The other libraries** (`crypto`, `http`, `server`, `pg`, `redis`) are done or in progress, and their APIs may still change; each one's doc says where it stands.
+
+## Packaging
+- **One conda package, `mojo-net`** (`conda.recipe/recipe.yaml`), with every library but the frozen `rt`: `linux`, `bytes`, `crypto`, `net`, `http`, `server`, `pg`, `redis`. It has one version, the workspace's in `pixi.toml` (the build checks that they match), since the libraries are built and tested together from one commit.
+- **Sources, not precompiled packages.** They install in `$PREFIX/lib/mojo/<pkg>/`, which the Mojo compiler searches with no `-I`. A `.mojoc` file loads only on the compiler that built it, while sources build on any Mojo 1.2.x: the package needs `mojo-compiler >=1.2,<1.3`, and it is `noarch` (Linux only, through `__linux`). The build still precompiles each library, as a check.
+- **`pixi run package`** builds it with rattler-build (in a pixi environment of its own) into `output/noarch/`. Then it installs the package in a fresh environment and runs `conda.recipe/test_package.mojo` there: each library, imported from the package, does one real thing.
+- **GitHub CI** (`.github/workflows/ci.yml`) runs `pixi run ci` and `pixi run package` on x86_64 and on a real aarch64 runner, and keeps each package as a workflow artifact for 30 days.
+- **Not published yet.** Publishing to the modular-community channel needs a licence (none is chosen yet), a public repository, and a recipe whose source is the repository at a full commit hash rather than `../src`.
 
 ## Contracts
 Code comments cite these by number, so keep the numbering stable. Contracts 2, 3 and 6 concern event loops (`rt`, or any loop built on `linux.Epoll`).

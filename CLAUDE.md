@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Work on one library must not gate or leak into another.
 - Package status:
   - `linux`, `bytes`: shared base layers;
-  - `net`: the TCP/UDP library (client side done; packaging left);
+  - `net`: the TCP/UDP library (client side done; API stable, packaged);
   - `http`: the HTTP/1.1 library, done through H6 (`docs/http.md`);
   - `server`: the HTTP server (roadmap step 3), done through S5 (`docs/server.md`);
   - `pg`: the PostgreSQL driver (`docs/pg.md`), done through P7: P1, `crypto` (hashes and MACs for authentication) and `bytes.base64`; P2, the sans-I/O session codec; P3, the blocking client (`pg.client`, `pg.config`); P4, the extended protocol (parameters, prepared statements); P5, binary types and a statement cache; P6, transactions, notifications and a pool; P7, three independent reviews and their fixes;
@@ -27,11 +27,14 @@ Run everything through pixi (`~/.pixi/bin/pixi`). The Mojo toolchain is pinned i
 ```bash
 pixi run test                      # every tests/**/test_*.mojo, plus the ABI layout check
 pixi run test net/                 # only files whose path contains "net/" (no ABI check)
-pixi run ci                        # import-check + test + nolibc-check + examples-check: what CI must run
+pixi run ci                        # import-check + api-check + test + nolibc-check + examples-check: what CI must run
 pixi run mojo run -I src tests/linux/test_sys.mojo                      # one file
 pixi run mojo run -D MOJO_NET_FAULTS=1 -I src tests/net/test_tcp_faults.mojo   # one fault-seam file
 pixi run mojo run -D MOJO_NET_SIM=1 -I src tests/rt/test_loop_contract.mojo     # one file on the rt simulator
 pixi run import-check              # package import rules (tools/check_imports.py)
+pixi run api-check                 # linux, bytes, net public API vs api/*.txt (tools/check_api.py)
+pixi run api-update                # accept a deliberate API change (say why in the commit)
+pixi run package                   # conda package (conda.recipe/), built and tested by rattler-build
 pixi run examples-check            # build every examples/<pkg>/*.mojo
 pixi run aarch64-check             # cross-compile every test and example for aarch64 (~12 min; not in ci)
 pixi run abi-check                 # constants + struct layouts vs this host's C headers
@@ -40,6 +43,12 @@ pixi run gen                       # regenerate src/linux/{nr,consts,errno}.mojo
 pixi run spikes                    # re-run the M1 spikes
 pixi run bench build               # rt benchmarks (bench/rt/README.md)
 ```
+
+**Stability and packaging** (`docs/design.md`):
+- `linux`, `bytes` and `net` are stable: changes are additive, and `api-check` fails on any change to their public API until `api-update` records it. Rename or remove only after a replacement has shipped beside the old name, deprecated.
+- `mojo-net` is one noarch conda package of sources (every library but `rt`) in `$PREFIX/lib/mojo/<pkg>/`, for `mojo-compiler >=1.2,<1.3`; its version is `pixi.toml`'s. `conda.recipe/test_package.mojo` runs in a fresh environment against the installed package. A new library goes into the recipe's list and that test.
+- Not published: no licence is chosen yet, and the repository is private. Do not publish without the user's decision.
+- GitHub CI (`.github/workflows/ci.yml`) runs `ci` and `package` on x86_64 and on a real aarch64 runner (`ubuntu-24.04-arm`).
 
 **Test runner (`tools/run_tests.sh`):**
 - Each test file ends with `def main() raises: TestSuite.discover_tests[__functions_in_module()]().run()`; `mojo test` no longer exists.

@@ -1,0 +1,73 @@
+# The public API of `bytes`, rendered from `mojo doc` by tools/check_api.py.
+# Stable: change it only as docs/design.md ("Stability") allows, then run
+# `pixi run api-update` and say why in the commit.
+
+# bytes.base64
+def base64_decode(t: Span[UInt8]) raises -> List[UInt8]
+def base64_decode(text: StringSpan) raises -> List[UInt8]
+def base64_encode(data: Span[UInt8]) -> String
+
+# bytes.buffer
+comptime CHECK_SPANS = get_defined_bool[StringSpan("MOJO_NET_CHECK_SPANS")]() or get_defined_bool[StringSpan("MOJO_NET_FAULTS")]()
+comptime DEFAULT_MAX_SIZE = 67108864
+comptime MIN_GROWTH = 256
+comptime POISON = UInt8(221)
+struct ByteBuffer(Copyable, Defaultable, Deinitable, Movable, Sized, Writable)
+    def __init__(out self)
+    def __init__(out self, *, capacity: Int, max_size: Int = Int(67108864)) raises
+    def __init__(out self, *, copy: Self)
+    def __init__(out self, *, max_size: Int) raises
+    def __len__(self) -> Int
+    def byte_at(self, offset: Int) raises -> UInt8
+    def capacity(self) -> Int
+    def clear(mut self)
+    def commit(mut self, n: Int) raises
+    def compact(mut self) -> Bool
+    def consume(mut self, n: Int) raises
+    def discard_read_bytes(mut self) -> Int
+    def ensure_writable(mut self, n: Int) raises
+    def find(self, byte: UInt8, start: Int = Int(0)) -> Optional[Int]
+    def find(self, pattern: Span[UInt8], start: Int = Int(0)) -> Optional[Int]
+    def is_empty(self) -> Bool
+    def max_size(self) -> Int
+    def max_writable(self) -> Int
+    def read_bytes(mut self, n: Int) raises -> List[UInt8]
+    def read_index(self) -> Int
+    def read_until(self, delimiter: Span[UInt8], max_bytes: Int, start: Int = Int(0)) raises -> Optional[Int]
+    def read_until(self, delimiter: UInt8, max_bytes: Int, start: Int = Int(0)) raises -> Optional[Int]
+    def readable(self) -> Int
+    def readable_span(self) -> Span[UInt8, origin_of(self._buf)]
+    def shrink_to(mut self, capacity: Int)
+    def writable(self) -> Int
+    def writable_span(mut self) -> Span[UInt8, origin_of(self._buf)]
+    def write_byte(mut self, b: UInt8) raises
+    def write_bytes(mut self, data: Span[UInt8]) raises
+    def write_to(self, mut writer: T)
+
+# bytes.codec
+def drive_chunked[C: Codec & Copyable, //, render: def(C.Event) thin -> String](proto: C, input: Span[UInt8], *, seed: UInt64 = UInt64(24301), random_rounds: Int = Int(200), max_pair_len: Int = Int(256)) raises -> List[String]
+def escape_bytes(data: Span[UInt8]) -> String
+trait Codec(Deinitable, Movable)
+    comptime Event
+    def feed(mut self, data: Span[UInt8]) raises
+    def feed_capacity(self) -> Int
+    def feed_eof(mut self) raises
+    def handle_timeout(mut self, now: Instant) raises
+    def next_deadline(self) -> Optional[Instant]
+    def next_event(mut self) raises -> Optional[Self.Event]
+    def poll_transmit(mut self, mut out: ByteBuffer) raises -> Int
+struct LineCodec(Codec, Copyable, Deinitable, Movable)
+    comptime DEFAULT_MAX_BUFFERED = 1048576
+    comptime DEFAULT_MAX_LINE = 8192
+    comptime Event = List[UInt8]
+    def __init__(out self, *, max_line_length: Int = Int(8192), max_buffered: Int = Int(1048576), crlf: Bool = False) raises
+    def feed(mut self, data: Span[UInt8]) raises
+    def feed_capacity(self) -> Int
+    def feed_eof(mut self) raises
+    def handle_timeout(mut self, now: Instant) raises
+    def next_deadline(self) -> Optional[Instant]
+    def next_event(mut self) raises -> Optional[List[UInt8]]
+    def pending_transmit(self) -> Int
+    def poll_transmit(mut self, mut out: ByteBuffer) raises -> Int
+    def send_line(mut self, line: Span[UInt8]) raises
+    def set_deadline(mut self, at: Optional[Instant])

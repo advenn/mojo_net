@@ -1,0 +1,58 @@
+# `pixi run ci` on x86_64 and on a real aarch64 machine, then the conda
+# package, built and tested on each (docs/design.md, "Packaging"). The
+# package is kept as a workflow artifact only: nothing is published.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: ci (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      # Skips are failures here: the runners have PostgreSQL and Valkey (from
+      # pixi) and IPv6 loopback.
+      MOJO_NET_REQUIRE_PG: "1"
+      MOJO_NET_REQUIRE_REDIS: "1"
+      MOJO_NET_REQUIRE_IPV6: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: prefix-dev/setup-pixi@v0.11.2
+        with:
+          pixi-version: v0.82.1
+          environments: default package
+      - name: Host
+        run: |
+          uname -a
+          echo "cpus: $(nproc)"
+          grep -E 'MemTotal|MemAvailable' /proc/meminfo
+      - name: pixi run ci
+        run: pixi run ci
+      - name: Package
+        run: pixi run package
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mojo-net-${{ matrix.arch }}
+          path: output/noarch/*.conda
+          if-no-files-found: error
+          retention-days: 30

@@ -13,3 +13,6 @@ spikes/epoll_echo/out/*
 bench/rt/out/*
 !bench/rt/out/*.json
 __pycache__/
+
+# conda packages built by `pixi run package`
+output/

@@ -4,7 +4,7 @@ channels = ["https://conda.modular.com/max", "conda-forge"]
 name = "mojo_net"
 platforms = ["linux-64", "linux-aarch64"]
 version = "0.1.0"
-description = "Native Mojo networking libraries for Linux: shared layers (linux syscalls, bytes), the TCP/socket library (net), and an experimental, frozen event-loop runtime (rt)."
+description = "Native Mojo networking libraries for Linux: raw syscalls (linux), bytes, TCP/UDP sockets (net), HTTP/1.1 (http, server), PostgreSQL (pg), Redis (redis); and an experimental, frozen event-loop runtime (rt)."
 
 [tasks]
 # Run all tests, or those whose path contains the given filter: `pixi run test net/`.
@@ -18,15 +18,19 @@ abi-check = "python3 tools/gen_abi.py --check && mojo run -I src build/test_abi_
 nolibc-check = "bash tools/check_nolibc.sh tests/linux/test_sys.mojo tests/linux/test_epoll.mojo tests/linux/test_poll.mojo tests/net/test_socket.mojo tests/net/test_tcp.mojo tests/net/test_unix.mojo tests/net/test_udp.mojo"
 # Verify the package import rules (docs/design.md, "Packages").
 import-check = "python3 tools/check_imports.py"
+# Verify the stable packages' public API (linux, bytes, net) against api/*.txt
+# (docs/design.md, "Stability"); `api-update` accepts a deliberate change.
+api-check = "python3 tools/check_api.py"
+api-update = "python3 tools/check_api.py --write"
 # Build every example, so none can rot unnoticed.
 examples-check = "bash tools/check_examples.sh"
 # Cross-compile every test file and example for aarch64 (objects only:
 # no aarch64 host here). Slow (~10 s a file), so not part of `ci`.
 aarch64-check = "bash tools/check_aarch64.sh"
-# Everything CI must run: the import rules, every test file (which includes the
-# ABI layout check), the no-libc check and the example builds.
-# Set MOJO_NET_REQUIRE_IPV6=1 on runners with IPv6.
-ci = { depends-on = ["import-check", "test", "nolibc-check", "examples-check"] }
+# Everything CI must run: the import rules, the stable API, every test file
+# (which includes the ABI layout check), the no-libc check and the example
+# builds. Set MOJO_NET_REQUIRE_IPV6=1 on runners with IPv6.
+ci = { depends-on = ["import-check", "api-check", "test", "nolibc-check", "examples-check"] }
 # Re-run the M1 threading/runtime/callback spikes (see docs/spikes.md).
 spikes = "bash spikes/run_spikes.sh"
 # rt benchmarks against tokio (rt is frozen; see bench/rt/README.md):
@@ -44,3 +48,14 @@ postgresql = "18.*"
 # Test-only: a real server for tests/redis (Valkey: BSD-licensed, and it
 # speaks Redis's protocol, RESP2 and RESP3).
 valkey-server = "9.*"
+
+# The conda package (conda.recipe/recipe.yaml), built and tested by
+# rattler-build in an environment of its own: `pixi run package`.
+[feature.package.dependencies]
+rattler-build = ">=0.77"
+
+[feature.package.tasks]
+package = "bash tools/build_package.sh"
+
+[environments]
+package = { features = ["package"], no-default-feature = true }

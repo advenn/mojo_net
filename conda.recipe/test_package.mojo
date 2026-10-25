@@ -1,0 +1,86 @@
+"""The conda package's own test (conda.recipe/recipe.yaml): each library
+imports from the installed sources in `$PREFIX/lib/mojo`, with no `-I src`,
+and does one real thing. The full suite runs from the repository
+(`pixi run ci`); this checks that the package holds what it should and
+compiles where it is installed.
+"""
+
+from std.testing import assert_equal, assert_true
+
+from bytes import ByteBuffer
+from bytes.base64 import base64_decode, base64_encode
+from crypto.sha256 import sha256
+from http.parse import HeadParser, RequestHead
+from linux.time import Deadline, Duration
+from net.addr import SocketAddr
+from net.tcp import TcpListener, TcpStream
+from pg.auth import md5_password
+from pg.config import Config as PgConfig
+from redis.config import Config as RedisConfig
+from redis.resp import RespParser, Value
+from server.date import http_date
+
+
+def _tcp() raises:
+    """`linux` and `net`: a TCP round trip over loopback, with deadlines."""
+    var listener = TcpListener.bind(SocketAddr.parse("127.0.0.1:0"))
+    var client = TcpStream.connect(listener.local_addr())
+    var server = listener.accept().into_stream()
+    server.set_deadline(Deadline.after(Duration.from_secs(10)))
+    client.write_all("ping".as_bytes())
+    var got = List[UInt8](length=4, fill=0)
+    server.read_exact(got)
+    assert_equal(String(unsafe_from_utf8=got), "ping")
+    client^.close()
+    server^.close()
+    listener^.close()
+
+
+def _bytes_and_crypto() raises:
+    var buf = ByteBuffer()
+    buf.write_bytes("mojo".as_bytes())
+    assert_equal(base64_encode(buf.readable_span()), "bW9qbw==")
+    assert_equal(String(unsafe_from_utf8=base64_decode("bW9qbw==")), "mojo")
+    var digest = sha256("abc".as_bytes())  # (FIPS 180-2's first vector)
+    assert_equal(Int(digest[0]), 0xBA)
+    assert_equal(Int(digest[31]), 0xAD)
+
+
+def _protocols() raises:
+    """`http`, `server`, `pg` and `redis`: their sans-I/O parts."""
+    var parser = HeadParser.for_requests()
+    var head = RequestHead()
+    var request = "GET /x HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    var taken = parser.request(request.as_bytes(), head)
+    assert_equal(taken.value(), request.byte_length())
+    assert_equal(head.target, "/x")
+    assert_equal(String(head.headers.get("host").value()), "example.com")
+
+    assert_equal(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT")
+
+    var pg = PgConfig.parse("postgresql://app@db.internal:5433/orders")
+    assert_equal(pg.port, 5433)
+    assert_equal(pg.database, "orders")
+    var salt: List[UInt8] = [1, 2, 3, 4]
+    # (as libpq computes it: "md5" + md5(md5(password + user) + salt), from hashlib)
+    assert_equal(md5_password("app", "secret", salt), "md5911f527656472583a006e7727877b33e")
+
+    var r = RedisConfig.parse("redis://cache.internal:6380/2")
+    assert_equal(r.port, 6380)
+    assert_equal(r.database, 2)
+    var rx = ByteBuffer()
+    rx.write_bytes("*2\r\n:1\r\n$3\r\nabc\r\n".as_bytes())
+    var resp = RespParser()
+    assert_true(resp.parse(rx))
+    var v = Value()
+    resp.take(v)
+    assert_equal(v.count(), 2)
+    assert_equal(v.int(1), 1)
+    assert_equal(v.text(2), "abc")
+
+
+def main() raises:
+    _tcp()
+    _bytes_and_crypto()
+    _protocols()
+    print("mojo-net: every library imports and works")
