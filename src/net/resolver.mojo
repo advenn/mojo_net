@@ -94,6 +94,9 @@ comptime _OUT_FAILED = 3
 comptime _OUT_TIMEOUT = 4
 """Every try ended, at least one of them by its timeout."""
 
+comptime _MAX_DRAIN = 64
+"""Datagrams one `_drain` call reads at most (see there)."""
+
 comptime _RECV_BUF = 65535
 
 
@@ -476,9 +479,16 @@ struct Lookup(Movable):
             return
 
     def _drain(mut self, i: Int, deadline: Deadline) raises IoError:
-        """Receive every queued datagram of query `i` until EAGAIN or an
-        accepted answer."""
+        """Receive the queued datagrams of query `i` until EAGAIN or an
+        accepted answer, at most `_MAX_DRAIN` of them: under a stream of
+        strays (from the server's address and port, or a spoofer that
+        knows ours) it returns to `advance`, whose expiry check then ends
+        the try on time instead of reading for as long as they come."""
+        var left = _MAX_DRAIN
         while self._queries[i].state == _WAITING and self._queries[i].udp:
+            if left == 0:
+                return
+            left -= 1
             var r = sys.recv(self._queries[i].udp.value(), Span(self._rbuf), 0)
             if is_err(r):
                 var e = Errno(err_of(r))
@@ -511,7 +521,11 @@ struct Lookup(Movable):
             if from_tcp:
                 self._fail_try(i, deadline)
                 return
-            # The same server again over TCP, with a fresh try timeout.
+            # The same server again over TCP, with a fresh try timeout (no
+            # new exchange after the caller's deadline).
+            if deadline.is_expired():
+                self._fail_try(i, deadline)
+                return
             self._queries[i].close()
             self._queries[i].try_deadline = deadline.earliest(
                 Deadline.after(self._timeout)
@@ -522,8 +536,9 @@ struct Lookup(Movable):
         if (
             ans.rcode == RCODE_FORMERR or ans.rcode == RCODE_NOTIMP
         ) and self._queries[i].edns:
-            # Perhaps no EDNS(0) support: the same server, without OPT.
-            if not self._send(i, False, deadline):
+            # Perhaps no EDNS(0) support: the same server, without OPT (no
+            # new exchange after the caller's deadline).
+            if deadline.is_expired() or not self._send(i, False, deadline):
                 self._fail_try(i, deadline)
             return
         ref q = self._queries[i]
@@ -623,7 +638,9 @@ struct Resolver(Copyable, Movable):
     @staticmethod
     def system() -> Resolver:
         """/etc/resolv.conf and /etc/hosts (files that are missing or
-        unreadable mean the defaults)."""
+        unreadable mean the defaults), read once: a long-lived resolver
+        does not see later changes (glibc rereads a changed resolv.conf).
+        Make a new one when the network changes (DHCP, a VPN)."""
         return Resolver(ResolvConf.load(), Hosts.load())
 
     def start(
@@ -643,9 +660,11 @@ struct Resolver(Copyable, Movable):
             return Lookup(only^)
         except:
             pass
-        var listed = self.hosts.lookup(host)
+        var listed = _filter(self.hosts.lookup(host), want_v4, want_v6)
         if len(listed) > 0:
-            return Lookup(_filter(listed, want_v4, want_v6))
+            # (Listed, but not in a family asked for: DNS is asked, as glibc's
+            # files source answers NOTFOUND for that family.)
+            return Lookup(listed^)
         if _is_localhost(host):
             var lo = List[IpAddr]()
             if want_v6:
@@ -654,11 +673,14 @@ struct Resolver(Copyable, Movable):
                 lo.append(IpAddr(Ipv4Addr(127, 0, 0, 1)))
             return Lookup(lo^)
         var names = search_names(host, self.conf)
+        var dns_v6 = want_v6 and not self.conf.no_aaaa
+        if not want_v4 and not dns_v6:
+            return Lookup(List[IpAddr]())  # (`no-aaaa`, and only IPv6 asked for)
         return Lookup(
             names^,
             self.conf,
             want_v4=want_v4,
-            want_v6=want_v6,
+            want_v6=dns_v6,
             deadline=deadline,
         )
 
@@ -730,6 +752,8 @@ def precedence(ip: IpAddr) -> Int:
             compat = False
     if compat and ip.v6() != Ipv6Addr.from_bits(0):
         return 1  # IPv4-compatible ::a.b.c.d
+    if s[0] == 0 and s[1] == 0 and s[2] == 0 and s[3] == 0 and s[4] == 0 and s[5] == 0xFFFF:
+        return 35  # IPv4-mapped ::ffff:0:0/96, as IPv4 itself
     return 40
 
 

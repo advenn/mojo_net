@@ -5,23 +5,30 @@ like glibc, it skips what it does not understand.
 
 resolv.conf (resolv.conf(5)):
 - `nameserver ADDR`: an IPv4 or IPv6 address (port 53; an IPv6 zone such
-  as `fe80::1%eth0` is allowed). Only the first `MAX_NAMESERVERS` (3)
-  count. With none, 127.0.0.1 and ::1 are used, as glibc and Go do.
+  as `fe80::1%eth0` is allowed). IPv4 also in the forms glibc accepts
+  there (inet_aton's: `127.1`, `10.0.0.01` as octal, `0x7f.1`). Only the
+  first `MAX_NAMESERVERS` (3) count. With none, 127.0.0.1 and ::1 are
+  used, as glibc and Go do.
 - `search D1 D2 ...` and `domain D`: the search list; the last such line
   wins. Without one, the domain part of the host name (what follows its
   first `.`) is used, if it has one. At most `MAX_SEARCH` domains count.
 - `options`: `ndots:N` (0..15, default 1), `timeout:N` seconds per query
   (1..30, default 5), `attempts:N` rounds over the servers (1..5, default
-  2), `rotate`, `edns0`, `use-vc` (TCP only). Values out of range are
-  clamped. Other options (`single-request`, `trust-ad`, ...) are ignored:
-  lookups already use a separate socket per query type, which is what
-  `single-request-reopen` works around.
+  2), `rotate`, `edns0`, `use-vc` (TCP only), `no-tld-query` (a name
+  without dots is not sent to DNS as it is, once the search list has been
+  tried) and `no-aaaa` (no AAAA queries; IPv6 addresses in the hosts file
+  still count). A value is read as glibc's atoi reads it (its leading
+  digits) and clamped to the range. Other options (`single-request`,
+  `trust-ad`, ...) are ignored: lookups already use a separate socket per
+  query type, which is what `single-request-reopen` works around.
 - Lines starting with `#` or `;` are comments. The LOCALDOMAIN and
   RES_OPTIONS environment overrides are not read.
 
 hosts (hosts(5)): `ADDR NAME [ALIASES...]`; `#` starts a comment anywhere
 on a line; names compare ignoring ASCII case; lines with an address that
-does not parse are skipped. A name's addresses keep file order. Only
+does not parse are skipped. A name's addresses keep file order. The file
+is read whole, of any size (merged ad-block lists run past 16 MiB): the
+table holds every name anyway, so a size cap could only drop them all. Only
 `files` then `dns` is implemented (no other NSS sources: `myhostname`,
 `mdns`, ...).
 """
@@ -101,15 +108,17 @@ def _lower_name(name: StringSlice) -> String:
 
 
 def _parse_int(s: StringSlice) -> Optional[Int]:
-    """A non-negative decimal of at most 6 digits."""
+    """The leading decimal digits of `s`, as glibc's atoi reads an option
+    value (`5,` is 5), saturating at 1e9 (any range here clamps below it);
+    None without a leading digit."""
     var b = s.as_bytes()
-    if len(b) == 0 or len(b) > 6:
+    if len(b) == 0 or b[0] < 48 or b[0] > 57:
         return None
     var v = 0
     for c in b:
         if c < 48 or c > 57:
-            return None
-        v = v * 10 + Int(c - 48)
+            break
+        v = min(v * 10 + Int(c - 48), 1_000_000_000)
     return v
 
 
@@ -135,6 +144,10 @@ struct ResolvConf(Copyable, Movable):
     var rotate: Bool
     var edns0: Bool
     var use_tcp: Bool
+    var no_tld_query: Bool
+    """A name without dots is not tried as it is after the search list."""
+    var no_aaaa: Bool
+    """No AAAA queries (hosts file entries still count)."""
 
     def __init__(out self):
         """The defaults, with no nameservers yet."""
@@ -146,6 +159,8 @@ struct ResolvConf(Copyable, Movable):
         self.rotate = False
         self.edns0 = False
         self.use_tcp = False
+        self.no_tld_query = False
+        self.no_aaaa = False
 
     @staticmethod
     def parse(text: StringSlice, hostname: StringSlice = "") -> ResolvConf:
@@ -224,6 +239,10 @@ struct ResolvConf(Copyable, Movable):
                 self.edns0 = True
             elif opt == "use-vc" or opt == "usevc" or opt == "tcp":
                 self.use_tcp = True
+            elif opt == "no-tld-query":
+                self.no_tld_query = True
+            elif opt == "no-aaaa":
+                self.no_aaaa = True
             return
         var key = String(from_utf8_lossy=b[:colon])
         var v = _parse_int(String(from_utf8_lossy=b[colon + 1 :]))
@@ -246,12 +265,73 @@ def _nameserver(text: StringSlice) -> Optional[SocketAddr]:
         return SocketAddr(IpAddr.parse(text), DNS_PORT)
     except:
         pass
+    var v4 = _inet_aton(text)
+    if v4:
+        return SocketAddr(IpAddr(v4.value()), DNS_PORT)
     try:
         return SocketAddr(
             SocketAddrV6.parse(String("[", text, "]:53"), resolve_zone=True)
         )
     except:
         return None
+
+
+def _inet_aton(text: StringSlice) -> Optional[Ipv4Addr]:
+    """An IPv4 address as glibc's `__inet_aton_exact` reads a nameserver
+    line: 1 to 4 parts, each decimal, octal (a leading 0) or hex (`0x`),
+    the last filling the bytes left (`127.1` is 127.0.0.1), nothing after
+    it. None otherwise."""
+    var b = text.as_bytes()
+    var parts = List[UInt64]()
+    var i = 0
+    var n = len(b)
+    while True:
+        if i >= n or not (b[i] >= 48 and b[i] <= 57):
+            return None  # (every part starts with a digit)
+        var base: UInt64 = 10
+        if b[i] == 48:
+            base = 8
+            i += 1
+            if i < n and (b[i] == 120 or b[i] == 88):
+                base = 16
+                i += 1
+                if i >= n or b[i] == 46:
+                    return None  # ("0x" needs a digit, as glibc reads it)
+        var v: UInt64 = 0
+        while i < n and b[i] != 46:
+            var c = Int(b[i])
+            var d: Int
+            if c >= 48 and c <= 57:
+                d = c - 48
+            elif base == 16 and c >= 97 and c <= 102:
+                d = c - 87
+            elif base == 16 and c >= 65 and c <= 70:
+                d = c - 55
+            else:
+                return None
+            if UInt64(d) >= base:
+                return None
+            v = v * base + UInt64(d)
+            if v > 0xFFFFFFFF:
+                return None
+            i += 1
+        parts.append(v)
+        if i >= n:
+            break
+        i += 1  # (the dot)
+        if len(parts) == 4:
+            return None
+    var k = len(parts)
+    for j in range(k - 1):
+        if parts[j] > 0xFF:
+            return None
+    var last = parts[k - 1]
+    if last > (UInt64(0xFFFFFFFF) >> UInt64(8 * (k - 1))):
+        return None
+    var bits = last
+    for j in range(k - 1):
+        bits |= parts[j] << UInt64(8 * (3 - j))
+    return Ipv4Addr(bits=UInt32(bits))
 
 
 # ---- hosts -------------------------------------------------------------------
@@ -295,10 +375,10 @@ struct Hosts(Copyable, Movable, Sized):
 
     @staticmethod
     def load(path: StringSlice = HOSTS) -> Hosts:
-        """Read and parse `path`; a file that is missing or cannot be read
-        is an empty table."""
+        """Read and parse `path`, of any size (module docs); a file that is
+        missing or cannot be read is an empty table."""
         try:
-            var text = read_file(path, "read(hosts)")
+            var text = read_file(path, "read(hosts)", max_bytes=Int.MAX)
             return Hosts.parse(String(from_utf8_lossy=Span(text)))
         except:
             return Hosts()
@@ -325,12 +405,15 @@ def search_names(name: StringSlice, conf: ResolvConf) -> List[String]:
     - with at least `ndots` dots, the name itself first, then with each
       search domain appended;
     - with fewer, the search domains first, then the name itself.
-    Candidates that are not valid DNS names (too long, ...) are left out."""
+    Candidates that are not valid DNS names (too long, ...) are left out,
+    and so is a name ending in two dots (glibc refuses it too).
+    With `no-tld-query`, a name without dots is not tried as it is once the
+    search list has been (glibc's RES_NOTLDQUERY)."""
     var out = List[String]()
     var b = name.as_bytes()
     if len(b) > 0 and b[len(b) - 1] == 46:
         var bare = _lower_name(name)
-        if is_valid_name(bare):
+        if is_valid_name(name) and not (len(b) > 1 and b[len(b) - 2] == 46):
             out.append(bare^)
         return out^
     var bare = _lower_name(name)
@@ -343,7 +426,9 @@ def search_names(name: StringSlice, conf: ResolvConf) -> List[String]:
         var cand = String(bare, ".", d)
         if is_valid_name(cand):
             suffixed.append(cand^)
-    var itself_ok = is_valid_name(bare)
+    var itself_ok = is_valid_name(bare) and not (
+        conf.no_tld_query and dots == 0 and len(suffixed) > 0
+    )
     if dots >= conf.ndots:
         if itself_ok:
             out.append(bare.copy())

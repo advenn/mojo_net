@@ -59,13 +59,16 @@ Rules every `Codec` follows:
 6. **Errors on the input side are terminal.** Once `feed`, `feed_eof` or
    `next_event` raises, the stream is unusable: the codec keeps raising an
    error of the same kind from those methods, and the driver closes the
-   connection. Misuse of the send side (an invalid outgoing message) raises
-   without poisoning.
+   connection. Two driver mistakes raise without poisoning, since no input
+   is lost: misuse of the send side (an invalid outgoing message), and a
+   `feed` after `feed_eof` (rule 10).
 7. **Transmit is FIFO and append-only.** `poll_transmit(out)` appends queued
    bytes to `out` (never reading or consuming what is already there), in
-   the order they were queued, and returns how many it appended; 0 means
-   nothing is pending. It appends at most `out.max_writable()` bytes and
-   keeps the rest queued. Drivers poll after every call into the codec.
+   the order they were queued, and returns how many it appended. It
+   appends at most `out.max_writable()` bytes and keeps the rest queued, so
+   0 means nothing is pending only while `out` has room: a driver whose
+   `out` is full sends from it before it polls again. Drivers poll after
+   every call into the codec.
 8. **Deadlines are absolute and re-read.** `next_deadline()` is the earliest
    instant at which `handle_timeout` must be called (None: no timer). It can
    change after any call, so drivers read it again each time.
@@ -73,7 +76,7 @@ Rules every `Codec` follows:
    with `now` before the deadline is a no-op (timers fire early, wakeups are
    spurious). It may raise `TimedOut`.
 10. **EOF is explicit.** `feed_eof()` says the peer finished sending; `feed`
-    after it raises `InvalidInput`. Complete events are still delivered;
+    after it raises `InvalidInput` (without poisoning: rule 6). Complete events are still delivered;
     a partial message then makes `next_event` raise `UnexpectedEof`.
 """
 

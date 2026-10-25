@@ -348,7 +348,9 @@ struct TcpStream(AsFd, Movable, Read, Writable):
         silence, every 10 s, giving up after 3) and TCP_USER_TIMEOUT of the
         same total for unacknowledged writes (see
         `net.blocking.detect_dead_peers`). A dead peer then fails the next
-        read or write with `TimedOut` (ETIMEDOUT) within about a minute."""
+        read or write with `TimedOut` (ETIMEDOUT) within about a minute. So
+        does a live peer that stops reading that long while data is queued
+        for it (the user timeout bounds zero-window probing too)."""
         detect_dead_peers(self._sock, keepalive)
 
     def idle_state(self) -> IdleState:

@@ -333,17 +333,28 @@ def test_ensure_writable_grows_instead_of_costly_compaction() raises:
     assert_equal(len(b), 246)
 
 
-def test_at_max_size_compaction_is_the_fallback() raises:
+def test_at_max_size_a_costly_compaction_grows_once_instead() raises:
     var b = ByteBuffer(capacity=256, max_size=256)
     var data = List[UInt8]()
     for i in range(256):
         data.append(UInt8(i))
     b.write_bytes(Span(data))
     b.consume(10)
-    b.ensure_writable(5)  # cannot grow: compacts even though it is costly
-    assert_equal(b.capacity(), 256)
+    # Compacting would move 246 bytes to reclaim 10: it grows once to twice
+    # the cap instead (the module docs' exception), keeping the cap on what
+    # is readable.
+    b.ensure_writable(5)
+    assert_equal(b.capacity(), 512)
     assert_equal(b.read_index(), 0)
     assert_equal(Int(b.readable_span()[0]), 10)
+    assert_equal(b.writable(), 10)
+    # A cheap compaction at the cap still compacts.
+    var c = ByteBuffer(capacity=256, max_size=256)
+    c.write_bytes(Span(data))
+    c.consume(200)
+    c.ensure_writable(100)
+    assert_equal(c.capacity(), 256)
+    assert_equal(c.read_index(), 0)
     assert_equal(b.writable(), 10)
     b.ensure_writable(10)  # exactly fits
     assert_equal(_kind_of_ensure(b, 11), ErrorKind.OutOfMemory)
@@ -738,8 +749,8 @@ def test_random_operations_match_list_model() raises:
             b.shrink_to(rng.below(200))
         # Invariants after every step.
         assert_equal(len(b), len(model))
-        assert_true(b.capacity() <= 300)
-        assert_true(b.read_index() + len(b) + b.writable() == b.capacity())
+        assert_true(b.capacity() <= 600)
+        assert_equal(b.writable(), min(b.capacity() - b.read_index() - len(b), 300 - len(b)))
         var s = b.readable_span()
         for i in range(len(model)):
             if s[i] != model[i]:

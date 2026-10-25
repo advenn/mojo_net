@@ -220,12 +220,14 @@ def test_literals_hosts_and_localhost_need_no_server() raises:
     assert_equal(_set(r.lookup_ip("api.LOCALHOST.", _secs(1))), "127.0.0.1 ::1")
     assert_equal(_set(r.lookup_ip("localhost", _secs(1), want_v6=False)), "127.0.0.1")
     assert_equal(_kind(r, "v6.local", _secs(1)), "ok")
+    # Listed with IPv6 only, asked for IPv4: DNS is asked, as glibc's files
+    # source answers NOTFOUND for the family (here the "server" refuses).
     var only4 = String()
     try:
         _ = r.lookup_ip("v6.local", _secs(1), want_v6=False)
     except e:
         only4 = String(e.kind)
-    assert_equal(only4, "NotFound")
+    assert_equal(only4, "Other")
     assert_equal(_kind(r, "bad..name", _secs(1)), "InvalidInput")
     assert_equal(_kind(r, "", _secs(1)), "InvalidInput")
 

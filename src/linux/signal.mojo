@@ -7,8 +7,14 @@ signal (`kill`) goes to any thread that does not block it, and there the
 Mojo runtime's handler ends the process (SIGTERM, SIGINT, SIGHUP). The
 runtime starts its threads before `main`, with the mask the process was
 started with, so blocking in `main` is too late: block first, then re-run
-the program (`linux.process.exec_self`), whose threads inherit the mask.
-docs/spikes.md has the measurements.
+the program (`linux.process.Exec.this_program().exec()`), whose threads
+inherit the mask. docs/spikes.md has the measurements.
+
+Signals 32 and 33 belong to glibc, which the Mojo runtime runs on: thread
+cancellation and `setuid`/`setgid` across threads, which waits until every
+thread has handled signal 33. As glibc's own `sigprocmask` does, `block`,
+`set_mask` and `SignalFd.new` leave them out of any set they are given, so
+that blocking "every signal" cannot hang a later `setuid`.
 """
 
 from .abi import SignalfdSiginfo
@@ -71,8 +77,12 @@ struct SignalSet(Equatable, TrivialRegisterPassable, Writable):
         writer.write(")")
 
 
+comptime _LIBC_SIGNALS: UInt64 = (UInt64(1) << 31) | (UInt64(1) << 32)
+"""Signals 32 (SIGCANCEL) and 33 (SIGSETXID): glibc's own (module docs)."""
+
+
 def _sigprocmask(how: Int, set: SignalSet) raises IoError -> SignalSet:
-    var new = set.bits
+    var new = set.bits & ~_LIBC_SIGNALS if how != SIG_UNBLOCK else set.bits
     var old: UInt64 = 0
     var r = syscall4(
         SYS_rt_sigprocmask, how, Int(Pointer(to=new)), Int(Pointer(to=old)), _SIGSET_SIZE
@@ -84,7 +94,8 @@ def _sigprocmask(how: Int, set: SignalSet) raises IoError -> SignalSet:
 
 
 def block(set: SignalSet) raises IoError -> SignalSet:
-    """Block `set` in the calling thread (only); returns its mask before."""
+    """Block `set` in the calling thread (only), less glibc's signals 32 and
+    33 (module docs); returns its mask before."""
     return _sigprocmask(SIG_BLOCK, set)
 
 
@@ -94,7 +105,8 @@ def unblock(set: SignalSet) raises IoError -> SignalSet:
 
 
 def set_mask(set: SignalSet) raises IoError -> SignalSet:
-    """Make `set` the calling thread's mask; returns the mask before."""
+    """Make `set`, less glibc's signals 32 and 33 (module docs), the calling
+    thread's mask; returns the mask before."""
     return _sigprocmask(SIG_SETMASK, set)
 
 
@@ -116,7 +128,9 @@ struct SignalFd(AsFd, Movable, Writable):
 
     @staticmethod
     def new(set: SignalSet) raises IoError -> SignalFd:
-        var bits = set.bits
+        """A signalfd for `set`, less glibc's signals 32 and 33 (module
+        docs)."""
+        var bits = set.bits & ~_LIBC_SIGNALS
         var r = syscall4(
             SYS_signalfd4, -1, Int(Pointer(to=bits)), _SIGSET_SIZE, SFD_CLOEXEC | SFD_NONBLOCK
         )

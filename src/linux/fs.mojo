@@ -111,6 +111,10 @@ def open_dir(path: StringSlice) raises IoError -> OwnedFd:
     return fd^
 
 
+comptime _BENEATH_TRIES = 32
+"""How many times `open_beneath` tries an openat2 that answers EAGAIN."""
+
+
 def open_beneath[F: AsFd](dir: F, path: StringSlice) raises IoError -> OwnedFd:
     """Open `path` for reading, relative to the directory `dir`, never
     leaving it: openat2 with RESOLVE_BENEATH (no "..", absolute path or
@@ -118,16 +122,30 @@ def open_beneath[F: AsFd](dir: F, path: StringSlice) raises IoError -> OwnedFd:
     O_NONBLOCK, so that a FIFO cannot block the caller (check the type
     with `stat_fd`; reading a regular file never waits on that flag).
     `NotFound` for a missing file, `PermissionDenied`, and EXDEV
-    (`InvalidInput`) for a path that would leave `dir`."""
+    (`InvalidInput`) for a path that would leave `dir`.
+
+    EAGAIN is retried, up to `_BENEATH_TRIES` times: with RESOLVE_BENEATH
+    the kernel answers it to a lookup through ".." that raced with a rename
+    or mount anywhere on the host (openat2(2) says to retry). It also means
+    the file is under a write lease, which lasts until the lease breaks:
+    `WouldBlock` once the tries run out."""
     comptime op = "openat2"
     var cpath = _cpath(path, op)
     var how = OpenHow(
         UInt64(O_RDONLY | O_CLOEXEC | O_NONBLOCK), 0, UInt64(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)
     )
     var r: Int
+    var tries = 0
     while True:
         r = syscall4(SYS_openat2, Int(dir.raw_fd()), Int(cpath.unsafe_ptr()), Int(Pointer(to=how)), 24)
-        if not (is_err(r) and Errno(err_of(r)) == Errno.EINTR):
+        if not is_err(r):
+            break
+        var e = Errno(err_of(r))
+        if e == Errno.EAGAIN:
+            tries += 1
+            if tries >= _BENEATH_TRIES:
+                break
+        elif e != Errno.EINTR:
             break
     keep_alive(cpath)
     keep_alive(how)
@@ -137,12 +155,17 @@ def open_beneath[F: AsFd](dir: F, path: StringSlice) raises IoError -> OwnedFd:
 
 
 def stat_fd[F: AsFd](fd: F) raises IoError -> Statx:
-    """The metadata of the open file `fd` (statx with AT_EMPTY_PATH)."""
+    """The metadata of the open file `fd` (statx with AT_EMPTY_PATH; EINTR
+    retried, which FUSE can answer)."""
     var st = Statx()
     var empty = List[UInt8](length=1, fill=0)
-    var r = syscall5(
-        SYS_statx, Int(fd.raw_fd()), Int(empty.unsafe_ptr()), AT_EMPTY_PATH, STATX_BASIC_STATS, Int(Pointer(to=st))
-    )
+    var r: Int
+    while True:
+        r = syscall5(
+            SYS_statx, Int(fd.raw_fd()), Int(empty.unsafe_ptr()), AT_EMPTY_PATH, STATX_BASIC_STATS, Int(Pointer(to=st))
+        )
+        if not (is_err(r) and Errno(err_of(r)) == Errno.EINTR):
+            break
     keep_alive(empty)
     keep_alive(st)
     _ = check("statx", r)

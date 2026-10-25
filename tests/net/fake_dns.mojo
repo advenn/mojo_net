@@ -132,6 +132,11 @@ def answer(server, tcp, data):
         return ok(v4(name, '192.0.2.9')) if qtype == A else ok()
     if name == 'drop.test':
         return []
+    if name == 'junk.test':  # 200 strays with the wrong ID, and no answer
+        if qtype != A:
+            return ok()
+        wrong_id = bytes([qid[0], qid[1] ^ 0xFF])
+        return [(0, reply(wrong_id, q, 0, (v4(name, '6.6.6.6'),)))] * 200
     if name == 'loop.test':
         return ok(v4(name, '127.0.0.1')) if qtype == A else ok(v6(name, '::1'))
     if name == 'slowaaaa.test':

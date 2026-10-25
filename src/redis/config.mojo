@@ -49,7 +49,10 @@ struct Config(Copyable, Movable):
     and the setup commands. `Duration.ZERO`: no limit."""
     var keepalive: Bool
     """For TCP: keepalive probes and a user timeout, so that a server that
-    vanished is noticed in about a minute (`net.blocking.detect_dead_peers`)."""
+    vanished is noticed in about a minute (`net.blocking.detect_dead_peers`).
+    The user timeout also ends a connection whose server stops reading for
+    a minute while the client has data queued for it: a large pipeline
+    into a server busy in a long script. Turn it off for such work."""
     var limits: Limits
     """What a reply may hold (`redis.resp.Limits`)."""
 

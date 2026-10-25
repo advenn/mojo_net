@@ -266,6 +266,8 @@ struct ResolvConf(Copyable, Deinitable, Movable)
     var edns0: Bool
     var nameservers: List[SocketAddr]
     var ndots: Int
+    var no_aaaa: Bool
+    var no_tld_query: Bool
     var rotate: Bool
     var search: List[String]
     var timeout: Duration

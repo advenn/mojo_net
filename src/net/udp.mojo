@@ -620,7 +620,9 @@ struct UdpSocket(AsFd, Movable, Writable):
     def try_recv_from(
         self, buf: MutSpan[UInt8, _]
     ) raises IoError -> Optional[Datagram]:
-        """One datagram without waiting, or None when none is queued."""
+        """One datagram without waiting, or None when none is queued. After
+        `shutdown_read` it answers None forever while epoll reports the
+        socket readable with EPOLLRDHUP (`net.blocking`'s module docs)."""
         return _try_recv(self._sock, buf, 0, "recv_from")
 
     def try_recv(self, buf: MutSpan[UInt8, _]) raises IoError -> Optional[Datagram]:

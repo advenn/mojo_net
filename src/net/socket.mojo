@@ -1773,14 +1773,12 @@ struct Socket(AsFd, Movable, Writable):
         )
 
     def set_tos(self, tos: Int) raises IoError:
-        """IP_TOS (IPv4 DSCP/ECN byte, 0..255). On TCP sockets the kernel
-        keeps the two ECN bits to itself."""
-        self._set_int(
-            IPPROTO_IP,
-            IP_TOS,
-            _c_int(tos, "setsockopt(IP_TOS)"),
-            "setsockopt(IP_TOS)",
-        )
+        """IP_TOS (IPv4 DSCP/ECN byte, 0..255; `InvalidInput` outside it,
+        where the kernel would keep only the low byte). On TCP sockets the
+        kernel keeps the two ECN bits to itself."""
+        if tos < 0 or tos > 255:
+            raise _invalid("setsockopt(IP_TOS)")
+        self._set_int(IPPROTO_IP, IP_TOS, Int32(tos), "setsockopt(IP_TOS)")
 
     def tos(self) raises IoError -> Int:
         return self._get_int(IPPROTO_IP, IP_TOS, "getsockopt(IP_TOS)")

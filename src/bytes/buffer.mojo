@@ -14,14 +14,25 @@ Layout (SwiftNIO / Netty style), with separate read and write indices:
   `readable_span()` and calls `consume(sent)` after a partial send.
 
 Memory policy:
+- The readable bytes never exceed `max_size()`: a write past it raises
+  `OutOfMemory`. That is the defence against a peer that sends an
+  unbounded frame.
 - Capacity grows on demand (at least doubling, so appends are amortized
-  O(1)) and never past `max_size()`. Exceeding the cap raises `OutOfMemory`:
-  that is the defence against a peer that sends an unbounded frame.
+  O(1)), up to `max_size()`, with one exception below.
 - Growing copies only the readable bytes and drops the consumed prefix.
 - `ensure_writable` compacts in place, instead of growing, only when the
   bytes it moves are no more than the bytes it reclaims. Each consumed byte
   then pays for at most one moved byte, so compaction is amortized O(1)
   per byte and a large unread tail is never memmoved over and over.
+- The exception: at `max_size()`, a buffer kept nearly full while it is
+  drained in small pieces could only compact, moving nearly all of it to
+  reclaim a few bytes, again and again. There it grows once to
+  `2 * max_size()` instead, after which compaction always reclaims more
+  than it moves. So `capacity()` stays within `2 * max_size()`, and gets
+  past `max_size()` only in that case.
+- The cap must be memory the process can have: past it a write raises, but
+  an allocation the system refuses below it ends the process (Mojo's
+  allocator aborts on failure). The default cap is far below that.
 - A buffer that becomes empty resets both indices to 0 for free.
 
 Spans: `readable_span()` / `writable_span()` borrow the buffer (their origin
@@ -96,7 +107,8 @@ narrower targets such as aarch64 NEON)."""
 struct ByteBuffer(Copyable, Defaultable, Movable, Sized, Writable):
     """An owned, growable byte buffer with separate read and write indices.
 
-    Invariant: `0 <= _r <= _w <= len(_buf) <= _max`.
+    Invariant: `0 <= _r <= _w`, `_w - _r <= _max`, and
+    `len(_buf) <= _storage_max()` (see the module docs).
     """
 
     var _buf: List[UInt8]
@@ -106,7 +118,8 @@ struct ByteBuffer(Copyable, Defaultable, Movable, Sized, Writable):
     var _w: Int
     """Write index: end of the readable bytes, start of the writable tail."""
     var _max: Int
-    """Hard cap on capacity."""
+    """Hard cap on the readable bytes (and on capacity, but for the
+    module docs' exception)."""
 
     # ---- construction --------------------------------------------------------
 
@@ -168,8 +181,9 @@ struct ByteBuffer(Copyable, Defaultable, Movable, Sized, Writable):
     @inline(.always)
     def writable(self) -> Int:
         """Bytes that can be written right now without growing or
-        compacting (the length of `writable_span()`)."""
-        return len(self._buf) - self._w
+        compacting (the length of `writable_span()`): the free tail, but
+        never past `max_size()` readable bytes."""
+        return min(len(self._buf) - self._w, self._max - (self._w - self._r))
 
     @inline(.always)
     def capacity(self) -> Int:
@@ -204,7 +218,7 @@ struct ByteBuffer(Copyable, Defaultable, Movable, Sized, Writable):
         `recv` straight into the buffer. Call `ensure_writable(n)` first and
         `commit(got)` after. Invalidated by any mutating call, `commit`
         included: take it again for the next `recv`."""
-        return Span(self._buf)[self._w : len(self._buf)]
+        return Span(self._buf)[self._w : self._w + self.writable()]
 
     @inline(.always)
     def byte_at(self, offset: Int) raises IoError -> UInt8:
@@ -224,7 +238,7 @@ struct ByteBuffer(Copyable, Defaultable, Movable, Sized, Writable):
         Raises `InvalidInput` for `n < 0` and `OutOfMemory` when the readable
         bytes plus `n` would exceed `max_size()`; the buffer is unchanged
         when it raises."""
-        if n <= len(self._buf) - self._w:
+        if n <= self.writable():
             if n < 0:
                 raise IoError.of_kind(
                     "ByteBuffer.ensure_writable", ErrorKind.InvalidInput
@@ -253,11 +267,23 @@ struct ByteBuffer(Copyable, Defaultable, Movable, Sized, Writable):
         var new_cap = max(grown, need, MIN_GROWTH)
         if new_cap > self._max:
             new_cap = self._max
-        if new_cap <= cap:
-            # At the cap and compaction is the only way left (need <= cap).
-            self._compact()
+        if new_cap > cap:
+            self._realloc(new_cap)
             return
-        self._realloc(new_cap)
+        # At the cap (need <= max <= cap), where compacting would move more
+        # than it reclaims (used > r). Grow once to twice the cap: there,
+        # with the tail full again, r > 2 * max - n - used >= max >= used,
+        # so every later compaction reclaims more than it moves.
+        var storage = self._storage_max()
+        if cap < storage:
+            self._realloc(storage)
+            return
+        self._compact()
+
+    @inline(.always)
+    def _storage_max(self) -> Int:
+        """The most capacity may reach: twice `max_size()` (saturating)."""
+        return self._max * 2 if self._max <= Int.MAX // 2 else Int.MAX
 
     def _realloc(mut self, new_cap: Int):
         """Move the readable bytes to the front of a fresh `new_cap` block
@@ -315,7 +341,7 @@ struct ByteBuffer(Copyable, Defaultable, Movable, Sized, Writable):
         """Mark `n` bytes of the writable tail as written (after a `recv`
         into `writable_span()`). `InvalidInput` unless
         `0 <= n <= writable()`."""
-        if n < 0 or n > len(self._buf) - self._w:
+        if n < 0 or n > self.writable():
             raise IoError.of_kind("ByteBuffer.commit", ErrorKind.InvalidInput)
         self._w += n
         comptime if CHECK_SPANS:

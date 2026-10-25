@@ -41,9 +41,25 @@ POLLHUP). When the syscall says EAGAIN again after a wakeup:
   instance cannot be created (EMFILE, ENOMEM), the error is raised, tagged
   with `op`. Users of those options should still drain the error queue
   promptly: each such operation pays an extra descriptor and a few syscalls.
-- Otherwise (another handle took the data first, ...): wait again, but
-  raise `TimedOut` once the deadline has passed, so readiness that keeps
-  being reported without progress cannot outlive the deadline.
+- Otherwise the same edge-triggered instance takes over too. A harmless
+  race (another handle took the data first) costs it a descriptor, but
+  readiness that ppoll keeps reporting while the syscall cannot progress
+  would otherwise spin until the deadline, or forever without one: an
+  AF_UNIX peek behind out-of-band data (the queue is not empty, yet a
+  peek finds nothing), or a peek past `SO_PEEK_OFF`. `TimedOut` still ends
+  the operation at the deadline.
+- AF_UNIX sends wait at most `_UNIX_SEND_SLICE` at a time and retry the
+  send in between: once the send side is shut down (by the peer's
+  shutdown(SHUT_RD), or by another handle's shutdown(SHUT_WR)) the kernel
+  reports nothing to a writer waiting for room, while the send itself
+  answers EPIPE (`BrokenPipe`), as a TCP send would.
+
+The `try_*` forms never wait, so they cannot tell a finished endpoint from
+an idle one: where the blocking forms raise above (a shut-down AF_UNIX
+listener, a UDP socket after `shutdown_read`), they keep answering None (or
+0) while epoll keeps reporting the descriptor readable, with EPOLLHUP or
+EPOLLRDHUP. A readiness loop that sees None together with either of those
+should treat the endpoint as done instead of waiting for it again.
 
 `op` names the operation in raised errors ("read", "write", "peek", ...).
 This module does not import `rt` (blocking layer).
@@ -83,6 +99,9 @@ comptime DEFAULT_READ_TO_END_MAX = 64 * 1024 * 1024
 """Default cap of `read_to_end` (bytes appended per call), the same as
 `ByteBuffer`'s default `max_size`: what a peer may make us buffer."""
 
+comptime _UNIX_SEND_SLICE = Duration.from_millis(250)
+"""The longest an AF_UNIX send waits before trying again (module docs)."""
+
 comptime _READ_CHUNK_MIN = 8 * 1024
 comptime _READ_CHUNK_MAX = 1024 * 1024
 
@@ -105,6 +124,9 @@ struct _Waiter(Movable):
     var rev: Int16
     var woke: Bool
     var edge: Optional[Epoll]
+    var sliced: Int
+    """For a send: -1 until known, then 1 for AF_UNIX (its waits are cut
+    into `_UNIX_SEND_SLICE`s), 0 otherwise."""
 
     def __init__(
         out self, events: Int, hup_errno: Errno, rdhup_ends: Bool = False
@@ -120,6 +142,7 @@ struct _Waiter(Movable):
         self.rev = 0
         self.woke = False
         self.edge = None
+        self.sliced = -1 if (events & POLLOUT) != 0 else 0
 
     @inline(.always)
     def progressed(mut self):
@@ -141,12 +164,25 @@ struct _Waiter(Movable):
                 raise IoError.from_errno(op, self.hup_errno)
             if deadline.is_expired():
                 raise IoError.of_kind(op, ErrorKind.TimedOut)
-            if (rev & POLLERR) != 0 and not self.edge:
+            if not self.edge:
+                # (POLLERR from the error queue, or readiness that cannot
+                # progress: see the module docs)
                 self.edge = _edge_triggered(sock, self.events, op)
-        if self.edge:
-            self.rev = _wait_edge(self.edge.value(), deadline, op)
-        else:
-            self.rev = wait_ready(sock, self.events, deadline, op)
+        if self.sliced < 0:
+            self.sliced = 1 if sock.domain() == Domain.UNIX else 0
+        var until = deadline
+        if self.sliced == 1:
+            until = deadline.earliest(Deadline.after(_UNIX_SEND_SLICE))
+        try:
+            if self.edge:
+                self.rev = _wait_edge(self.edge.value(), until, op)
+            else:
+                self.rev = wait_ready(sock, self.events, until, op)
+        except e:
+            if e.kind == ErrorKind.TimedOut and not deadline.is_expired():
+                self.woke = False  # (a slice ran out: try the send again)
+                return
+            raise e
         self.woke = True
 
 
@@ -424,7 +460,9 @@ def accept_with_deadline(
       queue is empty, for TCP (the kernel's answer) and AF_UNIX alike (whose
       nonblocking accept would keep saying EAGAIN; see the module docs).
     `peer` receives the peer address (it is reset before every attempt)."""
-    var w = _Waiter(POLLIN, Errno.EINVAL)
+    # (rdhup_ends: an AF_UNIX listener shut down with SHUT_RD reports
+    # POLLIN|POLLRDHUP and no POLLHUP; a TCP listener never reports RDHUP)
+    var w = _Waiter(POLLIN, Errno.EINVAL, rdhup_ends=True)
     while True:
         peer.reset()
         var r = sys.accept4(
@@ -445,7 +483,9 @@ def try_accept(
     """`accept4(SOCK_CLOEXEC | SOCK_NONBLOCK)` that never waits: the
     connection, or None when none is queued (EAGAIN). EINTR and
     ECONNABORTED retry; EMFILE/ENFILE raise `TooManyFiles` with the
-    connection left queued (see `accept_with_deadline`)."""
+    connection left queued (see `accept_with_deadline`). A shut-down
+    AF_UNIX listener answers None forever while epoll reports it readable
+    (with EPOLLHUP or EPOLLRDHUP): see the module docs."""
     while True:
         peer.reset()
         var r = sys.accept4(
@@ -465,7 +505,8 @@ def try_recv(
 ) raises IoError -> Optional[Int]:
     """One recv that never waits (the socket is O_NONBLOCK): the bytes read,
     0 at EOF (and for an empty `buf`), or None when nothing is queued
-    (EAGAIN). EINTR retries; anything else raises, tagged with `op`."""
+    (EAGAIN). EINTR retries; anything else raises, tagged with `op`. (None
+    with EPOLLHUP or EPOLLRDHUP reported: see the module docs.)"""
     if len(buf) == 0:
         return 0
     while True:
@@ -606,7 +647,14 @@ def detect_dead_peers(sock: Socket, keepalive: TcpKeepalive) raises IoError:
     unacknowledged, keepalive probes do not run, and without a user
     timeout the kernel retransmits for about 15 minutes (tcp_retries2)
     before giving up. Values outside the kernel's ranges raise
-    `InvalidInput` (see `TcpKeepalive`)."""
+    `InvalidInput` (see `TcpKeepalive`).
+
+    The user timeout also bounds zero-window probing: a live peer that
+    stops reading for longer than the total (60 s by default) while we
+    have data queued for it gets the connection aborted (`TimedOut`,
+    ETIMEDOUT), whatever the write deadline. A server busy in one long
+    request (a lock wait, a long script) while the client streams a large
+    pipeline into it is such a peer."""
     sock.set_tcp_keepalive(keepalive)
     sock.set_keepalive(True)
     # The kernel rounds the times up to whole seconds: use what it stored.

@@ -222,4 +222,24 @@ These names and their documented behavior are stable for v1.
      - `examples/net/udp_echo.mojo`: blocking, or an epoll loop with batches.
      - `examples/net/udp_ping.mojo`: by name, RTT and loss.
      - `UdpSocket.connect_host`, the guide above, and the UDP rows of the API table.
+- **Second review (2026-10-25)** of `linux`, `bytes` and `net`, by four independent reviewers (the syscall layer; buffers, addresses, socket options and buffered reads; the streams and dialing; DNS). Nothing critical or high; every finding was reproduced, then fixed under a regression test that fails on the old code, or documented:
+  - **`linux`** (`tests/linux/test_linux_fs_signal_process_regressions*.mojo`):
+    - `open_beneath` retries EAGAIN, which openat2 answers with RESOLVE_BENEATH whenever a ".." lookup races a rename anywhere on the host (static files failed at random with a 500); bounded, since a write lease's EAGAIN lasts.
+    - `block`, `set_mask`, `SignalFd.new` and `spawn`'s child mask leave glibc's signals 32 and 33 out, as glibc's sigprocmask does: blocking "every signal" hung a `setuid` in another thread.
+    - `all_threads_block` skips a thread that ended mid-read (ESRCH) and reads `SigBlk:` only at a line start (a thread named `SigBlk:ffffffff` passed for one that blocks everything).
+    - `stat_fd` retries EINTR; the affinity calls handle more than 1024 CPUs; a test checks that every `pkg.module.name` a docstring cites exists.
+  - **`bytes`** (`tests/bytes/test_bytes_buffer_regressions.mojo`): a `ByteBuffer` kept full at its cap and drained in small pieces memmoved nearly all of it per refill (288 µs a byte at 4 MiB). It now grows once to twice the cap there, so compaction always reclaims more than it moves; the readable bytes still never pass the cap. The codec contract's rules 6, 7 and 10 now say what every codec does.
+  - **`net` addresses and options** (`tests/net/test_net_socket_unixaddr_regressions.mojo`, `test_net_addr_regressions.mojo`): `set_tos` refuses values the kernel would truncate; a pathname starting with `@` or `(` no longer prints like an abstract name or `(unnamed)`; `Ipv6Addr.segment` aborts on an index outside 0..7 in every build.
+  - **Streams** (`tests/net/test_net_streams_regressions.mojo`):
+    - A wait that reports readiness while the syscall cannot progress goes edge-triggered after the first such wakeup: an AF_UNIX peek behind out-of-band data spun at full CPU until the deadline, or forever.
+    - A `UnixListener` shut down with SHUT_RD ends `accept` with EINVAL instead of spinning (the F01 fix covered SHUT_RDWR).
+    - An AF_UNIX writer waiting for room retries every 250 ms, so a shutdown of its send side raises `BrokenPipe`, as for TCP, where it used to wait until its deadline.
+    - Documented: the dead-peer user timeout also aborts a live peer that stops reading for a minute with data queued (pg and redis enable it by default), and a `try_*` None alongside EPOLLHUP/EPOLLRDHUP means the endpoint is finished.
+  - **DNS** (`tests/net/test_net_dns_regressions*.mojo`):
+    - A hosts file over 16 MiB was read as empty; it is now read whole.
+    - One `advance` reads at most 64 datagrams a query, so a stream of strays cannot keep a lookup past its deadline; no retry (without EDNS, or over TCP) starts after the deadline.
+    - A name ending in two dots is refused (`localhost..` went to DNS).
+    - Closer to glibc: nameserver lines take inet_aton's forms (checked against glibc's inet_aton through Python), option values are clamped atoi-style, `no-tld-query` and `no-aaaa` work, and a name the hosts file lists only in the other family is looked up in DNS.
+    - RFC fixes: IPv4-mapped addresses have precedence 35; a TTL with its top bit set is 0; an extended RCODE (BADVERS) is a failure.
+    - Documented: `Resolver.system()` reads the configuration once.
 - **Later:** sendfile, vectored helpers, TLS integration points.

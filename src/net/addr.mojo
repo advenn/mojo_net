@@ -516,8 +516,10 @@ struct Ipv6Addr(Comparable, Hashable, TrivialRegisterPassable, Writable):
 
     @inline(.always)
     def segment(self, i: Int) -> UInt16:
-        """Segment `i` in 0..7, most significant first."""
-        debug_assert(i >= 0 and i < 8, "Ipv6Addr.segment index out of range")
+        """Segment `i` in 0..7, most significant first. Another index aborts
+        in every build (it never reads some other segment)."""
+        if i < 0 or i > 7:
+            abort("Ipv6Addr.segment index out of range")
         var half = self._hi if i < 4 else self._lo
         return UInt16((half >> UInt64(48 - 16 * (i & 3))) & 0xFFFF)
 
@@ -1303,7 +1305,9 @@ struct UnixAddr(Copyable, Equatable, Hashable, Movable, Writable):
     def write_to(self, mut writer: Some[Writer]):
         """Pathname as is, abstract as `@name` (the `ss`/systemd
         convention), unnamed as `(unnamed)`. Bytes outside printable ASCII
-        and backslashes are written as `\\xNN`."""
+        and backslashes are written as `\\xNN`, and so is a pathname's
+        leading `@` or `(`, so that no pathname reads as an abstract name
+        or as `(unnamed)`."""
         if self._kind == Self._UNNAMED:
             writer.write("(unnamed)")
             return
@@ -1311,8 +1315,9 @@ struct UnixAddr(Copyable, Equatable, Hashable, Movable, Writable):
             writer.write("@")
         var run = 0
         var n = Int(self._len)
+        var lead = self._kind == Self._PATHNAME and n > 0 and (self._name[0] == 0x40 or self._name[0] == 0x28)
         for i in range(n + 1):
-            if i < n and _is_plain(self._name[i]):
+            if i < n and _is_plain(self._name[i]) and not (i == 0 and lead):
                 continue
             if run < i:
                 writer.write_string(

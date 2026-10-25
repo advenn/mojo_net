@@ -356,6 +356,8 @@ def parse_response(
         var rtype = _u16(msg, pos)
         var rclass = _u16(msg, pos + 2)
         var ttl = _u32(msg, pos + 4)
+        if ttl > 0x7FFFFFFF:
+            ttl = 0  # (RFC 2181 section 8: a TTL with the top bit set is 0)
         var rdlen = Int(_u16(msg, pos + 8))
         var rdata = pos + 10
         if rdata + rdlen > len(msg):
@@ -407,6 +409,12 @@ def parse_response(
             min_ttl = min(min_ttl, r.ttl)
     if len(result.addrs) > 0:
         result.ttl = min_ttl
+    var nscount = Int(_u16(msg, 8))
+    var extended = _extended_rcode(msg, pos, nscount, Int(_u16(msg, 10)))
+    if extended != 0:
+        # An RCODE past 15 (BADVERS is 16) has 0 in the header's four bits:
+        # it is a failure, not an empty NOERROR.
+        return DnsAnswer((extended << 4) | rcode, False)
     if (
         ancount == 0
         and (flags & _FLAG_AA) == 0
@@ -415,6 +423,29 @@ def parse_response(
     ):
         result.lame = True
     return result^
+
+
+def _extended_rcode(msg: Span[UInt8, _], at: Int, nscount: Int, arcount: Int) -> Int:
+    """The upper 8 bits of the RCODE, from the OPT record of the additional
+    section (RFC 6891 6.1.3: its TTL's top byte), skipping the `nscount`
+    authority records from `at`; 0 without one. The additional section is
+    otherwise never read, so a malformed one counts as none."""
+    var pos = at
+    var name = List[UInt8]()
+    try:
+        for k in range(nscount + arcount):
+            pos = read_name(msg, pos, name)
+            var rtype = _u16(msg, pos)
+            var ttl = _u32(msg, pos + 4)
+            var rdlen = Int(_u16(msg, pos + 8))
+            if pos + 10 + rdlen > len(msg):
+                return 0
+            if k >= nscount and rtype == TYPE_OPT:
+                return Int(ttl >> 24)
+            pos += 10 + rdlen
+    except:
+        return 0
+    return 0
 
 
 def _has_soa(msg: Span[UInt8, _], at: Int, nscount: Int) raises IoError -> Bool:

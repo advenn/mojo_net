@@ -55,7 +55,18 @@ from .sys import keep_alive
 from .syscall import err_of, is_err, syscall1, syscall2, syscall3, syscall4, syscall5
 
 comptime _CPU_WORDS = 16
-"""Affinity masks of 1024 CPUs."""
+"""Affinity masks start at 1024 CPUs: `allowed_cpus` doubles its mask
+while the kernel answers EINVAL (one smaller than `nr_cpu_ids`), and the
+masks given to the kernel grow to the highest CPU named."""
+
+
+comptime _MAX_CPUS = 1 << 22
+"""The kernel's limit on CPU numbers (CONFIG_NR_CPUS at most 2^22)."""
+
+
+def _mask_words(cpu: Int) -> Int:
+    """Words of a mask that holds `cpu` (at least `_CPU_WORDS`)."""
+    return max(_CPU_WORDS, cpu // 64 + 1)
 
 
 def _entries(data: List[UInt8]) -> List[List[UInt8]]:
@@ -277,11 +288,11 @@ struct Child(AsFd, Movable, Writable):
         writer.write("Child(pid=", self.pid, ")")
 
 
-def _child(path: Int, argv: Int, envp: Int, keep: Int, cpus: Int, mask: Int):
+def _child(path: Int, argv: Int, envp: Int, keep: Int, cpus: Int, cpu_bytes: Int, mask: Int):
     """The new child, until execve: raw syscalls on prepared memory only
     (see the module docs). Never returns."""
     if cpus != 0:
-        _ = syscall3(SYS_sched_setaffinity, 0, _CPU_WORDS * 8, cpus)
+        _ = syscall3(SYS_sched_setaffinity, 0, cpu_bytes, cpus)
     if keep >= 0:
         _ = syscall3(SYS_fcntl, keep, F_SETFD, 0)  # survives execve
     if mask != 0:
@@ -307,10 +318,10 @@ def spawn(
       SIGTERM for a signalfd may not want its children to have.
     - A child whose execve fails exits with status 127."""
     program._layout()
-    var mask = List[UInt64](length=_CPU_WORDS, fill=0)
+    if cpu >= _MAX_CPUS:
+        raise IoError.of_kind("spawn", ErrorKind.InvalidInput)
+    var mask = List[UInt64](length=_mask_words(max(cpu, 0)), fill=0)
     if cpu >= 0:
-        if cpu >= _CPU_WORDS * 64:
-            raise IoError.of_kind("spawn", ErrorKind.InvalidInput)
         mask[cpu // 64] = UInt64(1) << UInt64(cpu % 64)
     var pidfd: Int32 = -1
     var args = CloneArgs()
@@ -321,12 +332,14 @@ def spawn(
     var argv = program._argv_ptr()
     var envp = program._envp_ptr()
     var cpus = Int(mask.unsafe_ptr()) if cpu >= 0 else 0
-    var sigs: UInt64 = signal_mask.value().bits if signal_mask else 0
+    var cpu_bytes = len(mask) * 8
+    # (less glibc's signals 32 and 33, as `linux.signal.set_mask` does)
+    var sigs: UInt64 = signal_mask.value().bits & ~((UInt64(1) << 31) | (UInt64(1) << 32)) if signal_mask else 0
     var sigs_at = Int(Pointer(to=sigs)) if signal_mask else 0
     var op: StaticString = "clone3"
     var r = syscall2(SYS_clone3, Int(Pointer(to=args)), 88)
     if r == 0:
-        _child(path, argv, envp, Int(keep), cpus, sigs_at)
+        _child(path, argv, envp, Int(keep), cpus, cpu_bytes, sigs_at)
     if is_err(r) and (Errno(err_of(r)) == Errno.ENOSYS or Errno(err_of(r)) == Errno.EPERM):
         # clone3 refused (a seccomp filter): clone(2) with CLONE_PIDFD,
         # which stores the pidfd at parent_tid, its third argument on both
@@ -334,7 +347,7 @@ def spawn(
         op = "clone"
         r = syscall5(SYS_clone, CLONE_PIDFD | SIGCHLD, 0, Int(Pointer(to=pidfd)), 0, 0)
         if r == 0:
-            _child(path, argv, envp, Int(keep), cpus, sigs_at)
+            _child(path, argv, envp, Int(keep), cpus, cpu_bytes, sigs_at)
     # Everything the child reads stays alive (and undestroyed) past the
     # clone on both sides: in the child, nothing after `_child` runs.
     keep_alive(args)
@@ -371,9 +384,16 @@ def reap_others(known: List[Int]) raises IoError -> Int:
 
 def allowed_cpus() raises IoError -> List[Int]:
     """The CPUs the calling thread may run on (its affinity), in order."""
-    var mask = List[UInt64](length=_CPU_WORDS, fill=0)
-    var r = syscall3(SYS_sched_getaffinity, 0, _CPU_WORDS * 8, Int(mask.unsafe_ptr()))
-    keep_alive(mask)
+    var words = _CPU_WORDS
+    var mask = List[UInt64](length=words, fill=0)
+    var r: Int
+    while True:
+        r = syscall3(SYS_sched_getaffinity, 0, words * 8, Int(mask.unsafe_ptr()))
+        keep_alive(mask)
+        if not (is_err(r) and Errno(err_of(r)) == Errno.EINVAL and words * 64 < _MAX_CPUS):
+            break
+        words *= 2  # (the kernel's mask is larger: more than words * 64 CPUs)
+        mask = List[UInt64](length=words, fill=0)
     _ = check("sched_getaffinity", r)
     var out = List[Int]()
     for w in range(r // 8):
@@ -387,13 +407,16 @@ def allowed_cpus() raises IoError -> List[Int]:
 
 def set_allowed_cpus(cpus: List[Int]) raises IoError:
     """Restrict the calling thread to `cpus` (EINVAL if none is usable)."""
-    var mask = List[UInt64](length=_CPU_WORDS, fill=0)
+    var top = 0
     for i in range(len(cpus)):
         var c = cpus[i]
-        if c < 0 or c >= _CPU_WORDS * 64:
+        if c < 0 or c >= _MAX_CPUS:
             raise IoError.of_kind("set_allowed_cpus", ErrorKind.InvalidInput)
-        mask[c // 64] |= UInt64(1) << UInt64(c % 64)
-    var r = syscall3(SYS_sched_setaffinity, 0, _CPU_WORDS * 8, Int(mask.unsafe_ptr()))
+        top = max(top, c)
+    var mask = List[UInt64](length=_mask_words(top), fill=0)
+    for i in range(len(cpus)):
+        mask[cpus[i] // 64] |= UInt64(1) << UInt64(cpus[i] % 64)
+    var r = syscall3(SYS_sched_setaffinity, 0, len(mask) * 8, Int(mask.unsafe_ptr()))
     keep_alive(mask)
     _ = check("sched_setaffinity", r)
 
@@ -444,7 +467,9 @@ def threads() raises IoError -> List[Int]:
 def _sigblk(status: List[UInt8]) -> Optional[UInt64]:
     """The SigBlk mask of a /proc/<pid>/task/<tid>/status text."""
     var key = _bytes("SigBlk:")
-    for i in range(len(status) - len(key)):
+    for i in range(len(status) - len(key) + 1):
+        if i > 0 and status[i - 1] != UInt8(10):
+            continue  # (only at the start of a line: not in a thread's Name)
         var at = True
         for j in range(len(key)):
             if status[i + j] != key[j]:
@@ -483,8 +508,10 @@ def all_threads_block(set: SignalSet) raises IoError -> Bool:
         try:
             status = read_file(String("/proc/self/task/", tids[i], "/status"), "all_threads_block")
         except e:
-            if e.kind == ErrorKind.NotFound:
-                continue  # gone
+            # Gone: ENOENT at the open, or ESRCH when it ended between the
+            # open and the read.
+            if e.kind == ErrorKind.NotFound or e.errno == Errno.ESRCH:
+                continue
             raise e
         var mask = _sigblk(status)
         if not mask or not SignalSet(mask.value()).includes(set):

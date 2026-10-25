@@ -75,7 +75,10 @@ struct Config(Copyable, Movable):
     var keepalive: Bool
     """For TCP: keepalive probes and a user timeout, so that a server that
     vanished (power loss, a NAT or load balancer dropping the flow) is
-    noticed in about a minute (`net.blocking.detect_dead_peers`)."""
+    noticed in about a minute (`net.blocking.detect_dead_peers`). The user
+    timeout also ends a session whose server stops reading for a minute
+    while the client has data queued for it: a large pipeline or COPY into
+    a backend waiting on a lock. Turn it off for such work."""
     var _params: List[String]
 
     def __init__(

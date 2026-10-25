@@ -329,6 +329,10 @@ def _death_child(mode: String) raises:
     elif mode == "ipaddr_v4":
         var a = IpAddr.parse("::7f00:1")
         print("SURVIVED", a.v4())
+    elif mode == "ipv6_segment_8":
+        print("SURVIVED", Ipv6Addr.parse("1:2:3:4:5:6:7:8").segment(8))
+    elif mode == "ipv6_segment_minus_1":
+        print("SURVIVED", Ipv6Addr.parse("1:2:3:4:5:6:7:8").segment(-1))
     elif mode == "control":
         print("SURVIVED control")
     else:
@@ -390,11 +394,15 @@ def _check_wrong_family_aborts(tmp: String) raises:
         "socketaddr_v4",
         "socketaddr_v6",
         "ipaddr_v4",
+        "ipv6_segment_8",  # (B6, second review: it read segment 0 or 4)
+        "ipv6_segment_minus_1",
     ]
     var msgs: List[StaticString] = [
         "SocketAddr.v4() on an IPv6 address",
         "SocketAddr.v6() on an IPv4 address",
         "IpAddr.v4() on an IPv6 address",
+        "Ipv6Addr.segment index out of range",
+        "Ipv6Addr.segment index out of range",
     ]
     for i in range(len(cases)):
         var r = _run_child(runner, cases[i])
