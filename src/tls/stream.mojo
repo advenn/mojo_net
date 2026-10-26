@@ -23,6 +23,7 @@ complete message.
 from bytes.buffer import ByteBuffer
 from linux import ErrorKind, IoError
 from linux.time import Deadline, Duration
+from net.socket import Shutdown
 from net.tcp import TcpStream
 
 from .client import FEED_LIMIT, TlsClient, TlsEventKind
@@ -31,6 +32,11 @@ from .error import Category, TlsError, tls_error
 
 comptime _OUT_MAX = 256 * 1024
 """Ciphertext gathered for one send."""
+comptime CLOSE_LINGER = Duration.from_secs(2)
+"""How long `close` waits, by default, for the server to end the
+connection after close_notify."""
+comptime _LINGER_MAX = 256 * 1024
+"""Bytes `close` discards while it waits (a server still sending is cut)."""
 
 
 struct TlsStream(Movable, Writable):
@@ -253,11 +259,31 @@ struct TlsStream(Movable, Writable):
             if self._tls.has_events() or self._tls.is_closed():
                 return False
 
-    def close(deinit self) raises TlsError:
-        """Send close_notify and close the socket (TB13: without waiting
-        for the server's). Dropping the stream closes the socket without it."""
+    def close(deinit self, linger: Duration = CLOSE_LINGER) raises TlsError:
+        """Send close_notify, then end the connection without losing what
+        was sent. The socket is half-closed (its FIN follows the data) and
+        read to the server's end, for at most `linger` and 256 KiB,
+        discarding what arrives; then it is closed. The server's
+        close_notify is not required (TB13).
+
+        Closing a socket while unread input is in it makes Linux send a
+        reset, which drops what was not yet delivered, and a TLS 1.3
+        server's session tickets sit unread in the socket of a client that
+        only writes. Dropping the stream instead closes the socket at once,
+        without close_notify: an abortive end."""
         self._tls.close()
         self._flush()
+        try:
+            self._tcp.shutdown(Shutdown.WRITE)
+            self._tcp.set_read_deadline(Deadline.after(linger))
+            var drained = 0
+            while drained < _LINGER_MAX:
+                var n = self._tcp.read(Span(self._in))
+                if n == 0:
+                    break
+                drained += n
+        except:
+            pass  # (reset, gone quiet, or still sending: nothing more to save)
         try:
             self._tcp^.close()
         except e:

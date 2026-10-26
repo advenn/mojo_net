@@ -67,7 +67,10 @@ Any failure frees the OpenSSL connection, and the error stays: every later call 
 ## Endings
 - **The server's close_notify** is a CLOSED event (`read` returns 0) and is answered with ours. Input after it is ignored.
 - **A TCP end without close_notify** raises `TRUNCATED` (`UnexpectedEof`), never a clean end, after the data before it is delivered (TB12). The data may have been cut short; only the protocol above can tell (an HTTP `Content-Length` that is complete). Many HTTPS servers end this way after `Connection: close`: `http.Client` decides per RFC 9112 §9.8 (`docs/http.md`).
-- **`close()`** sends close_notify once and does not wait for the server's (TB13). Nothing is sent during a handshake.
+- **`close()`** sends close_notify once (TB13; nothing is sent during a handshake), then ends the connection without losing what was sent:
+  - It half-closes the socket, so the FIN follows the data, and reads to the server's end, discarding what arrives. It waits at most `linger` (2 s by default) and reads at most 256 KiB. The server's close_notify is not required.
+  - Only then does it close the socket. Closing a socket that still holds unread input makes Linux send a reset, which drops the data not yet delivered. A TLS 1.3 server's session tickets sit unread in the socket of a client that only writes. Our GitHub CI caught this as a cut 5 MiB upload.
+  - Dropping a `TlsStream` instead closes its socket at once, without close_notify: an abortive end.
 
 ## Bounds
 OpenSSL's memory buffers never refuse a write, so the state machine bounds them itself (TB17): at most 32 KiB of unread ciphertext and undelivered plaintext together (`feed_capacity()`, more than one record of any version; a driver that feeds without draining gets room 0), 256 KiB from the server before the handshake ends (a backstop above OpenSSL's 100 KiB limit on certificate chains), and 256 KiB of ciphertext waiting to be sent before `write` takes no more. Plaintext buffers are wiped with `OPENSSL_cleanse` when released (TB18).
@@ -99,10 +102,10 @@ OpenSSL's memory buffers never refuse a write, so the state machine bounds them 
 ## Checks
 What runs, in `pixi run ci` on x86_64 and aarch64 unless said. Gates are the research's TG numbers. Planted bugs were each put in a scratch copy of `src/` and had to turn the named tests red; all did, except the one noted.
 
-- **TG1, certificates and names** (`tests/tls/test_client.mojo`, 39 tests): a throwaway PKI made by the `openssl` command (`tests/tls/tls_pki.py`) and a server in Python's `ssl` (`tls_peer.py`) in a child process.
+- **TG1, certificates and names** (`tests/tls/test_client.mojo`, 41 tests): a throwaway PKI made by the `openssl` command (`tests/tls/tls_pki.py`) and a server in Python's `ssl` (`tls_peer.py`) in a child process.
   - Accepted: DNS names, IPv4 and IPv6 addresses (without SNI, as the server sees), TLS 1.2 with ECDSA and RSA, an intermediate CA, a one-label wildcard, ALPN.
   - Refused, each with its category and OpenSSL's verify code: a wrong host (62), a CN-only certificate, wildcards across labels, partial wildcards, a wrong IP and an IP spelled as a DNS name (64), expired (10) and not yet valid (9), self-signed (18), an unrelated CA (20), a missing intermediate (20), an intermediate that is no CA, a trusted leaf that is no CA (no partial chains), a client-only certificate (26), RSA 1024 (66), SHA-1 (68), TLS 1.1, RSA key exchange with CBC, and a server that does not speak TLS.
-  - Also: deadlines, truncation, close_notify both ways, 5 MiB each way, any receive size from 1 byte up giving the same data, and the feed room bounding a driver that never drains.
+  - Also: deadlines, truncation, close_notify both ways, 5 MiB each way, an 8 MiB upload closed while most of it is still unsent (no reset), `close`'s linger bounds, any receive size from 1 byte up giving the same data, and the feed room bounding a driver that never drains.
   - Planted bugs: no host checks, no IP checks, SNI sent for addresses, `SSL_VERIFY_NONE` with the verify result ignored, partial chains on, security level 0, a feed room that ignores undelivered data. All caught.
 - **TG4, post-handshake messages** (`test_transcripts.mojo`, against `openssl s_server`): KeyUpdate with and without a request (the client answers the request, as s_server's trace shows); a TLS 1.2 HelloRequest, refused without a second ClientHello; plaintext injected into the stream.
 - **TG5, damage** (`test_mutations.mojo`): a seeded proxy (`tls_mitm.py`) flips, drops, duplicates, inserts or replaces bytes, or cuts the connection, in the handshake or the data. The oracle: never a clean end with different data, never bytes the server did not send, never a hang. 80 seeds in CI; 3,000 seeds passed once, after a harness bug was fixed (a peer whose unread output filled its pipe). The truncation-as-clean-end bug is caught by seed 5.

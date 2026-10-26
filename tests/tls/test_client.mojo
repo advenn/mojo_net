@@ -4,6 +4,7 @@ is accepted, and every certificate, version and cipher that must be
 refused, with its category and OpenSSL's verify code (TC9, TC18)."""
 
 from std.testing import TestSuite, assert_equal, assert_true
+from std.time import perf_counter_ns
 
 from bytes.buffer import ByteBuffer
 from linux import ErrorKind
@@ -335,6 +336,43 @@ def test_large_upload_and_our_close_notify() raises:
     s^.close()
     assert_equal(peer.expect("GOT"), String("GOT ", N, " close_notify"))
     peer^.stop()
+
+
+def test_close_after_upload_loses_nothing() raises:
+    """Closing must not reset the connection while sent data is still
+    queued: the server's TLS 1.3 session tickets sit unread in an
+    upload-only client's receive buffer, and Linux answers the close of a
+    socket with unread input with a reset, dropping what is not yet
+    delivered. The sink has a small receive window and waits before
+    reading, so much of the upload is still unsent when `close` is called."""
+    comptime N = 8 * 1024 * 1024 + 5
+    var peer = Peer("sink", opts("delay=0.5", "rcvbuf=32768"))
+    var s = connect(peer, trusting())
+    s.write_all(Span(pattern(N)))
+    s^.close()
+    assert_equal(peer.expect("GOT"), String("GOT ", N, " close_notify"))
+    peer^.stop()
+
+
+def test_close_waits_at_most_its_linger() raises:
+    """A server that neither ends the connection nor stops sending does
+    not hold `close` past its linger."""
+    var quiet = Peer("stall")
+    var s = connect(quiet, trusting())
+    var t0 = perf_counter_ns()
+    s^.close(linger=Duration.from_millis(200))
+    var took = perf_counter_ns() - t0
+    assert_true(took >= 150_000_000 and took < 2_000_000_000, String(took))
+    quiet^.stop()
+    var talker = Peer("echo", opts("big=100000000"))
+    var t = connect(talker, trusting())
+    t.write_all("go\n".as_bytes())
+    t0 = perf_counter_ns()
+    t^.close(linger=Duration.from_secs(30))  # (cut after _LINGER_MAX bytes, long before)
+    took = perf_counter_ns() - t0
+    assert_true(took < 5_000_000_000, String(took))
+    _ = talker.expect("SERVER_ERROR")  # (cut while sending, not read to its end)
+    talker^.stop()
 
 
 def test_any_receive_size_gives_the_same_data() raises:

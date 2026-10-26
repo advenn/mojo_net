@@ -18,6 +18,7 @@ Modes, after the handshake:
             "GOT <bytes> close_notify" or "GOT <bytes> error:<reason>",
             then close_notify
   hello     send "hello" and close_notify without reading
+  stall     say nothing for 5 s, then close
 Modes without TLS:
   garbage   send an HTTP response instead of a ServerHello, then close
   silent    accept and say nothing for 10 s
@@ -31,6 +32,8 @@ Options:
   alpn=<a,b>     protocols the server will choose from
   big=<n>        bytes the echo mode sends after the echo
   count=<n>      connections to serve
+  delay=<s>      seconds the sink waits before it starts reading
+  rcvbuf=<n>     SO_RCVBUF of the connections (a small receive window)
   host=<addr>    the address to listen on (default 127.0.0.1; ::1 for IPv6)
   quiet=1        print only the PORT line (for long runs whose output
                  nobody reads: a full pipe would block the server)
@@ -118,6 +121,7 @@ def serve(ctx, c, mode, opts):
             s.close()  # (no SSL_shutdown: the TCP connection just ends)
             return
         elif mode == "sink":
+            time.sleep(float(opts.get("delay", "0")))
             total, how = 0, "close_notify"
             while True:
                 try:
@@ -138,6 +142,8 @@ def serve(ctx, c, mode, opts):
         elif mode == "hello":
             s.sendall(b"hello")
             s.unwrap()
+        elif mode == "stall":
+            time.sleep(5)
     except (ssl.SSLError, OSError) as e:
         print("SERVER_ERROR", getattr(e, "reason", None) or type(e).__name__, flush=True)
     s.close()
@@ -152,6 +158,8 @@ def main():
     ctx = context(d, opts) if mode not in ("garbage", "silent") else None
     host = opts.get("host", "127.0.0.1")
     ls = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET)
+    if "rcvbuf" in opts:  # (inherited by accepted sockets: a small window)
+        ls.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(opts["rcvbuf"]))
     ls.bind((host, 0))
     ls.listen(8)
     print("PORT", ls.getsockname()[1], flush=True)
