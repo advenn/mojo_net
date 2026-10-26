@@ -1,5 +1,9 @@
 # mojo_net
 
+> **Warning: this is an AI-generated project, and not all of it has been reviewed. Use it at your own risk.**
+>
+> The code, tests and documentation were written by an AI (Claude) at the direction of the maintainer. The tests compare it with independent implementations, and planted bugs show that the tests catch them. The TLS code has had two internal reviews, also by AI, but no human expert's (`docs/tls.md`). Read [SECURITY.md](SECURITY.md) before relying on it.
+
 Native Mojo networking libraries for Linux (x86_64 and aarch64, kernel 5.15+):
 - raw syscalls, with no libc on the I/O path;
 - sockets;
@@ -77,3 +81,6 @@ pixi run package          # the conda package, built and tested in a fresh envir
 GitHub CI runs `ci` and `package` on x86_64 and on a real aarch64 machine.
 
 `CLAUDE.md` lists the repository rules and the Mojo 1.2 pitfalls found so far.
+
+## License
+[Apache License 2.0](LICENSE). The software is provided "as is", without warranties or conditions of any kind (section 7 of the license).
