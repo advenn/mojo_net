@@ -2,7 +2,7 @@
 
 An HTTP/1.1 server for Mojo on Linux (roadmap step 3). It is built on the `http` library's sans-I/O `ServerConnection` and on `net`'s nonblocking sockets. Package rules and contracts are in `docs/design.md`; HTTP itself is in `docs/http.md`.
 
-**Status: done through S5:** the serving loop, streaming, graceful shutdown with signals and worker processes, routing and static files, and an independent review with its fixes. Leads for later are at the end.
+**Status: done through S7:** the serving loop, streaming, graceful shutdown with signals and worker processes, routing and static files, an independent review with its fixes, server-sent events, and TLS (HTTPS) through OpenSSL. Leads for later are at the end.
 
 ## Guide
 **A server** is a `Handler` run by a `Server`:
@@ -295,6 +295,29 @@ while True:
 - **Overload:** `res.retry_later(status, delay)` answers 429 or 503 with `Retry-After` in whole seconds, rounded up. `http.retry.retry_after` reads it on the client side.
 - **The encoder** (`http.sse.write_event(out, data, event=, id=, retry_ms=)`) splits `data` into `data:` lines at every line end, and refuses an `event` or `id` that would break the stream (a line end, a NUL in the ID). `write_comment` writes comments.
 
+## TLS (S7)
+```mojo
+from tls import ServerConfig as TlsConfig
+
+var server = Server(App(), ServerConfig())
+server.bind(SocketAddr.parse("0.0.0.0:8443"))
+server.serve_tls(TlsConfig(certificate="fullchain.pem", key="privkey.pem", names=["example.com"]))
+server.run()
+```
+`examples/server/https.mojo` is this program. The TLS itself is `tls.TlsServer` (`docs/tls.md`, "The server"): OpenSSL does the protocol, and the server drives it over memory buffers in its loop, between the socket and the HTTP codec. Every connection accepted after `serve_tls` is TLS; the listener serves nothing else.
+- **What the server adds** (rules TS6 to TS13 of `docs/research/tls_with_openssl.md`):
+  - **ALPN** is `http/1.1`, whatever the configuration asks: a client that offers only `h2` gets a fatal alert, one that offers none is served.
+  - **Admission** (TS7), before OpenSSL sees a byte: at most `tls_max_handshakes` handshakes under way (1,024) and `tls_handshake_rate` begun a second (1,000). Beyond either, accepting pauses, and the connections wait in the kernel's queue rather than being refused.
+  - **One deadline per handshake** (TS8): `tls_handshake_timeout` (10 s) from accept, which progress does not extend, so a ClientHello dribbled a byte at a time is cut there. A client may send at most 32 KiB before its handshake ends.
+  - **The other timeouts** count plaintext: a client sending records without data makes no progress on a body. Records without data also count against the connection's slice of a turn, and more than 256 KiB of them in a row fails it.
+  - **Closing** (TS10): a graceful end (`Connection: close`, an idle connection at a shutdown) sends close_notify after the last response. A timeout or an error sends none; after a TLS failure, only the alert OpenSSL queued goes out, if the socket takes it at once. A shutdown lets handshakes under way finish within their deadline, then takes the request that came with the handshake's end as in progress.
+  - **A Host that is not the SNI** gets 421 Misdirected Request, and the connection closes (TS6). A port, a trailing dot and case do not count; a request without a host makes no claim. A client that asked for no name in SNI (it connected by address) is not checked.
+  - **Reloading** (TS12): every `tls_reload_check` (10 s) the certificate and key files are compared with what was loaded (inode, size, modification time). When either changed, a new context is built from them for new connections; connections keep the context they began with. A failed build leaves the old one serving and is said on stderr, and is tried again when the files change again. Replace the files by renaming new ones over them, as certbot does, so that a check never reads half a file.
+  - **Renewal** (TS12): once a day, and after each reload, a line on stderr when less than a third of the certificate's lifetime is left.
+  - **Secrets** (TS11): `serve_tls` removes `SSLKEYLOGFILE` from the environment, and workers start without it, so that no libssl writes session keys there. Failures are not logged; the client's SNI is attacker-controlled.
+  - **Workers** (TS13): each worker calls `serve_tls` itself, after `run_workers`, so each builds its own context and no TLS state crosses a fork.
+- **Not here:** HTTP/2, session resumption, client certificates, OCSP stapling and kTLS (`docs/tls.md`, "Scope").
+
 ## Milestones
 - **S1: the serving loop.** Done.
   - `Server[H: Handler]` with `ServerConfig`, `Request` and `Response`, and the behaviour above. `run()` loops forever; `step(timeout)` runs one turn, for tests and for embedding the server in another loop.
@@ -408,7 +431,7 @@ while True:
       - the stdio fix was hidden by the lifeline fix (log lines on a lifeline no longer stop a worker); the test now checks the supervisor's fds 0–2 directly;
       - `body_cut` at close was reached by no case until a client resetting mid-body was added;
       - `body_cut` on a malformed body is defense in depth: without it the hook still comes, when the connection closes after its 400.
-  - **Leads for later:** a vDSO clock; sendfile for large files (it needs the SIGPIPE decision in `linux/sys.mojo`); precompressed files; and TLS, which is a project of its own.
+  - **Leads for later:** a vDSO clock; sendfile for large files (it needs the SIGPIPE decision in `linux/sys.mojo`); precompressed files. (TLS came in S7.)
 - **S6: server-sent events.** Done. `res.event_stream()`, heartbeats (`ServerConfig.heartbeat`), `res.retry_later`, and `List[UInt8]` forms of `http.sse.write_event` / `write_comment` for `produce`.
   - **Tests** (`tests/server/test_sse.mojo`): Python clients parse what arrives with `tests/http/sse_oracle.py`, written from the WHATWG standard's text independently of the parser. Covered:
     - the fields, and events with IDs, read back as written;
@@ -420,3 +443,7 @@ while True:
   - **Planted bugs:** 10 of 12 caught. Neither survivor can corrupt a stream:
     - a heartbeat for a stream that is not paused: such a stream has just sent, or was just woken;
     - no reset of the quiet time when a stream starts: a reused connection's next event stream could get its first heartbeat early.
+- **S7: TLS.** Done. `Server.serve_tls(tls.ServerConfig)`, the `tls_*` settings of `ServerConfig`, and the behaviour in "TLS" above; `TlsServer.pending_transmit()` (and `TlsClient`'s) for the backpressure over TLS.
+  - **Tests** (`tests/server/test_tls.mojo`, 12; and `test_workers.mojo`'s TLS case), against clients in Python's `ssl`: three keep-alive requests and a 100 KB body over TLS 1.3 with ALPN `http/1.1`, then close_notify after `Connection: close`; `h2` alone refused with `no_application_protocol`; an unknown SNI answered nothing; the 421 (and a port, a trailing dot, case); a ClientHello dribbled for longer than a 1 s deadline cut at it; a ClientHello that never ends closed; two handshakes at once, then the next two only after the first two ended; three a second, the fourth in the next second; a reload while a connection lives, then broken files with the last good certificate serving on; close_notify to an idle connection at a shutdown, and a handshake under way at a shutdown let finish, its request answered as the last; two workers over TLS, which never see `SSLKEYLOGFILE`.
+  - **Planted bugs:** 9 of 9 caught: no close_notify, no 421, no handshake deadline, no cap on handshakes at once or a second, no reload, the configured ALPN kept, `SSLKEYLOGFILE` passed on, handshakes cut at a shutdown. (`test_workers.mojo` builds its app from `MOJO_NET_TEST_SRC` when set, so that a planted copy reaches it.)
+  - **Not run here:** sslyze against the listener (not on conda-forge); the protocol profile is tested on `tls.TlsServer` itself (`docs/tls.md`, "Checks"), and the listener uses that context unchanged.

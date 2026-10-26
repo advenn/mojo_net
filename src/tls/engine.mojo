@@ -377,6 +377,14 @@ struct Engine(Movable):
     def has_unread_input(self) -> Bool:
         return self._hdr > 0 or self._body > 0
 
+    def pending_transmit(self) -> Int:
+        """Ciphertext waiting to be sent, plus plaintext written early and
+        not yet encrypted (once established)."""
+        var n = len(self._tx) + (self._early_left() if self._state == _OPEN else 0)
+        if self._wbio != 0:
+            n += Int(self._lib[].BIO_ctrl_pending(self._wbio))
+        return n
+
     def _frame(mut self, data: Span[UInt8, _]):
         """Follow the record framing of `data` (5-byte headers whose last
         two bytes give the body's length), for `has_unread_input`."""

@@ -3,9 +3,11 @@ under `run_workers` (WORKERS of them; 0 for one process with
 `Stop.on_signals`). PIN=1 pins the workers; CRASH=1 makes every worker
 exit with status 3 as soon as it starts; STUBBORN=1 makes the workers
 ignore stop requests (no `stop_on`); STOP_TIMEOUT_MS and RESTART_DELAY_MS
-set the supervisor's `stop_timeout` and `restart_delay`. Routes: /pid
-("<worker> <pid>"), /upload (the body's length), /threads ("<threads>
-<Cpus_allowed_list>" of the worker), /env (its MOJO_NET_WORKER)."""
+set the supervisor's `stop_timeout` and `restart_delay`; TLS_DIR=<dir>
+serves HTTPS with the test PKI there (tests/tls/tls_pki.py), each worker
+building its own context. Routes: /pid ("<worker> <pid>"), /upload (the
+body's length), /threads ("<threads> <Cpus_allowed_list>" of the worker),
+/env (its MOJO_NET_WORKER), /keylog (its SSLKEYLOGFILE)."""
 
 from std.os import getenv
 from std.sys import argv, exit
@@ -17,6 +19,7 @@ from linux.syscall import syscall0
 from linux.time import Duration
 from net.addr import SocketAddr
 from server import Handler, Request, Response, Server, ServerConfig, Stop, WorkerConfig, run_workers
+from tls import ServerConfig as TlsConfig
 
 
 def _cpus_allowed() raises -> String:
@@ -45,6 +48,8 @@ struct App(Handler):
             res.text(200, String(len(threads()), " ", _cpus_allowed()))
         elif path == "/env":
             res.text(200, String("[", getenv("MOJO_NET_WORKER"), "]"))
+        elif path == "/keylog":
+            res.text(200, String("[", getenv("SSLKEYLOGFILE"), "]"))
         else:
             res.text(404, "")
 
@@ -70,6 +75,9 @@ def main() raises:
             exit(3)
     var server = Server(App(stop.worker, syscall0(SYS_getpid)), ServerConfig(reuseport=True))
     server.bind(SocketAddr.parse(String(argv()[1])))
+    var tls_dir = getenv("TLS_DIR")
+    if tls_dir.byte_length() > 0:
+        server.serve_tls(TlsConfig(certificate=tls_dir + "/good.chain.pem", key=tls_dir + "/good.key", names=["localhost", "127.0.0.1"]))
     if getenv("STUBBORN") != "1":
         server.stop_on(stop^)
     server.run()

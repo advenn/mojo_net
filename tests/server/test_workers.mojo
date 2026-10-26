@@ -15,9 +15,10 @@ from std.python import Python
 from std.testing import TestSuite, assert_equal, assert_true
 
 comptime _DRIVER = """
-import glob, hashlib, os, shutil, signal, socket, subprocess, sys, time
+import glob, hashlib, os, shutil, signal, socket, ssl, subprocess, sys, tempfile, time
 mode = sys.argv[1]
 out = []
+TLS = None  # (an ssl context: the routes are fetched over HTTPS)
 
 def build():
     # One binary per test process (its pid in the path), built once.
@@ -34,7 +35,8 @@ def build():
     if not os.path.exists(exe):
         os.makedirs(d, exist_ok=True)
         tmp = exe + f".{os.getpid()}"
-        r = subprocess.run([shutil.which("mojo"), "build", "-I", "src", "tests/server/workers_app.mojo", "-o", tmp],
+        src = os.environ.get("MOJO_NET_TEST_SRC", "src")  # (a planted copy, to check a test catches it)
+        r = subprocess.run([shutil.which("mojo"), "build", "-I", src, "tests/server/workers_app.mojo", "-o", tmp],
                            capture_output=True, text=True)
         if r.returncode != 0:
             print("build failed: " + r.stdout + r.stderr, flush=True)
@@ -86,7 +88,11 @@ def start(preexec=None, pass_fds=(), **env):
 
 def get(path):
     c = socket.create_connection(("127.0.0.1", port), timeout=5)
-    c.sendall(b"GET " + path + b" HTTP/1.1\\r\\nHost: x\\r\\nConnection: close\\r\\n\\r\\n")
+    host = b"x"
+    if TLS:
+        c = TLS.wrap_socket(c, server_hostname="localhost")
+        host = b"localhost"  # (another host than the SNI gets 421)
+    c.sendall(b"GET " + path + b" HTTP/1.1\\r\\nHost: " + host + b"\\r\\nConnection: close\\r\\n\\r\\n")
     d = b""
     while True:
         x = c.recv(4096)
@@ -166,7 +172,18 @@ def cpu_list(text):
         got.update(range(int(a), int(b or a) + 1))
     return got
 
-if mode == "supervise":
+if mode == "tls":
+    d = tempfile.mkdtemp(prefix="mojo_net_tls_workers_")  # (not mojo_net_workers_*: build() sweeps those)
+    subprocess.run([sys.executable, "tests/tls/tls_pki.py", d], check=True, capture_output=True)
+    TLS = ssl.create_default_context(cafile=d + "/root.pem")
+    p = start(WORKERS="2", TLS_DIR=d, SSLKEYLOGFILE=d + "/keys.log")
+    out.append(f"{len(workers(2))} workers over TLS")
+    out.append(get(b"/keylog"))
+    p.send_signal(signal.SIGTERM)
+    out.append(f"supervisor exit {wait(p, 30)}")
+    out.append(f"key log written={os.path.exists(d + '/keys.log')}")
+    shutil.rmtree(d, ignore_errors=True)
+elif mode == "supervise":
     p = start(WORKERS="3")
     pids = workers(3)
     out.append(f"{len(pids)} workers")
@@ -346,6 +363,12 @@ def test_a_single_process_stops_gracefully_on_sigint() raises:
         _drive("single"),
         "-1|alive while a request is in progress=True|HTTP/1.1 200 OK close=True got 10|exit 0",
     )
+
+
+def test_workers_serve_tls() raises:
+    """S7, TS13: each worker builds its own TLS context after starting (no
+    TLS state crosses the fork), and none sees SSLKEYLOGFILE (TS11)."""
+    assert_equal(_drive("tls"), "2 workers over TLS|[]|supervisor exit 0|key log written=False")
 
 
 def test_a_second_sigint_stops_a_single_process_at_once() raises:

@@ -155,6 +155,11 @@ struct TlsClient(Movable):
         waits to be encrypted)."""
         return self._e.has_transmit()
 
+    def pending_transmit(self) -> Int:
+        """How much waits to be sent (`poll_transmit`): ciphertext, and
+        plaintext written early, once it can be encrypted."""
+        return self._e.pending_transmit()
+
     def has_unread_input(self) -> Bool:
         """Whether the input fed so far ends inside a record (the rest of it
         still to come). Told from the record framing itself: OpenSSL may

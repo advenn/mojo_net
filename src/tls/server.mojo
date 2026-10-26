@@ -97,6 +97,11 @@ struct TlsServer(Movable):
     def has_transmit(self) -> Bool:
         return self._e.has_transmit()
 
+    def pending_transmit(self) -> Int:
+        """How much waits to be sent (`poll_transmit`): ciphertext, and
+        plaintext written early, once it can be encrypted."""
+        return self._e.pending_transmit()
+
     def has_unread_input(self) -> Bool:
         """Whether the input fed so far ends inside a record."""
         return self._e.has_unread_input()

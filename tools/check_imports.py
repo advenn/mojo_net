@@ -28,7 +28,7 @@ import tempfile
 
 # Dependencies point downward only: linux <- bytes <- net <- rt, and
 # net <- http <- server; tls sits on net (and is OpenSSL's only caller),
-# and http's client uses it for https.
+# http's client uses it for https, and server for its TLS listener.
 # `rt` is frozen and experimental: nothing outside it may import it.
 ALLOWED = {
     "linux": {"linux"},
@@ -36,7 +36,7 @@ ALLOWED = {
     "net": {"linux", "bytes", "net"},
     "rt": {"linux", "bytes", "net", "rt"},
     "http": {"linux", "bytes", "net", "tls", "http"},
-    "server": {"linux", "bytes", "net", "http", "server"},
+    "server": {"linux", "bytes", "net", "http", "tls", "server"},
     "crypto": {"crypto"},
     "pg": {"linux", "bytes", "net", "crypto", "pg"},
     "redis": {"linux", "bytes", "net", "redis"},

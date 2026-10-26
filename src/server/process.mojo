@@ -314,6 +314,7 @@ struct _Supervisor:
         self.program = Exec.this_program()
         self.program.remove_env(_WORKER_ENV)
         self.program.remove_env(_REEXEC_ENV)
+        self.program.remove_env("SSLKEYLOGFILE")  # (TS11: no libssl writes session keys)
         self.cpus = allowed_cpus()
         self.cpu_list = String()
         for i in range(len(self.cpus)):
