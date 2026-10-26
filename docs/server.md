@@ -32,7 +32,7 @@ def main() raises:
 - **`handle`** gets the whole request: `req.method`, `req.target` (`path()`, `query()`), `req.host()`, `req.headers`, `req.body` (`text()`), `req.peer`. It fills the response: `res.text(...)`, `res.bytes(...)`, or `status`, `headers` and `body` directly. The server adds `Date`, `Content-Length` and the configured `Server`; HEAD drops the body; an error raised gets a 500.
 - **`path()` is raw,** not percent-decoded. Make access decisions on decoded segments, as `Router` matches them: `/%61dmin` is `/admin`.
 - **One loop serves every connection** of the process, so `handle` must not block: no blocking I/O, no sleeping. Handler state needs no locks.
-- **`ServerConfig`** holds the limits and timeouts: `max_connections`, `max_body`, the header, idle, read, write, linger and shutdown timeouts, `min_rate`, `limits` for request heads, `reuseport`, `server_name`. `Server(...)` refuses one that cannot work (`InvalidInput`): a `server_name` that is no field value, `max_connections` past the id space.
+- **`ServerConfig`** holds the limits and timeouts: `max_connections`, `max_body`, the header, idle, read, write, linger and shutdown timeouts, `min_rate`, `limits` for request heads, `reuseport`, `server_name`, and the event streams' `heartbeat`. `Server(...)` refuses one that cannot work (`InvalidInput`): a `server_name` that is no field value, `max_connections` past the id space.
 
 **Routes** go to functions instead (see Routing), with parameters:
 ```mojo
@@ -47,7 +47,7 @@ var server = Server(router^)
 
 **Static files** come from `StaticFiles.open(dir)`, behind a route (see Static files). The application passes `produce` and `stream_ended` on to it, because large files stream.
 
-**Streaming** responses are a `res.stream()` in `handle`, then `produce` calls that append pieces as the client takes them (see Streaming). Server-sent events are streams that pause when there is nothing to send: something else (another request, `Server.wake`) wakes them when there is. Request bodies stream into `on_body` when `stream_request` says so.
+**Streaming** responses are a `res.stream()` in `handle`, then `produce` calls that append pieces as the client takes them (see Streaming). Server-sent events are streams that pause when there is nothing to send: something else (another request, `Server.wake`) wakes them when there is. `res.event_stream()` sets their fields and keeps them alive with heartbeats (see Server-sent events). Request bodies stream into `on_body` when `stream_request` says so.
 
 **Several cores:** `run_workers` runs the program as one worker process per CPU on the same port, under a supervisor that restarts them and stops them gracefully (see Processes):
 ```mojo
@@ -259,6 +259,42 @@ The `Handler` hooks beyond `handle` all have defaults, so a handler that buffers
 - An error from `stream_request` or `on_body` answers 500, ignores the rest of the request, and closes the connection after the response (unless the rest is short enough to drain).
 - An error from `produce` cuts the response: the connection closes, and the client sees an incomplete body.
 
+## Server-sent events (S6)
+An event stream is a streamed response whose `produce` writes events with `http.sse.write_event`. This is how an OpenAI-compatible server sends tokens as the model makes them (`examples/server/sse_tokens.mojo`):
+```mojo
+def handle(mut self, req: Request, mut res: Response) raises:
+    if self.busy():
+        res.retry_later(429, Duration.from_secs(1))  # Retry-After: 1
+        return
+    self.start_generation(req.id)  # the model runs outside the handler
+    res.event_stream()
+
+def produce(mut self, req: Request, mut out: List[UInt8]) raises -> Bool:
+    for token in self.take_tokens(req.id):  # what the model made since
+        write_event(out, token_json(token))
+    if self.done(req.id):
+        write_event(out, "[DONE]")
+        return False  # the end of the stream
+    return True  # nothing more yet: paused until the next wake
+
+def stream_ended(mut self, req: Request, finished: Bool):
+    self.stop_generation(req.id)  # finished, or the client left
+```
+And in the program's loop, `server.wake(id)` when the model has new tokens for `id`:
+```mojo
+while True:
+    server.step(Duration.from_millis(10))
+    for id in model.ids_with_new_tokens():
+        server.wake(id)
+```
+- **`res.event_stream()`** sets `Content-Type: text/event-stream` and `Cache-Control: no-cache`. It also sets `X-Accel-Buffering: no`, so that nginx passes each event on at once rather than buffering them. Then it calls `stream()`. The handler may change these fields afterwards.
+- **Heartbeats:** while an event stream is paused, a comment line (`:`) goes out each time it has sent nothing for `ServerConfig.heartbeat` (15 s; `Duration.ZERO` for none). Clients ignore comments, and proxies and load balancers that close idle connections (often at 60 s) see traffic.
+  - A heartbeat goes between lines, never inside one. A stream whose last bytes did not end a line gets none until it does.
+  - A stream with the handler's `Content-Length` gets none, since one would break its framing. Nor does HEAD, which has no body.
+- **Cancelling:** a client that leaves, while the stream is paused or as a heartbeat goes out, ends it. `stream_ended(req, False)` is then where the generation for it stops.
+- **Overload:** `res.retry_later(status, delay)` answers 429 or 503 with `Retry-After` in whole seconds, rounded up. `http.retry.retry_after` reads it on the client side.
+- **The encoder** (`http.sse.write_event(out, data, event=, id=, retry_ms=)`) splits `data` into `data:` lines at every line end, and refuses an `event` or `id` that would break the stream (a line end, a NUL in the ID). `write_comment` writes comments.
+
 ## Milestones
 - **S1: the serving loop.** Done.
   - `Server[H: Handler]` with `ServerConfig`, `Request` and `Response`, and the behaviour above. `run()` loops forever; `step(timeout)` runs one turn, for tests and for embedding the server in another loop.
@@ -373,3 +409,14 @@ The `Handler` hooks beyond `handle` all have defaults, so a handler that buffers
       - `body_cut` at close was reached by no case until a client resetting mid-body was added;
       - `body_cut` on a malformed body is defense in depth: without it the hook still comes, when the connection closes after its 400.
   - **Leads for later:** a vDSO clock; sendfile for large files (it needs the SIGPIPE decision in `linux/sys.mojo`); precompressed files; and TLS, which is a project of its own.
+- **S6: server-sent events.** Done. `res.event_stream()`, heartbeats (`ServerConfig.heartbeat`), `res.retry_later`, and `List[UInt8]` forms of `http.sse.write_event` / `write_comment` for `produce`.
+  - **Tests** (`tests/server/test_sse.mojo`): Python clients parse what arrives with `tests/http/sse_oracle.py`, written from the WHATWG standard's text independently of the parser. Covered:
+    - the fields, and events with IDs, read back as written;
+    - heartbeats while a stream is paused, and none while it sends (woken every 30 ms, with a 250 ms heartbeat);
+    - none inside a line, none with a Content-Length (the body stays exactly its length), none on HEAD;
+    - a client that leaves after a heartbeat ends the stream;
+    - `retry_later`: rounding up, the phrase as the default body, the statuses it refuses.
+  - **By hand:** `examples/server/sse_tokens.mojo` against `curl -N` and `examples/http/sse_events.mojo` (every token, then `[DONE]`); 64 streams at once, then a 429 with `Retry-After: 1`.
+  - **Planted bugs:** 10 of 12 caught. Neither survivor can corrupt a stream:
+    - a heartbeat for a stream that is not paused: such a stream has just sent, or was just woken;
+    - no reset of the quiet time when a stream starts: a reused connection's next event stream could get its first heartbeat early.

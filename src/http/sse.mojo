@@ -335,44 +335,76 @@ def write_event(
     line that dispatches it. `InvalidInput` (nothing appended) for an
     `event` or `id` with a line end, an `id` with a NUL, or a negative
     `retry_ms` other than -1 (none)."""
+    var b = List[UInt8]()
+    write_event(b, data, event=event, id=id, retry_ms=retry_ms)
+    out.write_bytes(Span(b))
+
+
+def write_event(
+    mut out: List[UInt8],
+    data: StringSlice,
+    *,
+    event: StringSlice = "",
+    id: StringSlice = "",
+    retry_ms: Int = -1,
+) raises IoError:
+    """`write_event` into a list (`server.Handler.produce` writes into
+    one)."""
     comptime op = "write_event"
     if _has_line_end(event.as_bytes()) or _has_line_end(id.as_bytes()) or retry_ms < -1:
         raise IoError.of_kind(op, ErrorKind.InvalidInput)
     for c in id.as_bytes():
         if c == 0:
             raise IoError.of_kind(op, ErrorKind.InvalidInput)
-    var s = String()
     if retry_ms >= 0:
-        s += String("retry: ", retry_ms, "\n")
+        _put(out, "retry: ")
+        _put(out, String(retry_ms))
+        out.append(_LF)
     if event.byte_length() > 0:
-        s += "event: " + String(event) + "\n"
+        _put(out, "event: ")
+        out.extend(event.as_bytes())
+        out.append(_LF)
     if id.byte_length() > 0:
-        s += "id: " + String(id) + "\n"
+        _put(out, "id: ")
+        out.extend(id.as_bytes())
+        out.append(_LF)
     var b = data.as_bytes()
     var start = 0
     var i = 0
     while i <= len(b):
         if i == len(b) or b[i] == _LF or b[i] == _CR:
-            s += "data: " + String(StringSlice(unsafe_from_utf8=b[start:i])) + "\n"
+            _put(out, "data: ")
+            out.extend(b[start:i])
+            out.append(_LF)
             if i < len(b) and b[i] == _CR and i + 1 < len(b) and b[i + 1] == _LF:
                 i += 1
             start = i + 1
         i += 1
-    s += "\n"
-    out.write_bytes(s.as_bytes())
+    out.append(_LF)
 
 
 def write_comment(mut out: ByteBuffer, text: StringSlice = "") raises IoError:
     """Append a comment line (`:` and the text): ignored by clients, it keeps
     an idle stream alive through proxies (a heartbeat). `InvalidInput` for
     a text with a line end."""
+    var b = List[UInt8]()
+    write_comment(b, text)
+    out.write_bytes(Span(b))
+
+
+def write_comment(mut out: List[UInt8], text: StringSlice = "") raises IoError:
+    """`write_comment` into a list."""
     if _has_line_end(text.as_bytes()):
         raise IoError.of_kind("write_comment", ErrorKind.InvalidInput)
-    var s = String(":")
+    out.append(_COLON)
     if text.byte_length() > 0:
-        s += " " + String(text)
-    s += "\n"
-    out.write_bytes(s.as_bytes())
+        out.append(_SPACE)
+        out.extend(text.as_bytes())
+    out.append(_LF)
+
+
+def _put(mut out: List[UInt8], s: StringSlice):
+    out.extend(s.as_bytes())
 
 
 def _has_line_end(b: Span[UInt8, _]) -> Bool:

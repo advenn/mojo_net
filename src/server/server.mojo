@@ -45,6 +45,9 @@ The loop, per connection:
   is queued (`produce`; `stream_ended` once it is over). A stream with
   nothing to send pauses until its connection is woken (`Server.wake`,
   `Handler.take_wakes`); a client that leaves a paused stream ends it.
+- Server-sent events: `res.event_stream()` is a stream with the event
+  stream's fields; while it is paused, a comment line goes out every
+  `heartbeat`, so that proxies and clients do not time it out.
 - Accepting pauses at `max_connections`, and for 100 ms on EMFILE.
 - Lingering close (RFC 9112 9.6): when the server ends a connection
   whose client may still be sending (input was left unread:
@@ -67,7 +70,7 @@ from bytes.buffer import ByteBuffer
 from http.connection import EventKind, ServerConnection, ServerEvent
 from http.headers import Headers, eq_ignore_case, is_field_byte
 from http.parse import Limits, RequestHead, ResponseHead
-from http.types import Version
+from http.types import Version, reason as _phrase
 from linux import Epoll, ErrorKind, IoError
 from linux.errno import Errno
 from linux.abi import EpollEvent
@@ -85,6 +88,8 @@ comptime _LISTENER: UInt64 = UInt64.MAX
 comptime _STOP: UInt64 = UInt64.MAX - 1
 comptime _PAUSE = Duration.from_millis(100)
 comptime _READ_CHUNK = 64 * 1024
+comptime _HEARTBEAT = ":\n"
+"""A paused event stream's heartbeat: an empty comment line."""
 comptime _HIGH_WATER = 64 * 1024
 """Output a connection may queue before it stops answering the pipelined
 requests it has buffered (backpressure); below it, responses are batched
@@ -152,6 +157,9 @@ struct ServerConfig(Copyable, Movable):
     """The Server field of every response; none if empty."""
     var limits: Limits
     """Request head limits (`http.parse.Limits`)."""
+    var heartbeat: Duration
+    """How long a paused event stream (`Response.event_stream`) may send
+    nothing before a comment line goes out (`Duration.ZERO`: never)."""
 
     def __init__(
         out self,
@@ -168,6 +176,7 @@ struct ServerConfig(Copyable, Movable):
         reuseport: Bool = False,
         server_name: StringSlice = "",
         limits: Limits = Limits(),
+        heartbeat: Duration = Duration.from_secs(15),
     ):
         self.max_connections = max_connections
         self.max_body = max_body
@@ -181,14 +190,17 @@ struct ServerConfig(Copyable, Movable):
         self.reuseport = reuseport
         self.server_name = String(server_name)
         self.limits = limits
+        self.heartbeat = heartbeat
 
     def _sweep_every(self) -> Duration:
-        """How often timeouts are checked: a quarter of the shortest one,
-        at most a second, at least 10 ms."""
+        """How often timeouts (and heartbeats) are checked: a quarter of
+        the shortest one, at most a second, at least 10 ms."""
         var t = min(
             min(min(self.header_timeout, self.idle_timeout), self.linger_timeout),
             min(self.read_timeout, self.write_timeout),
         )
+        if Duration.ZERO < self.heartbeat:
+            t = min(t, self.heartbeat)
         var q = Duration.from_nanos(t.as_nanos() // 4)
         return max(min(q, Duration.from_secs(1)), Duration.from_millis(10))
 
@@ -270,6 +282,8 @@ struct Response(Movable):
     var headers: Headers
     var body: List[UInt8]
     var _stream: Bool
+    var _events: Bool
+    """An event stream: heartbeats while it is paused."""
 
     def __init__(out self):
         self.status = 200
@@ -277,6 +291,7 @@ struct Response(Movable):
         self.headers = Headers()
         self.body = List[UInt8]()
         self._stream = False
+        self._events = False
 
     def stream(mut self):
         """Make this a streamed response: the head goes out now (chunked,
@@ -284,6 +299,37 @@ struct Response(Movable):
         `Handler.produce`, piece by piece, as the client takes it. `body`
         is ignored."""
         self._stream = True
+
+    def event_stream(mut self) raises IoError:
+        """Make this a stream of server-sent events (the WHATWG standard):
+        `Content-Type: text/event-stream`, `Cache-Control: no-cache`, and
+        `X-Accel-Buffering: no` (so that nginx passes each event on at
+        once), then `stream()`. `produce` writes events with
+        `http.sse.write_event` (`write_comment` for comments). While the
+        stream is paused, a comment line goes out every
+        `ServerConfig.heartbeat`, between lines (never inside one), so
+        that proxies and clients keep it open. A Content-Length set by the
+        handler stops the heartbeats, which would break its framing."""
+        self.headers.set("Content-Type", "text/event-stream")
+        self.headers.set("Cache-Control", "no-cache")
+        self.headers.set("X-Accel-Buffering", "no")
+        self._events = True
+        self.stream()
+
+    def retry_later(mut self, status: Int, delay: Duration, body: StringSlice = "") raises IoError:
+        """Answer `status` (429 Too Many Requests, 503 Service Unavailable)
+        with `Retry-After`: `delay` in seconds, rounded up (RFC 9110
+        10.2.3), and a text body (the status's phrase if `body` is empty).
+        `InvalidInput` for a status that is not 3xx, 4xx or 5xx."""
+        if status < 300 or status > 599:
+            raise IoError.of_kind("Response.retry_later", ErrorKind.InvalidInput)
+        var ns = delay.as_nanos()
+        var secs = ns // 1_000_000_000 + (1 if ns % 1_000_000_000 > 0 else 0)
+        if body.byte_length() > 0:
+            self.text(status, body)
+        else:
+            self.text(status, String(_phrase(status), "\n"))
+        self.headers.set("Retry-After", String(secs))
 
     def text(
         mut self,
@@ -309,6 +355,7 @@ struct Response(Movable):
         self.headers.clear()
         self.body.clear()
         self._stream = False
+        self._events = False
 
 
 trait Handler(Deinitable, Movable):
@@ -400,6 +447,12 @@ struct _Conn(Movable):
     """The current request's body goes to `Handler.on_body`."""
     var paused: Bool
     """The streamed response waits for a wake."""
+    var beating: Bool
+    """The streamed response is an event stream that gets heartbeats."""
+    var line_open: Bool
+    """The stream's last byte did not end a line (no heartbeat now)."""
+    var last_out: Instant
+    """When the stream last sent something (its head, body, a heartbeat)."""
     var hangup: Bool
     """Epoll reported that the peer closed or half-closed (sticky)."""
     var eof: Bool
@@ -445,6 +498,9 @@ struct _Conn(Movable):
         self.rejected = False
         self.streamed = False
         self.paused = False
+        self.beating = False
+        self.line_open = False
+        self.last_out = now
         self.hangup = False
         self.eof = False
         self.refused = False
@@ -652,6 +708,8 @@ struct _Conn(Movable):
                     if self.answer(handler, config, date):
                         self.state = _PRODUCING  # until produce says the end
                         self.paused = False
+                        self.last_out = now
+                        self.line_open = False
                         return True
                 self.waiting(config, now)
                 if answered and (
@@ -700,9 +758,13 @@ struct _Conn(Movable):
         while self.http.pending_transmit() + len(self.out) < _HIGH_WATER:
             self.res.body.clear()
             var more = handler.produce(self.req, self.res.body)
-            if len(self.res.body) > 0:
+            var n = len(self.res.body)
+            if n > 0:
                 self.http.send_body(Span(self.res.body))
                 sent = True
+                self.last_out = now
+                var last = self.res.body[n - 1]
+                self.line_open = last != 10 and last != 13
             if not more:
                 self.http.end_response()
                 self.waiting(config, now)
@@ -833,6 +895,7 @@ struct _Conn(Movable):
             self.http.send_response(fallback)
         elif streaming:
             swap(head.headers, self.res.headers)
+            self.beating = self.res._events and not has.framing
             return True  # the body comes from produce
         elif not bodiless and not self.res._stream:
             self.http.send_body(Span(self.res.body))
@@ -1265,7 +1328,17 @@ struct Server[H: Handler](Movable):
                         pass
                     self._close(slot)
                 continue
-            if now < c.deadline or c.state == _PRODUCING:
+            if c.state == _PRODUCING:
+                if (
+                    c.paused
+                    and c.beating
+                    and not c.line_open
+                    and Duration.ZERO < self.config.heartbeat
+                    and now - c.last_out >= self.config.heartbeat
+                ):
+                    self._beat(slot, now)
+                continue
+            if now < c.deadline:
                 continue
             if c.state == _LINGERING or c.rejected or (c.state == _WAITING and not c.head_started):
                 # done lingering, answered already (an early 413), or idle:
@@ -1284,6 +1357,21 @@ struct Server[H: Handler](Movable):
                 self._serve(slot, now)  # flush the 408; it then closes
             else:
                 self._close(slot)
+
+    def _beat(mut self, slot: Int, now: Instant):
+        """A heartbeat for a paused event stream: one comment line, which
+        clients ignore, then a flush."""
+        ref c = self._conns[slot].value()
+        c.last_out = now
+        var ok = True
+        try:
+            c.http.send_body(_HEARTBEAT.as_bytes())
+        except:
+            ok = False
+        if ok:
+            self._serve(slot, now)
+        else:
+            self._close(slot)
 
 
 def _passed_on(e: Errno) -> Bool:

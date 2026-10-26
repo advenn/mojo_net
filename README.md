@@ -62,7 +62,7 @@ More in `examples/net/`:
 
 In `examples/pg/`: `query`, which runs SQL against PostgreSQL from a `postgresql://` URI and prints each result; `listen`, which waits for notifications on a channel. In `examples/redis/`: `cli`, which runs one command against a Redis or Valkey server and prints the reply; `transfer`, which moves an amount between two balances with WATCH and a transaction.
 
-And in `examples/http/`: `http_get`, a small `curl` built on `http.client.Client`; `sse_events`, which prints a URL's server-sent events as they arrive (as from an LLM API); `hello_server`, an epoll server driving one `ServerConnection` per connection (over 1M pipelined requests per second on one core). In `examples/server/`: `hello`, the same on `server.Server`; `workers`, one supervised worker process per CPU on one port, stopped gracefully by SIGTERM or Ctrl-C; `files`, a static file server.
+And in `examples/http/`: `http_get`, a small `curl` built on `http.client.Client`; `sse_events`, which prints a URL's server-sent events as they arrive (as from an LLM API); `hello_server`, an epoll server driving one `ServerConnection` per connection (over 1M pipelined requests per second on one core). In `examples/server/`: `hello`, the same on `server.Server`; `sse_tokens`, tokens streamed as server-sent events the way an OpenAI-compatible server sends them; `workers`, one supervised worker process per CPU on one port, stopped gracefully by SIGTERM or Ctrl-C; `files`, a static file server.
 
 ## Develop
 Everything runs through [pixi](https://pixi.sh):
