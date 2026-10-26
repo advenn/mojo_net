@@ -114,20 +114,10 @@ struct TlsStream(Movable, Writable):
         if len(buf) == 0:
             return 0
         while True:
-            var left = len(self._data) - self._data_off
-            if left > 0:
-                var n = min(left, len(buf))
-                for i in range(n):
-                    buf[i] = self._data[self._data_off + i]
-                self._data_off += n
+            var n = self._take(buf)
+            if n > 0:
                 return n
-            var ev = self._tls.next_event()
-            if ev:
-                if ev.value().kind == TlsEventKind.DATA:
-                    swap(self._data, ev.value().data)
-                    self._data_off = 0
-                elif ev.value().kind == TlsEventKind.CLOSED:
-                    self._flush()  # (our close_notify in reply)
+            if self._next():
                 continue
             if self._tls.is_closed():
                 return 0
@@ -153,6 +143,115 @@ struct TlsStream(Movable, Writable):
         while off < len(data):
             off += self._tls.write(data[off:])
             self._flush()
+
+    # ---- readiness loops -------------------------------------------------
+
+    def try_read(mut self, buf: MutSpan[UInt8, _]) raises TlsError -> Optional[Int]:
+        """For readiness loops, as `TcpStream.try_read`: plaintext without
+        waiting, ignoring the read deadline. The bytes copied; 0 after the
+        server's close_notify (or for an empty `buf`); None when nothing
+        has arrived. Decrypted plaintext can wait here while the socket is
+        quiet: check `buffered()` before waiting for the socket to be
+        readable."""
+        if len(buf) == 0:
+            return 0
+        while True:
+            var n = self._take(buf)
+            if n > 0:
+                return n
+            if self._next():
+                continue
+            if self._tls.is_closed():
+                return 0
+            _ = self.flush_ready()  # (a key update's reply)
+            var room = min(self._tls.feed_capacity(), len(self._in))
+            if room <= 0:
+                raise tls_error("tls: the connection cannot take input", ErrorKind.Other, Category.PROTOCOL)
+            var got: Optional[Int]
+            try:
+                got = self._tcp.try_read(Span(self._in)[0:room])
+            except e:
+                raise TlsError(e)
+            if not got:
+                return None
+            try:
+                if got.value() == 0:
+                    self._tls.feed_eof()
+                else:
+                    self._tls.feed(Span(self._in)[0 : got.value()])
+            except e:
+                self._alert()
+                raise e^
+
+    def try_write(mut self, data: Span[UInt8, _]) raises TlsError -> Optional[Int]:
+        """For readiness loops, as `TcpStream.try_write`: how many bytes of
+        `data` were taken, without waiting and ignoring the write deadline;
+        None while earlier ciphertext still waits for the socket. Taken
+        bytes may still wait as ciphertext: when the socket is writable,
+        call `flush_ready()` (or this again) until `pending_output()` is 0."""
+        if not self.flush_ready():
+            return None
+        if len(data) == 0:
+            return 0
+        var n = self._tls.write(data)
+        _ = self.flush_ready()
+        return n
+
+    def flush_ready(mut self) raises TlsError -> Bool:
+        """Send queued ciphertext without waiting: True once none is left."""
+        while True:
+            if len(self._out) == 0:
+                if not self._tls.has_transmit():
+                    return True
+                _ = self._tls.poll_transmit(self._out)
+            var got: Optional[Int]
+            try:
+                got = self._tcp.try_write(self._out.readable_span())
+            except e:
+                raise TlsError(e)
+            if not got:
+                return False
+            try:
+                self._out.consume(got.value())
+            except e:
+                raise TlsError(e)
+
+    def pending_output(self) -> Int:
+        """Ciphertext not yet handed to the socket (an estimate: OpenSSL's
+        queue counts as 1 until it is taken)."""
+        return len(self._out) + (1 if self._tls.has_transmit() else 0)
+
+    def buffered(self) -> Bool:
+        """Whether plaintext (or the server's close_notify) waits here,
+        already read from the socket."""
+        return len(self._data) - self._data_off > 0 or self._tls.has_events()
+
+    def is_reusable(mut self) -> Bool:
+        """For a connection pool, on an idle connection: True when nothing
+        has arrived since the last read but TLS's own messages (such as
+        TLS 1.3 session tickets, which the server may send late). Data,
+        the server's close_notify, the stream's end or any error: False."""
+        if self.buffered() or self.pending_output() > 0 or self._tls.is_closed():
+            return False
+        while True:
+            var room = min(self._tls.feed_capacity(), len(self._in))
+            if room <= 0:
+                return False
+            var got: Optional[Int]
+            try:
+                got = self._tcp.try_read(Span(self._in)[0:room])
+            except:
+                return False
+            if not got:
+                return not self._tls.has_events()
+            if got.value() == 0:
+                return False
+            try:
+                self._tls.feed(Span(self._in)[0 : got.value()])
+            except:
+                return False
+            if self._tls.has_events() or self._tls.is_closed():
+                return False
 
     def close(deinit self) raises TlsError:
         """Send close_notify and close the socket (TB13: without waiting
@@ -198,10 +297,36 @@ struct TlsStream(Movable, Writable):
 
     # ---- inside ---------------------------------------------------------
 
+    def _take(mut self, buf: MutSpan[UInt8, _]) -> Int:
+        """Copy plaintext already decrypted into `buf`."""
+        var n = min(len(self._data) - self._data_off, len(buf))
+        for i in range(n):
+            buf[i] = self._data[self._data_off + i]
+        self._data_off += n
+        return n
+
+    def _next(mut self) raises TlsError -> Bool:
+        """Take the next event: True if there was one (DATA kept for
+        `_take`; CLOSED answered with our close_notify, best effort)."""
+        var ev = self._tls.next_event()
+        if not ev:
+            return False
+        if ev.value().kind == TlsEventKind.DATA:
+            swap(self._data, ev.value().data)
+            self._data_off = 0
+        elif ev.value().kind == TlsEventKind.CLOSED:
+            try:
+                _ = self.flush_ready()  # (our close_notify in reply)
+            except:
+                pass
+        return True
+
     def _flush(mut self) raises TlsError:
-        """Send every queued byte of ciphertext."""
-        while self._tls.has_transmit():
-            _ = self._tls.poll_transmit(self._out)
+        """Send every queued byte of ciphertext (waiting, under the write
+        deadline)."""
+        while len(self._out) > 0 or self._tls.has_transmit():
+            if len(self._out) == 0:
+                _ = self._tls.poll_transmit(self._out)
             try:
                 self._tcp.write_all(self._out.readable_span())
             except e:

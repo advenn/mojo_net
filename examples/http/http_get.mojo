@@ -2,8 +2,9 @@
 
     pixi run mojo run -I src examples/http/http_get.mojo URL [URL...]
 
-`http://` only (no TLS yet). Host names resolve without libc, and URLs on
-the same host reuse one kept-alive connection.
+`http://` and `https://` (certificates checked against the system's CA
+bundle: docs/tls.md). Host names resolve without libc, and URLs on the same
+scheme, host and port reuse one kept-alive connection.
 """
 
 from std.sys import argv, exit, stderr

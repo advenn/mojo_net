@@ -27,14 +27,15 @@ import sys
 import tempfile
 
 # Dependencies point downward only: linux <- bytes <- net <- rt, and
-# net <- http <- server; tls sits on net (and is OpenSSL's only caller).
+# net <- http <- server; tls sits on net (and is OpenSSL's only caller),
+# and http's client uses it for https.
 # `rt` is frozen and experimental: nothing outside it may import it.
 ALLOWED = {
     "linux": {"linux"},
     "bytes": {"linux", "bytes"},
     "net": {"linux", "bytes", "net"},
     "rt": {"linux", "bytes", "net", "rt"},
-    "http": {"linux", "bytes", "net", "http"},
+    "http": {"linux", "bytes", "net", "tls", "http"},
     "server": {"linux", "bytes", "net", "http", "server"},
     "crypto": {"crypto"},
     "pg": {"linux", "bytes", "net", "crypto", "pg"},
@@ -42,7 +43,8 @@ ALLOWED = {
     "tls": {"linux", "bytes", "net", "tls"},
 }
 # Packages whose protocol logic is sans-I/O: in src/, only the listed
-# modules may import `net` (the rest only parse and build bytes).
+# modules may import `net`, or `tls` (whose stream does I/O); the rest only
+# parse and build bytes.
 SANS_IO = {
     "http": {"client.mojo"},
     "pg": {"client.mojo"},
@@ -121,11 +123,12 @@ def check(root):
                 for line, name in imports(text):
                     if (
                         strict
-                        and name == "net"
+                        and name in ("net", "tls")
+                        and name != pkg
                         and pkg in SANS_IO
                         and os.path.basename(rel) not in SANS_IO[pkg]
                     ):
-                        bad.append(f"{rel}:{line}: src/{pkg} modules are sans-I/O: only {sorted(SANS_IO[pkg])} may import net")
+                        bad.append(f"{rel}:{line}: src/{pkg} modules are sans-I/O: only {sorted(SANS_IO[pkg])} may import {name}")
                         continue
                     if name == "std" or name in ALLOWED[pkg]:
                         continue
@@ -160,6 +163,7 @@ def _self_test():
         "src/tls/client.mojo": ("from net.tcp import TcpStream\n", "are sans-I/O"),
         "src/tls/stream.mojo": ("from net.tcp import TcpStream\nfrom .client import TlsClient\n", None),
         "src/net/q.mojo": ("from tls import TlsClient\n", "net may not import tls"),
+        "src/http/r.mojo": ("from tls.stream import TlsStream\n", "may import tls"),
     }
     with tempfile.TemporaryDirectory() as root:
         for rel, (src, _) in plant.items():
@@ -179,8 +183,8 @@ def _self_test():
         expected = sum(1 for _, w in plant.values() if w is not None)
         if len(bad) != expected:
             errors.append(f"expected {expected} violations, got {len(bad)}:\n{report}")
-        if files != 19:
-            errors.append(f"expected 19 files checked, got {files}")
+        if files != 20:
+            errors.append(f"expected 20 files checked, got {files}")
         if errors:
             sys.exit("check_imports self-test failed:\n" + "\n".join(errors))
 

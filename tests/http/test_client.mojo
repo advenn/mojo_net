@@ -65,12 +65,10 @@ def test_url_parsing() raises:
             kinds.append(_kind(e))
     for k in kinds:
         assert_equal(k, "InvalidInput")
-    var https = String()
-    try:
-        _ = Url.parse("https://example.com/")
-    except e:
-        https = _kind(e)
-    assert_equal(https, "Unsupported")
+    # https parses since H8 (tests/http/test_https.mojo has the rest).
+    var https = Url.parse("https://example.com/")
+    assert_true(https.tls)
+    assert_equal(Int(https.port), 443)
 
 
 # ---- against http.server --------------------------------------------------------------

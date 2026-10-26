@@ -4,11 +4,11 @@ HTTP/1.1 for Mojo on Linux, per RFC 9110 (semantics) and RFC 9112 (message synta
 - message types and a header map;
 - a sans-I/O parser and serializer, with body framing;
 - connection state machines for both sides, implementing the `Codec` contract;
-- a blocking client over `net`.
+- a blocking client over `net`, with `https://` through `tls`.
 
 It is the base of the HTTP server (roadmap step 3). Package rules and the shared contracts are in `docs/design.md`; the transport is `net` (`docs/net.md`).
 
-**Status: H1–H6 done.** Core types, the header map, the head parser, body framing, the connection codecs and a blocking client, independently reviewed and tuned. Next is the HTTP server (roadmap step 3), which builds on `ServerConnection`.
+**Status: H1–H6 and H8 done.** Core types, the header map, the head parser, body framing, the connection codecs and a blocking client, independently reviewed and tuned; `https://` (H8). Next is H7, a streaming response API with server-sent events.
 
 ## Scope
 **In scope:**
@@ -17,15 +17,14 @@ It is the base of the HTTP server (roadmap step 3). Package rules and the shared
 - `Content-Length`, chunked (with trailers) and close-delimited bodies;
 - 1xx responses, `Expect: 100-continue`, HEAD / 204 / 304;
 - `Upgrade` and CONNECT, handed over as a raw stream;
-- a blocking `http://` client with a keep-alive pool, connect-by-name and deadlines.
+- a blocking `http://` and `https://` client with a keep-alive pool, connect-by-name and deadlines.
 
 **Out of scope for now:**
-- TLS (`https://`): not yet; milestone H8 builds it on the `tls` package (`docs/tls.md`).
 - HTTP/2 and HTTP/3.
 - Content codings (gzip, br). Bodies are delivered as sent, with the coding headers.
 - Cookie jars, caches and proxies.
 
-**Sans-I/O.** Every protocol module parses and builds bytes and never touches a socket or a clock (design contract 1). So the same code runs under a blocking stream, an epoll loop or a test that feeds byte arrays. Only `http.client` imports `net`; `tools/check_imports.py` enforces it. The server is a separate package (`docs/server.md`).
+**Sans-I/O.** Every protocol module parses and builds bytes and never touches a socket or a clock (design contract 1). So the same code runs under a blocking stream, an epoll loop or a test that feeds byte arrays. Only `http.client` imports `net` and `tls`; `tools/check_imports.py` enforces it. The server is a separate package (`docs/server.md`).
 
 ## Strictness
 The parser is strict where leniency enables request smuggling or response splitting, and lenient only where RFC 9112 allows it and real peers need it.
@@ -62,7 +61,7 @@ from linux.time import Duration
 
 def main() raises:
     var client = Client(timeout=Duration.from_secs(10))  # per request, DNS included
-    var r = client.get("http://example.com/")
+    var r = client.get("https://example.com/")  # system roots; see docs/tls.md
     print(r.status, r.reason, r.headers.get("content-type").value())
     print(r.text())
 
@@ -74,7 +73,7 @@ def main() raises:
 
 - **Errors are `IoError`s:**
   - `InvalidInput` for a bad URL, method or header;
-  - `Unsupported` for https;
+  - for https, the `IoError` of the TLS failure: `PermissionDenied` for a certificate that is refused, `InvalidData` for a failed handshake; `client.last_tls_error()` has the category, OpenSSL's verify code and its text;
   - `TimedOut` past the deadline (`e.is_deadline()`);
   - `InvalidData` for a malformed response, or one larger than `max_body`;
   - otherwise the transport's error, for example `ConnectionRefused`.
@@ -82,7 +81,9 @@ def main() raises:
 - **What the client sends:** it sets Host, User-Agent and Content-Length. It refuses a caller's Content-Length or Transfer-Encoding, because it frames the body itself.
 - **Retries:** if a reused connection was closed before any byte of the response, or answered 408 (its idle timeout raced the request), an idempotent request (GET, HEAD, OPTIONS, TRACE, PUT, DELETE) is sent again on a new connection, once. Other methods raise, or get the 408, because the server may have acted on them.
 - **Early responses** (RFC 9112 9.5): a response that arrives while the body is still being sent stops the body if it is 300 or more, or closes the connection. Below 300 and keeping the connection, the body is sent to the end first. If sending fails (the server reset the connection), a response is returned only when it is complete by its own framing; a response delimited by the close raises the send error, since a reset may have cut it short.
-- **The pool:** at most `max_idle_per_host` idle connections per host and port, and `max_idle_conns` (32) in all, the oldest going first.
+- **The pool:** at most `max_idle_per_host` idle connections per scheme, host and port, and `max_idle_conns` (32) in all, the oldest going first.
+- **HTTPS:** `Client(tls=ClientConfig(trust=Trust.ca_file("ca.pem")))` trusts a private CA instead of the system roots; nothing loosens verification (`docs/tls.md`). The certificate must hold the URL's host, or its IP address. ALPN offers `http/1.1`. OpenSSL loads on the first `https://` request.
+- **The end of a TLS connection** (RFC 9112 9.8): a response complete by its Content-Length or its last chunk stands when the server then ends the connection without close_notify, as many do. A response delimited by the end of the connection needs close_notify, or it raises `UnexpectedEof`: without close_notify, it may have been cut short.
 
 ## Using the server codec
 `ServerConnection` does HTTP for one connection and no I/O. The driver feeds it what the socket reads and sends what it hands out. This is the loop of `examples/http/hello_server.mojo` (edge-triggered epoll) without the epoll part:
@@ -173,7 +174,7 @@ while True:
   - Tested per behaviour on both sides, and for the same merged transcript at feed sizes 1 to 13 over mixed pipelined exchanges. A 34-mutant run over the two codecs checks the tests.
 - **H5: blocking client.** Done.
   - `Client.request(method, url, headers, body)`, plus `get`, `head` and `post`, returning a whole `Response` (status, headers, body, trailers).
-  - **URLs:** `Url.parse` takes `http://` only (https is `Unsupported`), with IPv6 literals and no user info.
+  - **URLs:** `Url.parse` took `http://` only (https was `Unsupported` until H8), with IPv6 literals and no user info.
   - **Deadline:** one per request, covering DNS, Happy Eyeballs, sending and receiving.
   - **Body limit:** `max_body`; past it, `InvalidData`.
   - **Headers it adds:** Host, User-Agent and Content-Length unless the caller gives them. A caller's framing headers are refused.
@@ -228,4 +229,10 @@ while True:
     - a `HeadParser` given less input than it already scanned raises instead of reading past it;
     - unworkable `Limits` are refused when the connection is made;
     - `Headers(capacity=-1)` no longer aborts.
-- **Later:** a streaming response API on the client, redirects, content codings, TLS (with `net`).
+- **H8: HTTPS.** Done.
+  - `Url.parse` takes `https://` (port 443 by default; `authority()` omits the scheme's port).
+  - `Client` connects TCP, then runs a verified handshake with `tls.stream.TlsStream`, within the request's deadline. The pool key includes the scheme. A pooled TLS connection is reused if nothing but TLS's own messages arrived while it was idle (TLS 1.3 sends session tickets after the first response). A reused one the server ended without close_notify before any response byte is retried, as a dropped plain one is.
+  - Truncation per RFC 9112 9.8 (above); `last_tls_error()` for the reason of a TLS failure.
+  - **Tested** (`tests/http/test_https.mojo`) against `http_peer.py --tls`: bodies by length, chunked, to close_notify, 3 MB down and 2 MB up, full duplex, an early 413; reuse with session tickets; an `http://` request to the same host and port never given the pooled TLS connection; a POST after the server closed the idle connection with close_notify; the retry of a dropped connection and of a 408; the ends of a connection with and without close_notify; an untrusted CA, a certificate for another name and for another address.
+  - **Planted bugs**, each caught: a pool check that always reuses, no retry after a truncated end, a truncated end taken as the end of a close-delimited body, a pool key without the scheme.
+- **Later:** a streaming response API on the client (H7), redirects, content codings.

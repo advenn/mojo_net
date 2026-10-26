@@ -2,7 +2,7 @@
 
 TLS for the other libraries (`http`'s `https://`, later `pg` and `redis`), with all of the cryptography and the protocol done by OpenSSL 3.5, the long-term-support line. This package writes no TLS and no cryptography of its own. It configures OpenSSL, drives it over memory buffers, and checks its results. The decision and the rules cited below (TL, TC, TB, TS, TA, TG) are in `docs/research/tls_with_openssl.md`; what was measured before any code was written is in `docs/spikes.md`, "TLS through OpenSSL (T0)". Package rules and the shared contracts are in `docs/design.md`.
 
-**Status: T1 done**, the client: verification, the sans-I/O state machine, a blocking stream, and the checks below. Next is H8, `https://` in `http.Client`.
+**Status: T1 done**, the client: verification, the sans-I/O state machine, a blocking stream, and the checks below. Its first user, `https://` in `http.Client`, is done too (H8, `docs/http.md`). Next is the review (TR), before the server side.
 
 > **This code was written by an AI and has not been reviewed by a TLS expert.** The tests compare it with independent implementations and plant bugs to show that they catch them (see "Checks"), but they can only find what someone thought to test. The external review (gate TG15) is still to come. Until then, treat it as unreviewed.
 
@@ -66,7 +66,7 @@ Any failure frees the OpenSSL connection, and the error stays: every later call 
 
 ## Endings
 - **The server's close_notify** is a CLOSED event (`read` returns 0) and is answered with ours. Input after it is ignored.
-- **A TCP end without close_notify** raises `TRUNCATED` (`UnexpectedEof`), never a clean end, after the data before it is delivered (TB12). The data may have been cut short; only the protocol above can tell (an HTTP `Content-Length` that is complete). Many HTTPS servers end this way after `Connection: close`: H8 decides per RFC 9112 §9.8.
+- **A TCP end without close_notify** raises `TRUNCATED` (`UnexpectedEof`), never a clean end, after the data before it is delivered (TB12). The data may have been cut short; only the protocol above can tell (an HTTP `Content-Length` that is complete). Many HTTPS servers end this way after `Connection: close`: `http.Client` decides per RFC 9112 §9.8 (`docs/http.md`).
 - **`close()`** sends close_notify once and does not wait for the server's (TB13). Nothing is sent during a handshake.
 
 ## Bounds
@@ -136,7 +136,7 @@ OpenSSL 3.5 is supported until 2030-04-08. On a High or Critical OpenSSL advisor
   - `tls.ffi`, `tls.consts` (generated), `tls.error`, `tls.target`, `tls.config`, `tls.client` (`TlsClient`), `tls.stream` (`TlsStream`).
   - Tests: 83 in 8 files, plus the ASan runs.
   - Tools: `tools/check_tls.py`, `tools/check_tls_asan.sh`, `tools/check_freshness.py`, `tools/gen_tls_consts.py`.
-- **H8: `https://` in `http.Client`** (in `http`): the pool keyed by TLS settings, ALPN `http/1.1`, cross-host redirects verified again, truncation handled per RFC 9112.
+- **H8: `https://` in `http.Client`** (in `http`). Done (`docs/http.md`): the pool keyed by scheme (one TLS context per `Client`), ALPN `http/1.1`, truncation handled per RFC 9112 §9.8. The client follows no redirects, so there is none to verify again. `TlsStream` gained the readiness-loop calls it needs: `try_read`, `try_write`, `flush_ready`, `buffered`, `is_reusable`.
 - **P9, R8: TLS for `pg` and `redis`.** Parked, by the user's priorities.
 - **TR: review.** Two independent internal reviews against the rules, each finding with a regression test (`tests/tls/test_tls_regressions*.mojo`); TG2, TG8 and TG11; the external review booked.
 - **T2: the server**, then **S7: the TLS listener** in `server`.

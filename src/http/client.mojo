@@ -1,15 +1,27 @@
-"""A blocking HTTP/1.1 client over `net`: `Client` sends requests to
-`http://` URLs and reads whole responses, keeping connections alive in a
-small pool. It drives `http.connection.ClientConnection` over a
-`TcpStream`; `client` and `server` are the only `http` modules that do I/O.
+"""A blocking HTTP/1.1 client over `net` and `tls`: `Client` sends requests
+to `http://` and `https://` URLs and reads whole responses, keeping
+connections alive in a small pool. It drives
+`http.connection.ClientConnection` over a `TcpStream`, or a `TlsStream`;
+`client` and `server` are the only `http` modules that do I/O.
 
     var client = Client()
-    var r = client.get("http://example.com/")
+    var r = client.get("https://example.com/")
     print(r.status, r.text())
 
-- URLs: `http://host[:port][/path][?query]` (`Url.parse`), with IPv6
-  literals in brackets. `https` raises `Unsupported` (no TLS yet), user
-  info in the authority `InvalidInput`; a fragment is dropped.
+- URLs: `http://host[:port][/path][?query]` and `https://...`
+  (`Url.parse`), with IPv6 literals in brackets; user info in the
+  authority is `InvalidInput`, and a fragment is dropped.
+- HTTPS (docs/tls.md, milestone H8): the server's certificate must be valid
+  for the URL's host (or IP address), under the `tls` package's policy and
+  the trust given to `Client(tls=...)` (system roots by default). ALPN
+  offers `http/1.1`. A TLS failure raises the `IoError` inside the
+  `TlsError` (`PermissionDenied` for a refused certificate);
+  `last_tls_error()` says why. The OpenSSL context is built on the first
+  `https://` request, so plain HTTP never loads OpenSSL.
+- A TLS connection that ends without close_notify (RFC 9112 9.8): a
+  response complete by its Content-Length or its last chunk stands; one
+  delimited by the end of the connection does not (`UnexpectedEof`), since
+  an attacker can cut a TLS connection short.
 - One deadline per request (`timeout`, default 30 s) covers name
   resolution, connecting (Happy Eyeballs), sending and receiving, also a
   response that keeps trickling in.
@@ -32,7 +44,7 @@ small pool. It drives `http.connection.ClientConnection` over a
   method usually has one (POST, PUT, PATCH). The caller's headers follow,
   in order. A caller's Content-Length or Transfer-Encoding is refused
   (`InvalidInput`): the client frames the body.
-- Connections are kept per host and port, at most `max_idle_per_host` of
+- Connections are kept per scheme, host and port, at most `max_idle_per_host` of
   them and `max_idle_conns` in all (the oldest goes first), and reused only
   after `max_idle` at most, if `idle_state()` still says EMPTY and the
   codec holds nothing unread; connections idle longer are closed whichever
@@ -55,6 +67,8 @@ from net.addr import IpAddr
 from net.blocking import IdleState
 from net.resolver import Resolver
 from net.tcp import TcpStream
+from tls import Category, ClientConfig, ClientContext, TlsError
+from tls.stream import TlsStream
 
 from .connection import E_NO_RESPONSE, ClientConnection, ClientEvent, EventKind
 from .headers import Headers, is_token, lower_ascii
@@ -73,23 +87,26 @@ comptime _MAX_INFORMATIONAL = 32
 
 
 struct Url(Copyable, Movable, Writable):
-    """An `http://` URL split for a request."""
+    """An `http://` or `https://` URL split for a request."""
 
+    var tls: Bool
+    """https."""
     var host: String
     """The host name or IP literal, IPv6 without its brackets."""
     var port: UInt16
     var target: String
     """The request target: path and query, at least "/"."""
 
-    def __init__(out self, host: StringSlice, port: UInt16, target: StringSlice):
+    def __init__(out self, host: StringSlice, port: UInt16, target: StringSlice, tls: Bool = False):
+        self.tls = tls
         self.host = String(host)
         self.port = port
         self.target = String(target)
 
     @staticmethod
     def parse(text: StringSlice) raises IoError -> Url:
-        """`http://host[:port][/path][?query][#fragment]`. `Unsupported`
-        for https, `InvalidInput` for anything else malformed: another
+        """`http[s]://host[:port][/path][?query][#fragment]` (ports 80 and
+        443 by default). `InvalidInput` for anything malformed: another
         scheme, user info, an empty host or one with characters outside
         letters, digits and `-._~`, a port outside 1..65535, or bytes in the
         path that are not visible ASCII (percent-encode them first)."""
@@ -106,17 +123,16 @@ struct Url(Copyable, Movable, Writable):
         var scheme = String()
         for i in range(sep):
             scheme += chr(Int(lower_ascii(b[i])))
-        if scheme == "https":
-            raise IoError.of_kind(op, ErrorKind.Unsupported)
-        if scheme != "http":
+        if scheme != "http" and scheme != "https":
             raise IoError.of_kind(op, ErrorKind.InvalidInput)
+        var tls = scheme == "https"
         var a = sep + 3
         var e = a
         while e < n and b[e] != 47 and b[e] != 63 and b[e] != 35:  # / ? #
             e += 1
         var host_lo = a
         var host_hi = e
-        var port = 80
+        var port = 443 if tls else 80
         if a < e and b[a] == 91:  # "[" IPv6 literal "]"
             var close = a
             while close < e and b[close] != 93:
@@ -170,22 +186,22 @@ struct Url(Copyable, Movable, Writable):
             if c <= 0x20 or c >= 0x7F:
                 raise IoError.of_kind(op, ErrorKind.InvalidInput)
         target += String(StringSlice(unsafe_from_utf8=b[e:f]))
-        return Url(StringSlice(unsafe_from_utf8=b[host_lo:host_hi]), UInt16(port), target)
+        return Url(StringSlice(unsafe_from_utf8=b[host_lo:host_hi]), UInt16(port), target, tls)
 
     def authority(self) -> String:
         """The Host field value: the host (IPv6 in brackets) and the port
-        unless it is 80."""
+        unless it is the scheme's (80, or 443 for https)."""
         var out = String()
         if self.host.find(":") >= 0:
             out += "[" + self.host + "]"
         else:
             out += self.host
-        if self.port != 80:
+        if self.port != (UInt16(443) if self.tls else UInt16(80)):
             out += String(":", self.port)
         return out^
 
     def write_to(self, mut writer: Some[Writer]):
-        writer.write("http://", self.authority(), self.target)
+        writer.write("https://" if self.tls else "http://", self.authority(), self.target)
 
 
 @inline(.always)
@@ -252,15 +268,102 @@ struct Response(Movable, Writable):
 # ---- the client ------------------------------------------------------------------
 
 
+struct _Stream(Movable):
+    """A connection's transport: plain TCP, or TLS over it. Each call
+    raises a plain `IoError`; a TLS failure's reason is kept in `failure`."""
+
+    var _plain: List[TcpStream]
+    """One stream, or none (a one-element List: Optional of a large struct
+    is slow in Mojo 1.2, CLAUDE.md)."""
+    var _tls: List[TlsStream]
+    var failure: Optional[TlsError]
+
+    def __init__(out self, var tcp: TcpStream):
+        self._plain = List[TcpStream]()
+        self._plain.append(tcp^)
+        self._tls = List[TlsStream]()
+        self.failure = None
+
+    def __init__(out self, var tls: TlsStream):
+        self._plain = List[TcpStream]()
+        self._tls = List[TlsStream]()
+        self._tls.append(tls^)
+        self.failure = None
+
+    def _io(mut self, var e: TlsError) -> IoError:
+        var io = e.io
+        self.failure = e^
+        return io
+
+    def set_deadline(mut self, deadline: Deadline):
+        if len(self._tls) > 0:
+            self._tls[0].set_deadline(deadline)
+        else:
+            self._plain[0].set_deadline(deadline)
+
+    def read(mut self, buf: MutSpan[UInt8, _]) raises IoError -> Int:
+        if len(self._plain) > 0:
+            return self._plain[0].read(buf)
+        try:
+            return self._tls[0].read(buf)
+        except e:
+            raise self._io(e^)
+
+    def try_read(mut self, buf: MutSpan[UInt8, _]) raises IoError -> Optional[Int]:
+        if len(self._plain) > 0:
+            return self._plain[0].try_read(buf)
+        try:
+            return self._tls[0].try_read(buf)
+        except e:
+            raise self._io(e^)
+
+    def try_write(mut self, buf: Span[UInt8, _]) raises IoError -> Optional[Int]:
+        if len(self._plain) > 0:
+            return self._plain[0].try_write(buf)
+        try:
+            return self._tls[0].try_write(buf)
+        except e:
+            raise self._io(e^)
+
+    def wait(mut self, events: Int16, deadline: Deadline) raises IoError -> Int16:
+        """Wait for the socket to be ready for `events`. For TLS, plaintext
+        already decrypted counts as readable, and queued ciphertext is sent
+        first: waiting to read with ciphertext unsent could deadlock."""
+        if len(self._plain) > 0:
+            return wait_ready(self._plain[0], events, deadline, "Client.request")
+        if events & Int16(POLLIN) and self._tls[0].buffered():
+            return Int16(POLLIN)
+        var want = events
+        var flushed: Bool
+        try:
+            flushed = self._tls[0].flush_ready()
+        except e:
+            raise self._io(e^)
+        if not flushed:
+            want = want | Int16(POLLOUT)
+        return wait_ready(self._tls[0].tcp(), want, deadline, "Client.request")
+
+    def truncated(self) -> Bool:
+        """Whether a TLS connection ended without close_notify."""
+        return Bool(self.failure) and self.failure.value().category == Category.TRUNCATED
+
+    def is_reusable(mut self) -> Bool:
+        """For the pool: nothing arrived while idle (TLS's own messages
+        aside) and the connection was not closed."""
+        if len(self._plain) > 0:
+            return self._plain[0].idle_state() == IdleState.EMPTY
+        return self._tls[0].is_reusable()
+
+
 struct _Conn(Movable):
     """A connection and its protocol state, pooled together."""
 
     var key: String
-    var stream: TcpStream
+    var stream: _Stream
     var codec: ClientConnection
     var idle_since: Instant
 
-    def __init__(out self, key: String, var stream: TcpStream) raises IoError:
+    def __init__(out self, key: String, var stream: _Stream) raises IoError:
         self.key = key
         self.stream = stream^
         self.codec = ClientConnection()
@@ -303,6 +406,10 @@ struct Client(Movable):
     var max_idle: Duration
     """How long a pooled connection may sit idle and still be reused."""
     var user_agent: String
+    var _tls_config: ClientConfig
+    var _tls: List[ClientContext]
+    """Built on the first https request (one element), then shared."""
+    var _tls_error: Optional[TlsError]
     var _resolver: Resolver
     var _pool: List[_Conn]
     var _buf: List[UInt8]
@@ -318,8 +425,11 @@ struct Client(Movable):
         max_idle_conns: Int = 32,
         max_idle: Duration = Duration.from_secs(60),
         user_agent: StringSlice = "mojo-net",
+        var tls: ClientConfig = ClientConfig(),
     ) raises IoError:
-        """`InvalidInput` for a zero timeout or a negative limit."""
+        """`InvalidInput` for a zero timeout or a negative limit. `tls` is
+        the trust for https (system roots by default); its ALPN list is
+        replaced by `http/1.1`."""
         if not (Duration.ZERO < timeout) or max_body < 0 or max_idle_per_host < 0 or max_idle_conns < 0:
             raise IoError.of_kind("Client.__init__", ErrorKind.InvalidInput)
         self.timeout = timeout
@@ -328,6 +438,10 @@ struct Client(Movable):
         self.max_idle_conns = max_idle_conns
         self.max_idle = max_idle
         self.user_agent = String(user_agent)
+        tls.alpn = ["http/1.1"]
+        self._tls_config = tls^
+        self._tls = List[ClientContext]()
+        self._tls_error = None
         self._resolver = Resolver.system()
         self._pool = List[_Conn]()
         self._buf = List[UInt8](length=_READ_SIZE, fill=0)
@@ -382,7 +496,9 @@ struct Client(Movable):
                 headers.name(i).as_bytes(), headers.value_bytes(i), utf8=False
             )
         var deadline = Deadline.after(self.timeout)
-        var key = String(u.host, " ", u.port)
+        # (TC17: one TLS context per Client, so the scheme is all the pool
+        # key needs to keep TLS and plain connections apart.)
+        var key = String("https " if u.tls else "http ", u.host, " ", u.port)
         var retried = False
         while True:
             var reused = False
@@ -390,10 +506,7 @@ struct Client(Movable):
             if conn:
                 reused = True
             else:
-                conn = _Conn(
-                    key,
-                    TcpStream.connect_host_deadline(u.host, u.port, deadline, self._resolver),
-                )
+                conn = _Conn(key, self._connect(u, deadline))
             var c = conn.take()
             var started = False
             try:
@@ -407,10 +520,34 @@ struct Client(Movable):
                     self._checkin(c^)
                 return r^
             except e:
-                if reused and not started and not retried and _idempotent(method) and _retryable(e):
+                if c.stream.failure:
+                    self._tls_error = c.stream.failure.value().copy()
+                # (A reused TLS connection the server ended without
+                # close_notify before any response byte is one it dropped.)
+                if reused and not started and not retried and _idempotent(method) and (_retryable(e) or c.stream.truncated()):
                     retried = True
                     continue
                 raise e
+
+    def _connect(mut self, u: Url, deadline: Deadline) raises IoError -> _Stream:
+        """A new connection to `u`'s host: TCP, then for https a verified
+        handshake within the same deadline."""
+        var tcp = TcpStream.connect_host_deadline(u.host, u.port, deadline, self._resolver)
+        if not u.tls:
+            return _Stream(tcp^)
+        try:
+            if len(self._tls) == 0:
+                self._tls.append(self._tls_config.build())
+            return _Stream(TlsStream.handshake(tcp^, self._tls[0], u.host, deadline))
+        except e:
+            var io = e.io
+            self._tls_error = e^
+            raise io
+
+    def last_tls_error(self) -> Optional[TlsError]:
+        """Why the last TLS failure happened (category, verify code,
+        OpenSSL's text), for the `IoError` a request raised."""
+        return self._tls_error.copy()
 
     def _exchange(
         mut self,
@@ -468,7 +605,7 @@ struct Client(Movable):
                 out.consume(wrote.value())
                 continue
             var events = POLLOUT if answered else (POLLIN | POLLOUT)
-            var rev = wait_ready(c.stream, Int16(events), deadline, "Client.request")
+            var rev = c.stream.wait(Int16(events), deadline)
             if not answered and rev & Int16(POLLIN | POLLHUP | POLLERR):
                 if self._read_ready(c, r, started, informational, deadline):
                     if r.status < 300 and not c.codec.should_close():
@@ -544,7 +681,7 @@ struct Client(Movable):
                 return False  # (the reset itself: nothing more to read)
             if not got:
                 try:
-                    _ = wait_ready(c.stream, Int16(POLLIN), deadline, "Client.request")
+                    _ = c.stream.wait(Int16(POLLIN), deadline)
                 except:
                     return False
                 continue
@@ -596,7 +733,7 @@ struct Client(Movable):
         while i >= 0:
             if self._pool[i].key == key:
                 var c = self._pool.pop(i)
-                if c.stream.idle_state() == IdleState.EMPTY:
+                if c.stream.is_reusable():
                     return c^
             i -= 1
         return None

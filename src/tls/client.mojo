@@ -366,6 +366,10 @@ struct TlsClient(Movable):
             raise TlsError(e, Category.RESOURCE)
         return total
 
+    def has_events(self) -> Bool:
+        """Whether `next_event` has an event to give."""
+        return self._next < len(self._events)
+
     def has_transmit(self) -> Bool:
         """Whether ciphertext waits to be sent."""
         return len(self._tx) > 0 or (self._wbio != 0 and Int(self._lib[].BIO_ctrl_pending(self._wbio)) > 0)

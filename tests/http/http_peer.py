@@ -2,7 +2,11 @@
 uses it). It is Python's http.server, so the client is checked against an
 independent implementation.
 
-    python http_peer.py      prints "PORT <n>" once it listens on 127.0.0.1
+    python http_peer.py              prints "PORT <n>" once it listens on 127.0.0.1
+    python http_peer.py --tls <dir> [name]
+                                     the same over TLS, with <dir>/<name>.chain.pem
+                                     and <name>.key (default: good; made by
+                                     tests/tls/tls_pki.py)
 
 Routes:
     GET  /hello            "hello", Content-Length
@@ -13,6 +17,11 @@ Routes:
     GET  /big?n=N          N bytes of "x"
     GET  /close            a response with Connection: close, then the server closes
     GET  /http10           an HTTP/1.0 response without a length, then close
+                           (over TLS: without close_notify, so cut short as far
+                           as the client can tell)
+    GET  /http10-notify    the same, ended by close_notify over TLS
+    *    /bye-later        "ok" with keep-alive, then 200 ms later the server closes
+                           the idle connection (with close_notify over TLS)
     GET  /slow             answers after 5 s
     *    /flaky            the first request on a connection gets "ok"; any later
                            one is read and the connection closed without an answer
@@ -37,6 +46,7 @@ Routes:
 import http.server
 import itertools
 import socket
+import ssl
 import struct
 import sys
 import threading
@@ -57,6 +67,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def setup(self):
+        if isinstance(self.request, ssl.SSLSocket):
+            self.request.do_handshake()  # (in this connection's thread)
         super().setup()
         self.conn_id = next(_ids)
         self.served = 0
@@ -118,6 +130,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/http10":
             self.wfile.write(b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nold style")
             self.close_connection = True
+        elif path == "/http10-notify":
+            self.wfile.write(b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nold style")
+            self.close_connection = True
+            if isinstance(self.connection, ssl.SSLSocket):
+                try:
+                    self.connection.unwrap()  # (close_notify, then the client's)
+                except (ssl.SSLError, OSError):
+                    pass
+        elif path == "/bye-later":
+            self._read_body()
+            self._send(200, b"ok")
+            self.wfile.flush()
+            time.sleep(0.2)
+            self.close_connection = True
+            if isinstance(self.connection, ssl.SSLSocket):
+                self.connection.settimeout(2)
+                try:
+                    self.connection.unwrap()
+                except (ssl.SSLError, OSError):
+                    pass
+            else:
+                self.connection.shutdown(socket.SHUT_RDWR)
         elif path == "/slow":
             time.sleep(5)
             self._send(200, b"late")
@@ -234,12 +268,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 class Server(http.server.ThreadingHTTPServer):
+    tls = None
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        if self.tls is not None:
+            sock = self.tls.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
+        return sock, addr
+
     def handle_error(self, request, client_address):
         pass  # clients that give up mid-response (the tests make some do so)
 
 
 def main():
     server = Server(("127.0.0.1", 0), Handler)
+    if len(sys.argv) >= 3 and sys.argv[1] == "--tls":
+        name = sys.argv[3] if len(sys.argv) > 3 else "good"
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(f"{sys.argv[2]}/{name}.chain.pem", f"{sys.argv[2]}/{name}.key")
+        ctx.set_alpn_protocols(["http/1.1"])
+        server.tls = ctx
     server.daemon_threads = True
     print("PORT", server.server_address[1], flush=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
