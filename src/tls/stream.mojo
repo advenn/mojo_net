@@ -51,6 +51,9 @@ struct TlsStream(Movable, Writable):
     var _data: List[UInt8]
     """Plaintext of the last DATA event, from `_data_off` on."""
     var _data_off: Int
+    var _broken: Optional[TlsError]
+    """A send that failed (it may have sent part of a record): every later
+    write, flush or close raises it, since the stream is corrupt."""
 
     @staticmethod
     def connect(host: StringSlice, port: UInt16, context: ClientContext, timeout: Duration) raises TlsError -> TlsStream:
@@ -93,6 +96,7 @@ struct TlsStream(Movable, Writable):
         self._in = List[UInt8](length=FEED_LIMIT, fill=0)
         self._data = List[UInt8]()
         self._data_off = 0
+        self._broken = None
         var rd = self._tcp.read_deadline()
         var wr = self._tcp.write_deadline()
         self._tcp.set_deadline(deadline)
@@ -116,18 +120,25 @@ struct TlsStream(Movable, Writable):
 
     def read(mut self, buf: MutSpan[UInt8, _]) raises TlsError -> Int:
         """Wait for plaintext and copy up to `len(buf)` bytes of it; 0 after
-        the server's close_notify (or for an empty `buf`)."""
+        the server's close_notify (or for an empty `buf`). The read
+        deadline bounds the whole call: records without data (session
+        tickets) do not extend it, and neither does sending what reading
+        queued (a key update's reply)."""
         if len(buf) == 0:
             return 0
+        var first = True
         while True:
             var n = self._take(buf)
             if n > 0:
                 return n
-            if self._next():
+            if self._next_or_alert():
                 continue
             if self._tls.is_closed():
                 return 0
-            self._flush()  # (a key update's reply)
+            if not first and self._tcp.read_deadline().is_expired():
+                raise TlsError(IoError.of_kind("TlsStream.read", ErrorKind.TimedOut))  # (as TCP raises it)
+            first = False
+            self._flush_by(self._tcp.read_deadline())  # (a key update's reply)
             try:
                 self._receive()
             except e:
@@ -144,7 +155,11 @@ struct TlsStream(Movable, Writable):
             got += n
 
     def write_all(mut self, data: Span[UInt8, _]) raises TlsError:
-        """Encrypt and send all of `data` (under the write deadline)."""
+        """Encrypt and send all of `data` (under the write deadline). A
+        failed send leaves the stream unusable: every later write, flush or
+        close raises the same error."""
+        if self._broken:
+            raise self._broken.value().copy()
         var off = 0
         while off < len(data):
             off += self._tls.write(data[off:])
@@ -165,7 +180,7 @@ struct TlsStream(Movable, Writable):
             var n = self._take(buf)
             if n > 0:
                 return n
-            if self._next():
+            if self._next_or_alert():
                 continue
             if self._tls.is_closed():
                 return 0
@@ -205,6 +220,8 @@ struct TlsStream(Movable, Writable):
 
     def flush_ready(mut self) raises TlsError -> Bool:
         """Send queued ciphertext without waiting: True once none is left."""
+        if self._broken:
+            raise self._broken.value().copy()
         while True:
             if len(self._out) == 0:
                 if not self._tls.has_transmit():
@@ -214,7 +231,7 @@ struct TlsStream(Movable, Writable):
             try:
                 got = self._tcp.try_write(self._out.readable_span())
             except e:
-                raise TlsError(e)
+                raise self._break(TlsError(e))
             if not got:
                 return False
             try:
@@ -237,7 +254,7 @@ struct TlsStream(Movable, Writable):
         has arrived since the last read but TLS's own messages (such as
         TLS 1.3 session tickets, which the server may send late). Data,
         the server's close_notify, the stream's end or any error: False."""
-        if self.buffered() or self.pending_output() > 0 or self._tls.is_closed():
+        if self.buffered() or self.pending_output() > 0 or self._tls.is_closed() or self._broken:
             return False
         while True:
             var room = min(self._tls.feed_capacity(), len(self._in))
@@ -249,7 +266,9 @@ struct TlsStream(Movable, Writable):
             except:
                 return False
             if not got:
-                return not self._tls.has_events()
+                # Part of a record (its rest held back) is not "nothing":
+                # it would be read as the answer to the next request.
+                return not self._tls.has_events() and not self._tls.has_unread_input()
             if got.value() == 0:
                 return False
             try:
@@ -271,6 +290,8 @@ struct TlsStream(Movable, Writable):
         server's session tickets sit unread in the socket of a client that
         only writes. Dropping the stream instead closes the socket at once,
         without close_notify: an abortive end."""
+        if self._broken:
+            raise self._broken.value().copy()
         self._tls.close()
         self._flush()
         try:
@@ -347,17 +368,47 @@ struct TlsStream(Movable, Writable):
                 pass
         return True
 
+    def _next_or_alert(mut self) raises TlsError -> Bool:
+        """`_next`; a failure it raises sends OpenSSL's alert first."""
+        try:
+            return self._next()
+        except e:
+            self._alert()
+            raise e^
+
+    def _break(mut self, var e: TlsError) -> TlsError:
+        """Latch a failed send (the first stays)."""
+        if not self._broken:
+            self._broken = e.copy()
+        return e^
+
     def _flush(mut self) raises TlsError:
         """Send every queued byte of ciphertext (waiting, under the write
         deadline)."""
+        if self._broken:
+            raise self._broken.value().copy()
         while len(self._out) > 0 or self._tls.has_transmit():
             if len(self._out) == 0:
                 _ = self._tls.poll_transmit(self._out)
             try:
                 self._tcp.write_all(self._out.readable_span())
             except e:
-                raise TlsError(e)
+                raise self._break(TlsError(e))
             self._out.clear()
+
+    def _flush_by(mut self, deadline: Deadline) raises TlsError:
+        """`_flush`, also bounded by `deadline` (the write deadline is put
+        back after)."""
+        if not self._tls.has_transmit() and len(self._out) == 0:
+            return
+        var wr = self._tcp.write_deadline()
+        self._tcp.set_write_deadline(wr.earliest(deadline))
+        try:
+            self._flush()
+        except e:
+            self._tcp.set_write_deadline(wr)
+            raise e^
+        self._tcp.set_write_deadline(wr)
 
     def _alert(mut self):
         """After a failure, send the alert OpenSSL queued, if the socket

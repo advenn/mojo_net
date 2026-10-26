@@ -9,8 +9,11 @@ from std.os import getenv
 from std.python import Python, PythonObject
 from std.testing import assert_equal, assert_true
 
+from bytes.buffer import ByteBuffer
 from linux.time import Deadline, Duration
-from tls import Category, ClientConfig, ClientContext, TlsError, Trust
+from net.tcp import TcpStream
+from tls import Category, ClientConfig, ClientContext, TlsClient, TlsError, TlsEventKind, Trust
+from tls.client import FEED_LIMIT
 from tls.stream import TlsStream
 
 
@@ -19,7 +22,7 @@ def pki() raises -> String:
     var os = Python.import_module("os")
     var tempfile = Python.import_module("tempfile")
     var d = String(py=os.path.join(tempfile.gettempdir(), String("mojo_net_tls_", Int(py=os.getpid()))))
-    if Bool(py=os.path.isdir(d)) and Bool(py=os.path.exists(d + "/client_only.pem")):
+    if Bool(py=os.path.isdir(d)) and Bool(py=os.path.exists(d + "/root.crl.pem")):
         return d
     var subprocess = Python.import_module("subprocess")
     var pysys = Python.import_module("sys")
@@ -241,3 +244,68 @@ def opts(*items: String) -> List[String]:
     for i in items:
         out.append(i)
     return out^
+
+
+struct CodecDriver(Movable):
+    """`TlsClient` over a `TcpStream`, driven by hand: for tests that
+    must not send, or must not drain, as a stream would."""
+
+    var tls: TlsClient
+    var tcp: TcpStream
+    var buf: List[UInt8]
+    var out: ByteBuffer
+    var sent: Int
+    """Ciphertext handed to the socket."""
+    var hello: Int
+    """Of which the ClientHello."""
+
+    def __init__(out self, port: Int, ctx: ClientContext) raises:
+        self.tls = TlsClient(ctx, "localhost")
+        self.tcp = TcpStream.connect_host("127.0.0.1", UInt16(port), Duration.from_secs(5))
+        self.tcp.set_deadline(Deadline.after(Duration.from_secs(20)))
+        self.buf = List[UInt8](length=FEED_LIMIT, fill=0)
+        self.out = ByteBuffer()
+        self.sent = 0
+        self.hello = 0
+
+    def send(mut self) raises:
+        """Everything queued, to the socket (a failed send is ignored: the
+        server may have gone)."""
+        while self.tls.has_transmit():
+            if self.tls.poll_transmit(self.out) == 0:
+                break
+            try:
+                self.tcp.write_all(self.out.readable_span())
+            except:
+                pass
+            self.sent += len(self.out)
+            self.out.clear()
+
+    def receive(mut self) raises TlsError -> Bool:
+        """One receive into the codec (at most its room): False at the end."""
+        var room = min(self.tls.feed_capacity(), len(self.buf))
+        if room == 0:
+            return False
+        var n: Int
+        try:
+            n = self.tcp.read(Span(self.buf)[0:room])
+        except e:
+            raise TlsError(e)
+        if n == 0:
+            self.tls.feed_eof()
+            return False
+        self.tls.feed(Span(self.buf)[0:n])
+        return True
+
+    def handshake(mut self) raises:
+        while True:
+            self.send()
+            if self.hello == 0:
+                self.hello = self.sent
+            var ev = self.tls.next_event()
+            if ev:
+                if ev.value().kind == TlsEventKind.ESTABLISHED:
+                    return
+                continue
+            if not self.receive():
+                raise Error("the connection ended during the handshake")

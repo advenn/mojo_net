@@ -41,9 +41,15 @@ end, because data may have been cut off: only a framing layer above, such
 as an HTTP Content-Length, can tell a complete message.
 
 **Bounds** (TB17). Unread ciphertext and undelivered plaintext together
-stay within `FEED_LIMIT` (`feed_capacity()` says how much room is left); a server may send
-at most `HANDSHAKE_LIMIT` bytes before the handshake ends; `write` stops
-taking plaintext while `TRANSMIT_LIMIT` bytes wait to be sent.
+stay within `FEED_LIMIT` (`feed_capacity()` says how much room is left;
+each undelivered DATA event counts `EVENT_COST` bytes more); a server may
+send at most `HANDSHAKE_LIMIT` bytes before the handshake ends; `write`
+stops taking plaintext while `TRANSMIT_LIMIT` bytes wait to be sent. A
+server cannot make work without end either: once established, at most
+`QUIET_LIMIT` bytes may arrive without any application data in them
+(session tickets, key updates), and what reading makes OpenSSL queue to
+send (key update replies, alerts) may not take the transmit queue past
+`OUTPUT_LIMIT`. Either fails the connection.
 """
 
 from std.ffi import c_int
@@ -83,9 +89,13 @@ from .ffi import (
     SEAM_PEERNAME,
     SEAM_READ,
     SEAM_REUSED,
+    SEAM_SET_HOST,
+    SEAM_SNI,
     SEAM_SSL_NEW,
+    SEAM_TRANSMIT_FULL,
     SEAM_VERIFY_RESULT,
     SEAM_VERSION_LOW,
+    SEAM_WBIO_NEW,
     SEAM_WRITE,
     Library,
     Obj,
@@ -110,6 +120,18 @@ comptime HANDSHAKE_LIMIT = 256 * 1024
 OpenSSL's 100 KiB limit on a certificate chain)."""
 comptime TRANSMIT_LIMIT = 256 * 1024
 """Ciphertext waiting to be sent above which `write` takes no more."""
+comptime OUTPUT_LIMIT = TRANSMIT_LIMIT + 2 * MAX_RECORD
+"""The transmit queue after reading: `write` fills it to `TRANSMIT_LIMIT`
+plus one record at most, so more means the server provokes output (key
+update replies, alerts) faster than it reads it."""
+comptime QUIET_LIMIT = 256 * 1024
+"""Ciphertext a server may send once established without any application
+data in it: a few session tickets and key updates are normal; a flood of
+them would keep a reader working past its deadline."""
+comptime EVENT_COST = 64
+"""Bytes each undelivered DATA event counts against the feed room, on top
+of its data: a server sending tiny records cannot make a driver that does
+not drain hold more than about `FEED_LIMIT` in events."""
 
 comptime _HANDSHAKE = 0
 comptime _OPEN = 1
@@ -176,13 +198,25 @@ struct TlsClient(Movable):
     var _tx: ByteBuffer
     """Ciphertext taken out of `_wbio` when the connection failed (its alert)."""
     var _early: List[UInt8]
-    """Plaintext written before the connection was established."""
+    """Plaintext written before the connection was established, from
+    `_early_off` on (one buffer, reserved once, so no copy is left
+    unwiped)."""
+    var _early_off: Int
     var _rbuf: List[UInt8]
     """Where records are decrypted (one record)."""
     var _received: Int
     """Ciphertext fed before the handshake ended."""
     var _held: Int
-    """Plaintext in undelivered DATA events (counted against the feed room)."""
+    """Plaintext in undelivered DATA events, plus `EVENT_COST` each
+    (counted against the feed room)."""
+    var _quiet: Int
+    """Ciphertext fed since the last application data (QUIET_LIMIT)."""
+    var _hdr: Int
+    """Bytes of the current record's 5-byte header fed so far."""
+    var _len: Int
+    """That header's length field, as it arrives."""
+    var _body: Int
+    """Bytes of the current record's body still to come."""
     var _version: String
     var _cipher: String
     var _group: String
@@ -197,7 +231,7 @@ struct TlsClient(Movable):
         except e:
             raise TlsError(e, Category.INPUT, String(server_name))
         self._context = context.copy()
-        self._lib = context.library()
+        self._lib = context._library()
         self._ssl = 0
         self._rbio = 0
         self._wbio = 0
@@ -210,16 +244,21 @@ struct TlsClient(Movable):
         self._next = 0
         self._tx = ByteBuffer()
         self._early = List[UInt8]()
+        self._early_off = 0
         self._rbuf = List[UInt8](length=MAX_RECORD, fill=0)
         self._received = 0
         self._held = 0
+        self._quiet = 0
+        self._hdr = 0
+        self._len = 0
+        self._body = 0
         self._version = String()
         self._cipher = String()
         self._group = String()
         self._alpn = String()
         ref L = self._lib[]
         L.ERR_clear_error()
-        self._ssl = L.SSL_new(context.ssl_ctx())
+        self._ssl = L.SSL_new(context._ssl_ctx())
         if seam(SEAM_SSL_NEW) != 0 and self._ssl != 0:
             L.SSL_free(self._ssl)
             self._ssl = 0
@@ -232,7 +271,7 @@ struct TlsClient(Movable):
         self._rbio = L.BIO_new(L.BIO_s_mem()) if seam(SEAM_BIO_NEW) == 0 else 0
         if self._rbio != 0:
             L.SSL_set0_rbio(self._ssl, self._rbio)
-        self._wbio = L.BIO_new(L.BIO_s_mem())
+        self._wbio = L.BIO_new(L.BIO_s_mem()) if seam(SEAM_WBIO_NEW) == 0 else 0
         if self._wbio != 0:
             L.SSL_set0_wbio(self._ssl, self._wbio)
         if self._rbio == 0 or self._wbio == 0:
@@ -249,8 +288,13 @@ struct TlsClient(Movable):
     def __deinit__(deinit self):
         ref L = self._lib[]
         L.OPENSSL_cleanse(buf(self._rbuf), len(self._rbuf))  # (TB18)
+        _ = len(self._rbuf)  # (the buffer outlives the call)
         if len(self._early) > 0:
             L.OPENSSL_cleanse(buf(self._early), len(self._early))
+            _ = len(self._early)
+        for i in range(self._next, len(self._events)):  # (undelivered plaintext)
+            if len(self._events[i].data) > 0:
+                L.OPENSSL_cleanse(buf(self._events[i].data), len(self._events[i].data))
         if self._ssl != 0:
             L.SSL_free(self._ssl)
 
@@ -263,15 +307,15 @@ struct TlsClient(Movable):
             raise self._fail(tls_error("tls: no verify parameters", ErrorKind.Other, Category.LIBRARY, L.drain_errors()))
         L.X509_VERIFY_PARAM_set_hostflags(param, HOST_FLAGS)
         if self._target.is_ip:
-            if L.X509_VERIFY_PARAM_set1_ip(param, buf(self._target.ip), len(self._target.ip)) != 1:
+            if L.X509_VERIFY_PARAM_set1_ip(param, buf(self._target.ip), len(self._target.ip)) != 1 or seam(SEAM_SET_HOST) != 0:
                 raise self._fail(tls_error("tls: setting the expected address failed", ErrorKind.Other, Category.LIBRARY, L.drain_errors()))
             return
         var name = _c_name(self._target.name)
         var n = self._target.name.byte_length()
-        var sni = L.SSL_ctrl_str(self._ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, buf(name))
+        var sni = L.SSL_ctrl_str(self._ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, buf(name)) if seam(SEAM_SNI) == 0 else 0
         # An explicit length: 0 would mean strlen, and an empty name turns
         # the check off (T0). Target refuses empty names; n > 0 says so.
-        var host = n > 0 and L.X509_VERIFY_PARAM_set1_host(param, buf(name), n) == 1
+        var host = n > 0 and L.X509_VERIFY_PARAM_set1_host(param, buf(name), n) == 1 and seam(SEAM_SET_HOST) == 0
         _ = name^
         if sni != 1 or not host:
             raise self._fail(tls_error("tls: setting the expected host failed", ErrorKind.Other, Category.LIBRARY, L.drain_errors()))
@@ -310,7 +354,12 @@ struct TlsClient(Movable):
         var rc = L.BIO_write_ex(self._rbio, in_buf(data), len(data), size_out(written))
         if rc != 1 or written[0] != len(data) or seam(SEAM_BIO_WRITE) != 0:
             raise self._fail(tls_error("tls: BIO_write_ex failed", ErrorKind.OutOfMemory, Category.RESOURCE, L.drain_errors()))
+        if self._state == _OPEN:
+            self._quiet += len(data)  # (application data read resets it)
+        self._frame(data)
         self._pump()
+        if self._state == _OPEN and self._quiet > QUIET_LIMIT:
+            _ = self._fail(tls_error("tls: the server sent too much without any data in it", ErrorKind.InvalidData, Category.PROTOCOL, String(self._quiet, " bytes")))
 
     def feed_eof(mut self) raises TlsError:
         """The server's byte stream ended. Unless its close_notify came
@@ -331,7 +380,8 @@ struct TlsClient(Movable):
         if self._next < len(self._events):
             var ev = TlsEvent(self._events[self._next].kind)
             swap(ev.data, self._events[self._next].data)
-            self._held -= len(ev.data)
+            if ev.kind == TlsEventKind.DATA:
+                self._held -= len(ev.data) + EVENT_COST
             self._next += 1
             if self._next == len(self._events):
                 self._events.clear()
@@ -343,7 +393,10 @@ struct TlsClient(Movable):
 
     def poll_transmit(mut self, mut out: ByteBuffer) raises TlsError -> Int:
         """Append queued ciphertext to `out` (as much as it can take);
-        returns how many bytes (rule 7)."""
+        returns how many bytes (rule 7). Plaintext written before the
+        connection was established and not yet encrypted (the queue was
+        full) is encrypted here as room appears."""
+        self._resume_early()
         var total = 0
         try:
             var n = min(len(self._tx), out.max_writable())
@@ -371,8 +424,38 @@ struct TlsClient(Movable):
         return self._next < len(self._events)
 
     def has_transmit(self) -> Bool:
-        """Whether ciphertext waits to be sent."""
-        return len(self._tx) > 0 or (self._wbio != 0 and Int(self._lib[].BIO_ctrl_pending(self._wbio)) > 0)
+        """Whether ciphertext waits to be sent (or plaintext written early
+        waits to be encrypted)."""
+        if len(self._tx) > 0 or (self._state == _OPEN and self._early_left() > 0):
+            return True
+        return self._wbio != 0 and Int(self._lib[].BIO_ctrl_pending(self._wbio)) > 0
+
+    def has_unread_input(self) -> Bool:
+        """Whether the input fed so far ends inside a record (the rest of it
+        still to come). Told from the record framing itself: OpenSSL may
+        have taken the partial record out of its read BIO already."""
+        return self._hdr > 0 or self._body > 0
+
+    def _frame(mut self, data: Span[UInt8, _]):
+        """Follow the record framing of `data` (5-byte headers whose last
+        two bytes give the body's length), for `has_unread_input`."""
+        var i = 0
+        var n = len(data)
+        while i < n:
+            if self._body > 0:
+                var k = min(self._body, n - i)
+                self._body -= k
+                i += k
+                continue
+            if self._hdr == 3:
+                self._len = Int(data[i]) << 8
+            elif self._hdr == 4:
+                self._len |= Int(data[i])
+            self._hdr += 1
+            i += 1
+            if self._hdr == 5:
+                self._hdr = 0
+                self._body = self._len
 
     # ---- the application's side -----------------------------------------
 
@@ -387,9 +470,14 @@ struct TlsClient(Movable):
             raise tls_error("tls: write after close", ErrorKind.BrokenPipe, Category.CLOSED)
         if self._state == _HANDSHAKE:
             var n = min(len(data), max(0, TRANSMIT_LIMIT - len(self._early)))
+            if n > 0 and self._early.capacity() < TRANSMIT_LIMIT:
+                self._early.reserve(TRANSMIT_LIMIT)  # (once: no copy left unwiped)
             self._early.extend(data[0:n])
             return n
         try:
+            self._flush_early()
+            if self._early_left() > 0:
+                return 0  # (the queue is full: earlier bytes go first)
             return self._encrypt(data)
         except e:
             raise self._fail(e^)
@@ -463,6 +551,7 @@ struct TlsClient(Movable):
         if len(self._early) > 0:
             self._lib[].OPENSSL_cleanse(buf(self._early), len(self._early))
             self._early.clear()
+            self._early_off = 0
         return e^
 
     def _drop_transmit(mut self):
@@ -484,14 +573,44 @@ struct TlsClient(Movable):
             if self._state == _HANDSHAKE:
                 self._handshake()
             if self._state == _OPEN:
+                self._flush_early()  # (before anything reading queues)
                 self._read_records()
-            if self._state == _OPEN and len(self._early) > 0 and not self._sent_close:
-                var early = self._early^
-                self._early = List[UInt8]()
-                var n = self._encrypt(early)
-                if n < len(early):
-                    self._early = List[UInt8](Span(early)[n:])
-                self._lib[].OPENSSL_cleanse(buf(early), len(early))
+            if self._wbio != 0 and Int(self._lib[].BIO_ctrl_pending(self._wbio)) > OUTPUT_LIMIT:
+                raise tls_error("tls: the server provokes more output than it reads", ErrorKind.InvalidData, Category.RESOURCE)
+        except e:
+            _ = self._fail(e^)
+
+    def _early_left(self) -> Int:
+        return len(self._early) - self._early_off
+
+    def _flush_early(mut self) raises TlsError:
+        """Encrypt the plaintext written before the connection was
+        established, as far as the transmit queue has room; wiped once all
+        of it is."""
+        if self._early_left() == 0 or self._state != _OPEN or self._sent_close:
+            return
+        var early = List[UInt8]()
+        swap(early, self._early)  # (moved out: `_encrypt` takes `self`)
+        var n: Int
+        try:
+            n = self._encrypt(Span(early)[self._early_off :])
+        except e:
+            swap(early, self._early)
+            raise e^
+        swap(early, self._early)
+        self._early_off += n
+        if self._early_off == len(self._early):
+            self._lib[].OPENSSL_cleanse(buf(self._early), len(self._early))
+            _ = len(self._early)
+            self._early.clear()
+            self._early_off = 0
+
+    def _resume_early(mut self):
+        """`_flush_early` for `poll_transmit`: a failure latches."""
+        if self._early_left() == 0 or self._failed:
+            return
+        try:
+            self._flush_early()
         except e:
             _ = self._fail(e^)
 
@@ -552,12 +671,13 @@ struct TlsClient(Movable):
             raise tls_error("tls: the server negotiated a version below TLS 1.2", ErrorKind.InvalidData, Category.PROTOCOL)
         if L.SSL_session_reused(self._ssl) != 0 or seam(SEAM_REUSED) != 0:
             raise tls_error("tls: a session was resumed, though resumption is off", ErrorKind.InvalidData, Category.PROTOCOL)
-        var alpn = self._selected_alpn() if seam(SEAM_ALPN) == 0 else String("h3")
-        if alpn.byte_length() > 0:
+        var chosen = self._selected_alpn() if seam(SEAM_ALPN) == 0 else List[UInt8]("h3".as_bytes())
+        var alpn = String(from_utf8_lossy=Span(chosen))  # (for display only)
+        if len(chosen) > 0:
             var offered = self._context.alpn()
             var known = False
             for p in offered:
-                if p == alpn:
+                if _same(Span(chosen), p.as_bytes()):  # (bytes, not decoded text)
                     known = True
             if not known:
                 raise tls_error("tls: the server chose a protocol that was not offered", ErrorKind.InvalidData, Category.ALPN, alpn)
@@ -568,18 +688,19 @@ struct TlsClient(Movable):
         self._state = _OPEN
         self._events.append(TlsEvent(TlsEventKind.ESTABLISHED))
 
-    def _selected_alpn(self) -> String:
+    def _selected_alpn(self) -> List[UInt8]:
+        """The server's ALPN choice, as the bytes it sent (empty: none)."""
         ref L = self._lib[]
         var data = List[Int](length=1, fill=0)
         var length = List[UInt32](length=1, fill=0)
         L.SSL_get0_alpn_selected(self._ssl, size_out(data), u32_out(length))
+        var out = List[UInt8]()
         if data[0] == 0 or length[0] == 0:
-            return String()
+            return out^
         var p = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=data[0])
-        var out = List[UInt8](capacity=Int(length[0]))
         for i in range(Int(length[0])):
             out.append(p[unsafe_offset=i])
-        return String(from_utf8_lossy=Span(out))
+        return out^
 
     def _read_records(mut self) raises TlsError:
         """Decrypt until OpenSSL needs more input (TB9): TLS 1.3 session
@@ -594,13 +715,18 @@ struct TlsClient(Movable):
             if rc == 1:
                 if got[0] > 0:
                     self._events.append(TlsEvent(TlsEventKind.DATA, List[UInt8](Span(self._rbuf)[0 : got[0]])))
-                    self._held += got[0]
+                    self._held += got[0] + EVENT_COST
+                    self._quiet = 0
                 continue
             var err = L.SSL_get_error(self._ssl, rc) if forced == 0 else c_int(forced)  # (TB6)
             if err == SSL_ERROR_WANT_READ and not self._eof:
                 return
             if err == SSL_ERROR_ZERO_RETURN:
                 _ = L.drain_errors()
+                if self._early_left() > 0:
+                    # Written (and taken) before the handshake, never sent:
+                    # say so rather than drop it.
+                    raise tls_error("tls: the server closed before the data written could be sent", ErrorKind.BrokenPipe, Category.CLOSED)
                 self._state = _DONE
                 self._events.append(TlsEvent(TlsEventKind.CLOSED))
                 if not self._sent_close:
@@ -624,7 +750,7 @@ struct TlsClient(Movable):
         ref L = self._lib[]
         var done = List[Int](length=1, fill=0)
         var taken = 0
-        while taken < len(data) and Int(L.BIO_ctrl_pending(self._wbio)) < TRANSMIT_LIMIT:
+        while taken < len(data) and Int(L.BIO_ctrl_pending(self._wbio)) < TRANSMIT_LIMIT and seam(SEAM_TRANSMIT_FULL) == 0:
             var n = min(MAX_RECORD, len(data) - taken)
             L.ERR_clear_error()
             var forced = seam(SEAM_WRITE)
@@ -634,6 +760,15 @@ struct TlsClient(Movable):
                 raise tls_error("tls: encrypting a record failed", ErrorKind.Other, Category.PROTOCOL, String("SSL_get_error ", err, " ", L.drain_errors()))
             taken += done[0]
         return taken
+
+
+def _same(a: Span[UInt8, _], b: Span[UInt8, _]) -> Bool:
+    if len(a) != len(b):
+        return False
+    for i in range(len(a)):
+        if a[i] != b[i]:
+            return False
+    return True
 
 
 def _c_name(s: String) raises TlsError -> List[UInt8]:

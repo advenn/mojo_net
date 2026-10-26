@@ -19,6 +19,14 @@ Modes, after the handshake:
             then close_notify
   hello     send "hello" and close_notify without reading
   stall     say nothing for 5 s, then close
+  bye       close_notify at once (unwrap), print "DONE"
+  drip      send `records` (40000) one-byte records, then close_notify
+  stale     (memory BIOs) read a line, answer "echo:" + it, then send all
+            of one more record ("stale") but its last byte, print "HELD",
+            wait 1.5 s, send the last byte, close
+  tamper    (memory BIOs) read a line, answer "echo:" + it with the last
+            bit of its record flipped, then print "ALERT <reason>" for
+            the alert the client sends back, or "NO_ALERT"
 Modes without TLS:
   garbage   send an HTTP response instead of a ServerHello, then close
   silent    accept and say nothing for 10 s
@@ -34,6 +42,8 @@ Options:
   count=<n>      connections to serve
   delay=<s>      seconds the sink waits before it starts reading
   rcvbuf=<n>     SO_RCVBUF of the connections (a small receive window)
+  tickets=<n>    TLS 1.3 session tickets sent after the handshake (2)
+  records=<n>    records the drip mode sends
   host=<addr>    the address to listen on (default 127.0.0.1; ::1 for IPv6)
   quiet=1        print only the PORT line (for long runs whose output
                  nobody reads: a full pipe would block the server)
@@ -79,6 +89,8 @@ def context(d, opts):
     ctx.load_cert_chain(chain, f"{d}/{name}.key")
     if "alpn" in opts:
         ctx.set_alpn_protocols(opts["alpn"].split(","))
+    if "tickets" in opts:
+        ctx.num_tickets = int(opts["tickets"])
     ctx.sni_callback = lambda sock, name, c: print("SNI", name or "-", flush=True)
     return ctx
 
@@ -102,6 +114,12 @@ def serve(ctx, c, mode, opts):
     if mode == "silent":
         time.sleep(10)
         c.close()
+        return
+    if mode == "stale":
+        serve_stale(ctx, c)
+        return
+    if mode == "tamper":
+        serve_tamper(ctx, c)
         return
     try:
         s = ctx.wrap_socket(c, server_side=True)
@@ -144,9 +162,112 @@ def serve(ctx, c, mode, opts):
             s.unwrap()
         elif mode == "stall":
             time.sleep(5)
+        elif mode == "bye":
+            s.unwrap()
+            print("DONE", flush=True)
+            return
+        elif mode == "drip":
+            for _ in range(int(opts.get("records", "40000"))):
+                s.sendall(b"x")
+            s.unwrap()
     except (ssl.SSLError, OSError) as e:
         print("SERVER_ERROR", getattr(e, "reason", None) or type(e).__name__, flush=True)
     s.close()
+
+
+class MemoryServer:
+    """A server over memory BIOs, for modes that touch records."""
+
+    def __init__(self, ctx, c):
+        self.inc, self.out = ssl.MemoryBIO(), ssl.MemoryBIO()
+        self.obj = ctx.wrap_bio(self.inc, self.out, server_side=True)
+        self.c = c
+        c.settimeout(10)
+
+    def flush(self):
+        data = self.out.read()
+        if data:
+            self.c.sendall(data)
+
+    def more(self):
+        data = self.c.recv(65536)
+        if not data:
+            raise ConnectionError("closed")
+        self.inc.write(data)
+
+    def handshake(self):
+        while True:
+            try:
+                self.obj.do_handshake()
+                self.flush()
+                break
+            except ssl.SSLWantReadError:
+                self.flush()
+                self.more()
+        print("OK", self.obj.version(), self.obj.selected_alpn_protocol() or "-", flush=True)
+
+    def read_line(self):
+        line = b""
+        while not line.endswith(b"\n"):
+            try:
+                line += self.obj.read(65536)
+            except ssl.SSLWantReadError:
+                self.flush()
+                self.more()
+        return line
+
+
+def serve_tamper(ctx, c):
+    m = MemoryServer(ctx, c)
+    try:
+        m.handshake()
+        line = m.read_line()
+        m.flush()
+        m.obj.write(b"echo:" + line)
+        bad = bytearray(m.out.read())
+        bad[-1] ^= 1  # (the record's authentication tag)
+        c.sendall(bytes(bad))
+        c.settimeout(5)
+        while True:  # what the client answers
+            data = c.recv(65536)
+            if not data:
+                break
+            m.inc.write(data)
+            try:
+                m.obj.read(65536)
+            except ssl.SSLWantReadError:
+                continue
+    except ssl.SSLError as e:
+        print("ALERT", getattr(e, "reason", None) or type(e).__name__, flush=True)
+        c.close()
+        return
+    except OSError:
+        pass
+    print("NO_ALERT", flush=True)
+    c.close()
+
+
+def serve_stale(ctx, c):
+    """The stale mode, over memory BIOs so that one record can be cut."""
+    m = MemoryServer(ctx, c)
+    out = m.out
+    try:
+        m.handshake()
+        line = m.read_line()
+        obj = m.obj
+        obj.write(b"echo:" + line)
+        m.flush()
+        time.sleep(0.3)
+        obj.write(b"stale")
+        record = out.read()
+        c.sendall(record[:-1])
+        print("HELD", len(record), flush=True)
+        time.sleep(1.5)
+        c.sendall(record[-1:])
+        time.sleep(0.3)
+    except (ssl.SSLError, OSError) as e:
+        print("SERVER_ERROR", getattr(e, "reason", None) or type(e).__name__, flush=True)
+    c.close()
 
 
 def main():

@@ -1,0 +1,35 @@
+# Gate TG8 (docs/tls.md, "Checks"): the tls tests against an OpenSSL built
+# with AddressSanitizer from source, and the planted bug it must catch.
+# Weekly, since it downloads and builds OpenSSL (a few minutes).
+name: tls-weekly
+
+on:
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tg8:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    name: tg8 (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: prefix-dev/setup-pixi@v0.11.2
+        with:
+          pixi-version: v0.82.1
+      - name: self-test (a planted use-after-free inside libssl)
+        run: pixi run tls-asan-openssl --self-test
+      - name: pixi run tls-asan-openssl
+        run: pixi run tls-asan-openssl

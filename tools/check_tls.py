@@ -2,12 +2,14 @@
 """Checks on the `tls` package's use of OpenSSL (docs/tls.md, "Checks";
 rules TL2, TL5, TL7 and TB14 of docs/research/tls_with_openssl.md).
 
-1. FFI stays in one module (TL7): `OwnedDLHandle`, `DLHandle`,
-   `external_call`, `get_symbol`, `dlopen` and `dlsym` appear in code under
-   src/ only in src/tls/ffi.mojo.
+1. FFI stays in one module (TL7, TB16): `OwnedDLHandle`, `DLHandle`,
+   `external_call`, `get_symbol`, `dlopen`, `dlsym` and `abi("C")` appear
+   in code under src/ only in src/tls/ffi.mojo.
 2. The binding table is an allowlist (TL5): every OpenSSL function
    src/tls/ffi.mojo binds is listed in BINDINGS below, so binding a new one
-   is a reviewed change to this file.
+   is a reviewed change to this file. Every binding names its function as
+   a literal (`_sym[F](self._handle, "name")`), so none escapes the list,
+   and `get_symbol` is called only inside `_sym`.
 3. No dangerous API by name (TL5): code in src/tls names none of FORBIDDEN
    (APIs with a CVE history, and features this package never enables).
 4. Symbol versions (TL2): each bound function's ELF version node in the
@@ -15,6 +17,10 @@ rules TL2, TL5, TL7 and TB14 of docs/research/tls_with_openssl.md).
    the package runs on any OpenSSL 3.5 or later 3.x.
 5. Constants (TB14): src/tls/consts.mojo matches the headers
    (tools/gen_tls_consts.py --check).
+6. A built context is read-only (TB3): no public function in src/tls
+   outside ffi.mojo returns an OpenSSL handle (`Obj`) or the `Library`.
+7. The package needs OpenSSL 3.5.9 or later (TL1): conda.recipe/recipe.yaml
+   says `openssl >=3.5.9`.
 
     python3 tools/check_tls.py [--root DIR]
 
@@ -32,12 +38,14 @@ import tempfile
 
 FFI_MODULE = os.path.join("src", "tls", "ffi.mojo")
 FFI_TOKENS = ("OwnedDLHandle", "DLHandle", "external_call", "get_symbol", "dlopen", "dlsym")
+FFI_LITERALS = ('abi("C")',)
+RECIPE = os.path.join("conda.recipe", "recipe.yaml")
 
 BINDINGS = {
     # library, errors, memory
     "OpenSSL_version_num", "OpenSSL_version", "OPENSSL_init_ssl", "OSSL_LIB_CTX_new", "OSSL_LIB_CTX_free",
     "OSSL_PROVIDER_load", "OSSL_PROVIDER_unload", "ERR_clear_error", "ERR_get_error", "ERR_peek_error",
-    "ERR_error_string_n", "OPENSSL_cleanse", "OPENSSL_sk_num",
+    "ERR_error_string_n", "OPENSSL_cleanse", "OPENSSL_sk_num", "OPENSSL_sk_value", "X509_OBJECT_get_type",
     # certificates and verification
     "X509_verify_cert_error_string", "X509_get_default_cert_file", "X509_STORE_get0_objects",
     "X509_VERIFY_PARAM_set_flags", "X509_VERIFY_PARAM_clear_flags", "X509_VERIFY_PARAM_get_flags",
@@ -82,12 +90,27 @@ FORBIDDEN = (
     "SSL_set_verify", "SSL_set_security_level", "SSL_set_cipher_list", "SSL_set_options",
     "legacy",  # the legacy provider
     "_get1_peer",  # (each get1 needs a free; the package uses get0)
+    # TL6: libssl talks only to memory BIOs
+    "SSL_set_fd", "SSL_set_rfd", "SSL_set_wfd", "BIO_s_socket", "BIO_new_socket", "BIO_s_connect",
+    "BIO_new_connect", "BIO_s_accept", "BIO_new_accept", "BIO_s_fd", "BIO_new_fd",
+    # TB1: the BIOs belong to the SSL (set0), never freed or shared here
+    "SSL_set_bio", "BIO_free", "BIO_up_ref",
+    # TC16: no resumption
+    "SSL_set_session", "sess_set_new_cb",
+    # TC1: trust is loaded explicitly and counted
+    "SSL_CTX_set_default_verify_paths",
+    # TB9: read until WANT_READ, never by what is pending
+    "SSL_pending", "SSL_has_pending",
+    # TB16: no callbacks into Mojo
+    "set_info_callback", "set_msg_callback",
 )
 
 _TRIPLE = re.compile(r'("""|\'\'\')(?:.|\n)*?\1')
 _COMMENT = re.compile(r"#.*$", re.M)
 _STRING = re.compile(r'"(?:[^"\\\n]|\\.)*"')
 _BOUND = re.compile(r'_sym\[[^\]]*\]\(\s*self\._handle\s*,\s*"(\w+)"\s*\)')
+_SYM_CALL = re.compile(r'(?<!def )\b_sym\[')
+_HANDLE_OUT = re.compile(r'^\s*def ([A-Za-z]\w*)\(.*\)\s*(?:raises(?:\s+\w+)?\s*)?->\s*(Obj|ArcPointer\[Library\])\s*:', re.M)
 
 
 def _blank(m):
@@ -99,12 +122,12 @@ def code_of(text, keep_strings=True):
     code = _TRIPLE.sub(_blank, text)
     lines = []
     for line in code.split("\n"):
-        # Drop a comment that is not inside a string literal.
-        out, i, quote = [], 0, False
+        # Drop a comment that is not inside a string literal ('...' or "...").
+        out, i, quote = [], 0, ""
         while i < len(line):
             c = line[i]
-            if c == '"':
-                quote = not quote
+            if c in "\"'" and (not quote or quote == c):
+                quote = "" if quote else c
             elif c == "\\" and quote:
                 out.append(line[i : i + 2])
                 i += 2
@@ -138,6 +161,13 @@ def check_source(root):
                 for tok in FFI_TOKENS:
                     if re.search(r"\b" + tok + r"\b", line):
                         bad.append(f"{rel}:{n}: {tok} outside {FFI_MODULE} (TL7)")
+                for tok in FFI_LITERALS:
+                    if tok in line:
+                        bad.append(f"{rel}:{n}: {tok} outside {FFI_MODULE} (TB16)")
+            if rel.startswith(os.path.join("src", "tls") + os.sep):
+                for m in _HANDLE_OUT.finditer(code):
+                    n = code[: m.start()].count("\n") + 1
+                    bad.append(f"{rel}:{n}: public {m.group(1)}() hands out an OpenSSL handle ({m.group(2)}): a built context must stay read-only (TB3)")
         if rel.startswith(os.path.join("src", "tls") + os.sep):
             for n, line in enumerate(code.split("\n"), 1):
                 for tok in FORBIDDEN:
@@ -146,9 +176,19 @@ def check_source(root):
     bound = []
     ffi = os.path.join(root, FFI_MODULE)
     if os.path.exists(ffi):
-        bound = _BOUND.findall(code_of(open(ffi, encoding="utf-8").read()))
+        code = code_of(open(ffi, encoding="utf-8").read())
+        bound = _BOUND.findall(code)
         for name in sorted(set(bound) - BINDINGS):
             bad.append(f"{FFI_MODULE}: binds {name}, which is not in BINDINGS in tools/check_tls.py (TL5)")
+        calls = len(_SYM_CALL.findall(code))
+        if calls != len(bound):
+            bad.append(f"{FFI_MODULE}: {calls - len(bound)} _sym binding(s) without a literal name on self._handle (TL5)")
+        uses = len(re.findall(r"\bget_symbol\b", code))
+        if uses > 1:
+            bad.append(f"{FFI_MODULE}: get_symbol is called outside _sym ({uses} uses) (TL5)")
+    recipe = os.path.join(root, RECIPE)
+    if os.path.exists(recipe) and not re.search(r"openssl\s*>=\s*3\.5\.9\b", open(recipe, encoding="utf-8").read()):
+        bad.append(f"{RECIPE}: openssl must be >=3.5.9 (TL1)")
     return bad, sorted(set(bound))
 
 
@@ -187,8 +227,13 @@ def _self_test():
         "src/net/a.mojo": ('from std.ffi import external_call\n"""external_call in a docstring is prose"""\n', "external_call outside"),
         "src/tls/b.mojo": ("var x = 1  # SSL_free_buffers in a comment is fine\nL.SSL_free_buffers(s)\n", "SSL_free_buffers"),
         "src/tls/c.mojo": ('var m = "SSL_VERIFY_NONE"\n', "SSL_VERIFY_NONE"),
-        "src/tls/ffi.mojo": ('self.f = _sym[F](self._handle, "SSL_new")\nself.g = _sym[F](self._handle, "SSL_CTX_set_keylog_x")\n', "keylog"),
+        "src/tls/ffi.mojo": ('def _sym[F](h, name):\n    return h.get_symbol(name)\nself.f = _sym[F](self._handle, "SSL_new")\nself.g = _sym[F](self._handle, "SSL_CTX_set_keylog_x")\nself.h = _sym[F](self._handle, name)\n', "keylog"),
         "src/linux/d.mojo": ("var h = OwnedDLHandle(path)\n", "OwnedDLHandle outside"),
+        "src/tls/e.mojo": ("L.SSL_set_fd(s, 3)\n", "SSL_set_fd"),
+        "src/tls/f.mojo": ("var s = '#'; L.SSL_free_buffers(s)\n", "SSL_free_buffers"),
+        "src/tls/g.mojo": ('comptime G = def() thin abi("C") -> None\n', 'abi("C") outside'),
+        "src/tls/h.mojo": ("struct C:\n    def ssl_ctx(self) -> Obj:\n        return 0\n    def _ok(self) -> Obj:\n        return 0\n", "hands out"),
+        RECIPE: ("requirements:\n  run:\n    - openssl >=3.5,<4\n", "openssl must be"),
     }
     with tempfile.TemporaryDirectory() as root:
         for rel, (src, _) in plant.items():
@@ -203,6 +248,10 @@ def _self_test():
                 errors.append(f"{rel}: expected a violation containing {want!r}")
         if not any("not in BINDINGS" in b and "SSL_CTX_set_keylog_x" in b for b in bad):
             errors.append("an unlisted binding went unreported")
+        if not any("without a literal name" in b for b in bad):
+            errors.append("a binding without a literal name went unreported")
+        if any("_ok()" in b for b in bad) or any("get_symbol is called outside" in b for b in bad):
+            errors.append(f"a private accessor, or get_symbol inside _sym, was reported: {bad}")
         if any("docstring" in b or (b.startswith("src/tls/b.mojo:1") ) for b in bad):
             errors.append(f"prose or a comment was reported: {bad}")
         if bound != ["SSL_CTX_set_keylog_x", "SSL_new"]:

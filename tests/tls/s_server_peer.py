@@ -15,6 +15,9 @@ unless said):
   plaintext  send "one", then plaintext straight onto the TCP connection (P)
   renego     TLS 1.2: send "one", a HelloRequest (r), "two"; wait for
              "back" or the connection's end
+  keyflood   KeyUpdates asking for one back (K), 12000 of them (or the
+             count given as a third argument), each sent once s_server has
+             done the last; stops at the first that fails; no -trace
 """
 
 import os
@@ -28,16 +31,18 @@ TIMEOUT = 20.0
 
 
 class Server:
-    def __init__(self, d, extra):
+    def __init__(self, d, extra, trace=True):
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
         self.port = s.getsockname()[1]
         s.close()  # (s_server binds it again: a small race, retried below)
-        args = ["openssl", "s_server", "-accept", f"127.0.0.1:{self.port}", "-naccept", "1",
-                "-cert", f"{d}/good.pem", "-key", f"{d}/good.key", "-trace", "-ign_eof", *extra]
+        # (stdbuf: s_server prints through stdio, fully buffered on a pipe)
+        args = ["stdbuf", "-oL", "openssl", "s_server", "-accept", f"127.0.0.1:{self.port}", "-naccept", "1",
+                "-cert", f"{d}/good.pem", "-key", f"{d}/good.key", *(["-trace"] if trace else []), "-ign_eof", *extra]
         self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, text=True, bufsize=1)
         self.lines = []
+        self.handshakes = [0, 0]  # "SSL_do_handshake -> 1" lines, and the others
         self.cond = threading.Condition()
         threading.Thread(target=self._read, daemon=True).start()
         self.wait_for("ACCEPT")
@@ -46,6 +51,8 @@ class Server:
         for line in self.proc.stdout:
             with self.cond:
                 self.lines.append(line.rstrip("\n"))
+                if line.startswith("SSL_do_handshake -> "):
+                    self.handshakes[0 if line.strip().endswith("-> 1") else 1] += 1
                 self.cond.notify_all()
         with self.cond:
             self.lines.append(None)
@@ -68,6 +75,27 @@ class Server:
                 if left <= 0:
                     return False
                 self.cond.wait(left)
+
+    def key_updates(self, n):
+        """Send K n times, each once s_server has finished the one before
+        (it takes a command only when one read of stdin holds just it):
+        how many succeeded."""
+        for i in range(n):
+            try:
+                self.proc.stdin.write("K\n")
+                self.proc.stdin.flush()
+            except BrokenPipeError:
+                return i
+            deadline = time.monotonic() + TIMEOUT
+            with self.cond:
+                while self.handshakes[0] + self.handshakes[1] <= i:
+                    left = deadline - time.monotonic()
+                    if left <= 0 or (self.lines and self.lines[-1] is None):
+                        return self.handshakes[0]
+                    self.cond.wait(left)
+                if self.handshakes[1] > 0:
+                    return self.handshakes[0]
+        return n
 
     def send(self, line):
         try:
@@ -109,7 +137,7 @@ class Server:
 def main():
     d, scenario = sys.argv[1], sys.argv[2]
     extra = ["-tls1_2"] if scenario == "renego" else ["-tls1_3"]
-    srv = Server(d, extra)
+    srv = Server(d, extra, trace=scenario != "keyflood")
     print("PORT", srv.port, flush=True)
     if not srv.wait_for("CIPHER is"):
         print("NO_HANDSHAKE", flush=True)
@@ -126,6 +154,10 @@ def main():
         srv.send("one")
         srv.send("P")
         print("STEP sent", flush=True)
+    elif scenario == "keyflood":
+        n = int(sys.argv[3]) if len(sys.argv) > 3 else 12000
+        print("STEP sent", srv.key_updates(n), flush=True)
+        srv.send("Q")
     elif scenario == "renego":
         srv.send("one")
         srv.send("r")

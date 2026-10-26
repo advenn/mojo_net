@@ -26,6 +26,9 @@ tls-check = "python3 tools/check_tls.py"
 gen-tls = "python3 tools/gen_tls_consts.py --write"
 # The tls tests under AddressSanitizer and LeakSanitizer (gate TG7).
 tls-asan = "bash tools/check_tls_asan.sh"
+# Gate TG8: the same tests against an OpenSSL built with ASan from source
+# (downloaded once, pinned; not in ci, since it needs the network once).
+tls-asan-openssl = "bash tools/check_tls_asan_openssl.sh"
 # Whether pixi.lock's openssl and ca-certificates are current (gate TG14;
 # daily in .github/workflows/freshness.yml, not in `ci`).
 tls-freshness = "python3 tools/check_freshness.py"

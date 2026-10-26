@@ -11,21 +11,27 @@ from linux.time import Deadline, Duration
 from tls import Category, ClientConfig, TlsClient, TlsError, Trust
 from tls.ffi import (
     SEAM_ALPN,
+    SEAM_ALPN_SET,
     SEAM_BIO_NEW,
     SEAM_BIO_WRITE,
     SEAM_CHECK_HOST,
     SEAM_CHECK_IP,
     SEAM_CTX_NEW,
     SEAM_HANDSHAKE,
+    SEAM_LIBCTX,
+    SEAM_LOAD_VERIFY,
     SEAM_PEER_CERT,
     SEAM_PEERNAME,
     SEAM_READ,
     SEAM_READBACK,
     SEAM_REUSED,
+    SEAM_SET_HOST,
+    SEAM_SNI,
     SEAM_SSL_NEW,
     SEAM_VERIFY_RESULT,
     SEAM_VERSION,
     SEAM_VERSION_LOW,
+    SEAM_WBIO_NEW,
     SEAM_WRITE,
 )
 from tls.stream import TlsStream
@@ -110,6 +116,32 @@ def test_connection_object_failures() raises:
     assert_equal(_feed_error(tls, "x".as_bytes()).category, Category.RESOURCE)
     assert_equal(_event_error(tls).category, Category.RESOURCE)  # (latched)
     assert_equal(fault.pending(), 0)
+
+
+def test_more_setup_failures() raises:
+    """The calls that had no seam until the review (TR): each fails with
+    its category, and LeakSanitizer (`pixi run tls-asan`) finds nothing
+    left behind by any of them."""
+    fault.clear()
+    fault.inject(SEAM_WBIO_NEW, Errno.EIO)
+    assert_equal(_client_error("localhost").category, Category.RESOURCE)
+    fault.inject(SEAM_SNI, Errno.EIO)
+    assert_equal(_client_error("localhost").category, Category.LIBRARY)
+    fault.inject(SEAM_SET_HOST, Errno.EIO)
+    assert_equal(_client_error("localhost").category, Category.LIBRARY)
+    fault.inject(SEAM_SET_HOST, Errno.EIO)
+    assert_equal(_client_error("127.0.0.1").category, Category.LIBRARY)
+    fault.inject(SEAM_ALPN_SET, Errno.EIO)
+    var alpn: List[String] = ["http/1.1"]
+    assert_equal(_build_error(ClientConfig(trust=Trust.ca_file(pki() + "/root.pem"), alpn=alpn^)).category, Category.LIBRARY)
+    fault.inject(SEAM_LOAD_VERIFY, Errno.EIO)
+    assert_equal(_build_error(_ca()).category, Category.NO_TRUST_STORE)
+    fault.inject(SEAM_LIBCTX, Errno(1))
+    assert_equal(_build_error(_ca()).category, Category.LIBRARY)
+    fault.inject(SEAM_LIBCTX, Errno(2))
+    assert_equal(_build_error(_ca()).category, Category.LIBRARY)
+    assert_equal(fault.pending(), 0)
+    _ = _ca().build()  # (and afterwards all is well)
 
 
 def test_every_handshake_error_code() raises:

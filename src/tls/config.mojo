@@ -42,6 +42,7 @@ from .consts import (
     SSL_CTRL_SET_SIGALGS_LIST,
     SSL_MODE_AUTO_RETRY,
     SSL_MODE_RELEASE_BUFFERS,
+    SSL_OP_CLEANSE_PLAINTEXT,
     SSL_OP_ENABLE_MIDDLEBOX_COMPAT,
     SSL_OP_NO_COMPRESSION,
     SSL_OP_NO_RENEGOTIATION,
@@ -50,12 +51,13 @@ from .consts import (
     TLS1_2_VERSION,
     X509_CHECK_FLAG_NEVER_CHECK_SUBJECT,
     X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS,
+    X509_LU_X509,
     X509_V_FLAG_PARTIAL_CHAIN,
     X509_V_FLAG_TRUSTED_FIRST,
     X509_V_FLAG_X509_STRICT,
 )
 from .error import Category, TlsError, tls_error
-from .ffi import SEAM_CTX_NEW, SEAM_READBACK, Library, Obj, buf, c_string, from_c_string, seam
+from .ffi import SEAM_ALPN_SET, SEAM_CTX_NEW, SEAM_LOAD_VERIFY, SEAM_READBACK, Library, Obj, buf, c_string, from_c_string, seam
 
 
 comptime SECURITY_LEVEL = 2
@@ -65,8 +67,10 @@ comptime TLS13_SUITES = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACH
 comptime GROUPS = "X25519MLKEM768:X25519:P-256:P-384"
 comptime SIGALGS = "ECDSA+SHA256:ECDSA+SHA384:ECDSA+SHA512:ed25519:ed448:rsa_pss_pss_sha256:rsa_pss_pss_sha384:rsa_pss_pss_sha512:rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:RSA+SHA256:RSA+SHA384:RSA+SHA512"
 """SHA-2 and EdDSA only (no SHA-1, no MD5)."""
-comptime OPTIONS: UInt64 = SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION | SSL_OP_ENABLE_MIDDLEBOX_COMPAT
-"""Exactly the options a context has (TC13)."""
+comptime OPTIONS: UInt64 = SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION | SSL_OP_ENABLE_MIDDLEBOX_COMPAT | SSL_OP_CLEANSE_PLAINTEXT
+"""Exactly the options a context has (TC13). CLEANSE_PLAINTEXT makes
+OpenSSL wipe its own copies of plaintext when it frees them (TB18): with
+RELEASE_BUFFERS it frees its read buffer after every idle read."""
 comptime MODES = SSL_MODE_AUTO_RETRY | SSL_MODE_RELEASE_BUFFERS
 comptime VERIFY_FLAGS: UInt64 = X509_V_FLAG_X509_STRICT | X509_V_FLAG_TRUSTED_FIRST
 comptime HOST_FLAGS: c_uint = X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS | X509_CHECK_FLAG_NEVER_CHECK_SUBJECT
@@ -84,24 +88,33 @@ comptime _SYSTEM_BUNDLES: List[StaticString] = [
 
 struct Trust(Copyable, Movable, Writable):
     """Which CA certificates a client trusts (TC2): the system's, or the
-    ones in a file you give, which then replace the system's."""
+    ones in a file you give, which then replace the system's. An empty
+    path is refused when the context is built: it never means the
+    system's (a variable left unset must not widen the trust)."""
 
     var _ca_file: String
+    var _system: Bool
 
     @staticmethod
     def system() -> Trust:
-        return Trust(String())
+        return Trust(String(), True)
 
     @staticmethod
     def ca_file(path: StringSlice) -> Trust:
         """Trust exactly the certificates in the PEM file at `path`."""
-        return Trust(String(path))
+        return Trust(String(path), False)
 
     def __init__(out self, ca_file: String):
+        """`ca_file`, as `Trust.ca_file`."""
         self._ca_file = ca_file
+        self._system = False
+
+    def __init__(out self, ca_file: String, system: Bool):
+        self._ca_file = ca_file
+        self._system = system
 
     def is_system(self) -> Bool:
-        return self._ca_file.byte_length() == 0
+        return self._system
 
     def write_to(self, mut writer: Some[Writer]):
         if self.is_system():
@@ -185,10 +198,12 @@ struct ClientContext(Copyable, Movable, Writable):
     def __init__(out self, var inner: _Context):
         self._inner = ArcPointer(inner^)
 
-    def library(self) -> ArcPointer[Library]:
+    def _library(self) -> ArcPointer[Library]:
+        """For `tls.client` only: the context is read-only once built
+        (TB3), so nothing outside the package gets the OpenSSL handles."""
         return self._inner[].lib
 
-    def ssl_ctx(self) -> Obj:
+    def _ssl_ctx(self) -> Obj:
         return self._inner[].ctx
 
     def alpn(self) -> List[String]:
@@ -251,10 +266,10 @@ def _configure(L: Library, ctx: Obj) raises TlsError:
     _check(L.SSL_CTX_get_verify_mode(ctx) == SSL_VERIFY_PEER, "tls: peer verification did not take", L)
     var param = L.SSL_CTX_get0_param(ctx)
     _check(param != 0, "tls: no verify parameters", L)
-    _ = L.X509_VERIFY_PARAM_clear_flags(param, X509_V_FLAG_PARTIAL_CHAIN)
+    _ = L.X509_VERIFY_PARAM_clear_flags(param, UInt64.MAX)
     _check(L.X509_VERIFY_PARAM_set_flags(param, VERIFY_FLAGS) == 1, "tls: setting the verify flags failed", L)
     var flags = L.X509_VERIFY_PARAM_get_flags(param)
-    _check(flags & VERIFY_FLAGS == VERIFY_FLAGS and flags & X509_V_FLAG_PARTIAL_CHAIN == 0, "tls: the verify flags did not take", L)
+    _check(flags == VERIFY_FLAGS and flags & X509_V_FLAG_PARTIAL_CHAIN == 0, "tls: the verify flags did not take", L)
     L.X509_VERIFY_PARAM_set_hostflags(param, HOST_FLAGS)
     _check(L.X509_VERIFY_PARAM_get_hostflags(param) == HOST_FLAGS, "tls: the host-name flags did not take", L)
 
@@ -276,7 +291,7 @@ def _set_alpn(L: Library, ctx: Obj, protocols: List[String]) raises TlsError:
         return
     var wire = alpn_wire(protocols)
     # SSL_CTX_set_alpn_protos returns 0 on success (TC15).
-    _check(L.SSL_CTX_set_alpn_protos(ctx, buf(wire), c_uint(len(wire))) == 0, "tls: setting the ALPN list failed", L)
+    _check(L.SSL_CTX_set_alpn_protos(ctx, buf(wire), c_uint(len(wire))) == 0 and seam(SEAM_ALPN_SET) == 0, "tls: setting the ALPN list failed", L)
     _ = wire^
 
 
@@ -287,18 +302,26 @@ struct _Loaded(Movable):
 
 
 def _anchors(L: Library, ctx: Obj) -> Int:
+    """The certificates in the store (CRLs are objects too, not anchors)."""
     var store = L.SSL_CTX_get_cert_store(ctx)
     if store == 0:
         return 0
     var objects = L.X509_STORE_get0_objects(store)
-    return 0 if objects == 0 else Int(L.OPENSSL_sk_num(objects))
+    if objects == 0:
+        return 0
+    var n = 0
+    for i in range(Int(L.OPENSSL_sk_num(objects))):
+        var obj = L.OPENSSL_sk_value(objects, c_int(i))
+        if obj != 0 and L.X509_OBJECT_get_type(obj) == X509_LU_X509:
+            n += 1
+    return n
 
 
 def _load_file(L: Library, ctx: Obj, path: String) raises TlsError -> _Loaded:
     if not exists(path):
         raise tls_error("tls: the CA file does not exist", ErrorKind.NotFound, Category.NO_TRUST_STORE, path)
     var p = _cs(path, "tls: CA file path")
-    var ok = L.SSL_CTX_load_verify_file(ctx, buf(p)) == 1
+    var ok = L.SSL_CTX_load_verify_file(ctx, buf(p)) == 1 and seam(SEAM_LOAD_VERIFY) == 0
     _ = p^
     if not ok:
         raise tls_error("tls: the CA file did not load", ErrorKind.InvalidData, Category.NO_TRUST_STORE, path + ": " + L.drain_errors())
@@ -311,6 +334,8 @@ def _load_file(L: Library, ctx: Obj, path: String) raises TlsError -> _Loaded:
 def _load_trust(L: Library, ctx: Obj, trust: Trust) raises TlsError -> _Loaded:
     """The trust store, in TC1's order; never empty."""
     if not trust.is_system():
+        if trust._ca_file.byte_length() == 0:
+            raise tls_error("tls: the CA file path is empty (for the system roots, use Trust.system())", ErrorKind.InvalidInput, Category.INPUT)
         return _load_file(L, ctx, trust._ca_file)
     var file = getenv("SSL_CERT_FILE")
     if file.byte_length() > 0:
@@ -325,7 +350,7 @@ def _load_trust(L: Library, ctx: Obj, trust: Trust) raises TlsError -> _Loaded:
         if len(entries) == 0:
             raise tls_error("tls: SSL_CERT_DIR is missing or empty", ErrorKind.NotFound, Category.NO_TRUST_STORE, dir)
         var d = _cs(dir, "tls: SSL_CERT_DIR")
-        var ok = L.SSL_CTX_load_verify_dir(ctx, buf(d)) == 1
+        var ok = L.SSL_CTX_load_verify_dir(ctx, buf(d)) == 1 and seam(SEAM_LOAD_VERIFY) == 0
         _ = d^
         if not ok:
             raise tls_error("tls: SSL_CERT_DIR did not load", ErrorKind.InvalidData, Category.NO_TRUST_STORE, dir + ": " + L.drain_errors())

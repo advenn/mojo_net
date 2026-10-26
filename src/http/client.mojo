@@ -69,6 +69,7 @@ from net.resolver import Resolver
 from net.tcp import TcpStream
 from tls import Category, ClientConfig, ClientContext, TlsError
 from tls.stream import TlsStream
+from tls.target import Target
 
 from .connection import E_NO_RESPONSE, ClientConnection, ClientEvent, EventKind
 from .headers import Headers, is_token, lower_ascii
@@ -742,7 +743,14 @@ struct Client(Movable):
 
     def _connect(mut self, u: Url, deadline: Deadline) raises IoError -> _Stream:
         """A new connection to `u`'s host: TCP, then for https a verified
-        handshake within the same deadline."""
+        handshake within the same deadline. For https the host must be a
+        name or address TLS can check (`tls.target`), before any DNS query
+        or connection."""
+        if u.tls:
+            try:
+                _ = Target(u.host)
+            except e:
+                raise IoError.of_kind("Client.request", ErrorKind.InvalidInput)
         var tcp = TcpStream.connect_host_deadline(u.host, u.port, deadline, self._resolver)
         if not u.tls:
             return _Stream(tcp^)

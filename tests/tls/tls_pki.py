@@ -28,6 +28,9 @@ Leaves (signed by root unless said):
   rsa1024       localhost, RSA 1024 (below security level 2)
   sha1          localhost, signed with SHA-1
   client_only   localhost, extendedKeyUsage clientAuth only
+  by_other      localhost and 127.0.0.1, signed by other (an unrelated root)
+Other files:
+  root.crl.pem  an empty CRL issued by root (a CRL is no trust anchor)
 """
 
 import os
@@ -82,6 +85,21 @@ def signed(d, name, issuer, subject, ext, *, kind="ec", digest="sha256", dates=N
     write_chain(d, name, chain)
 
 
+def crl(d, issuer):
+    """<issuer>.crl.pem: an empty CRL, through `openssl ca -gencrl`."""
+    db = os.path.join(d, issuer + ".crl.db")
+    os.makedirs(db, exist_ok=True)
+    open(os.path.join(db, "index.txt"), "w").close()
+    with open(os.path.join(db, "crlnumber"), "w") as f:
+        f.write("01\n")
+    cnf = os.path.join(db, "ca.cnf")
+    with open(cnf, "w") as f:
+        f.write(f"[ca]\ndefault_ca = d\n[d]\ndatabase = {db}/index.txt\ncrlnumber = {db}/crlnumber\n"
+                "default_md = sha256\ndefault_crl_days = 2\n")
+    run("ca", "-gencrl", "-config", cnf, "-keyfile", os.path.join(d, issuer + ".key"),
+        "-cert", os.path.join(d, issuer + ".pem"), "-out", os.path.join(d, issuer + ".crl.pem"))
+
+
 def write_chain(d, name, chain):
     with open(os.path.join(d, name + ".chain.pem"), "w") as out:
         for part in (name, *chain):
@@ -117,6 +135,8 @@ def main():
     signed(d, "rsa1024", "root", "/CN=localhost", LEAF_EXT + host, kind="1024")
     signed(d, "sha1", "root", "/CN=localhost", LEAF_EXT + host, digest="sha1")
     signed(d, "client_only", "root", "/CN=localhost", LEAF_EXT + host + "extendedKeyUsage=clientAuth\n")
+    signed(d, "by_other", "other", "/CN=localhost", LEAF_EXT + names)
+    crl(d, "root")
     if len(sys.argv) == 4 and sys.argv[2] == "--owner":
         watch(int(sys.argv[3]), d)
     print("PKI", d, flush=True)

@@ -50,8 +50,10 @@ comptime _RTLD_NOW = 2
 comptime _RTLD_NODELETE = 0x1000
 comptime _RUNTIME_LIB = "libKGENCompilerRTShared.so"
 comptime _LIBSSL = "libssl.so.3"
-comptime MIN_VERSION: UInt64 = 0x30500000
-"""The floor: OpenSSL 3.5, the LTS line (TL1, TL3)."""
+comptime _LIBCRYPTO = "libcrypto.so.3"
+comptime MIN_VERSION: UInt64 = 0x30500090
+"""The floor: OpenSSL 3.5.9 on the 3.5 LTS line, the first with every fix
+TL1 names (TL1, TL3). The low nibbles are the patch: 3.5.9 is 0x30500090."""
 comptime _NEXT_MAJOR: UInt64 = 0x40000000
 """4.x has a new soname and is not bound here."""
 
@@ -97,6 +99,22 @@ comptime SEAM_REUSED = 1015
 """The gate: `SSL_session_reused` says a session was resumed."""
 comptime SEAM_ALPN = 1016
 """The gate: the server's ALPN choice is "h3", which nobody offers."""
+comptime SEAM_TRANSMIT_FULL = 1017
+"""`_encrypt`: the transmit queue counts as full (each check of its room
+is a call)."""
+comptime SEAM_WBIO_NEW = 1018
+"""`BIO_new` returns NULL (the write BIO)."""
+comptime SEAM_SNI = 1019
+"""Setting the SNI name fails."""
+comptime SEAM_SET_HOST = 1020
+"""`X509_VERIFY_PARAM_set1_host` (or `set1_ip`) fails."""
+comptime SEAM_ALPN_SET = 1021
+"""`SSL_CTX_set_alpn_protos` fails."""
+comptime SEAM_LOAD_VERIFY = 1022
+"""`SSL_CTX_load_verify_file` (or `_dir`) fails."""
+comptime SEAM_LIBCTX = 1023
+"""`Library`: 1, `OSSL_LIB_CTX_new` returns NULL; 2, the default provider
+does not load. (1023 is the last seam number.)"""
 
 
 @always_inline
@@ -163,14 +181,39 @@ def from_c_string(addr: Obj) -> String:
 
 def runtime_dir() raises IoError -> String:
     """The directory the Mojo runtime library was mapped from."""
+    return _dir_of(mapped_path(_RUNTIME_LIB))
+
+
+def mapped_path(file_name: StaticString) raises IoError -> String:
+    """The path the first mapping of `file_name` in /proc/self/maps comes
+    from (searched as bytes: other mappings' names need not be UTF-8)."""
     var maps = read_file("/proc/self/maps", "tls: /proc/self/maps")
-    var text = StringSlice(unsafe_from_utf8=Span(maps))
-    for line in text.split("\n"):
-        if line.endswith("/" + _RUNTIME_LIB):
-            var start = line.find("/")
-            var stop = line.rfind("/")
-            return String(unsafe_from_utf8=line.as_bytes()[start:stop])
-    raise IoError.of_kind("tls: the Mojo runtime library is not mapped", ErrorKind.NotFound)
+    var want = String("/", file_name)
+    var w = want.as_bytes()
+    var start = 0
+    var n = len(maps)
+    while start < n:
+        var end = start
+        while end < n and maps[end] != 10:
+            end += 1
+        if end - start >= len(w):
+            var tail = True
+            for i in range(len(w)):
+                if maps[end - len(w) + i] != w[i]:
+                    tail = False
+                    break
+            if tail:
+                var slash = start
+                while slash < end and maps[slash] != 47:
+                    slash += 1
+                return String(from_utf8_lossy=Span(maps)[slash:end])
+        start = end + 1
+    raise IoError.of_kind("tls: a library expected in this process is not mapped", ErrorKind.NotFound)
+
+
+def _dir_of(path: String) -> String:
+    var i = path.rfind("/")
+    return String(path[byte=0:i]) if i > 0 else String()
 
 
 # ---- C signatures (LP64: long and size_t are Int, int is c_int) -------------
@@ -180,6 +223,7 @@ comptime _F_o = def() thin abi("C") -> Obj
 comptime _F_v = def() thin abi("C") -> None
 comptime _F_o_i = def(c_int) thin abi("C") -> Obj
 comptime _F_o_o = def(Obj) thin abi("C") -> Obj
+comptime _F_o_oi = def(Obj, c_int) thin abi("C") -> Obj
 comptime _F_v_o = def(Obj) thin abi("C") -> None
 comptime _F_i_o = def(Obj) thin abi("C") -> c_int
 comptime _F_l_o = def(Obj) thin abi("C") -> Int
@@ -221,6 +265,8 @@ struct Library(Movable):
     var _handle: OwnedDLHandle
     var path: String
     """The absolute path of the libssl that was loaded."""
+    var crypto_path: String
+    """The libcrypto it uses: the one beside it, or loading fails."""
     var version: String
     """`OpenSSL_version(OPENSSL_VERSION)`, for diagnostics."""
     var version_number: UInt64
@@ -246,6 +292,8 @@ struct Library(Movable):
     var X509_get_default_cert_file: _F_o
     var X509_STORE_get0_objects: _F_o_o
     var OPENSSL_sk_num: _F_i_o
+    var OPENSSL_sk_value: _F_o_oi
+    var X509_OBJECT_get_type: _F_i_o
     var X509_VERIFY_PARAM_set_flags: _F_i_ou64
     var X509_VERIFY_PARAM_clear_flags: _F_i_ou64
     var X509_VERIFY_PARAM_get_flags: _F_u64_o
@@ -315,6 +363,12 @@ struct Library(Movable):
         except:
             raise IoError.of_kind("tls: cannot load libssl.so.3 (is the openssl 3.5 package installed?)", ErrorKind.NotFound)
         self.path = path
+        # libssl finds its libcrypto by soname, so one some other code
+        # loaded first (another OpenSSL, through LD_PRELOAD or a library)
+        # would be used instead of the one beside it: refuse that (TL3).
+        self.crypto_path = mapped_path(_LIBCRYPTO)
+        if _dir_of(self.crypto_path) != _dir_of(path):
+            raise IoError.of_kind("tls: libssl.so.3 is not using the libcrypto.so.3 beside it (another OpenSSL was loaded first)", ErrorKind.Unsupported)
         self.OpenSSL_version_num = _sym[_F_u64](self._handle, "OpenSSL_version_num")
         self.version_number = self.OpenSSL_version_num() if seam(SEAM_VERSION) == 0 else 0x30400000
         if self.version_number < MIN_VERSION or self.version_number >= _NEXT_MAJOR:
@@ -337,6 +391,8 @@ struct Library(Movable):
         self.X509_get_default_cert_file = _sym[_F_o](self._handle, "X509_get_default_cert_file")
         self.X509_STORE_get0_objects = _sym[_F_o_o](self._handle, "X509_STORE_get0_objects")
         self.OPENSSL_sk_num = _sym[_F_i_o](self._handle, "OPENSSL_sk_num")
+        self.OPENSSL_sk_value = _sym[_F_o_oi](self._handle, "OPENSSL_sk_value")
+        self.X509_OBJECT_get_type = _sym[_F_i_o](self._handle, "X509_OBJECT_get_type")
         self.X509_VERIFY_PARAM_set_flags = _sym[_F_i_ou64](self._handle, "X509_VERIFY_PARAM_set_flags")
         self.X509_VERIFY_PARAM_clear_flags = _sym[_F_i_ou64](self._handle, "X509_VERIFY_PARAM_clear_flags")
         self.X509_VERIFY_PARAM_get_flags = _sym[_F_u64_o](self._handle, "X509_VERIFY_PARAM_get_flags")
@@ -395,11 +451,12 @@ struct Library(Movable):
         self.SSL_get0_group_name = _sym[_F_o_o](self._handle, "SSL_get0_group_name")
         self.SSL_get0_alpn_selected = _sym[_F_v_osu](self._handle, "SSL_get0_alpn_selected")
         self.SSL_session_reused = _sym[_F_i_o](self._handle, "SSL_session_reused")
-        self.libctx = self.OSSL_LIB_CTX_new()
+        var forced = seam(SEAM_LIBCTX)
+        self.libctx = self.OSSL_LIB_CTX_new() if forced != 1 else 0
         if self.libctx == 0:
             raise IoError.of_kind("tls: OSSL_LIB_CTX_new failed", ErrorKind.OutOfMemory)
         var name = c_string("default", "tls: provider")
-        var provider = self.OSSL_PROVIDER_load(self.libctx, buf(name))
+        var provider = self.OSSL_PROVIDER_load(self.libctx, buf(name)) if forced != 2 else 0
         _ = name^
         if provider == 0:
             self.OSSL_LIB_CTX_free(self.libctx)  # (no __deinit__ without every field)

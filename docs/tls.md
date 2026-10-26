@@ -2,9 +2,9 @@
 
 TLS for the other libraries (`http`'s `https://`, later `pg` and `redis`), with all of the cryptography and the protocol done by OpenSSL 3.5, the long-term-support line. This package writes no TLS and no cryptography of its own. It configures OpenSSL, drives it over memory buffers, and checks its results. The decision and the rules cited below (TL, TC, TB, TS, TA, TG) are in `docs/research/tls_with_openssl.md`; what was measured before any code was written is in `docs/spikes.md`, "TLS through OpenSSL (T0)". Package rules and the shared contracts are in `docs/design.md`.
 
-**Status: T1 done**, the client: verification, the sans-I/O state machine, a blocking stream, and the checks below. Its first user, `https://` in `http.Client`, is done too (H8, `docs/http.md`). Next is the review (TR), before the server side.
+**Status: T1 done**, the client: verification, the sans-I/O state machine, a blocking stream, and the checks below. Its first user, `https://` in `http.Client`, is done too (H8, `docs/http.md`). The internal review (TR) is done; its findings are fixed (see "Review"). The external review is still to come, and then the server side.
 
-> **This code was written by an AI and has not been reviewed by a TLS expert.** The tests compare it with independent implementations and plant bugs to show that they catch them (see "Checks"), but they can only find what someone thought to test. The external review (gate TG15) is still to come. Until then, treat it as unreviewed.
+> **This code was written by an AI and has not been reviewed by a TLS expert.** Two internal reviews, also by AI, found no way past verification, and the tests compare it with independent implementations and plant bugs to show that they catch them (see "Checks"). But they can only find what someone thought to test. The external review (gate TG15) is still to come. Until then, treat it as unreviewed.
 
 ## Scope
 **In scope (T1):**
@@ -43,7 +43,7 @@ Every setting is made explicitly on each context and then read back, and `build(
 - **Options:** no compression, no renegotiation, middlebox compatibility; the session cache off. `SSL_OP_IGNORE_UNEXPECTED_EOF` is never set.
 - **Verification:** `SSL_VERIFY_PEER`, no callback, strict X.509 (`X509_V_FLAG_X509_STRICT`), trusted-first chain building, partial chains off. Host checks never fall back to the subject's CN and refuse partial wildcards (`a*.example.com`); a wildcard covers one label.
 
-**Trust** (TC1, TC2) is either the system's roots or a CA file you give, never both. System roots come from the first of these that is set, with no fallback after it: `SSL_CERT_FILE` (it must load); `SSL_CERT_DIR` (a hashed directory, which must exist and hold files); the loaded OpenSSL's default file (conda-forge's `ca-certificates` bundle, in `$PREFIX/ssl/cert.pem`); the distribution bundles Go looks for. A store with no CA in it is refused when the context is built.
+**Trust** (TC1, TC2) is either the system's roots (`Trust.system()`) or a CA file you give (`Trust.ca_file(path)`), never both. An empty path is refused when the context is built: it never means the system's roots, so a variable left unset cannot widen the trust to every public CA. System roots come from the first of these that is set, with no fallback after it: `SSL_CERT_FILE` (it must load); `SSL_CERT_DIR` (a hashed directory, which must exist and hold files); the loaded OpenSSL's default file (conda-forge's `ca-certificates` bundle, in `$PREFIX/ssl/cert.pem`); the distribution bundles Go looks for. A store with no CA certificate in it is refused when the context is built (a CRL in the file is no anchor).
 
 ## Names
 `tls.target.Target` decides once what the certificate must match (TC4, TC5, TC7):
@@ -62,10 +62,11 @@ After `SSL_do_handshake` returns 1, the client checks six things itself (TC9) be
 5. no session was resumed;
 6. the server's ALPN choice is one that was offered, or none.
 
-Any failure frees the OpenSSL connection, and the error stays: every later call raises it again (TB8). The client's Finished message is dropped, so the server never sees a completed handshake. When OpenSSL itself refuses the certificate, `TlsStream` sends its alert (`unknown_ca`, `certificate_expired`, `bad_certificate`, ...) if the socket takes it at once, so the server's log says why; the tests check that the server saw it.
+Any failure frees the OpenSSL connection, and the error stays: every later call raises it again (TB8). In TLS 1.3 the client's Finished is dropped, so the server never sees a completed handshake. In TLS 1.2 the client's Finished has already gone out by then, since it precedes the server's: the server may then count the handshake as done, but it gets no data, and its own data is discarded. OpenSSL's own verification, which refuses a bad certificate before the client's Finished, comes first in both versions; the gate is the second layer. When OpenSSL itself refuses the certificate, `TlsStream` sends its alert (`unknown_ca`, `certificate_expired`, `bad_certificate`, ...) if the socket takes it at once, so the server's log says why; the tests check that the server saw it.
 
 ## Endings
 - **The server's close_notify** is a CLOSED event (`read` returns 0) and is answered with ours. Input after it is ignored.
+- **A failure after the handshake** (a record that fails authentication, an unexpected message) is answered with OpenSSL's alert, best effort, before `read` raises it (RFC 8446 6.2).
 - **A TCP end without close_notify** raises `TRUNCATED` (`UnexpectedEof`), never a clean end, after the data before it is delivered (TB12). The data may have been cut short; only the protocol above can tell (an HTTP `Content-Length` that is complete). Many HTTPS servers end this way after `Connection: close`: `http.Client` decides per RFC 9112 §9.8 (`docs/http.md`).
 - **`close()`** sends close_notify once (TB13; nothing is sent during a handshake), then ends the connection without losing what was sent:
   - It half-closes the socket, so the FIN follows the data, and reads to the server's end, discarding what arrives. It waits at most `linger` (2 s by default) and reads at most 256 KiB. The server's close_notify is not required.
@@ -73,7 +74,14 @@ Any failure frees the OpenSSL connection, and the error stays: every later call 
   - Dropping a `TlsStream` instead closes its socket at once, without close_notify: an abortive end.
 
 ## Bounds
-OpenSSL's memory buffers never refuse a write, so the state machine bounds them itself (TB17): at most 32 KiB of unread ciphertext and undelivered plaintext together (`feed_capacity()`, more than one record of any version; a driver that feeds without draining gets room 0), 256 KiB from the server before the handshake ends (a backstop above OpenSSL's 100 KiB limit on certificate chains), and 256 KiB of ciphertext waiting to be sent before `write` takes no more. Plaintext buffers are wiped with `OPENSSL_cleanse` when released (TB18).
+OpenSSL's memory buffers never refuse a write, so the state machine bounds them itself (TB17):
+- **Feed room:** at most 32 KiB of unread ciphertext and undelivered plaintext together (`feed_capacity()`, more than one record of any version). Each undelivered DATA event counts 64 bytes more, so a server sending one-byte records cannot fill memory with events. A driver that feeds without draining gets room 0.
+- **Before the handshake ends:** at most 256 KiB from the server (a backstop above OpenSSL's 100 KiB limit on certificate chains).
+- **Writes:** 256 KiB of ciphertext waiting to be sent before `write` takes no more. Plaintext written before the handshake is held, encrypted the moment the connection is established and before anything is read, and later writes wait behind it.
+- **Work a server can cause:** once established, at most 256 KiB may arrive without any application data in it (session tickets, key updates); more fails the connection (`PROTOCOL`). What reading makes OpenSSL queue to send (key update replies, alerts for TLS 1.2 HelloRequests) may not take the transmit queue past 256 KiB plus two records (`RESOURCE`). Without these, a server flooding tickets kept a reader working past its deadline, and one flooding HelloRequests grew memory.
+- **Deadlines:** `read` checks its read deadline before every receive after the first, so records without data do not extend it, and sending what reading queued is bounded by it too.
+- **A failed send latches:** it may have sent part of a record, so every later write, flush and close raises the same error.
+- **Wiping:** plaintext buffers are wiped with `OPENSSL_cleanse` when released (TB18), undelivered events included, and OpenSSL wipes its own copies (`SSL_OP_CLEANSE_PLAINTEXT`).
 
 ## Errors
 `TlsError` holds an `IoError` (for code that checks kinds, and `is_deadline()`), a `Category`, OpenSSL's verify code and a detail: OpenSSL's text, and the path or name concerned. `is_authentication()` is true for the certificate categories.
@@ -92,12 +100,12 @@ OpenSSL's memory buffers never refuse a write, so the state machine bounds them 
 | `NONE` | the transport's own error (a reset, a deadline) | the socket's |
 
 ## How OpenSSL is reached
-- **One module calls C** (TL7): `tls.ffi`. It opens `libssl.so.3` by absolute path from the directory the Mojo runtime was loaded from, which is the program's own environment, through `std.ffi.OwnedDLHandle`. Then it takes the address of each function it uses, once. It refuses an OpenSSL older than 3.5 or from another major version (TL3), and calls `OPENSSL_init_ssl(OPENSSL_INIT_NO_LOAD_CONFIG)` first, so no `openssl.cnf` is read (TL4). Contexts live in a private library context with only the default provider.
-- **The functions bound are an allowlist** (TL5), in `tools/check_tls.py`. Each one's ELF version node is `OPENSSL_3.5.0` or older (TL2), so the package runs on any later 3.x. APIs with a CVE history, and the features listed above, are refused by name anywhere in `src/tls`.
+- **One module calls C** (TL7): `tls.ffi`. It opens `libssl.so.3` by absolute path from the directory the Mojo runtime was loaded from, which is the program's own environment, through `std.ffi.OwnedDLHandle`. libssl finds its `libcrypto.so.3` by soname, so one that other code loaded first (another OpenSSL, through `LD_PRELOAD` or a library) would be used instead: loading refuses unless the mapped libcrypto sits beside the libssl. Then it takes the address of each function it uses, once. It refuses an OpenSSL older than 3.5.9 or from another major version (TL1, TL3), and calls `OPENSSL_init_ssl(OPENSSL_INIT_NO_LOAD_CONFIG)` first, so no `openssl.cnf` is read (TL4). Contexts live in a private library context with only the default provider.
+- **The functions bound are an allowlist** (TL5), in `tools/check_tls.py`. Each binding names its function as a literal, so none escapes the list. Each one's ELF version node is `OPENSSL_3.5.0` or older (TL2), so the package runs on any later 3.x. APIs with a CVE history, the features listed above, socket BIOs, session setters and callbacks are refused by name anywhere in `src/tls`. No public function outside `tls.ffi` hands out an OpenSSL handle, so a built context cannot be changed (TB3).
 - **The macros' command codes** (`SSL_ctrl` and friends) come from the headers (`tools/gen_tls_consts.py`, `pixi run gen-tls`) and are checked against them in CI (TB14).
 - **No sockets in OpenSSL.** It sees only memory BIOs, and `net` does all of the I/O (T0 traced it). libssl and libcrypto make their own memory, randomness and file-read syscalls: the one exception to "no libc on the I/O path" (`docs/design.md`).
 - **Errors** (TB6): the thread's error queue is cleared before each OpenSSL call that can fail, and `SSL_get_error` is called right after it. Every `SSL_ERROR_*` value is handled, and an unknown one fails the connection. OpenSSL 3.5.9 clears the queue itself on entering `SSL_do_handshake` and `SSL_read_ex` (measured), so the clears are there for the API's contract, and a test without them still passes on 3.5.
-- **Packaging:** the conda package depends on `openssl >=3.5,<4` and `ca-certificates`; the repository's own environment is pinned to `openssl 3.5.*` (TA1).
+- **Packaging:** the conda package depends on `openssl >=3.5.9,<4` and `ca-certificates`; the repository's own environment is pinned to `openssl 3.5.*` (TA1).
 
 ## Checks
 What runs, in `pixi run ci` on x86_64 and aarch64 unless said. Gates are the research's TG numbers. Planted bugs were each put in a scratch copy of `src/` and had to turn the named tests red; all did, except the one noted.
@@ -109,10 +117,15 @@ What runs, in `pixi run ci` on x86_64 and aarch64 unless said. Gates are the res
   - Planted bugs: no host checks, no IP checks, SNI sent for addresses, `SSL_VERIFY_NONE` with the verify result ignored, partial chains on, security level 0, a feed room that ignores undelivered data. All caught.
 - **TG4, post-handshake messages** (`test_transcripts.mojo`, against `openssl s_server`): KeyUpdate with and without a request (the client answers the request, as s_server's trace shows); a TLS 1.2 HelloRequest, refused without a second ClientHello; plaintext injected into the stream.
 - **TG5, damage** (`test_mutations.mojo`): a seeded proxy (`tls_mitm.py`) flips, drops, duplicates, inserts or replaces bytes, or cuts the connection, in the handshake or the data. The oracle: never a clean end with different data, never bytes the server did not send, never a hang. 80 seeds in CI; 3,000 seeds passed once, after a harness bug was fixed (a peer whose unread output filled its pipe). The truncation-as-clean-end bug is caught by seed 5.
-- **TG6, faults** (`test_tls_faults.mojo`, built with `-D MOJO_NET_FAULTS=1`, seams in `tls.ffi`): OpenSSL too old, context and connection creation failing, a setting that does not read back, every `SSL_get_error` code from the handshake, reads and writes, and each of the six gate checks failing alone while OpenSSL passed.
+- **TG6, faults** (`test_tls_faults.mojo`, built with `-D MOJO_NET_FAULTS=1`, seams in `tls.ffi`): OpenSSL too old, context and connection creation failing, a setting that does not read back, every `SSL_get_error` code from the handshake, reads and writes, and each of the six gate checks failing alone while OpenSSL passed. Since TR also the write BIO, SNI, the expected host and address, ALPN, loading the trust store, and the library context and its provider, each failing cleanly with LeakSanitizer watching.
   - Planted bug not detectable: removing the error-queue clears (OpenSSL 3.5 clears it itself, see above). `test_stale_openssl_errors_are_ignored` still shows that a stale error neither fails a connection nor leaks into an error's text.
-- **TG7, sanitizers** (`pixi run tls-asan`): the client, codec, fault, transcript and damage tests built with AddressSanitizer and run with LeakSanitizer. Only the embedded Python interpreter and the test-only fault plan are suppressed. It found a real leak: an `SSL_CTX` was lost when configuration failed, because Mojo 1.2 skips `__deinit__` when `__init__` raises before a field's last assignment (`CLAUDE.md`). Fixed. A planted leak (a connection never freed) is caught. ASan cannot see misuse inside libssl itself (T0).
-- **TG10, defaults** (`test_config.mojo`, `test_hostile_config.mojo`): the trust order and its environment variables, empty and missing stores, ALPN encoding, and the whole policy under a hostile `openssl.cnf` (TLS 1.0, security level 0, the legacy provider) loaded into the process first.
+- **TG7, sanitizers** (`pixi run tls-asan`): the client, codec, fault, transcript, damage and review-regression tests built with AddressSanitizer and run with LeakSanitizer. Only the embedded Python interpreter and the test-only fault plan are suppressed. It found a real leak: an `SSL_CTX` was lost when configuration failed, because Mojo 1.2 skips `__deinit__` when `__init__` raises before a field's last assignment (`CLAUDE.md`). Fixed. A planted leak (a connection never freed) is caught. ASan cannot see misuse inside libssl itself (T0), except through the `memcpy` calls it intercepts.
+- **TG8, an instrumented OpenSSL** (`pixi run tls-asan-openssl`; weekly in `.github/workflows/tls-weekly.yml`): the same tests against OpenSSL 3.5.9 built from source with ASan (`enable-asan`), so every load and store libssl and libcrypto make is checked.
+  - **How it is loaded,** with no switch in `src/`: `tls.ffi` opens `libssl.so.3` beside the Mojo runtime library. The script builds a directory with a copy of that library and the instrumented OpenSSL, and puts it first on `LD_LIBRARY_PATH`. The test binaries use RUNPATH, which `LD_LIBRARY_PATH` precedes.
+  - **Measured:** a buffer freed before `SSL_write_ex` copies it is caught by both runs, since libssl copies it with `memcpy`. A `size_t` out-parameter freed before the call is caught only here: `ssl3_write_bytes` stores to it directly. That is the gate's planted bug (`--self-test`).
+  - **Planting a use-after-free in Mojo takes raw memory** (`unsafe_alloc`, `unsafe_free`). A `List` whose storage was handed out as a `MutAnyOrigin` pointer stays alive while that pointer is in use, even after `_ = list^`. That is the language's rule for such pointers, and it is also why the wrapper's buffer passing is safe.
+  - The full run passes: 86 tests in 7 files, with no report. It found one bug, in a new test: a context destroyed before OpenSSL read the `SSL_CTX` its raw handle pointed to (CLAUDE.md, FFI). Plain ASan missed it, since OpenSSL read the struct directly.
+- **TG10, defaults** (`test_config.mojo`, `test_hostile_config.mojo`, `test_tls_regressions_hostile.mojo`): the trust order and its environment variables, empty and missing stores, ALPN encoding, and the whole policy under a hostile `openssl.cnf` loaded into the process first: TLS 1.0, security level 0 and the legacy provider; then an extra CA (`VerifyCAFile`) and weakening options (unsafe renegotiation, ignoring an end without close_notify, kTLS), shown to reach Python's contexts and not ours.
 - **Static** (`pixi run tls-check`): FFI in one module, the binding allowlist, forbidden names, symbol versions, constants against the headers. Its self-test plants a violation of each. Also `import-check`: only `tls.stream` and `tls.target` import `net`.
 - **TG14, freshness** (`pixi run tls-freshness`, daily in `.github/workflows/freshness.yml`): fails when conda-forge has had a newer `openssl` 3.5 or `ca-certificates` than `pixi.lock` for more than two days. Its first run found `ca-certificates` three days stale.
 - **By hand, 2026-10-26: badssl.com and real APIs.**
@@ -120,9 +133,34 @@ What runs, in `pixi run ci` on x86_64 and aarch64 unless said. Gates are the res
   - Accepted: badssl.com's good hosts; `revoked` (no revocation checks, by design); the APIs of OpenAI, Anthropic, Hugging Face, GitHub and Google, over TLS 1.3 with X25519MLKEM768.
   - Some badssl.com hosts reset connections intermittently, for `openssl s_client` too.
 
+## Review
+**TR, 2026-10-26:** two independent internal reviews against the rules, both by AI, one of verification and the protocol, one of the FFI layer and memory. Neither found a way to establish a connection to a server whose certificate fails to chain to the configured trust or to match the name or address. Neither found a use-after-free, a double free, a leak or a wrong C signature. What they did find is fixed, each under a test that fails on the code before its fix (`tests/tls/test_tls_regressions.mojo`, `_faults.mojo`, `_hostile.mojo`, and `tests/http/test_https_regressions.mojo`):
+- **A hostile server could make work without end.**
+  - Session tickets or key updates without data kept `read`, `try_read` and `is_reusable` running past every deadline (a pool's check has none).
+  - Key update replies and TLS 1.2 HelloRequest alerts grew the transmit queue without bound.
+  - One-byte records multiplied the memory the feed room was meant to bound.
+  - Now: the input and output bounds and the event cost above, and `read` checks its deadline between receives.
+- **`Trust.ca_file("")` meant the system roots** (fail open, TC2). It is now refused.
+- **Plaintext written before the handshake** could be overtaken by later writes, wait for the next input, or be dropped without a word when the server's close_notify came with its Finished.
+- **Part of a record counted as "nothing arrived"** in `is_reusable`, so a held-back record could become the answer to the next request. The codec now follows the record framing itself, since OpenSSL takes partial records out of its read BIO.
+- **A failed send did not latch:** the next write sent the cut record again, corrupting the stream.
+- **Loading:** a libcrypto loaded first by other code was used in place of the one beside libssl, and the version floor was 3.5.0 where TL1 asks for 3.5.9.
+- **A built context was not read-only:** `ClientContext.ssl_ctx()` and `library()` handed out the handles anyone could use to add trust anchors. They are private now, and `tls-check` refuses a public accessor of that kind.
+- **Smaller:**
+  - no alert after a failure past the handshake;
+  - a CRL counted as a trust anchor;
+  - OpenSSL's own copies of plaintext not wiped;
+  - bad `https://` names reaching DNS and TCP before the TLS layer refused them;
+  - names `tls-check` should have refused, and ways around its allowlist;
+  - error paths without a fault seam.
+- **Taken as is, and said so:**
+  - In TLS 1.2 the client's Finished goes out before the gate runs (see "When a connection counts").
+  - Buffers lent to C stay alive because their pointers have `MutAnyOrigin`, which Mojo documents as keeping every value in scope alive and as slated for removal. The two places that relied on it alone now keep their owner alive explicitly. A Mojo change there needs a review of every call.
+  - `OPENSSL_init_ssl` runs without `OPENSSL_INIT_NO_ATEXIT`. An exit-time race between OpenSSL's cleanup and other threads is a known class of bug, not shown here.
+
 **Not verified yet:**
 - the x509-limbo corpus (TG2) and BetterTLS (TG3), which test chain building and name constraints in depth;
-- an ASan-built OpenSSL or Valgrind (TG8), and TLS-Anvil (TG11): both belong to TR;
+- TLS-Anvil (TG11): it needs a client that trusts TLS-Anvil's own certificates, which this package has no switch for;
 - ThreadSanitizer, for a context shared across threads (TL8);
 - the 256 KiB handshake bound, which OpenSSL's own limits reach first;
 - ASan on aarch64, beyond what CI shows;
@@ -141,5 +179,5 @@ OpenSSL 3.5 is supported until 2030-04-08. On a High or Critical OpenSSL advisor
   - Tools: `tools/check_tls.py`, `tools/check_tls_asan.sh`, `tools/check_freshness.py`, `tools/gen_tls_consts.py`.
 - **H8: `https://` in `http.Client`** (in `http`). Done (`docs/http.md`): the pool keyed by scheme (one TLS context per `Client`), ALPN `http/1.1`, truncation handled per RFC 9112 §9.8. The client follows no redirects, so there is none to verify again. `TlsStream` gained the readiness-loop calls it needs: `try_read`, `try_write`, `flush_ready`, `buffered`, `is_reusable`.
 - **P9, R8: TLS for `pg` and `redis`.** Parked, by the user's priorities.
-- **TR: review.** Two independent internal reviews against the rules, each finding with a regression test (`tests/tls/test_tls_regressions*.mojo`); TG2, TG8 and TG11; the external review booked.
+- **TR: review.** Done, but for TG2, TG11 and the external review. Two independent internal reviews, each finding fixed under a regression test (see "Review"), and TG8, OpenSSL built with ASan. The external review (TG15) is a person's job: it is not booked yet.
 - **T2: the server**, then **S7: the TLS listener** in `server`.

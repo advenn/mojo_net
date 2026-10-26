@@ -73,6 +73,7 @@ CONSTS = [
     ("SSL_OP_NO_RENEGOTIATION", "UInt64", ""),
     ("SSL_OP_ENABLE_MIDDLEBOX_COMPAT", "UInt64", ""),
     ("SSL_OP_NO_TICKET", "UInt64", ""),
+    ("SSL_OP_CLEANSE_PLAINTEXT", "UInt64", "wipe OpenSSL's own copies of plaintext (TB18)"),
     ("SSL_MODE_AUTO_RETRY", "Int", ""),
     ("SSL_MODE_RELEASE_BUFFERS", "Int", ""),
     # verify results (X509_V_*) the error categories name
@@ -94,6 +95,8 @@ CONSTS = [
     ("X509_V_ERR_EE_KEY_TOO_SMALL", "Int", ""),
     ("X509_V_ERR_CA_KEY_TOO_SMALL", "Int", ""),
     ("X509_V_ERR_CA_MD_TOO_WEAK", "Int", ""),
+    # trust store objects
+    ("X509_LU_X509", "c_int", "a certificate (not a CRL) in an X509_STORE"),
     # error-queue reason codes
     ("ERR_LIB_SSL", "Int", ""),
     ("SSL_R_UNEXPECTED_EOF_WHILE_READING", "Int", ""),

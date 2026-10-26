@@ -420,7 +420,7 @@ def test_any_receive_size_gives_the_same_data() raises:
 def _stale_error(ctx: ClientContext) raises:
     """Leave an error in this thread's OpenSSL error queue, as other code in
     the process might (an invalid cipher list on a scratch context)."""
-    ref L = ctx.library()[]
+    ref L = ctx._library()[]
     var scratch = L.SSL_CTX_new_ex(L.libctx, 0, L.TLS_client_method())
     var bogus = List[UInt8]("bogus".as_bytes())
     bogus.append(0)

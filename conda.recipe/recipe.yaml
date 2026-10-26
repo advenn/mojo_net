@@ -37,7 +37,7 @@ requirements:
     - __linux
     # tls: OpenSSL's libssl.so.3, loaded at run time from this environment
     # (3.5 or a later 3.x: docs/tls.md), and the CA bundle it trusts.
-    - openssl >=3.5,<4
+    - openssl >=3.5.9,<4
     - ca-certificates
 
 tests:
