@@ -538,7 +538,7 @@ The C baseline is the same algorithm in C. The tokio server is idiomatic code: a
 - **Consequence:** an event loop reads the clock once per turn and passes that instant down, and wall-clock text (an HTTP `Date`) is reformatted at most once a second. `server.Server` and `server.DateCache` do both.
 
 ## TLS through OpenSSL (T0, measured 2026-10-26)
-TLS comes from OpenSSL, never a TLS of our own (the user's decision; `reports/Secure TLS with C libraries.md` has the research and the rules TL/TC/TB/TS/TA cited below). This spike answers what the `tls` package (T1) must know before any code goes into `src/`. `pixi run spike-tls` re-checks every fact below and fails if one no longer holds; CI runs it on x86_64 and on the aarch64 runner.
+TLS comes from OpenSSL, never a TLS of our own (the user's decision; `docs/research/tls_with_openssl.md` has the research and the rules TL/TC/TB/TS/TA cited below). This spike answers what the `tls` package (T1) must know before any code goes into `src/`. `pixi run spike-tls` re-checks every fact below and fails if one no longer holds; CI runs it on x86_64 and on the aarch64 runner.
 
 **Setup.** conda-forge OpenSSL 3.5.9, pinned to the 3.5 LTS line in `pixi.toml` (3.6 loses fixes on 2026-11-01); Mojo 1.2.0; a throwaway ECDSA P-256 CA and a certificate for `localhost` and `127.0.0.1` (`spikes/tls/make_certs.sh`).
 

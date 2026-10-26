@@ -1,0 +1,6 @@
+# LeakSanitizer suppressions for tools/check_tls_asan.sh. Only what is not
+# the tls package's: the embedded Python interpreter (test peers are
+# driven through it, and it frees little at exit) and the test-only fault
+# plan (a process-global by design: src/linux/fault.mojo).
+leak:libpython3
+leak:linux::fault::

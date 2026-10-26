@@ -4,7 +4,7 @@ channels = ["https://conda.modular.com/max", "conda-forge"]
 name = "mojo_net"
 platforms = ["linux-64", "linux-aarch64"]
 version = "0.1.0"
-description = "Native Mojo networking libraries for Linux: raw syscalls (linux), bytes, TCP/UDP sockets (net), HTTP/1.1 (http, server), PostgreSQL (pg), Redis (redis); and an experimental, frozen event-loop runtime (rt)."
+description = "Native Mojo networking libraries for Linux: raw syscalls (linux), bytes, TCP/UDP sockets (net), TLS through OpenSSL (tls), HTTP/1.1 (http, server), PostgreSQL (pg), Redis (redis); and an experimental, frozen event-loop runtime (rt)."
 
 [tasks]
 # Run all tests, or those whose path contains the given filter: `pixi run test net/`.
@@ -15,9 +15,20 @@ gen = "python3 tools/gen_syscall_nr.py && python3 tools/gen_abi.py --write"
 # Verify committed constants and struct layouts against this host's C headers.
 abi-check = "python3 tools/gen_abi.py --check && mojo run -I src build/test_abi_layout.mojo"
 # Verify the I/O path imports no libc socket/poll/epoll symbols.
-nolibc-check = "bash tools/check_nolibc.sh tests/linux/test_sys.mojo tests/linux/test_epoll.mojo tests/linux/test_poll.mojo tests/net/test_socket.mojo tests/net/test_tcp.mojo tests/net/test_unix.mojo tests/net/test_udp.mojo"
+nolibc-check = "bash tools/check_nolibc.sh tests/linux/test_sys.mojo tests/linux/test_epoll.mojo tests/linux/test_poll.mojo tests/net/test_socket.mojo tests/net/test_tcp.mojo tests/net/test_unix.mojo tests/net/test_udp.mojo tests/tls/test_client.mojo"
 # Verify the package import rules (docs/design.md, "Packages").
 import-check = "python3 tools/check_imports.py"
+# The tls package's OpenSSL checks (docs/tls.md, "Checks"): FFI in one
+# module, an allowlist of bindings, no dangerous API, symbol versions,
+# constants against the headers.
+tls-check = "python3 tools/check_tls.py"
+# Regenerate src/tls/consts.mojo from the environment's OpenSSL headers.
+gen-tls = "python3 tools/gen_tls_consts.py --write"
+# The tls tests under AddressSanitizer and LeakSanitizer (gate TG7).
+tls-asan = "bash tools/check_tls_asan.sh"
+# Whether pixi.lock's openssl and ca-certificates are current (gate TG14;
+# daily in .github/workflows/freshness.yml, not in `ci`).
+tls-freshness = "python3 tools/check_freshness.py"
 # Verify the stable packages' public API (linux, bytes, net) against api/*.txt
 # (docs/design.md, "Stability"); `api-update` accepts a deliberate change.
 api-check = "python3 tools/check_api.py"
@@ -27,10 +38,10 @@ examples-check = "bash tools/check_examples.sh"
 # Cross-compile every test file and example for aarch64 (objects only:
 # no aarch64 host here). Slow (~10 s a file), so not part of `ci`.
 aarch64-check = "bash tools/check_aarch64.sh"
-# Everything CI must run: the import rules, the stable API, every test file
-# (which includes the ABI layout check), the no-libc check and the example
-# builds. Set MOJO_NET_REQUIRE_IPV6=1 on runners with IPv6.
-ci = { depends-on = ["import-check", "api-check", "test", "nolibc-check", "examples-check"] }
+# Everything CI must run: the import rules, the tls checks, the stable API,
+# every test file (which includes the ABI layout check), the tls tests under
+# ASan, the no-libc check and the example builds. Set MOJO_NET_REQUIRE_IPV6=1 on runners with IPv6.
+ci = { depends-on = ["import-check", "tls-check", "api-check", "test", "tls-asan", "nolibc-check", "examples-check"] }
 # Re-run the M1 threading/runtime/callback spikes (see docs/spikes.md).
 spikes = "bash spikes/run_spikes.sh"
 # The TLS-through-OpenSSL spike (T0): checks every recorded fact.
@@ -44,7 +55,7 @@ format = "mojo format src tests"
 mojo = "==1.2.0"
 # TLS comes from OpenSSL (never a TLS of our own), on its 3.5 LTS line,
 # supported to 2030-04-08; 3.6 loses fixes on 2026-11-01. Its libssl.so.3
-# is what spikes/tls (T0) and the coming `tls` package load.
+# is what spikes/tls (T0) and the `tls` package load.
 openssl = "3.5.*"
 # Test-only: differential oracles (ipaddress) and peer processes.
 python = ">=3.12"

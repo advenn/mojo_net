@@ -19,6 +19,8 @@ from pg.config import Config as PgConfig
 from redis.config import Config as RedisConfig
 from redis.resp import RespParser, Value
 from server.date import http_date
+from tls import ClientConfig, TlsClient
+from tls.stream import TlsStream
 
 
 def _tcp() raises:
@@ -79,8 +81,22 @@ def _protocols() raises:
     assert_equal(v.text(2), "abc")
 
 
+def _tls() raises:
+    """`tls`: the environment's OpenSSL loads, the system CA bundle holds
+    roots, and a connection queues a ClientHello (no network needed)."""
+    var ctx = ClientConfig().build()
+    assert_true(ctx.anchors() > 50, String(ctx))
+    var hello = TlsClient(ctx, "example.com")
+    var out = ByteBuffer()
+    assert_true(hello.poll_transmit(out) > 100)
+    assert_equal(Int(out.readable_span()[0]), 22)  # (a handshake record)
+    _ = TlsStream.connect  # (the blocking stream compiles here too)
+    print("tls:", ctx)
+
+
 def main() raises:
     _tcp()
+    _tls()
     _bytes_and_crypto()
     _protocols()
     print("mojo-net: every library imports and works")

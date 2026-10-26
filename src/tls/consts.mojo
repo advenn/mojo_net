@@ -1,0 +1,75 @@
+"""OpenSSL constants, generated from the OpenSSL 3.5 headers by
+tools/gen_tls_consts.py. Do not edit: run `pixi run gen-tls`, and CI's
+`--check` fails on any drift (rule TB14). The macros' command codes are
+here because the macros themselves are not symbols in libssl."""
+
+from std.ffi import c_int, c_uint
+
+comptime OPENSSL_VERSION_NUMBER: UInt64 = 810549248  # the major.minor line of the headers
+comptime OPENSSL_VERSION: c_int = 0  # OpenSSL_version(): the version text
+comptime OPENSSL_DIR: c_int = 4  # OpenSSL_version(): OPENSSLDIR
+comptime OPENSSL_INIT_NO_LOAD_CONFIG: UInt64 = 128  # OPENSSL_init_ssl: never read openssl.cnf
+comptime SSL_CTRL_SET_TLSEXT_HOSTNAME: c_int = 55  # SSL_set_tlsext_host_name
+comptime TLSEXT_NAMETYPE_host_name: Int = 0  # its name type
+comptime SSL_CTRL_MODE: c_int = 33  # SSL_CTX_set_mode
+comptime SSL_CTRL_CLEAR_MODE: c_int = 78  # SSL_CTX_clear_mode
+comptime SSL_CTRL_SET_MIN_PROTO_VERSION: c_int = 123  # SSL_CTX_set_min_proto_version
+comptime SSL_CTRL_SET_MAX_PROTO_VERSION: c_int = 124  # SSL_CTX_set_max_proto_version
+comptime SSL_CTRL_GET_MIN_PROTO_VERSION: c_int = 130  # SSL_CTX_get_min_proto_version
+comptime SSL_CTRL_GET_MAX_PROTO_VERSION: c_int = 131  # SSL_CTX_get_max_proto_version
+comptime SSL_CTRL_SET_GROUPS_LIST: c_int = 92  # SSL_CTX_set1_groups_list
+comptime SSL_CTRL_SET_SIGALGS_LIST: c_int = 98  # SSL_CTX_set1_sigalgs_list
+comptime SSL_CTRL_SET_SESS_CACHE_MODE: c_int = 44  # SSL_CTX_set_session_cache_mode
+comptime SSL_CTRL_GET_SESS_CACHE_MODE: c_int = 45  # SSL_CTX_get_session_cache_mode
+comptime SSL_SESS_CACHE_OFF: Int = 0  # no session cache
+comptime BIO_C_SET_BUF_MEM_EOF_RETURN: c_int = 130  # BIO_set_mem_eof_return
+comptime TLS1_VERSION: Int = 769
+comptime TLS1_1_VERSION: Int = 770
+comptime TLS1_2_VERSION: Int = 771  # the floor
+comptime TLS1_3_VERSION: Int = 772
+comptime SSL_VERIFY_PEER: c_int = 1
+comptime SSL_FILETYPE_PEM: c_int = 1
+comptime X509_V_FLAG_X509_STRICT: UInt64 = 32
+comptime X509_V_FLAG_TRUSTED_FIRST: UInt64 = 32768
+comptime X509_V_FLAG_PARTIAL_CHAIN: UInt64 = 524288  # kept off
+comptime X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS: c_uint = 4
+comptime X509_CHECK_FLAG_NEVER_CHECK_SUBJECT: c_uint = 32  # no subject CN fallback
+comptime SSL_ERROR_NONE: c_int = 0
+comptime SSL_ERROR_SSL: c_int = 1
+comptime SSL_ERROR_WANT_READ: c_int = 2
+comptime SSL_ERROR_WANT_WRITE: c_int = 3
+comptime SSL_ERROR_WANT_X509_LOOKUP: c_int = 4
+comptime SSL_ERROR_SYSCALL: c_int = 5
+comptime SSL_ERROR_ZERO_RETURN: c_int = 6
+comptime SSL_ERROR_WANT_CONNECT: c_int = 7
+comptime SSL_ERROR_WANT_ACCEPT: c_int = 8
+comptime SSL_ERROR_WANT_ASYNC: c_int = 9
+comptime SSL_ERROR_WANT_ASYNC_JOB: c_int = 10
+comptime SSL_ERROR_WANT_CLIENT_HELLO_CB: c_int = 11
+comptime SSL_ERROR_WANT_RETRY_VERIFY: c_int = 12
+comptime SSL_OP_NO_COMPRESSION: UInt64 = 131072
+comptime SSL_OP_NO_RENEGOTIATION: UInt64 = 1073741824
+comptime SSL_OP_ENABLE_MIDDLEBOX_COMPAT: UInt64 = 1048576
+comptime SSL_OP_NO_TICKET: UInt64 = 16384
+comptime SSL_MODE_AUTO_RETRY: Int = 4
+comptime SSL_MODE_RELEASE_BUFFERS: Int = 16
+comptime X509_V_OK: Int = 0
+comptime X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT: Int = 2
+comptime X509_V_ERR_CERT_SIGNATURE_FAILURE: Int = 7
+comptime X509_V_ERR_CERT_NOT_YET_VALID: Int = 9
+comptime X509_V_ERR_CERT_HAS_EXPIRED: Int = 10
+comptime X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT: Int = 18
+comptime X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN: Int = 19
+comptime X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY: Int = 20
+comptime X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE: Int = 21
+comptime X509_V_ERR_INVALID_CA: Int = 79
+comptime X509_V_ERR_INVALID_PURPOSE: Int = 26
+comptime X509_V_ERR_CERT_UNTRUSTED: Int = 27
+comptime X509_V_ERR_CERT_REJECTED: Int = 28
+comptime X509_V_ERR_HOSTNAME_MISMATCH: Int = 62
+comptime X509_V_ERR_IP_ADDRESS_MISMATCH: Int = 64
+comptime X509_V_ERR_EE_KEY_TOO_SMALL: Int = 66
+comptime X509_V_ERR_CA_KEY_TOO_SMALL: Int = 67
+comptime X509_V_ERR_CA_MD_TOO_WEAK: Int = 68
+comptime ERR_LIB_SSL: Int = 20
+comptime SSL_R_UNEXPECTED_EOF_WHILE_READING: Int = 294

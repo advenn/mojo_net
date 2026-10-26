@@ -15,7 +15,7 @@ A client for Redis and the servers that speak its protocol (Valkey, and others),
 - a deadline per call, a pool, and connection URIs (`redis://`, `unix://`).
 
 **Out of scope for now:**
-- **TLS** (`rediss://`): `net` has no TLS yet, so it is refused, not ignored.
+- **TLS** (`rediss://`): not yet (milestone R8, on the `tls` package), so it is refused, not ignored.
 - Cluster (MOVED/ASK redirects) and Sentinel: their errors reach the caller as server errors.
 - Client-side caching (CLIENT TRACKING), MONITOR, and RESP3's streamed strings and aggregates, which no server sends.
 - An async API (no async/await yet; see `docs/design.md`).

@@ -23,7 +23,7 @@ Leads: COPY (refused with CopyFail for now), TLS once `net` has it, protocol 3.2
 - transactions, a connection pool, LISTEN/NOTIFY.
 
 **Out of scope for now:**
-- **TLS:** `sslmode=require` and stronger, `channel_binding`, SCRAM-SHA-256-PLUS. `net` has no TLS yet. Connections are cleartext, so use them over a Unix socket, a trusted network or a TLS-terminating sidecar.
+- **TLS:** `sslmode=require` and stronger, `channel_binding`, SCRAM-SHA-256-PLUS: not yet (milestone P9, on the `tls` package). Connections are cleartext, so use them over a Unix socket, a trusted network or a TLS-terminating sidecar.
 - GSSAPI, SSPI and Kerberos authentication.
 - The replication protocol. COPY is a P5 candidate.
 - An async API (no async/await yet; see `docs/design.md`).

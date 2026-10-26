@@ -1,6 +1,6 @@
 """T0 spike: which ELF version node each OpenSSL function bound by the spike
 comes from, and a failure if any is newer than OPENSSL_3.5.0 (rule TL2 of
-reports/Secure TLS with C libraries.md). Test-only Python.
+docs/research/tls_with_openssl.md). Test-only Python.
 
     python spikes/tls/symver.py <lib dir> <mojo files...>
 """

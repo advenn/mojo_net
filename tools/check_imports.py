@@ -27,7 +27,7 @@ import sys
 import tempfile
 
 # Dependencies point downward only: linux <- bytes <- net <- rt, and
-# net <- http <- server.
+# net <- http <- server; tls sits on net (and is OpenSSL's only caller).
 # `rt` is frozen and experimental: nothing outside it may import it.
 ALLOWED = {
     "linux": {"linux"},
@@ -39,10 +39,17 @@ ALLOWED = {
     "crypto": {"crypto"},
     "pg": {"linux", "bytes", "net", "crypto", "pg"},
     "redis": {"linux", "bytes", "net", "redis"},
+    "tls": {"linux", "bytes", "net", "tls"},
 }
 # Packages whose protocol logic is sans-I/O: in src/, only the listed
 # modules may import `net` (the rest only parse and build bytes).
-SANS_IO = {"http": {"client.mojo"}, "pg": {"client.mojo"}, "redis": {"client.mojo"}}
+SANS_IO = {
+    "http": {"client.mojo"},
+    "pg": {"client.mojo"},
+    "redis": {"client.mojo"},
+    # (tls.target parses addresses with net.addr, which does no I/O.)
+    "tls": {"stream.mojo", "target.mojo"},
+}
 AREAS = ("src", "tests", "examples", "bench")
 FIXED = {"spikes": "net"}
 
@@ -150,6 +157,9 @@ def _self_test():
         "src/http/n.mojo": ("from rt.core import Loop\n", "http may not import rt"),
         "src/server/o.mojo": ("from http.connection import ServerConnection\nfrom net.tcp import TcpListener\n", None),
         "src/http/p.mojo": ("from server import Server\n", "http may not import server"),
+        "src/tls/client.mojo": ("from net.tcp import TcpStream\n", "are sans-I/O"),
+        "src/tls/stream.mojo": ("from net.tcp import TcpStream\nfrom .client import TlsClient\n", None),
+        "src/net/q.mojo": ("from tls import TlsClient\n", "net may not import tls"),
     }
     with tempfile.TemporaryDirectory() as root:
         for rel, (src, _) in plant.items():
@@ -169,8 +179,8 @@ def _self_test():
         expected = sum(1 for _, w in plant.values() if w is not None)
         if len(bad) != expected:
             errors.append(f"expected {expected} violations, got {len(bad)}:\n{report}")
-        if files != 16:
-            errors.append(f"expected 16 files checked, got {files}")
+        if files != 19:
+            errors.append(f"expected 19 files checked, got {files}")
         if errors:
             sys.exit("check_imports self-test failed:\n" + "\n".join(errors))
 

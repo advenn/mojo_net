@@ -20,7 +20,7 @@ It is the base of the HTTP server (roadmap step 3). Package rules and the shared
 - a blocking `http://` client with a keep-alive pool, connect-by-name and deadlines.
 
 **Out of scope for now:**
-- TLS (`https://`): `net` has no TLS yet.
+- TLS (`https://`): not yet; milestone H8 builds it on the `tls` package (`docs/tls.md`).
 - HTTP/2 and HTTP/3.
 - Content codings (gzip, br). Bodies are delivered as sent, with the coding headers.
 - Cookie jars, caches and proxies.

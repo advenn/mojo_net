@@ -39,7 +39,8 @@ Mechanism and limits:
   (contract 6 forbids global mutable state in `linux`).
 - Only syscalls issued through `linux.syscall` are seen. libc, the Mojo
   runtime and Python interop make their own syscalls; those are neither
-  counted nor faulted.
+  counted nor faulted. Seams elsewhere (the `tls` package's OpenSSL calls)
+  call `fire` with numbers from `SEAM_BASE` up.
 - Counters exist for syscall numbers `0 <= nr < 1024` (all numbers on
   x86_64 and aarch64 today). Each intercepted call costs a runtime lookup
   plus a scan of the rules.
@@ -195,6 +196,21 @@ def inject_short(
     ):
         raise IoError.of_kind("fault.inject_short", ErrorKind.InvalidInput)
     _add("fault.inject_short", nr, _SHORT, max_bytes, skip, times, every)
+
+
+def fire(nr: Int) -> Int:
+    """For seams outside `linux.syscall` (the `tls` package numbers its
+    OpenSSL seams from `SEAM_BASE`): count a call to `nr` and return the
+    value of the `inject` rule that fires on it (its errno, which the seam
+    reads as it documents), or 0 when none does."""
+    comptime assert ENABLED, _NEED_DEFINE
+    var length = 0
+    return -_intercept(nr, length)
+
+
+comptime SEAM_BASE = 1000
+"""Numbers from here to 1023 are no syscall (the highest is ~470): seams
+outside `linux.syscall` use them with `inject` and `fire`."""
 
 
 def clear():

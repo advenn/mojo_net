@@ -25,7 +25,7 @@ build:
   noarch: generic
   script:
     - mkdir -p "$PREFIX/lib/mojo" check
-    - for pkg in linux bytes crypto net http server pg redis; do mojo precompile -I src "src/$pkg" -o "check/$pkg.mojoc" || exit 1; cp -R "src/$pkg" "$PREFIX/lib/mojo/$pkg"; done
+    - for pkg in linux bytes crypto net tls http server pg redis; do mojo precompile -I src "src/$pkg" -o "check/$pkg.mojoc" || exit 1; cp -R "src/$pkg" "$PREFIX/lib/mojo/$pkg"; done
     - find "$PREFIX/lib/mojo" -name __pycache__ -prune -exec rm -rf {} +
 
 requirements:
@@ -35,6 +35,10 @@ requirements:
     - mojo-compiler >=1.2,<1.3
     # (raw Linux syscalls: x86_64 or aarch64, kernel 5.15 or newer)
     - __linux
+    # tls: OpenSSL's libssl.so.3, loaded at run time from this environment
+    # (3.5 or a later 3.x: docs/tls.md), and the CA bundle it trusts.
+    - openssl >=3.5,<4
+    - ca-certificates
 
 tests:
   - script:
@@ -50,7 +54,8 @@ about:
   description: |
     Raw Linux syscalls (linux), byte buffers and the sans-I/O codec contract
     (bytes), TCP/Unix/UDP sockets with deadlines, DNS and Happy Eyeballs
-    (net), HTTP/1.1 (http) and an HTTP/1.1 server (server), a PostgreSQL
-    driver (pg), a Redis client (redis), and the hashes they authenticate
-    with (crypto). Linux only, x86_64 and aarch64.
+    (net), TLS through OpenSSL (tls), HTTP/1.1 (http) and an HTTP/1.1
+    server (server), a PostgreSQL driver (pg), a Redis client (redis), and
+    the hashes they authenticate with (crypto). Linux only, x86_64 and
+    aarch64.
   # (no licence chosen yet; one is required before publishing)
