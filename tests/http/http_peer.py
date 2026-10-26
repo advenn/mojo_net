@@ -23,6 +23,14 @@ Routes:
     *    /bye-later        "ok" with keep-alive, then 200 ms later the server closes
                            the idle connection (with close_notify over TLS)
     GET  /slow             answers after 5 s
+    GET  /sse?n=N          N server-sent events (chunked), 20 ms apart: id 1..N,
+                           event "tick" for odd ids, data "n=<id>", a comment
+                           between, then "data: [DONE]"
+    GET  /sse-forever      an event every 20 ms until the client goes away; then
+                           /cancelled counts it
+    GET  /cancelled        how many /sse-forever streams ended by the client leaving
+    GET  /not-sse          a chunked text/plain body
+    GET  /typed?t=X        the same with Content-Type X (percent-decoded)
     *    /flaky            the first request on a connection gets "ok"; any later
                            one is read and the connection closed without an answer
     POST|PUT /echo         the request body back (Content-Length or chunked request)
@@ -51,8 +59,10 @@ import struct
 import sys
 import threading
 import time
+import urllib.parse
 
 _ids = itertools.count(1)
+_cancelled = [0]
 _early_done = threading.Event()
 _early_got = [0]
 
@@ -84,6 +94,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+
+    def _chunk(self, data):
+        self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+        self.wfile.flush()
 
     def _read_body(self):
         if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
@@ -152,6 +166,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     pass
             else:
                 self.connection.shutdown(socket.SHUT_RDWR)
+        elif path.startswith("/sse?n="):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for i in range(1, int(path[7:]) + 1):
+                ev = f"id: {i}\n" + ("event: tick\n" if i % 2 else "") + f"data: n={i}\n\n: between\n"
+                self._chunk(ev.encode())
+                time.sleep(0.02)
+            self._chunk(b"data: [DONE]\n\n")
+            self.wfile.write(b"0\r\n\r\n")
+        elif path == "/sse-forever":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.close_connection = True
+            try:
+                i = 0
+                while True:
+                    i += 1
+                    self._chunk(f"data: {i}\n\n".encode())
+                    time.sleep(0.02)
+            except OSError:
+                _cancelled[0] += 1
+        elif path == "/cancelled":
+            self._send(200, str(_cancelled[0]).encode())
+        elif path == "/not-sse" or path.startswith("/typed?t="):
+            self.send_response(200)
+            ctype = "text/plain" if path == "/not-sse" else urllib.parse.unquote(path[9:])
+            self.send_header("Content-Type", ctype)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self._chunk(b"data: no\n\n")
+            self.wfile.write(b"0\r\n\r\n")
         elif path == "/slow":
             time.sleep(5)
             self._send(200, b"late")

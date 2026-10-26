@@ -14,7 +14,7 @@ Native Mojo networking libraries for Linux (x86_64 and aarch64, kernel 5.15+):
 | `crypto` | SHA-256, MD5, HMAC-SHA-256, PBKDF2 and a constant-time comparison, for authentication protocols (no ciphers) | done for `pg` |
 | `net` | the TCP/UDP library: addresses, every socket option, TCP/Unix streams with deadlines, connect by name, buffered frame reads, UDP sockets (blocking, nonblocking, batched, multicast) ([docs/net.md](docs/net.md)) | TCP client and UDP stable |
 | `tls` | TLS 1.2/1.3 through OpenSSL 3.5: a verifying client (system roots or a CA file, names and IP addresses, ALPN) as a sans-I/O state machine, and a blocking stream; no knob loosens verification ([docs/tls.md](docs/tls.md)) | client done (T1); not yet reviewed by a TLS expert |
-| `http` | HTTP/1.1: a sans-I/O head parser, body framing and connection codecs for both sides, and a blocking `http://` and `https://` client with a keep-alive pool ([docs/http.md](docs/http.md)) | done |
+| `http` | HTTP/1.1: a sans-I/O head parser, body framing and connection codecs for both sides, server-sent events, and a blocking `http://` and `https://` client with a keep-alive pool and streamed responses ([docs/http.md](docs/http.md)) | done |
 | `server` | an HTTP/1.1 server: one epoll loop per process, a `Handler` trait, timeouts and backpressure, streamed bodies and server-sent events, graceful shutdown on SIGTERM; supervised worker processes on one port with SO_REUSEPORT; a router and static files ([docs/server.md](docs/server.md)) | done through S5 |
 | `pg` | a PostgreSQL driver: a sans-I/O protocol codec, authentication up to SCRAM-SHA-256, a blocking client with parameters, binary types, a statement cache, transactions, LISTEN/NOTIFY and a pool ([docs/pg.md](docs/pg.md)) | done (P7: reviewed); no TLS or COPY yet |
 | `redis` | a Redis client: a sans-I/O RESP2/RESP3 codec with typed replies, a blocking client with pipelines, transactions and typed helpers ([docs/redis.md](docs/redis.md)) | in progress: R3 of 6 done |
@@ -62,7 +62,7 @@ More in `examples/net/`:
 
 In `examples/pg/`: `query`, which runs SQL against PostgreSQL from a `postgresql://` URI and prints each result; `listen`, which waits for notifications on a channel. In `examples/redis/`: `cli`, which runs one command against a Redis or Valkey server and prints the reply; `transfer`, which moves an amount between two balances with WATCH and a transaction.
 
-And in `examples/http/`: `http_get`, a small `curl` built on `http.client.Client`; `hello_server`, an epoll server driving one `ServerConnection` per connection (over 1M pipelined requests per second on one core). In `examples/server/`: `hello`, the same on `server.Server`; `workers`, one supervised worker process per CPU on one port, stopped gracefully by SIGTERM or Ctrl-C; `files`, a static file server.
+And in `examples/http/`: `http_get`, a small `curl` built on `http.client.Client`; `sse_events`, which prints a URL's server-sent events as they arrive (as from an LLM API); `hello_server`, an epoll server driving one `ServerConnection` per connection (over 1M pipelined requests per second on one core). In `examples/server/`: `hello`, the same on `server.Server`; `workers`, one supervised worker process per CPU on one port, stopped gracefully by SIGTERM or Ctrl-C; `files`, a static file server.
 
 ## Develop
 Everything runs through [pixi](https://pixi.sh):

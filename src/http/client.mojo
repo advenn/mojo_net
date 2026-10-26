@@ -73,6 +73,7 @@ from tls.stream import TlsStream
 from .connection import E_NO_RESPONSE, ClientConnection, ClientEvent, EventKind
 from .headers import Headers, is_token, lower_ascii
 from .parse import RequestHead
+from .sse import SseEvent, SseParser
 from .types import Version
 
 comptime _READ_SIZE = 64 * 1024
@@ -148,7 +149,7 @@ struct Url(Copyable, Movable, Writable):
             # ... and an IPv6 address: `[127.0.0.1]` or `[1234]` would
             # otherwise reach the resolver, or connect over IPv4, while a
             # URL check elsewhere saw an IPv6 literal.
-            var v6 = False
+            var v6: Bool
             try:
                 v6 = IpAddr.parse(StringSlice(unsafe_from_utf8=b[host_lo:host_hi])).is_ipv6()
             except:
@@ -263,6 +264,159 @@ struct Response(Movable, Writable):
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write(self.version, " ", self.status, " ", self.reason, " (", len(self.body), " bytes)")
+
+
+struct StreamedResponse(Movable, Writable):
+    """A response whose body is read as it arrives (`Client.stream`). It
+    owns its connection: dropping it closes the connection (the way to
+    cancel a stream), and `Client.release` pools a finished one."""
+
+    var status: Int
+    var reason: String
+    var version: Version
+    var headers: Headers
+    var trailers: Headers
+    """Set once the body has ended."""
+    var _conn: List[_Conn]
+    """The connection (one element), until released."""
+    var _ev: ClientEvent
+    var _buf: List[UInt8]
+    var _piece: List[UInt8]
+    """Body bytes received but not yet read, from `_off` on."""
+    var _off: Int
+    var _done: Bool
+    var _idle: Duration
+    var _total: Deadline
+
+    def __init__(out self, var r: Response, var conn: List[_Conn], idle: Duration, total: Deadline):
+        self.status = r.status
+        self.reason = r.reason
+        self.version = r.version
+        self.headers = Headers()
+        swap(self.headers, r.headers)
+        self.trailers = Headers()
+        self._conn = conn^
+        self._ev = ClientEvent(EventKind.END)
+        self._buf = List[UInt8](length=_READ_SIZE, fill=0)
+        self._piece = List[UInt8]()
+        self._off = 0
+        self._done = False
+        self._idle = idle
+        self._total = total
+
+    def read(mut self, buf: MutSpan[UInt8, _]) raises IoError -> Int:
+        """Body bytes into `buf` as they arrive: how many, 0 at the end (or
+        for an empty `buf`). `TimedOut` after `idle_timeout` without any, or
+        past `total`; the transport's error if the connection fails. A
+        body delimited by the end of a TLS connection must end with
+        close_notify (`UnexpectedEof` otherwise: RFC 9112 9.8)."""
+        if len(buf) == 0:
+            return 0
+        while True:
+            var left = len(self._piece) - self._off
+            if left > 0:
+                var n = min(left, len(buf))
+                for i in range(n):
+                    buf[i] = self._piece[self._off + i]
+                self._off += n
+                return n
+            if self._done or len(self._conn) == 0:
+                return 0
+            ref c = self._conn[0]
+            if c.codec.poll(self._ev):
+                if self._ev.kind == EventKind.DATA:
+                    swap(self._piece, self._ev.data)
+                    self._off = 0
+                elif self._ev.kind == EventKind.END:
+                    self.trailers = self._ev.take_trailers()
+                    self._done = True
+                else:  # (no 1xx or switch after the final head)
+                    raise IoError.of_kind("StreamedResponse.read", ErrorKind.InvalidData)
+                continue
+            var deadline = Deadline.after(self._idle).earliest(self._total)
+            if self._total.is_expired():
+                raise IoError.of_kind("StreamedResponse.read", ErrorKind.TimedOut)
+            c.stream.set_deadline(deadline)
+            var room = min(_READ_SIZE, c.codec.feed_capacity())
+            var n = c.stream.read(Span(self._buf)[0:room])
+            if n == 0:
+                c.codec.feed_eof()
+            else:
+                c.codec.feed(Span(self._buf)[0:n])
+
+    def read_all(mut self, max_bytes: Int = 16 * 1024 * 1024) raises IoError -> List[UInt8]:
+        """The rest of the body; `InvalidData` past `max_bytes`."""
+        var out = List[UInt8]()
+        var buf = List[UInt8](length=16384, fill=0)
+        while True:
+            var n = self.read(Span(buf))
+            if n == 0:
+                return out^
+            if len(out) + n > max_bytes:
+                raise IoError.of_kind("StreamedResponse.read_all", ErrorKind.InvalidData)
+            out.extend(Span(buf)[0:n])
+
+    def is_done(self) -> Bool:
+        """Whether the body has been read to its end."""
+        return self._done and self._off >= len(self._piece)
+
+    def last_tls_error(self) -> Optional[TlsError]:
+        if len(self._conn) == 0:
+            return None
+        return self._conn[0].stream.failure.copy()
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write(self.version, " ", self.status, " ", self.reason, " (streamed)")
+
+
+struct EventStream(Movable):
+    """Server-sent events from a streamed response (`http.sse`):
+
+        var r = client.stream("POST", url, headers, body)
+        if r.status != 200: ...                 # an error body, not events
+        var events = EventStream(r^)
+        var ev = SseEvent()
+        while events.next(ev):
+            print(ev.event, ev.data)
+
+    `InvalidData` if the response is not `text/event-stream`."""
+
+    var response: StreamedResponse
+    var parser: SseParser
+    var _buf: List[UInt8]
+
+    def __init__(out self, var response: StreamedResponse) raises IoError:
+        var ct = response.headers.get("content-type")
+        var ok = False
+        if ct:
+            # The media type, parameters after ";" aside (RFC 9110 8.3.1).
+            var v = String(ct.value()).lower()
+            var semi = v.find(";")
+            var media = String(v[byte=0:semi]) if semi >= 0 else v
+            ok = media.strip() == "text/event-stream"
+        if not ok:
+            raise IoError.of_kind("EventStream", ErrorKind.InvalidData)
+        self.response = response^
+        self.parser = SseParser()
+        self._buf = List[UInt8](length=16384, fill=0)
+
+    def next(mut self, mut ev: SseEvent) raises IoError -> Bool:
+        """The next event into `ev`; False once the stream has ended."""
+        while True:
+            if self.parser.poll(ev):
+                return True
+            var room = min(len(self._buf), self.parser.feed_capacity())
+            if room <= 0:
+                return False
+            var n = self.response.read(Span(self._buf)[0:room])
+            if n == 0:
+                self.parser.feed_eof()
+                return self.parser.poll(ev)
+            self.parser.feed(Span(self._buf)[0:n])
+
+    def last_event_id(self) -> String:
+        """For a reconnection's Last-Event-ID."""
+        return self.parser.last_event_id()
 
 
 # ---- the client ------------------------------------------------------------------
@@ -415,6 +569,8 @@ struct Client(Movable):
     var _buf: List[UInt8]
     var _ev: ClientEvent
     """Reused for every event (`ClientConnection.poll`)."""
+    var _head_only: Bool
+    """`stream`: a response counts as come at its final head."""
 
     def __init__(
         out self,
@@ -446,6 +602,7 @@ struct Client(Movable):
         self._pool = List[_Conn]()
         self._buf = List[UInt8](length=_READ_SIZE, fill=0)
         self._ev = ClientEvent(EventKind.END)
+        self._head_only = False
 
     # ---- requests --------------------------------------------------------
 
@@ -473,6 +630,55 @@ struct Client(Movable):
         whole response. Errors: `InvalidInput` for a bad URL, method or
         header set; `TimedOut` past the deadline; `InvalidData` for a
         malformed response or one over `max_body`; the transport's errors."""
+        var kept = List[_Conn]()
+        return self._perform(method, url, headers, body, kept, False)
+
+    def stream(
+        mut self,
+        method: StringSlice,
+        url: StringSlice,
+        headers: Headers = Headers(),
+        body: Span[UInt8, _] = Span[UInt8, ImmStaticOrigin](),
+        *,
+        idle_timeout: Duration = Duration.from_secs(60),
+        total: Duration = Duration.MAX,
+    ) raises IoError -> StreamedResponse:
+        """Send the request as `request` does, and return as soon as the
+        response's head has come (within `timeout`): read the body as it
+        arrives with `StreamedResponse.read`, for streamed tokens or
+        server-sent events (`EventStream`). Each read waits at most
+        `idle_timeout` for more of the body, and all of it must come
+        within `total` (no limit by default). Dropping the response closes
+        the connection, which is how a client cancels; `release` gives a
+        finished one back to the pool."""
+        if not (Duration.ZERO < idle_timeout):
+            raise IoError.of_kind("Client.stream", ErrorKind.InvalidInput)
+        var kept = List[_Conn]()
+        var r = self._perform(method, url, headers, body, kept, True)
+        var d = Deadline.none() if total == Duration.MAX else Deadline.after(total)
+        return StreamedResponse(r^, kept^, idle_timeout, d)
+
+    def release(mut self, var r: StreamedResponse):
+        """Return a streamed response's connection to the pool, if its body
+        was read to the end and the connection is fit for reuse (dropping
+        the response closes it instead)."""
+        if len(r._conn) == 0 or not r._done:
+            return
+        var c = r._conn.pop()
+        if c.codec.is_idle():
+            self._checkin(c^)
+
+    def _perform(
+        mut self,
+        method: StringSlice,
+        url: StringSlice,
+        headers: Headers,
+        body: Span[UInt8, _],
+        mut kept: List[_Conn],
+        head_only: Bool,
+    ) raises IoError -> Response:
+        """`request`, or with `head_only`, up to the final head: the
+        connection then goes to `kept` with the rest of the response."""
         comptime op = "Client.request"
         var u = Url.parse(url)
         if (
@@ -509,17 +715,22 @@ struct Client(Movable):
                 conn = _Conn(key, self._connect(u, deadline))
             var c = conn.take()
             var started = False
+            self._head_only = head_only
             try:
                 var r = self._exchange(c, head, body, deadline, started)
+                self._head_only = False
                 if reused and r.status == 408 and not retried and _idempotent(method):
                     # The server timed the idle connection out as the
                     # request arrived (it never ran it): once more, anew.
                     retried = True
                     continue
-                if c.codec.is_idle():
+                if head_only:
+                    kept.append(c^)
+                elif c.codec.is_idle():
                     self._checkin(c^)
                 return r^
             except e:
+                self._head_only = False
                 if c.stream.failure:
                     self._tls_error = c.stream.failure.value().copy()
                 # (A reused TLS connection the server ended without
@@ -702,6 +913,8 @@ struct Client(Movable):
                 r.reason = h.reason
                 r.version = h.version
                 swap(r.headers, h.headers)
+                if self._head_only:
+                    return True  # (the body stays in the codec, for the stream)
             elif ev.kind == EventKind.DATA:
                 if len(r.body) + len(ev.data) > self.max_body:
                     raise IoError.of_kind("Client.request", ErrorKind.InvalidData)

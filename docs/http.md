@@ -85,6 +85,50 @@ def main() raises:
 - **HTTPS:** `Client(tls=ClientConfig(trust=Trust.ca_file("ca.pem")))` trusts a private CA instead of the system roots; nothing loosens verification (`docs/tls.md`). The certificate must hold the URL's host, or its IP address. ALPN offers `http/1.1`. OpenSSL loads on the first `https://` request.
 - **The end of a TLS connection** (RFC 9112 9.8): a response complete by its Content-Length or its last chunk stands when the server then ends the connection without close_notify, as many do. A response delimited by the end of the connection needs close_notify, or it raises `UnexpectedEof`: without close_notify, it may have been cut short.
 
+### Streaming and server-sent events
+`Client.stream` returns once the response head has arrived, and the body is read as it comes: streamed tokens from an LLM API, a large download, or server-sent events.
+
+```mojo
+from http.client import Client, EventStream
+from http.headers import Headers
+from http.retry import retry_after
+from http.sse import SseEvent
+from linux.time import Duration, unix_time_ns
+
+
+def main() raises:
+    var client = Client()
+    var h = Headers()
+    h.add("Content-Type", "application/json")
+    var body = String('{"stream": true}')
+    var r = client.stream(
+        "POST", "https://api.example.com/v1/chat", h, body.as_bytes(), idle_timeout=Duration.from_secs(30)
+    )
+    if r.status == 429:  # Retry-After, or retry-after-ms
+        print(retry_after(r.headers, unix_time_ns() // 1_000_000_000).value())
+        return
+    var events = EventStream(r^)  # InvalidData unless text/event-stream
+    var ev = SseEvent()
+    while events.next(ev):
+        if ev.data == "[DONE]":
+            break
+        print(ev.event, ev.data)
+```
+
+The whole program is `examples/http/sse_events.mojo`.
+
+- **Timeouts:**
+  - the client's `timeout` covers the request up to the response head;
+  - after that, each read waits at most `idle_timeout` (60 s by default) for more of the body;
+  - all of the body must arrive within `total` (unlimited by default).
+  - Either one raises `TimedOut`.
+- **Cancelling:** drop the `StreamedResponse` or `EventStream`. That closes its connection, so the server's next write fails.
+- **Reuse:** `client.release(r^)` pools the connection of a response read to its end. A response not read to its end is closed instead.
+- **`EventStream`** needs the media type `text/event-stream`, in any case, with or without parameters. Each `next(ev)` refills `ev`, and returns False at the end of the stream. `last_event_id()` gives the value to send as `Last-Event-ID` when reconnecting. The parser is `http.sse.SseParser`, which also parses event streams on its own.
+- **`http.retry`:**
+  - `retry_after(headers, now_unix)` reads `retry-after-ms` (OpenAI's API sends it) first, then `Retry-After` as seconds or as an HTTP-date. A date in the past gives 0. A malformed value gives None.
+  - `parse_http_date` reads the three forms of RFC 9110 5.6.7.
+
 ## Using the server codec
 `ServerConnection` does HTTP for one connection and no I/O. The driver feeds it what the socket reads and sends what it hands out. This is the loop of `examples/http/hello_server.mojo` (edge-triggered epoll) without the epoll part:
 
@@ -136,7 +180,9 @@ while True:
 | `parse` | `HeadParser`: incremental, limit-checked parsing of request and response heads into `RequestHead` / `ResponseHead`, which also encode themselves; `Limits`; the `E_*` rule names errors carry |
 | `body` | `request_framing` / `response_framing` (RFC 9112 6.3) and `content_length`; `BodyDecoder`: Content-Length, chunked with trailers, or to the end of the connection, returning ranges of the caller's input (`Piece`); `encode_chunk` / `encode_last_chunk` |
 | `connection` | `ServerConnection` and `ClientConnection`: one HTTP/1.1 connection each side as a `Codec` (events `HEAD` / `DATA` / `END`, plus `INFORMATIONAL` and `UPGRADE` for clients); framing and persistence headers on what they send |
-| `client` | `Client`: blocking requests to `http://` URLs with one deadline each, whole responses up to `max_body`, a keep-alive pool and a safe retry; `Url`, `Response`. Not re-exported from `http` (it imports `net`) |
+| `sse` | `SseParser`: the WHATWG event-stream parser as a `Codec` (`SseEvent`); `write_event` / `write_comment`, the encoder |
+| `retry` | `retry_after` (Retry-After, retry-after-ms) and `parse_http_date` (RFC 9110's three forms) |
+| `client` | `Client`: blocking requests to `http://` and `https://` URLs with one deadline each, whole responses up to `max_body`, or streamed (`stream`, `StreamedResponse`, `EventStream`); a keep-alive pool and a safe retry; `Url`, `Response`. Not re-exported from `http` (it imports `net` and `tls`) |
 
 ## Milestones
 - **H1: core types and the header map.** Done.
@@ -229,10 +275,28 @@ while True:
     - a `HeadParser` given less input than it already scanned raises instead of reading past it;
     - unworkable `Limits` are refused when the connection is made;
     - `Headers(capacity=-1)` no longer aborts.
+- **H7: streaming responses and server-sent events.** Done (after H8).
+  - `Client.stream` returns at the response head. `StreamedResponse.read` takes the body as it arrives, under `idle_timeout` per read and `total` for all of it; `read_all` reads it whole. Dropping the response cancels it, and `release` pools one read to its end.
+  - `EventStream` reads server-sent events from a streamed response of type `text/event-stream`.
+  - `http.sse`:
+    - `SseParser` follows the WHATWG algorithm: CR, LF or CRLF line ends, split anywhere across reads; the BOM; comments; the ID taken at dispatch and carried over; `retry` only when all digits; an unfinished event dropped at the end (`discarded()`).
+    - It is bounded by `max_line` and `max_data`.
+    - `write_event` / `write_comment` are the encoder, for the server side (S6).
+  - `http.retry`: `retry_after` (`retry-after-ms` first, then `Retry-After` as seconds or an HTTP-date) and `parse_http_date`, which reads all three forms and refuses impossible dates.
+  - **Tested:**
+    - `tests/http/test_sse.mojo`: the standard's examples and 400 random streams fed in random pieces, against `tests/http/sse_oracle.py`, a reference written from the standard's text; chunking invariance; bounds; the encoder's output parsed back.
+    - `test_retry.mojo`: 3,000 random instants in the three forms against Python's `email.utils`; leap years (2000, 2100); leap seconds; RFC 850's two-digit years.
+    - `test_client_stream.mojo`, against `http_peer.py`: a dripping body read as it arrives; 3 MB read whole, then reuse; a partly read stream not pooled; both timeouts; events over http and https; cancellation seen by the server; the media type checked exactly.
+  - **Planted bugs:** 20. The 18 that change behaviour are each caught by a failing test:
+    - 10 in the parser: line ends split across reads, the BOM, the ID's timing, NUL IDs, `retry`'s digits, the end of the stream, the space after the colon, both bounds, the event type's reset;
+    - 6 in the dates: the two-digit-year pivot, month lengths, the century leap rule, asctime's padded day, `retry-after-ms` first, seconds past 60;
+    - 2 in streaming: the idle timeout, the media type.
+    - The other two are equivalent to the original: `release` without its `_done` check (the codec is idle only once the END has been read), and a past date's wait without `max(0, ...)` (`Duration` clamps it to 0).
+  - **Example:** `examples/http/sse_events.mojo`, for a GET or a JSON POST, prints events as they arrive and reports how long a 429 or 503 asks to wait.
 - **H8: HTTPS.** Done.
   - `Url.parse` takes `https://` (port 443 by default; `authority()` omits the scheme's port).
   - `Client` connects TCP, then runs a verified handshake with `tls.stream.TlsStream`, within the request's deadline. The pool key includes the scheme. A pooled TLS connection is reused if nothing but TLS's own messages arrived while it was idle (TLS 1.3 sends session tickets after the first response). A reused one the server ended without close_notify before any response byte is retried, as a dropped plain one is.
   - Truncation per RFC 9112 9.8 (above); `last_tls_error()` for the reason of a TLS failure.
   - **Tested** (`tests/http/test_https.mojo`) against `http_peer.py --tls`: bodies by length, chunked, to close_notify, 3 MB down and 2 MB up, full duplex, an early 413; reuse with session tickets; an `http://` request to the same host and port never given the pooled TLS connection; a POST after the server closed the idle connection with close_notify; the retry of a dropped connection and of a 408; the ends of a connection with and without close_notify; an untrusted CA, a certificate for another name and for another address.
   - **Planted bugs**, each caught: a pool check that always reuses, no retry after a truncated end, a truncated end taken as the end of a close-delimited body, a pool key without the scheme.
-- **Later:** a streaming response API on the client (H7), redirects, content codings.
+- **Later:** redirects, content codings.
