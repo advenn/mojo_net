@@ -1,0 +1,1214 @@
+{
+ "versions": {
+  "cpu": "model name\t: 11th Gen Intel(R) Core(TM) i5-1145G7 @ 2.60GHz",
+  "kernel": "6.12.111+deb13-amd64",
+  "mojo": "Mojo 1.2.0 (2016d0cd)",
+  "nginx": "nginx version: nginx/1.31.8",
+  "go": "go version go1.26.2 linux/amd64",
+  "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)",
+  "wrk": "wrk d40fce9-dirty [epoll] Copyright (C) 2012 Will Glozer"
+ },
+ "duration_s": 10,
+ "runs": [
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 408.0,
+    "75%": 441.0,
+    "90%": 633.0,
+    "99%": 1160.0
+   },
+   "requests": 1425264,
+   "rps": 141117.72,
+   "wrk_cpu_s": 13.267226,
+   "server_cpu_s": 10.04,
+   "server_us_per_req": 7.044308984160128,
+   "wrk_cpu_share": 0.33168065,
+   "load": 2.74169921875,
+   "server": "mojo",
+   "scenario": "1cpu-keepalive",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 425.0,
+    "75%": 596.0,
+    "90%": 683.0,
+    "99%": 1070.0
+   },
+   "requests": 1307999,
+   "rps": 129504.02,
+   "wrk_cpu_s": 13.350288,
+   "server_cpu_s": 10.07,
+   "server_us_per_req": 7.698782644329238,
+   "wrk_cpu_share": 0.33375720000000003,
+   "load": 2.89794921875,
+   "server": "nginx",
+   "scenario": "1cpu-keepalive",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1200.0,
+    "75%": 1690.0,
+    "90%": 2410.0,
+    "99%": 4019.9999999999995
+   },
+   "requests": 527411,
+   "rps": 52508.11,
+   "wrk_cpu_s": 6.453531999999996,
+   "server_cpu_s": 9.91,
+   "server_us_per_req": 18.789900096888385,
+   "wrk_cpu_share": 0.16133829999999988,
+   "load": 2.9140625,
+   "server": "go",
+   "scenario": "1cpu-keepalive",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 414.0,
+    "75%": 574.0,
+    "90%": 635.0,
+    "99%": 1590.0
+   },
+   "requests": 1354596,
+   "rps": 134134.29,
+   "wrk_cpu_s": 14.764129000000004,
+   "server_cpu_s": 10.04,
+   "server_us_per_req": 7.411803962214564,
+   "wrk_cpu_share": 0.3691032250000001,
+   "load": 3.08740234375,
+   "server": "hyper",
+   "scenario": "1cpu-keepalive",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 4770.0,
+    "75%": 6990.0,
+    "90%": 9710.0,
+    "99%": 14390.0
+   },
+   "requests": 4710768,
+   "rps": 467542.51,
+   "wrk_cpu_s": 5.833891000000001,
+   "server_cpu_s": 9.96,
+   "server_us_per_req": 2.1143049286231035,
+   "wrk_cpu_share": 0.14584727500000003,
+   "load": 3.3818359375,
+   "server": "mojo",
+   "scenario": "1cpu-pipelined",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 19380.0,
+    "75%": 29500.0,
+    "90%": 40070.0,
+    "99%": 236810.0
+   },
+   "requests": 1158193,
+   "rps": 114810.73,
+   "wrk_cpu_s": 8.461407000000001,
+   "server_cpu_s": 9.98,
+   "server_us_per_req": 8.616871281384018,
+   "wrk_cpu_share": 0.21153517500000002,
+   "load": 3.45751953125,
+   "server": "nginx",
+   "scenario": "1cpu-pipelined",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 39600.0,
+    "75%": 62890.0,
+    "90%": 80500.0,
+    "99%": 107310.0
+   },
+   "requests": 651264,
+   "rps": 64558.84,
+   "wrk_cpu_s": 4.311142999999994,
+   "server_cpu_s": 9.98,
+   "server_us_per_req": 15.32404677672956,
+   "wrk_cpu_share": 0.10777857499999985,
+   "load": 3.69482421875,
+   "server": "go",
+   "scenario": "1cpu-pipelined",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 3650.0,
+    "75%": 5330.0,
+    "90%": 7120.0,
+    "99%": 9390.0
+   },
+   "requests": 6147312,
+   "rps": 608662.53,
+   "wrk_cpu_s": 8.170387999999996,
+   "server_cpu_s": 9.98,
+   "server_us_per_req": 1.6234738044856027,
+   "wrk_cpu_share": 0.20425969999999988,
+   "load": 3.6083984375,
+   "server": "hyper",
+   "scenario": "1cpu-pipelined",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 11810.0,
+    "75%": 14630.0,
+    "90%": 16140.0,
+    "99%": 18420.0
+   },
+   "requests": 809109,
+   "rps": 80408.36,
+   "wrk_cpu_s": 10.093253000000004,
+   "server_cpu_s": 9.88,
+   "server_us_per_req": 12.210962923413286,
+   "wrk_cpu_share": 0.2523313250000001,
+   "load": 4.1845703125,
+   "server": "mojo",
+   "scenario": "1cpu-1024conns",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 11990.0,
+    "75%": 14010.0,
+    "90%": 14970.0,
+    "99%": 18740.0
+   },
+   "requests": 829857,
+   "rps": 82587.81,
+   "wrk_cpu_s": 10.111919999999998,
+   "server_cpu_s": 9.85,
+   "server_us_per_req": 11.869514868224284,
+   "wrk_cpu_share": 0.25279799999999997,
+   "load": 4.0888671875,
+   "server": "nginx",
+   "scenario": "1cpu-1024conns",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 23800.0,
+    "75%": 27160.0,
+    "90%": 31020.0,
+    "99%": 38670.0
+   },
+   "requests": 426448,
+   "rps": 42290.15,
+   "wrk_cpu_s": 5.957375000000013,
+   "server_cpu_s": 9.96,
+   "server_us_per_req": 23.35571980640078,
+   "wrk_cpu_share": 0.14893437500000034,
+   "load": 4.814453125,
+   "server": "go",
+   "scenario": "1cpu-1024conns",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 10380.0,
+    "75%": 12230.0,
+    "90%": 14010.0,
+    "99%": 15920.0
+   },
+   "requests": 925978,
+   "rps": 91994.45,
+   "wrk_cpu_s": 11.158517000000003,
+   "server_cpu_s": 9.89,
+   "server_us_per_req": 10.68059932309407,
+   "wrk_cpu_share": 0.2789629250000001,
+   "load": 5.74658203125,
+   "server": "hyper",
+   "scenario": "1cpu-1024conns",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 687.0,
+    "75%": 1320.0,
+    "90%": 3310.0,
+    "99%": 7450.0
+   },
+   "requests": 2260924,
+   "rps": 223965.49,
+   "wrk_cpu_s": 25.898941000000008,
+   "server_cpu_s": 32.2,
+   "server_us_per_req": 14.24196478961699,
+   "wrk_cpu_share": 0.6474735250000002,
+   "load": 5.50634765625,
+   "server": "mojo",
+   "scenario": "4cpu-keepalive",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 629.0,
+    "75%": 1240.0,
+    "90%": 3320.0,
+    "99%": 7400.0
+   },
+   "requests": 2409742,
+   "rps": 238752.94,
+   "wrk_cpu_s": 27.090852999999953,
+   "server_cpu_s": 30.64,
+   "server_us_per_req": 12.715054142725652,
+   "wrk_cpu_share": 0.6772713249999989,
+   "load": 6.73876953125,
+   "server": "nginx",
+   "scenario": "4cpu-keepalive",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 2070.0,
+    "75%": 3710.0,
+    "90%": 6060.0,
+    "99%": 13190.0
+   },
+   "requests": 1101869,
+   "rps": 109223.38,
+   "wrk_cpu_s": 14.489165000000014,
+   "server_cpu_s": 33.21,
+   "server_us_per_req": 30.139699002331493,
+   "wrk_cpu_share": 0.3622291250000004,
+   "load": 8.1455078125,
+   "server": "go",
+   "scenario": "4cpu-keepalive",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 597.0,
+    "75%": 1050.0,
+    "90%": 3270.0,
+    "99%": 6860.0
+   },
+   "requests": 2588983,
+   "rps": 257113.75,
+   "wrk_cpu_s": 28.758123000000012,
+   "server_cpu_s": 29.77,
+   "server_us_per_req": 11.498723630089499,
+   "wrk_cpu_share": 0.7189530750000003,
+   "load": 8.73876953125,
+   "server": "hyper",
+   "scenario": "4cpu-keepalive",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1920.0,
+    "75%": 2820.0,
+    "90%": 3510.0,
+    "99%": 6120.0
+   },
+   "requests": 11388240,
+   "rps": 1129728.0,
+   "wrk_cpu_s": 16.127636999999993,
+   "server_cpu_s": 39.44,
+   "server_us_per_req": 3.4632217094125166,
+   "wrk_cpu_share": 0.4031909249999998,
+   "load": 9.3076171875,
+   "server": "mojo",
+   "scenario": "4cpu-pipelined",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 5890.0,
+    "75%": 8970.0,
+    "90%": 11890.0,
+    "99%": 18010.0
+   },
+   "requests": 3745975,
+   "rps": 371381.82,
+   "wrk_cpu_s": 19.376318999999995,
+   "server_cpu_s": 39.03,
+   "server_us_per_req": 10.41918325669552,
+   "wrk_cpu_share": 0.4844079749999999,
+   "load": 10.71826171875,
+   "server": "nginx",
+   "scenario": "4cpu-pipelined",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 45310.0,
+    "75%": 78120.0,
+    "90%": 114320.0,
+    "99%": 241080.0
+   },
+   "requests": 1238025,
+   "rps": 122768.28,
+   "wrk_cpu_s": 9.12714699999998,
+   "server_cpu_s": 32.63,
+   "server_us_per_req": 26.356495224248302,
+   "wrk_cpu_share": 0.2281786749999995,
+   "load": 10.79931640625,
+   "server": "go",
+   "scenario": "4cpu-pipelined",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1390.0,
+    "75%": 2140.0,
+    "90%": 3500.0,
+    "99%": 7170.0
+   },
+   "requests": 15600784,
+   "rps": 1546453.22,
+   "wrk_cpu_s": 20.135276999999974,
+   "server_cpu_s": 35.16,
+   "server_us_per_req": 2.25373288932146,
+   "wrk_cpu_share": 0.5033819249999993,
+   "load": 11.720703125,
+   "server": "hyper",
+   "scenario": "4cpu-pipelined",
+   "rep": 0
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 456.0,
+    "75%": 578.0,
+    "90%": 649.0,
+    "99%": 880.0
+   },
+   "requests": 1280608,
+   "rps": 126797.47,
+   "wrk_cpu_s": 13.45630899999992,
+   "server_cpu_s": 10.02,
+   "server_us_per_req": 7.824408406007147,
+   "wrk_cpu_share": 0.336407724999998,
+   "load": 11.73974609375,
+   "server": "nginx",
+   "scenario": "1cpu-keepalive",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1050.0,
+    "75%": 1470.0,
+    "90%": 1870.0,
+    "99%": 2760.0
+   },
+   "requests": 621570,
+   "rps": 61543.88,
+   "wrk_cpu_s": 6.4894089999999665,
+   "server_cpu_s": 10.02,
+   "server_us_per_req": 16.120469134610744,
+   "wrk_cpu_share": 0.16223522499999915,
+   "load": 10.46923828125,
+   "server": "go",
+   "scenario": "1cpu-keepalive",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 422.0,
+    "75%": 592.0,
+    "90%": 653.0,
+    "99%": 1340.0
+   },
+   "requests": 1333373,
+   "rps": 132026.25,
+   "wrk_cpu_s": 14.683779000000015,
+   "server_cpu_s": 10.02,
+   "server_us_per_req": 7.514776435401047,
+   "wrk_cpu_share": 0.36709447500000036,
+   "load": 8.814453125,
+   "server": "hyper",
+   "scenario": "1cpu-keepalive",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 500.0,
+    "75%": 717.0,
+    "90%": 785.0,
+    "99%": 1320.0
+   },
+   "requests": 1120871,
+   "rps": 110978.85,
+   "wrk_cpu_s": 12.213276999999948,
+   "server_cpu_s": 10.01,
+   "server_us_per_req": 8.930554898824218,
+   "wrk_cpu_share": 0.3053319249999987,
+   "load": 8.15380859375,
+   "server": "mojo",
+   "scenario": "1cpu-keepalive",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 15320.0,
+    "75%": 22430.0,
+    "90%": 31020.0,
+    "99%": 61470.0
+   },
+   "requests": 1463776,
+   "rps": 145685.9,
+   "wrk_cpu_s": 9.723868000000095,
+   "server_cpu_s": 9.96,
+   "server_us_per_req": 6.804319786634021,
+   "wrk_cpu_share": 0.24309670000000239,
+   "load": 7.1591796875,
+   "server": "nginx",
+   "scenario": "1cpu-pipelined",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 36810.0,
+    "75%": 59050.0,
+    "90%": 76500.0,
+    "99%": 103960.0
+   },
+   "requests": 707538,
+   "rps": 70453.69,
+   "wrk_cpu_s": 4.348005000000001,
+   "server_cpu_s": 9.97,
+   "server_us_per_req": 14.0911159541961,
+   "wrk_cpu_share": 0.10870012500000001,
+   "load": 6.51904296875,
+   "server": "go",
+   "scenario": "1cpu-pipelined",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 3250.0,
+    "75%": 4560.0,
+    "90%": 7010.0,
+    "99%": 0.0
+   },
+   "requests": 7638000,
+   "rps": 760107.78,
+   "wrk_cpu_s": 8.334697999999946,
+   "server_cpu_s": 9.95,
+   "server_us_per_req": 1.3026970411102383,
+   "wrk_cpu_share": 0.20836744999999865,
+   "load": 5.5908203125,
+   "server": "hyper",
+   "scenario": "1cpu-pipelined",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 4019.9999999999995,
+    "75%": 5800.0,
+    "90%": 7170.0,
+    "99%": 10950.0
+   },
+   "requests": 5587824,
+   "rps": 555572.63,
+   "wrk_cpu_s": 6.072801000000027,
+   "server_cpu_s": 9.98,
+   "server_us_per_req": 1.7860261883695692,
+   "wrk_cpu_share": 0.15182002500000066,
+   "load": 5.26611328125,
+   "server": "mojo",
+   "scenario": "1cpu-pipelined",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 9890.0,
+    "75%": 11060.0,
+    "90%": 13060.0,
+    "99%": 14220.0
+   },
+   "requests": 989439,
+   "rps": 97981.87,
+   "wrk_cpu_s": 11.121971999999971,
+   "server_cpu_s": 9.95,
+   "server_us_per_req": 10.056203565859038,
+   "wrk_cpu_share": 0.2780492999999993,
+   "load": 4.9111328125,
+   "server": "nginx",
+   "scenario": "1cpu-1024conns",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 20330.0,
+    "75%": 24240.0,
+    "90%": 27450.0,
+    "99%": 36390.0
+   },
+   "requests": 480980,
+   "rps": 47804.64,
+   "wrk_cpu_s": 5.822921000000008,
+   "server_cpu_s": 9.96,
+   "server_us_per_req": 20.707721734791466,
+   "wrk_cpu_share": 0.1455730250000002,
+   "load": 4.58544921875,
+   "server": "go",
+   "scenario": "1cpu-1024conns",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 9160.0,
+    "75%": 10860.0,
+    "90%": 13140.0,
+    "99%": 14280.0
+   },
+   "requests": 1030606,
+   "rps": 102205.09,
+   "wrk_cpu_s": 11.457029999999918,
+   "server_cpu_s": 9.96,
+   "server_us_per_req": 9.664216975255336,
+   "wrk_cpu_share": 0.2864257499999979,
+   "load": 4.50146484375,
+   "server": "hyper",
+   "scenario": "1cpu-1024conns",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 9880.0,
+    "75%": 11180.0,
+    "90%": 14210.0,
+    "99%": 15040.0
+   },
+   "requests": 967188,
+   "rps": 95776.84,
+   "wrk_cpu_s": 10.879265999999916,
+   "server_cpu_s": 9.94,
+   "server_us_per_req": 10.277216011778476,
+   "wrk_cpu_share": 0.2719816499999979,
+   "load": 4.63037109375,
+   "server": "mojo",
+   "scenario": "1cpu-1024conns",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 648.0,
+    "75%": 960.0,
+    "90%": 2820.0,
+    "99%": 6820.0
+   },
+   "requests": 2597515,
+   "rps": 257201.68,
+   "wrk_cpu_s": 29.167002000000082,
+   "server_cpu_s": 33.1,
+   "server_us_per_req": 12.742948548901547,
+   "wrk_cpu_share": 0.729175050000002,
+   "load": 4.6201171875,
+   "server": "nginx",
+   "scenario": "4cpu-keepalive",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1950.0,
+    "75%": 3380.0,
+    "90%": 5260.0,
+    "99%": 10680.0
+   },
+   "requests": 1189651,
+   "rps": 118085.91,
+   "wrk_cpu_s": 15.408972999999946,
+   "server_cpu_s": 35.28,
+   "server_us_per_req": 29.65575618395647,
+   "wrk_cpu_share": 0.38522432499999865,
+   "load": 6.38525390625,
+   "server": "go",
+   "scenario": "4cpu-keepalive",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 628.0,
+    "75%": 1020.0,
+    "90%": 3170.0,
+    "99%": 6870.0
+   },
+   "requests": 2655233,
+   "rps": 263121.01,
+   "wrk_cpu_s": 29.487070999999958,
+   "server_cpu_s": 30.21,
+   "server_us_per_req": 11.377532593184855,
+   "wrk_cpu_share": 0.7371767749999989,
+   "load": 7.0087890625,
+   "server": "hyper",
+   "scenario": "4cpu-keepalive",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 628.0,
+    "75%": 1000.0,
+    "90%": 2830.0,
+    "99%": 6600.0
+   },
+   "requests": 2511633,
+   "rps": 248694.36,
+   "wrk_cpu_s": 27.631862999999953,
+   "server_cpu_s": 34.67,
+   "server_us_per_req": 13.803768305321677,
+   "wrk_cpu_share": 0.6907965749999988,
+   "load": 8.96435546875,
+   "server": "mojo",
+   "scenario": "4cpu-keepalive",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 5960.0,
+    "75%": 9020.0,
+    "90%": 11840.0,
+    "99%": 19800.0
+   },
+   "requests": 3671396,
+   "rps": 363806.55,
+   "wrk_cpu_s": 17.37993199999994,
+   "server_cpu_s": 37.96,
+   "server_us_per_req": 10.339391337790858,
+   "wrk_cpu_share": 0.4344982999999985,
+   "load": 9.43115234375,
+   "server": "nginx",
+   "scenario": "4cpu-pipelined",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 38370.0,
+    "75%": 67750.0,
+    "90%": 97880.0,
+    "99%": 184030.0
+   },
+   "requests": 1438667,
+   "rps": 143342.95,
+   "wrk_cpu_s": 10.615619999999979,
+   "server_cpu_s": 36.59,
+   "server_us_per_req": 25.43326565494308,
+   "wrk_cpu_share": 0.2653904999999995,
+   "load": 10.55517578125,
+   "server": "go",
+   "scenario": "4cpu-pipelined",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1380.0,
+    "75%": 2190.0,
+    "90%": 3450.0,
+    "99%": 7070.0
+   },
+   "requests": 15516832,
+   "rps": 1538046.11,
+   "wrk_cpu_s": 21.0536350000001,
+   "server_cpu_s": 35.77,
+   "server_us_per_req": 2.3052385950946688,
+   "wrk_cpu_share": 0.5263408750000025,
+   "load": 10.42138671875,
+   "server": "hyper",
+   "scenario": "4cpu-pipelined",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1880.0,
+    "75%": 2790.0,
+    "90%": 3530.0,
+    "99%": 5950.0
+   },
+   "requests": 11580320,
+   "rps": 1150950.32,
+   "wrk_cpu_s": 16.004857000000015,
+   "server_cpu_s": 39.43,
+   "server_us_per_req": 3.404914544675795,
+   "wrk_cpu_share": 0.40012142500000036,
+   "load": 10.93212890625,
+   "server": "mojo",
+   "scenario": "4cpu-pipelined",
+   "rep": 1
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1020.0,
+    "75%": 1430.0,
+    "90%": 1790.0,
+    "99%": 2650.0
+   },
+   "requests": 640874,
+   "rps": 63453.37,
+   "wrk_cpu_s": 6.352048999999965,
+   "server_cpu_s": 10.04,
+   "server_us_per_req": 15.666105974029216,
+   "wrk_cpu_share": 0.15880122499999913,
+   "load": 11.39794921875,
+   "server": "go",
+   "scenario": "1cpu-keepalive",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 419.0,
+    "75%": 593.0,
+    "90%": 677.0,
+    "99%": 1250.0
+   },
+   "requests": 1331018,
+   "rps": 131791.16,
+   "wrk_cpu_s": 14.62678800000026,
+   "server_cpu_s": 10.01,
+   "server_us_per_req": 7.520559451487508,
+   "wrk_cpu_share": 0.36566970000000654,
+   "load": 9.67822265625,
+   "server": "hyper",
+   "scenario": "1cpu-keepalive",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 475.0,
+    "75%": 625.0,
+    "90%": 730.0,
+    "99%": 1100.0
+   },
+   "requests": 1206318,
+   "rps": 119438.29,
+   "wrk_cpu_s": 12.673428999999942,
+   "server_cpu_s": 10.0,
+   "server_us_per_req": 8.289688125353347,
+   "wrk_cpu_share": 0.31683572499999857,
+   "load": 8.96484375,
+   "server": "mojo",
+   "scenario": "1cpu-keepalive",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 470.0,
+    "75%": 588.0,
+    "90%": 659.0,
+    "99%": 1000.0
+   },
+   "requests": 1246336,
+   "rps": 124226.93,
+   "wrk_cpu_s": 13.449530999999979,
+   "server_cpu_s": 9.94,
+   "server_us_per_req": 7.975377426312006,
+   "wrk_cpu_share": 0.3362382749999995,
+   "load": 8.28125,
+   "server": "nginx",
+   "scenario": "1cpu-keepalive",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 36570.0,
+    "75%": 58440.0,
+    "90%": 75160.0,
+    "99%": 99850.0
+   },
+   "requests": 704216,
+   "rps": 70046.8,
+   "wrk_cpu_s": 4.358457000000158,
+   "server_cpu_s": 9.98,
+   "server_us_per_req": 14.171788201347313,
+   "wrk_cpu_share": 0.10896142500000394,
+   "load": 7.7509765625,
+   "server": "go",
+   "scenario": "1cpu-pipelined",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 5110.0,
+    "75%": 0.0,
+    "90%": 0.0,
+    "99%": 0.0
+   },
+   "requests": 7427040,
+   "rps": 737357.86,
+   "wrk_cpu_s": 8.143382000000088,
+   "server_cpu_s": 9.95,
+   "server_us_per_req": 1.3396992610784377,
+   "wrk_cpu_share": 0.2035845500000022,
+   "load": 7.02001953125,
+   "server": "hyper",
+   "scenario": "1cpu-pipelined",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 4300.0,
+    "75%": 6210.0,
+    "90%": 7740.0,
+    "99%": 11420.0
+   },
+   "requests": 5211376,
+   "rps": 516366.78,
+   "wrk_cpu_s": 6.115237999999863,
+   "server_cpu_s": 9.97,
+   "server_us_per_req": 1.9131223692168824,
+   "wrk_cpu_share": 0.15288094999999657,
+   "load": 6.19677734375,
+   "server": "mojo",
+   "scenario": "1cpu-pipelined",
+   "rep": 2
+  },
+  {
+   "errors": 19,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 19920.0,
+    "75%": 31990.0,
+    "90%": 0.0,
+    "99%": 0.0
+   },
+   "requests": 1380353,
+   "rps": 137302.23,
+   "wrk_cpu_s": 9.321291000000087,
+   "server_cpu_s": 9.95,
+   "server_us_per_req": 7.208301065017427,
+   "wrk_cpu_share": 0.23303227500000218,
+   "load": 5.86474609375,
+   "server": "nginx",
+   "scenario": "1cpu-pipelined",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 19730.0,
+    "75%": 23830.0,
+    "90%": 28240.0,
+    "99%": 39830.0
+   },
+   "requests": 484802,
+   "rps": 48041.25,
+   "wrk_cpu_s": 6.00745900000004,
+   "server_cpu_s": 9.96,
+   "server_us_per_req": 20.544469701032586,
+   "wrk_cpu_share": 0.15018647500000099,
+   "load": 6.181640625,
+   "server": "go",
+   "scenario": "1cpu-1024conns",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 8820.0,
+    "75%": 9720.0,
+    "90%": 12430.0,
+    "99%": 13250.0
+   },
+   "requests": 1095372,
+   "rps": 108562.81,
+   "wrk_cpu_s": 12.058683999999857,
+   "server_cpu_s": 9.97,
+   "server_us_per_req": 9.101930668302641,
+   "wrk_cpu_share": 0.30146709999999644,
+   "load": 6.01953125,
+   "server": "hyper",
+   "scenario": "1cpu-1024conns",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 8530.0,
+    "75%": 9200.0,
+    "90%": 10790.0,
+    "99%": 14650.0
+   },
+   "requests": 1127491,
+   "rps": 112173.17,
+   "wrk_cpu_s": 10.789481000000023,
+   "server_cpu_s": 9.87,
+   "server_us_per_req": 8.753950142395816,
+   "wrk_cpu_share": 0.2697370250000006,
+   "load": 6.21875,
+   "server": "mojo",
+   "scenario": "1cpu-1024conns",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 7970.0,
+    "75%": 8320.0,
+    "90%": 8670.0,
+    "99%": 10250.0
+   },
+   "requests": 1258375,
+   "rps": 125312.77,
+   "wrk_cpu_s": 11.771884999999884,
+   "server_cpu_s": 9.86,
+   "server_us_per_req": 7.835502135690871,
+   "wrk_cpu_share": 0.2942971249999971,
+   "load": 5.94482421875,
+   "server": "nginx",
+   "scenario": "1cpu-1024conns",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 2050.0,
+    "75%": 3680.0,
+    "90%": 6250.0,
+    "99%": 15750.0
+   },
+   "requests": 1102947,
+   "rps": 109289.93,
+   "wrk_cpu_s": 14.333867999999939,
+   "server_cpu_s": 33.09,
+   "server_us_per_req": 30.001441592388396,
+   "wrk_cpu_share": 0.35834669999999846,
+   "load": 5.416015625,
+   "server": "go",
+   "scenario": "4cpu-keepalive",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 633.0,
+    "75%": 1110.0,
+    "90%": 3310.0,
+    "99%": 7090.0
+   },
+   "requests": 2590075,
+   "rps": 258240.47,
+   "wrk_cpu_s": 28.67278999999985,
+   "server_cpu_s": 29.4,
+   "server_us_per_req": 11.351022653784156,
+   "wrk_cpu_share": 0.7168197499999962,
+   "load": 5.74658203125,
+   "server": "hyper",
+   "scenario": "4cpu-keepalive",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 674.0,
+    "75%": 1120.0,
+    "90%": 2820.0,
+    "99%": 6460.0
+   },
+   "requests": 2445844,
+   "rps": 242439.37,
+   "wrk_cpu_s": 26.941532000000166,
+   "server_cpu_s": 33.94,
+   "server_us_per_req": 13.8766004700218,
+   "wrk_cpu_share": 0.6735383000000041,
+   "load": 7.6005859375,
+   "server": "mojo",
+   "scenario": "4cpu-keepalive",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 632.0,
+    "75%": 910.0,
+    "90%": 2680.0,
+    "99%": 6300.0
+   },
+   "requests": 2607545,
+   "rps": 258297.32,
+   "wrk_cpu_s": 28.923634999999877,
+   "server_cpu_s": 33.3,
+   "server_us_per_req": 12.770632913334188,
+   "wrk_cpu_share": 0.7230908749999969,
+   "load": 8.27734375,
+   "server": "nginx",
+   "scenario": "4cpu-keepalive",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 33780.0,
+    "75%": 60100.0,
+    "90%": 86460.0,
+    "99%": 163380.0
+   },
+   "requests": 1592342,
+   "rps": 158117.86,
+   "wrk_cpu_s": 11.162236000000007,
+   "server_cpu_s": 38.24,
+   "server_us_per_req": 24.014941513820524,
+   "wrk_cpu_share": 0.2790559000000002,
+   "load": 9.17626953125,
+   "server": "go",
+   "scenario": "4cpu-pipelined",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1240.0,
+    "75%": 1820.0,
+    "90%": 2290.0,
+    "99%": 4050.0
+   },
+   "requests": 17706752,
+   "rps": 1753909.23,
+   "wrk_cpu_s": 22.63469099999986,
+   "server_cpu_s": 39.45,
+   "server_us_per_req": 2.227963660416094,
+   "wrk_cpu_share": 0.5658672749999966,
+   "load": 8.61376953125,
+   "server": "hyper",
+   "scenario": "4cpu-pipelined",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1790.0,
+    "75%": 2600.0,
+    "90%": 3180.0,
+    "99%": 4790.0
+   },
+   "requests": 12482288,
+   "rps": 1238237.34,
+   "wrk_cpu_s": 15.892904999999928,
+   "server_cpu_s": 39.68,
+   "server_us_per_req": 3.1789043803507817,
+   "wrk_cpu_share": 0.3973226249999982,
+   "load": 8.52685546875,
+   "server": "mojo",
+   "scenario": "4cpu-pipelined",
+   "rep": 2
+  },
+  {
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 5380.0,
+    "75%": 8100.0,
+    "90%": 11010.0,
+    "99%": 15890.0
+   },
+   "requests": 4137597,
+   "rps": 411165.57,
+   "wrk_cpu_s": 24.8939630000001,
+   "server_cpu_s": 39.91,
+   "server_us_per_req": 9.645695315421005,
+   "wrk_cpu_share": 0.6223490750000025,
+   "load": 8.1376953125,
+   "server": "nginx",
+   "scenario": "4cpu-pipelined",
+   "rep": 2
+  }
+ ]
+}

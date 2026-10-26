@@ -68,6 +68,20 @@ What it shows:
 - **Pipelined, hyper leads:** 1.07 µs a request against mojo's 1.62. nginx makes a system call per response (`writev`, below). Go gains little from pipelining (it was not traced).
 - **The four-CPU keep-alive runs measure wrk, not the servers.** wrk used 77–80% of its 4 threads, and mojo, nginx and hyper all stopped at about 285k. Telling them apart there needs more client CPU than this machine has to spare. The four CPUs are 2 cores, so each hardware thread runs at about half speed and the CPU per request doubles.
 
+**Re-run on 2026-10-26, after TLS came into `server` (T2, S7)** (`out/20261026-182035.json`; same machine and versions, a load of 2.7 to 3 at the start):
+
+| Scenario | mojo | nginx | Go | hyper |
+|---|---|---|---|---|
+| 1 CPU, 64 keep-alive | 119k; 8.29 µs | 127k; 7.82 µs | 62k; 16.12 µs | 132k; 7.51 µs |
+| 1 CPU, 256 conns, 16 pipelined | 516k; 1.91 µs | 137k; 7.21 µs | 70k; 14.17 µs | 737k; 1.34 µs |
+| 1 CPU, 1024 keep-alive | 96k; 10.28 µs | 98k; 10.06 µs | 48k; 20.71 µs | 102k; 9.66 µs |
+| 4 CPUs, 256 keep-alive | 242k; 13.88 µs | 257k; 12.74 µs | 109k; 30.00 µs | 258k; 11.38 µs |
+| 4 CPUs, 256 conns, 16 pipelined | 1151k; 3.40 µs | 371k; 10.34 µs | 143k; 25.43 µs | 1546k; 2.25 µs |
+
+(median requests a second; server CPU per request.) Every server was slower than the day before, on a busier machine; the order is the same. mojo's own keep-alive runs spread widely (111k to 141k).
+- **S7 costs plain HTTP nothing measurable.** An A/B of the benchmark server built from the commit before S7 and from S7, alternated 8 times on the pipelined scenario (6 s each): 1.88 µs a request at best before, 1.82 with S7 (medians 1.92 and 1.89). A first A/B with fewer runs, at a load of 4 to 7, had suggested 20% more; with more runs it was noise. The TLS code adds 130 KB to the binary.
+- HTTPS is not benchmarked yet.
+
 **Where mojo's time goes**, against hyper and nginx on one CPU (the best of 2 runs of 8 s; system calls counted with strace on a separate run):
 
 | | User + system per request (keep-alive) | Pipelined | System calls per request (keep-alive; pipelined) |
