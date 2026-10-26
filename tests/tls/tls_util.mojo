@@ -1,7 +1,9 @@
 """Shared helpers for tests/tls (not a test file itself): the test PKI
 (tests/tls/tls_pki.py, made once per process in a temporary directory that
 a watcher removes when the process ends) and `Peer`, a TLS server
-(tests/tls/tls_peer.py) in a child process. End each test with
+(tests/tls/tls_peer.py) in a child process; for `TlsServer`, `serving`,
+`ClientProc` (tests/tls/tls_client_peer.py or a command such as
+`openssl s_client`) and `ServerDriver`. End each test with
 `peer^.stop()`: Mojo destroys a value right after its last use, which would
 kill the peer early."""
 
@@ -11,8 +13,20 @@ from std.testing import assert_equal, assert_true
 
 from bytes.buffer import ByteBuffer
 from linux.time import Deadline, Duration
-from net.tcp import TcpStream
-from tls import Category, ClientConfig, ClientContext, TlsClient, TlsError, TlsEventKind, Trust
+from net.addr import SocketAddr
+from net.tcp import TcpListener, TcpStream
+from tls import (
+    Category,
+    ClientConfig,
+    ClientContext,
+    ServerConfig,
+    ServerContext,
+    TlsClient,
+    TlsError,
+    TlsEventKind,
+    TlsServer,
+    Trust,
+)
 from tls.client import FEED_LIMIT
 from tls.stream import TlsStream
 
@@ -309,3 +323,176 @@ struct CodecDriver(Movable):
                 continue
             if not self.receive():
                 raise Error("the connection ended during the handshake")
+
+
+# ---- the server side ---------------------------------------------------------
+
+
+def serving(
+    cert: StringSlice = "good",
+    names: List[String] = ["localhost", "127.0.0.1"],
+    alpn: List[String] = ["http/1.1"],
+    tls13_only: Bool = False,
+    key: StringSlice = "",
+) raises -> ServerContext:
+    """A server context with the test PKI's `cert` (its chain file, and its
+    key unless `key` names another)."""
+    var d = pki()
+    var k = String(key) if key.byte_length() > 0 else String(cert)
+    return ServerConfig(
+        certificate=d + "/" + cert + ".chain.pem", key=d + "/" + k + ".key", names=names.copy(), alpn=alpn.copy(), tls13_only=tls13_only
+    ).build()
+
+
+def listener() raises -> TcpListener:
+    var l = TcpListener.bind(SocketAddr.parse("127.0.0.1:0"))
+    l.set_deadline(Deadline.after(Duration.from_secs(30)))
+    return l^
+
+
+def client_peer(port: Int, scenario: StringSlice, opts: List[String] = List[String]()) raises -> ClientProc:
+    """tests/tls/tls_client_peer.py with `scenario`."""
+    var pysys = Python.import_module("sys")
+    var cmd = Python.list(pysys.executable, "tests/tls/tls_client_peer.py", pki(), String(port), scenario)
+    for o in opts:
+        _ = cmd.append(o)
+    return ClientProc(command=cmd)
+
+
+def s_client(port: Int, *args: String) raises -> PythonObject:
+    """`openssl s_client` to 127.0.0.1:`port`, trusting the test root, with
+    `args`."""
+    var cmd = Python.list("openssl", "s_client", "-connect", String("127.0.0.1:", port), "-CAfile", pki() + "/root.pem")
+    for a in args:
+        _ = cmd.append(a)
+    return cmd
+
+
+struct ClientProc(Movable):
+    """A client in a child process, its output read line by line."""
+
+    var proc: PythonObject
+    var lines: PythonObject
+
+    def __init__(out self, *, command: PythonObject, stdin: List[String] = List[String](), gap: Float64 = 0.3) raises:
+        """Any command (stderr joins stdout). Each of `stdin` is written to
+        it `gap` seconds apart, then its stdin is closed
+        (tests/tls/slow_stdin.py: `openssl s_client` takes a command letter
+        only when a read starts with it)."""
+        var subprocess = Python.import_module("subprocess")
+        var pysys = Python.import_module("sys")
+        var cmd = Python.list(pysys.executable, "tests/tls/slow_stdin.py", String(gap))
+        for p in stdin:
+            _ = cmd.append(p)
+        _ = cmd.append("--")
+        _ = cmd.extend(command)
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.lines = _lines(self.proc)
+
+    def line(self) raises -> String:
+        return String(String(py=self.lines.next(LINE_TIMEOUT)).strip())
+
+    def expect(self, prefix: StringSlice) raises -> String:
+        """Skip lines until one starting with `prefix`; return it."""
+        while True:
+            var l = self.line()
+            if l.byte_length() == 0:
+                raise Error(String("the client ended before a line starting with ", prefix))
+            if l.startswith(prefix):
+                return l
+
+    def rest(self) raises -> String:
+        """Every line left, until it exits (joined with newlines)."""
+        var out = String()
+        while True:
+            var l = self.line()
+            if l.byte_length() == 0:
+                return out^
+            out += l + "\n"
+
+    def __deinit__(deinit self):
+        _kill(self.proc)
+
+    def stop(deinit self):
+        _kill(self.proc)
+
+
+struct ServerDriver(Movable):
+    """`TlsServer` over an accepted `TcpStream`, driven by hand."""
+
+    var tls: TlsServer
+    var tcp: TcpStream
+    var buf: List[UInt8]
+    var out: ByteBuffer
+    var received: Int
+    """Ciphertext read from the socket."""
+    var ended: Bool
+
+    def __init__(out self, l: TcpListener, ctx: ServerContext) raises:
+        """Accept one connection (within the listener's deadline)."""
+        self.tcp = l.accept().into_stream()
+        self.tcp.set_deadline(Deadline.after(Duration.from_secs(30)))
+        self.tls = TlsServer(ctx)
+        self.buf = List[UInt8](length=FEED_LIMIT, fill=0)
+        self.out = ByteBuffer()
+        self.received = 0
+        self.ended = False
+
+    def send(mut self) raises TlsError:
+        """Everything queued, to the socket (a failed send is ignored: the
+        client may have gone)."""
+        while self.tls.has_transmit():
+            if self.tls.poll_transmit(self.out) == 0:
+                break
+            try:
+                self.tcp.write_all(self.out.readable_span())
+            except:
+                pass
+            self.out.clear()
+
+    def receive(mut self) raises TlsError -> Bool:
+        """One receive into the codec (at most its room): False at the end."""
+        var room = min(self.tls.feed_capacity(), len(self.buf))
+        if room == 0 or self.ended:
+            return False
+        var n: Int
+        try:
+            n = self.tcp.read(Span(self.buf)[0:room])
+        except e:
+            raise TlsError(e)
+        if n == 0:
+            self.ended = True
+            self.tls.feed_eof()
+            return False
+        self.received += n
+        self.tls.feed(Span(self.buf)[0:n])
+        return True
+
+    def serve(mut self, close_after: Int = -1) raises -> Optional[TlsError]:
+        """Answer each DATA event with "echo:" and its bytes until the
+        client's close_notify (answered with ours: None), the end of its
+        input, or a failure (its alert sent, then returned). With
+        `close_after`, send close_notify after that many answers."""
+        var answered = 0
+        try:
+            while True:
+                var ev = self.tls.next_event()
+                if ev:
+                    if ev.value().kind == TlsEventKind.DATA:
+                        var reply = List[UInt8]("echo:".as_bytes())
+                        reply.extend(Span(ev.value().data))
+                        _ = self.tls.write(Span(reply))
+                        answered += 1
+                        if answered == close_after:
+                            self.tls.close()
+                    elif ev.value().kind == TlsEventKind.CLOSED:
+                        self.send()
+                        return None
+                    continue
+                self.send()
+                if not self.receive() and not self.tls.has_events():
+                    _ = self.tls.next_event()  # (raises the failure, if any)
+                    return None
+        except e:
+            self.send()  # (the alert OpenSSL queued, TS10)
+            return e^

@@ -41,14 +41,17 @@ from .consts import (
     SSL_CTRL_SET_SESS_CACHE_MODE,
     SSL_CTRL_SET_SIGALGS_LIST,
     SSL_MODE_AUTO_RETRY,
+    SSL_MODE_NO_AUTO_CHAIN,
     SSL_MODE_RELEASE_BUFFERS,
     SSL_OP_CLEANSE_PLAINTEXT,
     SSL_OP_ENABLE_MIDDLEBOX_COMPAT,
     SSL_OP_NO_COMPRESSION,
     SSL_OP_NO_RENEGOTIATION,
+    SSL_OP_NO_TICKET,
     SSL_SESS_CACHE_OFF,
     SSL_VERIFY_PEER,
     TLS1_2_VERSION,
+    TLS1_3_VERSION,
     X509_CHECK_FLAG_NEVER_CHECK_SUBJECT,
     X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS,
     X509_LU_X509,
@@ -57,7 +60,20 @@ from .consts import (
     X509_V_FLAG_X509_STRICT,
 )
 from .error import Category, TlsError, tls_error
-from .ffi import SEAM_ALPN_SET, SEAM_CTX_NEW, SEAM_LOAD_VERIFY, SEAM_READBACK, Library, Obj, buf, c_string, from_c_string, seam
+from .ffi import (
+    SEAM_ALPN_SET,
+    SEAM_CTX_NEW,
+    SEAM_EARLY,
+    SEAM_LOAD_VERIFY,
+    SEAM_READBACK,
+    SEAM_TICKETS,
+    Library,
+    Obj,
+    buf,
+    c_string,
+    from_c_string,
+    seam,
+)
 
 
 comptime SECURITY_LEVEL = 2
@@ -72,6 +88,11 @@ comptime OPTIONS: UInt64 = SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION | SSL
 OpenSSL wipe its own copies of plaintext when it frees them (TB18): with
 RELEASE_BUFFERS it frees its read buffer after every idle read."""
 comptime MODES = SSL_MODE_AUTO_RETRY | SSL_MODE_RELEASE_BUFFERS
+comptime SERVER_OPTIONS: UInt64 = OPTIONS | SSL_OP_NO_TICKET
+"""A server's: no session tickets, alongside `SSL_CTX_set_num_tickets(0)`
+(TS4: the option alone makes TLS 1.3 tickets stateful, with a cache)."""
+comptime SERVER_MODES = MODES | SSL_MODE_NO_AUTO_CHAIN
+"""A server sends exactly the chain it was given (TS3)."""
 comptime VERIFY_FLAGS: UInt64 = X509_V_FLAG_X509_STRICT | X509_V_FLAG_TRUSTED_FIRST
 comptime HOST_FLAGS: c_uint = X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS | X509_CHECK_FLAG_NEVER_CHECK_SUBJECT
 
@@ -235,11 +256,13 @@ def _check(ok: Bool, what: StaticString, L: Library) raises TlsError:
         raise tls_error(what, ErrorKind.Other, Category.LIBRARY, L.drain_errors())
 
 
-def _configure(L: Library, ctx: Obj) raises TlsError:
-    """Every policy knob, set explicitly and read back (TC8, TC11-TC13, TC16)."""
-    _check(L.SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, 0) == 1, "tls: setting the TLS 1.2 floor failed", L)
+def _configure(L: Library, ctx: Obj, server: Bool = False, tls13_only: Bool = False) raises TlsError:
+    """Every policy knob, set explicitly and read back (TC8, TC11-TC13,
+    TC16; for a server, TS1-TS4 and TS14)."""
+    var floor = TLS1_3_VERSION if tls13_only else TLS1_2_VERSION
+    _check(L.SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, floor, 0) == 1, "tls: setting the version floor failed", L)
     _check(L.SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION, 0, 0) == 1, "tls: setting the version ceiling failed", L)
-    _check(L.SSL_CTX_ctrl(ctx, SSL_CTRL_GET_MIN_PROTO_VERSION, 0, 0) == TLS1_2_VERSION, "tls: the TLS 1.2 floor did not take", L)
+    _check(L.SSL_CTX_ctrl(ctx, SSL_CTRL_GET_MIN_PROTO_VERSION, 0, 0) == floor, "tls: the version floor did not take", L)
     _check(L.SSL_CTX_ctrl(ctx, SSL_CTRL_GET_MAX_PROTO_VERSION, 0, 0) == 0, "tls: the version ceiling did not take", L)
     L.SSL_CTX_set_security_level(ctx, c_int(SECURITY_LEVEL))
     _check(L.SSL_CTX_get_security_level(ctx) == SECURITY_LEVEL, "tls: the security level did not take", L)
@@ -255,15 +278,25 @@ def _configure(L: Library, ctx: Obj) raises TlsError:
     _ = suites^
     _ = groups^
     _ = sigalgs^
+    var options = SERVER_OPTIONS if server else OPTIONS
     _ = L.SSL_CTX_clear_options(ctx, UInt64.MAX)
-    _ = L.SSL_CTX_set_options(ctx, OPTIONS)
-    _check(L.SSL_CTX_get_options(ctx) == OPTIONS and seam(SEAM_READBACK) == 0, "tls: the options did not take", L)
+    _ = L.SSL_CTX_set_options(ctx, options)
+    _check(L.SSL_CTX_get_options(ctx) == options and seam(SEAM_READBACK) == 0, "tls: the options did not take", L)
+    var modes = SERVER_MODES if server else MODES
     _ = L.SSL_CTX_ctrl(ctx, SSL_CTRL_CLEAR_MODE, -1, 0)
-    _check(L.SSL_CTX_ctrl(ctx, SSL_CTRL_MODE, MODES, 0) == MODES, "tls: the modes did not take", L)
+    _check(L.SSL_CTX_ctrl(ctx, SSL_CTRL_MODE, modes, 0) == modes, "tls: the modes did not take", L)
     _ = L.SSL_CTX_ctrl(ctx, SSL_CTRL_SET_SESS_CACHE_MODE, SSL_SESS_CACHE_OFF, 0)
     _check(L.SSL_CTX_ctrl(ctx, SSL_CTRL_GET_SESS_CACHE_MODE, 0, 0) == SSL_SESS_CACHE_OFF, "tls: the session cache did not turn off", L)
-    L.SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, 0)
-    _check(L.SSL_CTX_get_verify_mode(ctx) == SSL_VERIFY_PEER, "tls: peer verification did not take", L)
+    # A client verifies the server; a server asks for no client certificate.
+    var verify = c_int(0) if server else SSL_VERIFY_PEER
+    L.SSL_CTX_set_verify(ctx, verify, 0)
+    _check(L.SSL_CTX_get_verify_mode(ctx) == verify, "tls: the verify mode did not take", L)
+    if server:
+        _check(L.SSL_CTX_set_num_tickets(ctx, 0) == 1, "tls: turning session tickets off failed", L)
+        var tickets = L.SSL_CTX_get_num_tickets(ctx) if seam(SEAM_TICKETS) == 0 else 2
+        _check(tickets == 0, "tls: session tickets did not turn off", L)
+        var early = L.SSL_CTX_get_max_early_data(ctx) if seam(SEAM_EARLY) == 0 else 16384
+        _check(early == 0, "tls: early data is not off", L)
     var param = L.SSL_CTX_get0_param(ctx)
     _check(param != 0, "tls: no verify parameters", L)
     _ = L.X509_VERIFY_PARAM_clear_flags(param, UInt64.MAX)

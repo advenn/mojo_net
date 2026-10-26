@@ -41,8 +41,8 @@ Mechanism and limits:
   runtime and Python interop make their own syscalls; those are neither
   counted nor faulted. Seams elsewhere (the `tls` package's OpenSSL calls)
   call `fire` with numbers from `SEAM_BASE` up.
-- Counters exist for syscall numbers `0 <= nr < 1024` (all numbers on
-  x86_64 and aarch64 today). Each intercepted call costs a runtime lookup
+- Counters exist for numbers `0 <= nr < 1100`: every syscall number on
+  x86_64 and aarch64 today (below 1000), then the seams. Each intercepted call costs a runtime lookup
   plus a scan of the rules.
 - The plan persists across tests in one process: start each test with
   `clear()`.
@@ -70,7 +70,7 @@ comptime _NEED_DEFINE = (
 comptime _GLOBAL_NAME = "mojo_net.linux.fault.plan.v1"
 
 # Counters cover syscall numbers below this (the highest today is ~470).
-comptime _NR_SLOTS = 1024
+comptime _NR_SLOTS = 1100
 
 comptime _FAIL = 0
 comptime _SHORT = 1
@@ -166,7 +166,7 @@ def inject(
     """Fail calls to syscall `nr` with `errno`, without issuing them.
 
     Raises InvalidInput for an errno outside `1..4095`, a syscall number
-    outside `0..1023`, `skip < 0`, `every < 1`, or `times` not `-1` or
+    outside `0..1099`, `skip < 0`, `every < 1`, or `times` not `-1` or
     positive.
     """
     comptime assert ENABLED, _NEED_DEFINE
@@ -209,7 +209,7 @@ def fire(nr: Int) -> Int:
 
 
 comptime SEAM_BASE = 1000
-"""Numbers from here to 1023 are no syscall (the highest is ~470): seams
+"""Numbers from here to 1099 are no syscall (the highest is ~470): seams
 outside `linux.syscall` use them with `inject` and `fire`."""
 
 

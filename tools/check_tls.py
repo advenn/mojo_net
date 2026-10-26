@@ -21,6 +21,9 @@ rules TL2, TL5, TL7 and TB14 of docs/research/tls_with_openssl.md).
    outside ffi.mojo returns an OpenSSL handle (`Obj`) or the `Library`.
 7. The package needs OpenSSL 3.5.9 or later (TL1): conda.recipe/recipe.yaml
    says `openssl >=3.5.9`.
+8. One callback (TS5): the only function in src/tls/ffi.mojo libssl may
+   call (`def ... abi("C")`) is `alpn_select`, and the only binding that
+   installs a callback is `SSL_CTX_set_alpn_select_cb`.
 
     python3 tools/check_tls.py [--root DIR]
 
@@ -59,13 +62,28 @@ BINDINGS = {
     "SSL_CTX_set_cipher_list", "SSL_CTX_set_ciphersuites", "SSL_CTX_set_verify", "SSL_CTX_get_verify_mode",
     "SSL_CTX_get0_param", "SSL_CTX_get_cert_store", "SSL_CTX_load_verify_file", "SSL_CTX_load_verify_dir",
     "SSL_CTX_set_alpn_protos",
+    # server contexts (TS1-TS5)
+    "TLS_server_method", "SSL_CTX_use_certificate_chain_file", "SSL_CTX_use_PrivateKey_file",
+    "SSL_CTX_check_private_key", "SSL_CTX_get0_certificate", "SSL_CTX_set_default_passwd_cb_userdata",
+    "SSL_CTX_set_num_tickets", "SSL_CTX_get_num_tickets", "SSL_CTX_get_max_early_data",
+    "SSL_CTX_set_alpn_select_cb", "X509_get0_notBefore", "X509_get0_notAfter", "ASN1_TIME_diff",
     # connections
     "SSL_new", "SSL_free", "SSL_set0_rbio", "SSL_set0_wbio", "SSL_set_connect_state", "SSL_ctrl",
     "SSL_get0_param", "SSL_do_handshake", "SSL_get_error", "SSL_read_ex", "SSL_write_ex", "SSL_shutdown",
     "SSL_get_verify_result", "SSL_get0_peer_certificate", "SSL_get0_peername", "SSL_version",
     "SSL_get_version", "SSL_get_current_cipher", "SSL_CIPHER_get_name", "SSL_get0_group_name",
-    "SSL_get0_alpn_selected", "SSL_session_reused",
+    "SSL_get0_alpn_selected", "SSL_session_reused", "SSL_set_accept_state", "SSL_get_servername",
 }
+
+CALLBACKS = {"alpn_select"}
+"""The Mojo functions libssl may call (check 8)."""
+CALLBACK_SETTERS = {"SSL_CTX_set_alpn_select_cb"}
+
+ALLOWED_NAMES = (
+    "SSL_CTX_set_default_passwd_cb_userdata",  # (data, not a callback: an empty password, so no prompt)
+    "SSL_CTX_get_max_early_data",  # (read back: it must be 0)
+)
+"""Names that contain a FORBIDDEN substring but are allowed whole."""
 
 # Substrings no code in src/tls may contain (case-sensitive).
 FORBIDDEN = (
@@ -110,6 +128,7 @@ _COMMENT = re.compile(r"#.*$", re.M)
 _STRING = re.compile(r'"(?:[^"\\\n]|\\.)*"')
 _BOUND = re.compile(r'_sym\[[^\]]*\]\(\s*self\._handle\s*,\s*"(\w+)"\s*\)')
 _SYM_CALL = re.compile(r'(?<!def )\b_sym\[')
+_CALLBACK_DEF = re.compile(r'^def\s+(\w+)\([^)]*\)\s*abi\("C"\)', re.M)
 _HANDLE_OUT = re.compile(r'^\s*def ([A-Za-z]\w*)\(.*\)\s*(?:raises(?:\s+\w+)?\s*)?->\s*(Obj|ArcPointer\[Library\])\s*:', re.M)
 
 
@@ -170,6 +189,8 @@ def check_source(root):
                     bad.append(f"{rel}:{n}: public {m.group(1)}() hands out an OpenSSL handle ({m.group(2)}): a built context must stay read-only (TB3)")
         if rel.startswith(os.path.join("src", "tls") + os.sep):
             for n, line in enumerate(code.split("\n"), 1):
+                for allowed in ALLOWED_NAMES:
+                    line = line.replace(allowed, "")
                 for tok in FORBIDDEN:
                     if tok in line:
                         bad.append(f"{rel}:{n}: forbidden OpenSSL name {tok!r} (TL5)")
@@ -186,6 +207,10 @@ def check_source(root):
         uses = len(re.findall(r"\bget_symbol\b", code))
         if uses > 1:
             bad.append(f"{FFI_MODULE}: get_symbol is called outside _sym ({uses} uses) (TL5)")
+        for name in sorted(set(_CALLBACK_DEF.findall(code)) - CALLBACKS):
+            bad.append(f"{FFI_MODULE}: {name} is a function libssl could call, which is not in CALLBACKS in tools/check_tls.py (TS5)")
+        for name in sorted(n for n in set(bound) if (n.endswith("_cb") or "callback" in n) and n not in CALLBACK_SETTERS):
+            bad.append(f"{FFI_MODULE}: {name} installs a callback, which is not in CALLBACK_SETTERS in tools/check_tls.py (TS5)")
     recipe = os.path.join(root, RECIPE)
     if os.path.exists(recipe) and not re.search(r"openssl\s*>=\s*3\.5\.9\b", open(recipe, encoding="utf-8").read()):
         bad.append(f"{RECIPE}: openssl must be >=3.5.9 (TL1)")
@@ -227,7 +252,8 @@ def _self_test():
         "src/net/a.mojo": ('from std.ffi import external_call\n"""external_call in a docstring is prose"""\n', "external_call outside"),
         "src/tls/b.mojo": ("var x = 1  # SSL_free_buffers in a comment is fine\nL.SSL_free_buffers(s)\n", "SSL_free_buffers"),
         "src/tls/c.mojo": ('var m = "SSL_VERIFY_NONE"\n', "SSL_VERIFY_NONE"),
-        "src/tls/ffi.mojo": ('def _sym[F](h, name):\n    return h.get_symbol(name)\nself.f = _sym[F](self._handle, "SSL_new")\nself.g = _sym[F](self._handle, "SSL_CTX_set_keylog_x")\nself.h = _sym[F](self._handle, name)\n', "keylog"),
+        "src/tls/ffi.mojo": ('def _sym[F](h, name):\n    return h.get_symbol(name)\nself.f = _sym[F](self._handle, "SSL_new")\nself.g = _sym[F](self._handle, "SSL_CTX_set_keylog_x")\nself.h = _sym[F](self._handle, name)\ndef alpn_select(a: Int) abi("C") -> Int:\n    return 0\ndef on_info(a: Int) abi("C") -> Int:\n    return 0\nself.i = _sym[F](self._handle, "SSL_CTX_set_verify_cb")\n', "keylog"),
+        "src/tls/i.mojo": ("L.SSL_CTX_set_default_passwd_cb(ctx, f)\nL.SSL_CTX_set_default_passwd_cb_userdata(ctx, p)\n", "passwd_cb"),
         "src/linux/d.mojo": ("var h = OwnedDLHandle(path)\n", "OwnedDLHandle outside"),
         "src/tls/e.mojo": ("L.SSL_set_fd(s, 3)\n", "SSL_set_fd"),
         "src/tls/f.mojo": ("var s = '#'; L.SSL_free_buffers(s)\n", "SSL_free_buffers"),
@@ -250,11 +276,17 @@ def _self_test():
             errors.append("an unlisted binding went unreported")
         if not any("without a literal name" in b for b in bad):
             errors.append("a binding without a literal name went unreported")
+        if not any("on_info is a function libssl could call" in b for b in bad) or any("alpn_select is a function" in b for b in bad):
+            errors.append("a second callback went unreported, or the allowed one was reported")
+        if not any("SSL_CTX_set_verify_cb installs a callback" in b for b in bad):
+            errors.append("a callback setter went unreported")
+        if [b for b in bad if b.startswith("src/tls/i.mojo")] != [b for b in bad if b.startswith("src/tls/i.mojo:1:")]:
+            errors.append(f"an allowed name (passwd_cb_userdata) was reported: {bad}")
         if any("_ok()" in b for b in bad) or any("get_symbol is called outside" in b for b in bad):
             errors.append(f"a private accessor, or get_symbol inside _sym, was reported: {bad}")
         if any("docstring" in b or (b.startswith("src/tls/b.mojo:1") ) for b in bad):
             errors.append(f"prose or a comment was reported: {bad}")
-        if bound != ["SSL_CTX_set_keylog_x", "SSL_new"]:
+        if bound != ["SSL_CTX_set_keylog_x", "SSL_CTX_set_verify_cb", "SSL_new"]:
             errors.append(f"bound names misread: {bound}")
         if os.environ.get("CONDA_PREFIX"):
             if check_versions(["SSL_new"]) or not check_versions(["SSL_no_such_function"]):

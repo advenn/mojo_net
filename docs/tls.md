@@ -2,22 +2,23 @@
 
 TLS for the other libraries (`http`'s `https://`, later `pg` and `redis`), with all of the cryptography and the protocol done by OpenSSL 3.5, the long-term-support line. This package writes no TLS and no cryptography of its own. It configures OpenSSL, drives it over memory buffers, and checks its results. The decision and the rules cited below (TL, TC, TB, TS, TA, TG) are in `docs/research/tls_with_openssl.md`; what was measured before any code was written is in `docs/spikes.md`, "TLS through OpenSSL (T0)". Package rules and the shared contracts are in `docs/design.md`.
 
-**Status: T1 done**, the client: verification, the sans-I/O state machine, a blocking stream, and the checks below. Its first user, `https://` in `http.Client`, is done too (H8, `docs/http.md`). The internal review (TR) is done; its findings are fixed (see "Review"). The external review is still to come, and then the server side.
+**Status: T1 and T2 done.** The client: verification, the sans-I/O state machine, a blocking stream, and the checks below; its first user, `https://` in `http.Client`, is done too (H8, `docs/http.md`). The internal review of the client (TR) is done, and its findings are fixed (see "Review"). The server (T2): a server context and the server side of a connection, as a sans-I/O state machine for an event loop; its first user, the TLS listener in `server` (S7), is next. The external review is still to come, and the server has had no review of its own yet.
 
 > **This code was written by an AI and has not been reviewed by a TLS expert.** Two internal reviews, also by AI, found no way past verification, and the tests compare it with independent implementations and plant bugs to show that they catch them (see "Checks"). But they can only find what someone thought to test. The external review (gate TG15) is still to come. Until then, treat it as unreviewed.
 
 ## Scope
-**In scope (T1):**
-- a TLS 1.2 and 1.3 client that verifies the server's certificate chain against system roots or a CA file, and its name or IP address;
-- ALPN, offered by the client and checked on return;
+**In scope:**
+- (T1) a TLS 1.2 and 1.3 client that verifies the server's certificate chain against system roots or a CA file, and its name or IP address;
+- ALPN, offered by the client and checked on return, and chosen by the server;
 - `TlsClient`, a sans-I/O state machine (contract 1) for any driver; `TlsStream`, a blocking stream over `net.TcpStream` with deadlines;
+- (T2) a TLS 1.2 and 1.3 server: one certificate chain and key per context, the names it serves, ALPN, and `TlsServer`, the server side as a sans-I/O state machine;
 - errors that name their reason (`Category`), with OpenSSL's verify code and text.
 
 **Out of scope, by design:**
 - **Any way to weaken verification.** There is no "insecure" flag, no verify callback, no accept-anyway, no partial chains, no subject-CN fallback. A self-signed server is trusted by listing its certificate as a CA file.
 - **Revocation (OCSP, CRLs, AIA fetching)** (TC14). This departs from NIST SP 800-52r2 on purpose, as Go, Python and OpenSSL's defaults do: online revocation checks are slow and fail open in practice, Let's Encrypt turned its OCSP responders off in 2025, and certificate lifetimes are shrinking to 47 days by 2029. A revoked certificate is accepted until it expires (badssl.com's `revoked` host is, see "Checks"). A CRL-file mode for private PKIs may come later, failing hard.
-- **Session resumption, 0-RTT, PSK, client certificates, kTLS, ECH, renegotiation.** Each is off, and the connection gate refuses a resumed session. Client certificates come with R8 (Redis).
-- **A server.** That is T2, after the review (TR).
+- **Session resumption, 0-RTT, PSK, client certificates, kTLS, ECH, renegotiation.** Each is off on both sides, and both gates refuse a resumed session. Client certificates come with R8 (Redis).
+- **On the server:** session tickets, OCSP stapling, mutual TLS, in-process ACME, and switching contexts by SNI (TS14, TS6). A second chain of another key type (RSA beside ECDSA) is not offered yet: one chain per context. A blocking server stream is not offered either: the state machine is for an event loop, the HTTP server's (S7).
 
 ## Use
 ```mojo
@@ -32,6 +33,32 @@ var n = s.read(buf)                   # 0: the server's close_notify
 s^.close()                            # our close_notify, then the socket
 ```
 `examples/tls/tls_get.mojo` fetches a page this way. `TlsStream.connect_deadline(host, port, ctx, deadline, server_name)` connects to `host` but expects a certificate for `server_name`; `TlsStream.handshake(tcp, ...)` runs over a connected `TcpStream`. A `ClientContext` is read-only once built and is shared by copying it. Use it from one thread at a time (TL8: not tested with ThreadSanitizer yet).
+
+## The server
+```mojo
+from tls import ServerConfig, TlsServer
+
+var ctx = ServerConfig(
+    certificate="fullchain.pem", key="privkey.pem",
+    names=["example.com", "www.example.com"], alpn=["http/1.1"],
+).build()                              # once per worker, then shared
+var tls = TlsServer(ctx)               # per accepted connection
+tls.feed(received); tls.poll_transmit(out); tls.next_event()  # as the client's
+```
+`TlsServer` is driven as `TlsClient` is, from the first byte the client sends, with the same events, latching, endings and bounds: both run on one engine (`tls.engine`), so a fix to one side is a fix to both.
+- **Policy** (TS1, TS2, TS4, TS14): the client's, plus no session tickets (none issued and `SSL_OP_NO_TICKET`, together: the option alone makes TLS 1.3 tickets stateful, with a cache), no session cache, no early data, no client certificates, and exactly the chain configured (`SSL_MODE_NO_AUTO_CHAIN`). Each is read back. `tls13_only` raises the floor to TLS 1.3, Mozilla's modern profile.
+- **Credentials** (TS3): the chain file holds the leaf first, then the intermediates; the key file an unencrypted PEM key. libssl reads both. `build()` refuses, naming why:
+  - a key file other users can read: it must be the user's at mode 0600 or 0400, or root's at 0640 at most (PostgreSQL's rule);
+  - an encrypted key, without prompting (libssl's default would ask on the terminal and wait);
+  - a key that does not match the leaf, a leaf that has expired or is not valid yet, or one that does not cover every configured name;
+  - a key below security level 2 (RSA 1024).
+
+  Prefer an ECDSA P-256 leaf: it signs some 15 times faster than RSA 2048, which caps one core near 2,700 handshakes a second.
+- **Names** (TS6): `names` lists the DNS names and IP addresses served (exact names; a wildcard certificate serves the names listed). A client that sends SNI must ask for one of the DNS names, or its connection fails when the handshake ends, before any data either way. A client connecting by address sends none and is served. The context is never switched mid-handshake (`SSL_set_SSL_CTX` is refused by `tls-check`).
+- **ALPN** (TS5): the protocols spoken, in the server's order. A client that offers ALPN but none of them gets a fatal `no_application_protocol` alert (RFC 9325, against cross-protocol attacks); one that offers none is served. This is the package's one callback into Mojo, `tls.ffi.alpn_select`: it reads its arguments and nothing else.
+- **Bounds:** a client may send at most 32 KiB before the handshake ends (TS8): a few times any real ClientHello, where OpenSSL alone would read 128 KiB. The other bounds are the engine's (see "Bounds").
+- **Reloading** (TS12): build a new context from the files and use it for new connections. Each connection keeps the context it began with, and a failed build leaves the old one serving. `expires_in()` and `renewal_due()` (less than a third of the leaf's lifetime left) are the expiry alarm.
+- **The driver's part** (S7): admitting handshakes before making a `TlsServer` (TS7), one deadline per handshake (TS8), sending the alert after a failure and then closing (TS10), logging the category and never the detail at error level (TS11: a client's SNI is in it, cleaned to printable ASCII), and removing `SSLKEYLOGFILE` from workers' environments.
 
 ## Policy
 Every setting is made explicitly on each context and then read back, and `build()` fails if any read-back differs. A configuration that something else in the process loaded first still reaches a new OpenSSL context (measured in T0), and the tests run under a hostile one:
@@ -93,7 +120,8 @@ OpenSSL's memory buffers never refuse a write, so the state machine bounds them 
 | `HOST_MISMATCH`, `IP_MISMATCH` | the certificate is for another name or address | `PermissionDenied` |
 | `NO_PEER_CERT`, `WEAK` | no certificate; a key or signature below security level 2 | `PermissionDenied` |
 | `PROTOCOL` | the handshake or a record failed: version, ciphers, a bad message, an alert | `InvalidData` |
-| `ALPN` | the server chose a protocol nobody offered | `InvalidData` |
+| `ALPN` | the server chose a protocol nobody offered; for a server, the client offered none it speaks | `InvalidData` |
+| `CREDENTIALS` | a server's certificate or key is unusable: missing, mismatched, encrypted, weak, or readable by others | `NotFound`, `InvalidData`, `PermissionDenied` |
 | `TRUNCATED` | the connection ended without close_notify | `UnexpectedEof` |
 | `NO_TRUST_STORE` | no CA certificate could be loaded | `NotFound`, `InvalidData` |
 | `INPUT`, `RESOURCE`, `LIBRARY`, `CLOSED` | a bad name or configuration; a memory bound; OpenSSL missing or older than 3.5; use after close | various |
@@ -101,7 +129,7 @@ OpenSSL's memory buffers never refuse a write, so the state machine bounds them 
 
 ## How OpenSSL is reached
 - **One module calls C** (TL7): `tls.ffi`. It opens `libssl.so.3` by absolute path from the directory the Mojo runtime was loaded from, which is the program's own environment, through `std.ffi.OwnedDLHandle`. libssl finds its `libcrypto.so.3` by soname, so one that other code loaded first (another OpenSSL, through `LD_PRELOAD` or a library) would be used instead: loading refuses unless the mapped libcrypto sits beside the libssl. Then it takes the address of each function it uses, once. It refuses an OpenSSL older than 3.5.9 or from another major version (TL1, TL3), and calls `OPENSSL_init_ssl(OPENSSL_INIT_NO_LOAD_CONFIG)` first, so no `openssl.cnf` is read (TL4). Contexts live in a private library context with only the default provider.
-- **The functions bound are an allowlist** (TL5), in `tools/check_tls.py`. Each binding names its function as a literal, so none escapes the list. Each one's ELF version node is `OPENSSL_3.5.0` or older (TL2), so the package runs on any later 3.x. APIs with a CVE history, the features listed above, socket BIOs, session setters and callbacks are refused by name anywhere in `src/tls`. No public function outside `tls.ffi` hands out an OpenSSL handle, so a built context cannot be changed (TB3).
+- **The functions bound are an allowlist** (TL5), in `tools/check_tls.py`. Each binding names its function as a literal, so none escapes the list. Each one's ELF version node is `OPENSSL_3.5.0` or older (TL2), so the package runs on any later 3.x. APIs with a CVE history, the features listed above, socket BIOs, session setters and callbacks are refused by name anywhere in `src/tls`. The one function libssl may call is the server's ALPN choice (`alpn_select`), and the one binding that installs a callback is its setter; `tls-check` refuses any other. No public function outside `tls.ffi` hands out an OpenSSL handle, so a built context cannot be changed (TB3).
 - **The macros' command codes** (`SSL_ctrl` and friends) come from the headers (`tools/gen_tls_consts.py`, `pixi run gen-tls`) and are checked against them in CI (TB14).
 - **No sockets in OpenSSL.** It sees only memory BIOs, and `net` does all of the I/O (T0 traced it). libssl and libcrypto make their own memory, randomness and file-read syscalls: the one exception to "no libc on the I/O path" (`docs/design.md`).
 - **Errors** (TB6): the thread's error queue is cleared before each OpenSSL call that can fail, and `SSL_get_error` is called right after it. Every `SSL_ERROR_*` value is handled, and an unknown one fails the connection. OpenSSL 3.5.9 clears the queue itself on entering `SSL_do_handshake` and `SSL_read_ex` (measured), so the clears are there for the API's contract, and a test without them still passes on 3.5.
@@ -119,13 +147,21 @@ What runs, in `pixi run ci` on x86_64 and aarch64 unless said. Gates are the res
 - **TG5, damage** (`test_mutations.mojo`): a seeded proxy (`tls_mitm.py`) flips, drops, duplicates, inserts or replaces bytes, or cuts the connection, in the handshake or the data. The oracle: never a clean end with different data, never bytes the server did not send, never a hang. 80 seeds in CI; 3,000 seeds passed once, after a harness bug was fixed (a peer whose unread output filled its pipe). The truncation-as-clean-end bug is caught by seed 5.
 - **TG6, faults** (`test_tls_faults.mojo`, built with `-D MOJO_NET_FAULTS=1`, seams in `tls.ffi`): OpenSSL too old, context and connection creation failing, a setting that does not read back, every `SSL_get_error` code from the handshake, reads and writes, and each of the six gate checks failing alone while OpenSSL passed. Since TR also the write BIO, SNI, the expected host and address, ALPN, loading the trust store, and the library context and its provider, each failing cleanly with LeakSanitizer watching.
   - Planted bug not detectable: removing the error-queue clears (OpenSSL 3.5 clears it itself, see above). `test_stale_openssl_errors_are_ignored` still shows that a stale error neither fails a connection nor leaks into an error's text.
-- **TG7, sanitizers** (`pixi run tls-asan`): the client, codec, fault, transcript, damage and review-regression tests built with AddressSanitizer and run with LeakSanitizer. Only the embedded Python interpreter and the test-only fault plan are suppressed. It found a real leak: an `SSL_CTX` was lost when configuration failed, because Mojo 1.2 skips `__deinit__` when `__init__` raises before a field's last assignment (`CLAUDE.md`). Fixed. A planted leak (a connection never freed) is caught. ASan cannot see misuse inside libssl itself (T0), except through the `memcpy` calls it intercepts.
+- **TG7, sanitizers** (`pixi run tls-asan`): the client, codec, fault, transcript, damage, review-regression and server tests built with AddressSanitizer and run with LeakSanitizer (the leak test with 1,000 connections, LeakSanitizer as its check). Only the embedded Python interpreter and the test-only fault plan are suppressed. It found a real leak: an `SSL_CTX` was lost when configuration failed, because Mojo 1.2 skips `__deinit__` when `__init__` raises before a field's last assignment (`CLAUDE.md`). Fixed. A planted leak (a connection never freed) is caught. ASan cannot see misuse inside libssl itself (T0), except through the `memcpy` calls it intercepts.
 - **TG8, an instrumented OpenSSL** (`pixi run tls-asan-openssl`; weekly in `.github/workflows/tls-weekly.yml`): the same tests against OpenSSL 3.5.9 built from source with ASan (`enable-asan`), so every load and store libssl and libcrypto make is checked.
   - **How it is loaded,** with no switch in `src/`: `tls.ffi` opens `libssl.so.3` beside the Mojo runtime library. The script builds a directory with a copy of that library and the instrumented OpenSSL, and puts it first on `LD_LIBRARY_PATH`. The test binaries use RUNPATH, which `LD_LIBRARY_PATH` precedes.
   - **Measured:** a buffer freed before `SSL_write_ex` copies it is caught by both runs, since libssl copies it with `memcpy`. A `size_t` out-parameter freed before the call is caught only here: `ssl3_write_bytes` stores to it directly. That is the gate's planted bug (`--self-test`).
   - **Planting a use-after-free in Mojo takes raw memory** (`unsafe_alloc`, `unsafe_free`). A `List` whose storage was handed out as a `MutAnyOrigin` pointer stays alive while that pointer is in use, even after `_ = list^`. That is the language's rule for such pointers, and it is also why the wrapper's buffer passing is safe.
   - The full run passes: 86 tests in 7 files, with no report. It found one bug, in a new test: a context destroyed before OpenSSL read the `SSL_CTX` its raw handle pointed to (CLAUDE.md, FFI). Plain ASan missed it, since OpenSSL read the struct directly.
-- **TG10, defaults** (`test_config.mojo`, `test_hostile_config.mojo`, `test_tls_regressions_hostile.mojo`): the trust order and its environment variables, empty and missing stores, ALPN encoding, and the whole policy under a hostile `openssl.cnf` loaded into the process first: TLS 1.0, security level 0 and the legacy provider; then an extra CA (`VerifyCAFile`) and weakening options (unsafe renegotiation, ignoring an end without close_notify, kTLS), shown to reach Python's contexts and not ours.
+- **TG10, defaults** (`test_config.mojo`, `test_hostile_config.mojo`, `test_tls_regressions_hostile.mojo`): the trust order and its environment variables, empty and missing stores, ALPN encoding, and the whole policy under a hostile `openssl.cnf` loaded into the process first: TLS 1.0, security level 0 and the legacy provider; then an extra CA (`VerifyCAFile`) and weakening options (unsafe renegotiation, ignoring an end without close_notify, kTLS), shown to reach Python's contexts and not ours; and for a server, four session tickets, tickets back on and `ffdhe2048` first, none of which takes.
+- **The server (T2):**
+  - `test_server.mojo` (18 tests), against Python's `ssl` (`tls_client_peer.py`) and `openssl s_client`: TLS 1.3 and 1.2 with an intermediate-profile suite; TLS 1.1, and TLS 1.2 under `tls13_only`, refused; ALPN chosen, refused with `no_application_protocol`, absent; an unknown SNI refused before any data, SNI normalized, none from an address; no ticket and no resumption on a reconnect; truncation; a ClientHello that never ends cut at 32 KiB; `ffdhe2048`, DHE, static RSA, CBC and CCM suites refused; renegotiation refused (s_client's `R`); the server closing first.
+  - `test_server_config.mojo` (13): every refusal above, the policy read back, an intermediate sent, lifetime and renewal, reloading with live connections, and no `SSLKEYLOGFILE` written. The encrypted key is tried on a pseudo-terminal of the program's own (`on_tty.py`): with the empty-password guard removed, the program prints "Enter PEM pass phrase:" and waits, and the test fails.
+  - `test_server_pair.mojo`: client and server in one process with every byte under a seed. 40 seeds of random split points arrive intact; 200 seeds of damage (flipped, lost, repeated or inserted bytes, cuts) in either direction all fail cleanly, never delivering bytes the other side did not send. A KeyUpdate flood from the client (made with libssl's `SSL_key_update` in the test) fails the server's connection.
+  - `test_server_faults.mojo` (6): each server-context call failing, and each part of the server's gate.
+  - `test_server_leak.mojo`: 10,000 connections (whole, dropped mid-handshake, damaged): resident memory did not grow (178 MB before, 143 MB after, under `mojo run`). A planted leak (no `SSL_free`) fails it.
+  - Planted bugs, each caught: tickets on, `ffdhe2048` in the groups, an ALPN callback that takes anything, no SNI check, the ClientHello bound at 256 KiB, a byte too many delivered, no bound on input without data, no empty password, no `SSL_free`.
+  - **Not run: TG12 as specified.** sslyze, tlsfuzzer and testssl.sh are not on conda-forge, so the Mozilla-profile scan is the tests above, with `openssl s_client` and Python's `ssl` as the scanners. Run sslyze (`--mozilla_config=intermediate`) against the S7 listener before it is published.
 - **Static** (`pixi run tls-check`): FFI in one module, the binding allowlist, forbidden names, symbol versions, constants against the headers. Its self-test plants a violation of each. Also `import-check`: only `tls.stream` and `tls.target` import `net`.
 - **TG14, freshness** (`pixi run tls-freshness`, daily in `.github/workflows/freshness.yml`): fails when conda-forge has had a newer `openssl` 3.5 or `ca-certificates` than `pixi.lock` for more than two days. Its first run found `ca-certificates` three days stale.
 - **By hand, 2026-10-26: badssl.com and real APIs.**
@@ -180,4 +216,7 @@ OpenSSL 3.5 is supported until 2030-04-08. On a High or Critical OpenSSL advisor
 - **H8: `https://` in `http.Client`** (in `http`). Done (`docs/http.md`): the pool keyed by scheme (one TLS context per `Client`), ALPN `http/1.1`, truncation handled per RFC 9112 §9.8. The client follows no redirects, so there is none to verify again. `TlsStream` gained the readiness-loop calls it needs: `try_read`, `try_write`, `flush_ready`, `buffered`, `is_reusable`.
 - **P9, R8: TLS for `pg` and `redis`.** Parked, by the user's priorities.
 - **TR: review.** Done, but for TG2, TG11 and the external review. Two independent internal reviews, each finding fixed under a regression test (see "Review"), and TG8, OpenSSL built with ASan. The external review (TG15) is a person's job: it is not booked yet.
-- **T2: the server**, then **S7: the TLS listener** in `server`.
+- **T2: the server.** Done, without an internal review of its own yet.
+  - `tls.engine` (what both sides share, out of `tls.client`), `tls.server_config` (`ServerConfig`, `ServerContext`), `tls.server` (`TlsServer`); `linux.fs.stat_path` for the key's permissions; `linux.fault` seams up to 1099.
+  - Tests: 42 in 6 files (one in `test_tls_regressions_hostile.mojo`), plus the ASan runs; `tls-check` knows the one callback.
+- **S7: the TLS listener** in `server`: admission, the handshake deadline, close policy, logging, reload on SIGHUP and the expiry alarm, workers, and the 421 for a `Host` other than the SNI.

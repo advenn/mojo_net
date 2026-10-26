@@ -677,6 +677,7 @@ def open_dir(path: StringSpan) raises -> OwnedFd
 def pread[F: AsFd](fd: F, buf: Span[UInt8], offset: Int) raises -> Int
 def read_file(path: StringSpan, op: StringSpan[ImmStaticOrigin], max_bytes: Int = Int(16777216)) raises -> List[UInt8]
 def stat_fd[F: AsFd](fd: F) raises -> Statx
+def stat_path(path: StringSpan) raises -> Statx
 
 # linux.nr
 comptime SYS_accept4 = Int(288) if CompilationTarget.is_x86() else Int(242)

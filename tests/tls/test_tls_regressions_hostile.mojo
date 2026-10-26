@@ -1,8 +1,9 @@
 """A hostile OpenSSL configuration that tries what the first one
 (tests/tls/test_hostile_config.mojo) does not: extra trust (VerifyCAFile
 naming an unrelated CA) and weakening options (unsafe legacy
-renegotiation, ignoring an end without close_notify, kTLS), loaded into
-the process before `tls` (TR review: a coverage gap, not a defect found;
+renegotiation, ignoring an end without close_notify, kTLS; for a server,
+session tickets and a finite-field group), loaded into the process before
+`tls` (TR review: a coverage gap, not a defect found;
 OpenSSL refuses certificate commands in `system_default`, which this
 shows rather than assumes). One configuration per process, hence its own
 file."""
@@ -12,7 +13,8 @@ from std.python import Python
 from std.testing import TestSuite, assert_equal, assert_true
 
 from tls import Category
-from tls_util import Peer, connect, opts, pki, read_error, refused, trusting
+from tls.config import SERVER_OPTIONS
+from tls_util import Peer, ServerDriver, client_peer, connect, listener, opts, pki, read_error, refused, serving, trusting
 
 
 def _load_hostile_config() raises -> String:
@@ -21,8 +23,8 @@ def _load_hostile_config() raises -> String:
         "openssl_conf = openssl_init\n[openssl_init]\nssl_conf = ssl_sect\n",
         "[ssl_sect]\nsystem_default = system_default_sect\n[system_default_sect]\n",
         "VerifyCAFile = ", pki(), "/other.pem\n",
-        "Options = UnsafeLegacyRenegotiation,IgnoreUnexpectedEOF,KTLS,-NoRenegotiation\n",
-        "MinProtocol = TLSv1\nCipherString = ALL:@SECLEVEL=0\n",
+        "Options = UnsafeLegacyRenegotiation,IgnoreUnexpectedEOF,KTLS,-NoRenegotiation,-NoTicket\n",
+        "MinProtocol = TLSv1\nCipherString = ALL:@SECLEVEL=0\nNumTickets = 4\nGroups = ffdhe2048:X25519\n",
     )
     var builtins = Python.import_module("builtins")
     var f = builtins.open(cnf, "w")
@@ -58,6 +60,28 @@ def test_extra_trust_and_options_do_not_take() raises:
     assert_equal(t.version(), "TLSv1.3")
     t^.close()
     good^.stop()
+
+
+def test_a_server_context_does_not_take_them_either() raises:
+    """T2: the same configuration, which also asks for four session
+    tickets, tickets back on and a finite-field group first: the server's
+    options read back exactly, and a client gets no ticket and no
+    resumption."""
+    _ = _load_hostile_config()
+    var ctx = serving()
+    ref L = ctx._library()[]
+    assert_equal(L.SSL_CTX_get_options(ctx._ssl_ctx()), SERVER_OPTIONS)
+    assert_equal(L.SSL_CTX_get_num_tickets(ctx._ssl_ctx()), 0)
+    var l = listener()
+    var c = client_peer(Int(l.local_addr().port()), "reconnect")
+    var d = ServerDriver(l, ctx)
+    _ = d.serve()
+    var d2 = ServerDriver(l, ctx)
+    _ = d2.serve()
+    assert_equal(c.expect("TICKET"), "TICKET False")
+    assert_equal(c.expect("REUSED"), "REUSED False")
+    assert_true(d.tls.group() != "ffdhe2048", d.tls.group())
+    c^.stop()
 
 
 def main() raises:

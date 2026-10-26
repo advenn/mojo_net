@@ -76,6 +76,7 @@ CONSTS = [
     ("SSL_OP_CLEANSE_PLAINTEXT", "UInt64", "wipe OpenSSL's own copies of plaintext (TB18)"),
     ("SSL_MODE_AUTO_RETRY", "Int", ""),
     ("SSL_MODE_RELEASE_BUFFERS", "Int", ""),
+    ("SSL_MODE_NO_AUTO_CHAIN", "Int", "a server sends exactly the chain configured (TS3)"),
     # verify results (X509_V_*) the error categories name
     ("X509_V_OK", "Int", ""),
     ("X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT", "Int", ""),
@@ -100,6 +101,14 @@ CONSTS = [
     # error-queue reason codes
     ("ERR_LIB_SSL", "Int", ""),
     ("SSL_R_UNEXPECTED_EOF_WHILE_READING", "Int", ""),
+    ("SSL_R_NO_APPLICATION_PROTOCOL", "Int", "the ALPN refusal (TS5)"),
+    ("ERR_SYSTEM_FLAG", "UInt64", "ERR_GET_LIB / ERR_GET_REASON (inline functions)"),
+    ("ERR_LIB_OFFSET", "UInt64", ""),
+    ("ERR_LIB_MASK", "UInt64", ""),
+    ("ERR_REASON_MASK", "UInt64", ""),
+    # a server's ALPN selection callback (TS5)
+    ("SSL_TLSEXT_ERR_OK", "c_int", ""),
+    ("SSL_TLSEXT_ERR_ALERT_FATAL", "c_int", ""),
 ]
 
 PROGRAM = """#include <stdio.h>

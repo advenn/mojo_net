@@ -29,6 +29,7 @@ Leaves (signed by root unless said):
   sha1          localhost, signed with SHA-1
   client_only   localhost, extendedKeyUsage clientAuth only
   by_other      localhost and 127.0.0.1, signed by other (an unrelated root)
+  soon          localhost, valid from 47 hours ago to 1 hour from now
 Other files:
   root.crl.pem  an empty CRL issued by root (a CRL is no trust anchor)
 """
@@ -136,6 +137,9 @@ def main():
     signed(d, "sha1", "root", "/CN=localhost", LEAF_EXT + host, digest="sha1")
     signed(d, "client_only", "root", "/CN=localhost", LEAF_EXT + host + "extendedKeyUsage=clientAuth\n")
     signed(d, "by_other", "other", "/CN=localhost", LEAF_EXT + names)
+    now = time.time()
+    stamp = lambda t: time.strftime("%Y%m%d%H%M%SZ", time.gmtime(t))
+    signed(d, "soon", "root", "/CN=localhost", LEAF_EXT + host, dates=(stamp(now - 47 * 3600), stamp(now + 3600)))
     crl(d, "root")
     if len(sys.argv) == 4 and sys.argv[2] == "--owner":
         watch(int(sys.argv[3]), d)

@@ -530,7 +530,7 @@ def test_same_plan_replays_identically() raises:
 def test_invalid_rules_are_rejected() raises:
     fault.clear()
     var cases = List[Optional[IoError]]()
-    for nr in [-1, 1024, 1 << 40]:
+    for nr in [-1, 1100, 1 << 40]:  # (0..1099: the syscalls, then the seams)
         try:
             fault.inject(nr, Errno.EIO)
             cases.append(None)
@@ -598,7 +598,7 @@ def test_invalid_rules_are_rejected() raises:
 def test_valid_edge_values_are_accepted() raises:
     fault.clear()
     fault.inject(0, Errno(1))
-    fault.inject(1023, Errno(4095), skip=1_000_000, every=1_000_000, times=-1)
+    fault.inject(1099, Errno(4095), skip=1_000_000, every=1_000_000, times=-1)  # (the last slot)
     fault.inject_short(SYS_recvfrom, 0)
     assert_equal(fault.pending(), 3)
     fault.clear()

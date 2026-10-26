@@ -44,6 +44,9 @@ struct Category(Equatable, TrivialRegisterPassable, Writable):
     """A memory bound was reached (the peer sent too much)."""
     comptime CLOSED = Category(14)
     """The connection was used after it closed."""
+    comptime CREDENTIALS = Category(15)
+    """A server's certificate or key is unusable: missing, mismatched,
+    encrypted, below the security level, or readable by other users."""
 
     def __init__(out self, value: Int):
         self.value = value
@@ -68,6 +71,7 @@ struct Category(Equatable, TrivialRegisterPassable, Writable):
             "library",
             "resource limit",
             "closed",
+            "unusable certificate or key",
         ]
         writer.write(names[self.value] if 0 <= self.value < len(names) else "unknown")
 

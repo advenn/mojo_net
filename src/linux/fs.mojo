@@ -1,7 +1,8 @@
 """Files with raw syscalls: whole small files (`read_file`: configuration
 such as /etc/resolv.conf and /etc/hosts, and procfs entries), and opening
 files beneath a directory without leaving it (`open_dir`, `open_beneath`,
-`stat_fd`, `pread`), which is what a static file server needs.
+`stat_fd`, `pread`), which is what a static file server needs; and
+`stat_path`, for a file named by path (a TLS key's permissions).
 
 No libc on the I/O path holds for files too: the stdlib's `open` goes
 through libc.
@@ -169,6 +170,23 @@ def stat_fd[F: AsFd](fd: F) raises IoError -> Statx:
     keep_alive(empty)
     keep_alive(st)
     _ = check("statx", r)
+    return st^
+
+
+def stat_path(path: StringSlice) raises IoError -> Statx:
+    """The metadata of the file at `path`, symbolic links followed (statx
+    from the working directory; EINTR retried)."""
+    comptime op = "stat_path"
+    var cpath = _cpath(path, op)
+    var st = Statx()
+    var r: Int
+    while True:
+        r = syscall5(SYS_statx, AT_FDCWD, Int(cpath.unsafe_ptr()), 0, STATX_BASIC_STATS, Int(Pointer(to=st)))
+        if not (is_err(r) and Errno(err_of(r)) == Errno.EINTR):
+            break
+    keep_alive(cpath)
+    keep_alive(st)
+    _ = check(op, r)
     return st^
 
 

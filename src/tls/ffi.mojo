@@ -21,6 +21,8 @@ How (docs/spikes.md, "TLS through OpenSSL" has the measurements):
   hold). Every buffer C reads or writes travels as a typed mutable pointer
   (`Buf`, `SizeOut`), never as an address: passed as an `Int`, the
   compiler read a buffer C had written back as its old contents (T0).
+- **One callback** (TS5): `alpn_select`, a server's ALPN choice, the only
+  Mojo function libssl calls. It reads its arguments and nothing else.
 - **Initialisation.** `OPENSSL_init_ssl(OPENSSL_INIT_NO_LOAD_CONFIG)` is
   the first call, so no `openssl.cnf` is read (TL4), and contexts are made
   in a private `OSSL_LIB_CTX` with only the default provider. A config
@@ -35,7 +37,19 @@ from std.sys import get_defined_bool
 from linux import ErrorKind, IoError
 from linux.fs import read_file
 
-from .consts import OPENSSL_DIR, OPENSSL_INIT_NO_LOAD_CONFIG, OPENSSL_VERSION
+from .consts import (
+    ERR_LIB_MASK,
+    ERR_LIB_OFFSET,
+    ERR_LIB_SSL,
+    ERR_REASON_MASK,
+    ERR_SYSTEM_FLAG,
+    OPENSSL_DIR,
+    OPENSSL_INIT_NO_LOAD_CONFIG,
+    OPENSSL_VERSION,
+    SSL_R_NO_APPLICATION_PROTOCOL,
+    SSL_TLSEXT_ERR_ALERT_FATAL,
+    SSL_TLSEXT_ERR_OK,
+)
 
 comptime Obj = Int
 """An OpenSSL object's address (0: NULL)."""
@@ -45,6 +59,8 @@ comptime SizeOut = Pointer[Int, MutAnyOrigin]
 """A `size_t *` (or `const unsigned char **`) out-parameter."""
 comptime U32Out = Pointer[UInt32, MutAnyOrigin]
 """An `unsigned int *` out-parameter."""
+comptime I32Out = Pointer[Int32, MutAnyOrigin]
+"""An `int *` out-parameter."""
 
 comptime _RTLD_NOW = 2
 comptime _RTLD_NODELETE = 0x1000
@@ -114,7 +130,24 @@ comptime SEAM_LOAD_VERIFY = 1022
 """`SSL_CTX_load_verify_file` (or `_dir`) fails."""
 comptime SEAM_LIBCTX = 1023
 """`Library`: 1, `OSSL_LIB_CTX_new` returns NULL; 2, the default provider
-does not load. (1023 is the last seam number.)"""
+does not load."""
+comptime SEAM_CHAIN = 1024
+"""`SSL_CTX_use_certificate_chain_file` fails."""
+comptime SEAM_KEY = 1025
+"""`SSL_CTX_use_PrivateKey_file` fails."""
+comptime SEAM_KEY_MATCH = 1026
+"""`SSL_CTX_check_private_key` says the key does not match."""
+comptime SEAM_LEAF = 1027
+"""`SSL_CTX_get0_certificate` returns NULL."""
+comptime SEAM_TICKETS = 1028
+"""A server context: the ticket count read back is 2."""
+comptime SEAM_EARLY = 1029
+"""A server context: the early data limit read back is 16384."""
+comptime SEAM_TIME = 1030
+"""`ASN1_TIME_diff` fails."""
+comptime SEAM_SERVER_NAME = 1031
+"""The server's gate: the client's SNI reads as "unknown.invalid".
+(Seams go up to 1099: `linux.fault`'s table.)"""
 
 
 @always_inline
@@ -143,6 +176,10 @@ def in_buf(data: Span[UInt8, _]) -> Buf:
 def out_buf(data: MutSpan[UInt8, _]) -> Buf:
     """Bytes C writes."""
     return data.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+
+
+def i32_out(mut b: List[Int32]) -> I32Out:
+    return b.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
 
 
 def size_out(mut b: List[Int]) -> SizeOut:
@@ -177,6 +214,53 @@ def from_c_string(addr: Obj) -> String:
         out.append(p[unsafe_offset=n])
         n += 1
     return String(from_utf8_lossy=Span(out))
+
+
+def is_alpn_refusal(e: UInt64) -> Bool:
+    """Whether the error-queue code `e` is libssl's "no application
+    protocol" (ERR_GET_LIB and ERR_GET_REASON are inline functions)."""
+    if e == 0 or e & ERR_SYSTEM_FLAG != 0:
+        return False
+    return Int((e >> ERR_LIB_OFFSET) & ERR_LIB_MASK) == ERR_LIB_SSL and Int(e & ERR_REASON_MASK) == SSL_R_NO_APPLICATION_PROTOCOL
+
+
+# ---- the one callback (TS5) ----------------------------------------------------
+
+comptime AlpnSelect = def(Obj, SizeOut, Buf, Buf, c_uint, Obj) thin abi("C") -> c_int
+"""`SSL_CTX_alpn_select_cb_func`."""
+
+
+def alpn_select(ssl: Obj, chosen: SizeOut, chosen_len: Buf, offered: Buf, offered_len: c_uint, prefs: Obj) abi("C") -> c_int:
+    """A server's ALPN choice, called by libssl inside `SSL_do_handshake`
+    when the client offers protocols: the first of the server's (`prefs`,
+    the address of a buffer holding the wire list's length in two bytes,
+    big-endian, then the list) that the client offered, matched as bytes.
+    `chosen` points into the client's list, which libssl copies on return.
+    None in common, or a malformed list: a fatal no_application_protocol
+    alert (RFC 7301 3.2; ALPACA, RFC 9325). It reads its arguments only:
+    it never raises, allocates, or touches any other state."""
+    var mine = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=prefs)
+    var mine_end = 2 + ((Int(mine[unsafe_offset=0]) << 8) | Int(mine[unsafe_offset=1]))
+    var n = Int(offered_len)
+    var i = 2
+    while i < mine_end:
+        var want = Int(mine[unsafe_offset=i])
+        var j = 0
+        while j < n:
+            var have = Int(offered[unsafe_offset=j])
+            if have == 0 or j + 1 + have > n:
+                return SSL_TLSEXT_ERR_ALERT_FATAL  # (libssl checks the list first)
+            if have == want:
+                var k = 0
+                while k < want and offered[unsafe_offset=j + 1 + k] == mine[unsafe_offset=i + 1 + k]:
+                    k += 1
+                if k == want:
+                    chosen[] = Int(offered) + j + 1
+                    chosen_len[] = UInt8(want)
+                    return SSL_TLSEXT_ERR_OK
+            j += 1 + have
+        i += 1 + want
+    return SSL_TLSEXT_ERR_ALERT_FATAL
 
 
 def runtime_dir() raises IoError -> String:
@@ -253,6 +337,12 @@ comptime _F_i_oblub = def(Obj, Buf, Int, c_uint, Obj) thin abi("C") -> c_int
 comptime _F_i_oblu = def(Obj, Buf, Int, c_uint) thin abi("C") -> c_int
 comptime _F_v_osu = def(Obj, SizeOut, U32Out) thin abi("C") -> None
 comptime _F_v_bl = def(Buf, Int) thin abi("C") -> None
+comptime _F_i_obi = def(Obj, Buf, c_int) thin abi("C") -> c_int
+comptime _F_v_ob = def(Obj, Buf) thin abi("C") -> None
+comptime _F_i_ol = def(Obj, Int) thin abi("C") -> c_int
+comptime _F_u32_o = def(Obj) thin abi("C") -> UInt32
+comptime _F_i_ccoo = def(I32Out, I32Out, Obj, Obj) thin abi("C") -> c_int
+comptime _F_v_oao = def(Obj, AlpnSelect, Obj) thin abi("C") -> None
 
 
 struct Library(Movable):
@@ -303,6 +393,9 @@ struct Library(Movable):
     var X509_VERIFY_PARAM_set1_ip: _F_i_obl
     var X509_check_host: _F_i_oblub
     var X509_check_ip: _F_i_oblu
+    var X509_get0_notBefore: _F_o_o
+    var X509_get0_notAfter: _F_o_o
+    var ASN1_TIME_diff: _F_i_ccoo
     var OPENSSL_cleanse: _F_v_bl
     var BIO_s_mem: _F_o
     var BIO_new: _F_o_o
@@ -330,12 +423,25 @@ struct Library(Movable):
     var SSL_CTX_load_verify_file: _F_i_ob
     var SSL_CTX_load_verify_dir: _F_i_ob
     var SSL_CTX_set_alpn_protos: _F_i_obu
+    # libssl: server contexts
+    var TLS_server_method: _F_o
+    var SSL_CTX_use_certificate_chain_file: _F_i_ob
+    var SSL_CTX_use_PrivateKey_file: _F_i_obi
+    var SSL_CTX_check_private_key: _F_i_o
+    var SSL_CTX_get0_certificate: _F_o_o
+    var SSL_CTX_set_default_passwd_cb_userdata: _F_v_ob
+    var SSL_CTX_set_num_tickets: _F_i_ol
+    var SSL_CTX_get_num_tickets: _F_l_o
+    var SSL_CTX_get_max_early_data: _F_u32_o
+    var SSL_CTX_set_alpn_select_cb: _F_v_oao
     # libssl: connections
     var SSL_new: _F_o_o
     var SSL_free: _F_v_o
     var SSL_set0_rbio: _F_v_oo
     var SSL_set0_wbio: _F_v_oo
     var SSL_set_connect_state: _F_v_o
+    var SSL_set_accept_state: _F_v_o
+    var SSL_get_servername: _F_o_oi
     var SSL_ctrl: _F_l_oilo
     var SSL_ctrl_str: _F_l_oilb
     var SSL_get0_param: _F_o_o
@@ -402,6 +508,9 @@ struct Library(Movable):
         self.X509_VERIFY_PARAM_set1_ip = _sym[_F_i_obl](self._handle, "X509_VERIFY_PARAM_set1_ip")
         self.X509_check_host = _sym[_F_i_oblub](self._handle, "X509_check_host")
         self.X509_check_ip = _sym[_F_i_oblu](self._handle, "X509_check_ip")
+        self.X509_get0_notBefore = _sym[_F_o_o](self._handle, "X509_get0_notBefore")
+        self.X509_get0_notAfter = _sym[_F_o_o](self._handle, "X509_get0_notAfter")
+        self.ASN1_TIME_diff = _sym[_F_i_ccoo](self._handle, "ASN1_TIME_diff")
         self.OPENSSL_cleanse = _sym[_F_v_bl](self._handle, "OPENSSL_cleanse")
         self.BIO_s_mem = _sym[_F_o](self._handle, "BIO_s_mem")
         self.BIO_new = _sym[_F_o_o](self._handle, "BIO_new")
@@ -428,11 +537,23 @@ struct Library(Movable):
         self.SSL_CTX_load_verify_file = _sym[_F_i_ob](self._handle, "SSL_CTX_load_verify_file")
         self.SSL_CTX_load_verify_dir = _sym[_F_i_ob](self._handle, "SSL_CTX_load_verify_dir")
         self.SSL_CTX_set_alpn_protos = _sym[_F_i_obu](self._handle, "SSL_CTX_set_alpn_protos")
+        self.TLS_server_method = _sym[_F_o](self._handle, "TLS_server_method")
+        self.SSL_CTX_use_certificate_chain_file = _sym[_F_i_ob](self._handle, "SSL_CTX_use_certificate_chain_file")
+        self.SSL_CTX_use_PrivateKey_file = _sym[_F_i_obi](self._handle, "SSL_CTX_use_PrivateKey_file")
+        self.SSL_CTX_check_private_key = _sym[_F_i_o](self._handle, "SSL_CTX_check_private_key")
+        self.SSL_CTX_get0_certificate = _sym[_F_o_o](self._handle, "SSL_CTX_get0_certificate")
+        self.SSL_CTX_set_default_passwd_cb_userdata = _sym[_F_v_ob](self._handle, "SSL_CTX_set_default_passwd_cb_userdata")
+        self.SSL_CTX_set_num_tickets = _sym[_F_i_ol](self._handle, "SSL_CTX_set_num_tickets")
+        self.SSL_CTX_get_num_tickets = _sym[_F_l_o](self._handle, "SSL_CTX_get_num_tickets")
+        self.SSL_CTX_get_max_early_data = _sym[_F_u32_o](self._handle, "SSL_CTX_get_max_early_data")
+        self.SSL_CTX_set_alpn_select_cb = _sym[_F_v_oao](self._handle, "SSL_CTX_set_alpn_select_cb")
         self.SSL_new = _sym[_F_o_o](self._handle, "SSL_new")
         self.SSL_free = _sym[_F_v_o](self._handle, "SSL_free")
         self.SSL_set0_rbio = _sym[_F_v_oo](self._handle, "SSL_set0_rbio")
         self.SSL_set0_wbio = _sym[_F_v_oo](self._handle, "SSL_set0_wbio")
         self.SSL_set_connect_state = _sym[_F_v_o](self._handle, "SSL_set_connect_state")
+        self.SSL_set_accept_state = _sym[_F_v_o](self._handle, "SSL_set_accept_state")
+        self.SSL_get_servername = _sym[_F_o_oi](self._handle, "SSL_get_servername")
         self.SSL_ctrl = _sym[_F_l_oilo](self._handle, "SSL_ctrl")
         self.SSL_ctrl_str = _sym[_F_l_oilb](self._handle, "SSL_ctrl")
         self.SSL_get0_param = _sym[_F_o_o](self._handle, "SSL_get0_param")

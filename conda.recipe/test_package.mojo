@@ -19,7 +19,7 @@ from pg.config import Config as PgConfig
 from redis.config import Config as RedisConfig
 from redis.resp import RespParser, Value
 from server.date import http_date
-from tls import ClientConfig, TlsClient
+from tls import Category, ClientConfig, ServerConfig, TlsClient, TlsServer
 from tls.stream import TlsStream
 
 
@@ -91,6 +91,14 @@ def _tls() raises:
     assert_true(hello.poll_transmit(out) > 100)
     assert_equal(Int(out.readable_span()[0]), 22)  # (a handshake record)
     _ = TlsStream.connect  # (the blocking stream compiles here too)
+    # The server side: a missing key is refused (no certificate needed).
+    var refused = False
+    try:
+        var server_ctx = ServerConfig(certificate="/nonexistent.pem", key="/nonexistent.key", names=["localhost"]).build()
+        _ = TlsServer(server_ctx)
+    except e:
+        refused = e.category == Category.CREDENTIALS
+    assert_true(refused)
     print("tls:", ctx)
 
 

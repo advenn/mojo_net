@@ -44,4 +44,11 @@ run transcripts -- tests/tls/test_transcripts.mojo
 run mutations -- tests/tls/test_mutations.mojo
 run regressions -- tests/tls/test_tls_regressions.mojo
 run regressions_faults -D MOJO_NET_FAULTS=1 -- tests/tls/test_tls_regressions_faults.mojo
+run server -- tests/tls/test_server.mojo
+run server_config -- tests/tls/test_server_config.mojo
+run server_pair -- tests/tls/test_server_pair.mojo
+run server_faults -D MOJO_NET_FAULTS=1 -- tests/tls/test_server_faults.mojo
+# (fewer rounds; ASan's quarantine holds freed memory, so LeakSanitizer
+# rather than the resident size is the check here)
+MOJO_NET_TLS_LEAK_ROUNDS=1000 MOJO_NET_TLS_LEAK_RSS=0 run server_leak -- tests/tls/test_server_leak.mojo
 exit $fail
