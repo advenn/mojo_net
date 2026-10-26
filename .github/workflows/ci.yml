@@ -48,6 +48,8 @@ jobs:
           grep -E 'MemTotal|MemAvailable' /proc/meminfo
       - name: pixi run ci
         run: pixi run ci
+      - name: TLS spike (T0, docs/spikes.md)
+        run: pixi run spike-tls
       - name: Package
         run: pixi run package
       - uses: actions/upload-artifact@v7

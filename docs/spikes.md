@@ -536,3 +536,33 @@ The C baseline is the same algorithm in C. The tokio server is idiomatic code: a
 `linux.time` reads `CLOCK_MONOTONIC` and `CLOCK_REALTIME` with the raw `clock_gettime` syscall: there is no vDSO without libc.
 - **Cost:** about 161 ns per read on an i5-1145G7, against 17 ns for the stdlib's vDSO-backed `perf_counter_ns`.
 - **Consequence:** an event loop reads the clock once per turn and passes that instant down, and wall-clock text (an HTTP `Date`) is reformatted at most once a second. `server.Server` and `server.DateCache` do both.
+
+## TLS through OpenSSL (T0, measured 2026-10-26)
+TLS comes from OpenSSL, never a TLS of our own (the user's decision; `reports/Secure TLS with C libraries.md` has the research and the rules TL/TC/TB/TS/TA cited below). This spike answers what the `tls` package (T1) must know before any code goes into `src/`. `pixi run spike-tls` re-checks every fact below and fails if one no longer holds; CI runs it on x86_64 and on the aarch64 runner.
+
+**Setup.** conda-forge OpenSSL 3.5.9, pinned to the 3.5 LTS line in `pixi.toml` (3.6 loses fixes on 2026-11-01); Mojo 1.2.0; a throwaway ECDSA P-256 CA and a certificate for `localhost` and `127.0.0.1` (`spikes/tls/make_certs.sh`).
+
+| Question | Answer |
+|---|---|
+| How does Mojo reach libssl? | At run time: `std.ffi.OwnedDLHandle` opens it, `get_symbol` gives each function's address, which becomes a typed `def(...) thin abi("C") -> R` pointer (2.3 ns a call, against 1.5 ns for a linked `external_call`). Works under `mojo run` and `mojo build` with no linker flags, and a missing symbol raises instead of failing to link. |
+| And a linked `external_call`? | Works only with `-Xlinker -L<env>/lib -Xlinker -lssl -Xlinker -lcrypto` on every `mojo run` and `mojo build` (without them: "JIT session error: Symbols not found", or an undefined reference). Rejected: every program importing `http` would need the flags. |
+| Which file is loaded? | Only an absolute path is deterministic. `dlopen("libssl.so.3")` searches from the caller: a plain build found the environment's 3.5.9, but under AddressSanitizer (which intercepts `dlopen`) the same binary loaded the host's 3.5.7 from `/lib`. The spike opens `libssl.so.3` from the directory the Mojo runtime library (`libKGENCompilerRTShared.so`) is mapped from, read in `/proc/self/maps`, and logs the version and path (TL3). |
+| Can we declare `dlopen`/`dlsym` ourselves? | No. The standard library declares them (`std.sys._libc`, with `char*` and `void*` types), and one C symbol may have only one signature per program, so our own declaration fails to compile in any program that also uses Python ("existing function with conflicting signature"). `OwnedDLHandle` is the way in. |
+| Buffers handed to C | Must go as typed, mutable pointers (`p.unsafe_origin_cast[MutAnyOrigin]()`), never as an `Int` address: passed as `Int`, the compiler read `ERR_error_string_n`'s output buffer back as its zero fill (or refused the code: "use of invalidated interior reference"). |
+| Macros | `SSL_set_tlsext_host_name`, `SSL_CTX_set_min_proto_version`, `SSL_set_mode`, `SSL_CTX_set1_groups_list`, `BIO_set_mem_eof_return` are macros: called as `SSL_ctrl`/`SSL_CTX_ctrl`/`BIO_ctrl` with 55, 123, 33, 92 and 130, read from the 3.5.9 headers. `SSL_CTX_set_options` takes a `uint64_t`. |
+| Does libssl touch sockets? | No: with memory BIOs, `strace -f` of a full handshake, data exchange and cut shows no socket syscall, and no config file opened. Our `net.TcpStream` carried a real handshake to Python's `ssl` (TLS 1.3, `close_notify` both ways). |
+| What is negotiated? | TLS 1.3, `TLS_AES_256_GCM_SHA384`, the hybrid post-quantum group `X25519MLKEM768`, with a TLS 1.2 floor and the group list `X25519MLKEM768:X25519:P-256:P-384`. |
+| Verification failures | A wrong host fails with verify result 62, a wrong IP 64, an unrelated CA 20 (`certificate verify failed`). |
+| Silent failures (the hazards the wrapper must make impossible) | An empty host name (`set1_host("")` returns 1) turns the check off: the handshake succeeds for any certificate the CA signed. With `SSL_VERIFY_NONE`, the handshake succeeds although the verify result is 20. An IP match leaves `SSL_get0_peername` empty, so a post-handshake check must use `X509_check_ip`. |
+| Truncation | A TCP end without `close_notify` is `SSL_ERROR_SSL` with "unexpected eof while reading", after the data that came before it is read. |
+| TLS 1.3 tickets | A read with only the server's tickets queued returns no data and `SSL_ERROR_WANT_READ`. |
+| A hostile `OPENSSL_CONF` (legacy provider, TLS 1.0, security level 0) | With `OPENSSL_init_ssl(OPENSSL_INIT_NO_LOAD_CONFIG)` as the first call, it has no effect. But if something else in the process initialised OpenSSL first with the config (embedded Python, another library), its `system_default` section still reaches our `SSL_CTX_new_ex`, even in a private `OSSL_LIB_CTX`: minimum version TLS 1.0, security level 0 (the legacy provider stays out of the private context). So the wrapper sets every policy knob itself and checks it back, and its tests run under this file. |
+| Version nodes | Every function the spike binds is in `OPENSSL_3.0.0` (45) or `OPENSSL_3.2.0` (`SSL_get0_group_name`), so the 3.5 floor holds (`spikes/tls/symver.py`, the prototype of TL2's check). |
+| AddressSanitizer | `mojo build --sanitize address` works, and LeakSanitizer found the spike's own bug: a provider loaded into a private library context must be unloaded (`OSSL_PROVIDER_unload`), since freeing the context does not drop it. Fixed, the run is clean. |
+
+**Consequences for T1** (beyond the report's rules):
+- **Library handle.** The `tls` package holds one `OwnedDLHandle` and a table of typed function pointers, built once and kept alive as long as any context or connection that uses it.
+- **Pointer rules.** Pointers to OpenSSL objects are typed, and buffers go as mutable pointers.
+- **Tests.** The tests use subprocess peers, not an in-process Python `ssl`, which would initialise OpenSSL with its config first.
+
+**Files:** `spikes/tls/` (`ffi.mojo`, `pair.mojo`, `peer.mojo`, `make_certs.sh`, `hostile.cnf`, `symver.py`, `run.sh`).

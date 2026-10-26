@@ -41,6 +41,7 @@ pixi run abi-check                 # constants + struct layouts vs this host's C
 pixi run nolibc-check              # no libc socket/poll/epoll symbols on the I/O path
 pixi run gen                       # regenerate src/linux/{nr,consts,errno}.mojo from headers
 pixi run spikes                    # re-run the M1 spikes
+pixi run spike-tls                 # the TLS-through-OpenSSL spike (T0): fails if a recorded fact changed
 pixi run bench build               # rt benchmarks (bench/rt/README.md)
 pixi run -e bench bench-server run  # HTTP server vs nginx, Go, hyper under wrk (bench/server/README.md)
 ```
@@ -48,7 +49,7 @@ pixi run -e bench bench-server run  # HTTP server vs nginx, Go, hyper under wrk 
 **Stability and packaging** (`docs/design.md`):
 - `linux`, `bytes` and `net` are stable: changes are additive, and `api-check` fails on any change to their public API until `api-update` records it. Rename or remove only after a replacement has shipped beside the old name, deprecated.
 - `mojo-net` is one noarch conda package of sources (every library but `rt`) in `$PREFIX/lib/mojo/<pkg>/`, for `mojo-compiler >=1.2,<1.3`; its version is `pixi.toml`'s. `conda.recipe/test_package.mojo` runs in a fresh environment against the installed package. A new library goes into the recipe's list and that test.
-- Not published: no licence is chosen yet, and the repository is private. Do not publish without the user's decision.
+- Not published yet. The user's goal (2026-10-26) is to open-source it under a permissive licence, with a warning that it is AI-generated and not fully reviewed, once the AI-stack milestones are done. Confirm with the user before making the repository public or publishing a package; the conda name `mojo-net` (importing `net`) collides with a published community package.
 - GitHub CI (`.github/workflows/ci.yml`) runs `ci` and `package` on x86_64 and on a real aarch64 runner (`ubuntu-24.04-arm`).
 
 **Test runner (`tools/run_tests.sh`):**
@@ -158,7 +159,11 @@ pixi run -e bench bench-server run  # HTTP server vs nginx, Go, hyper under wrk 
 - **Comptime backend alias:** `comptime Backend: Driver = A if cond else B` has the trait type, so members beyond the trait are invisible through it. Tests reach simulator-only members with `rebind[SimDriver](ev.driver)`.
 - **Typed raises:** inside a `try` whose calls raise `IoError`, you can't `raise Error(...)`.
 - **Comptime arrays:** a comptime `Array` of non-`ImplicitlyCopyable` values can't be indexed at runtime; use if-chains.
-- **FFI:** declare each `external_call` C symbol with exactly one signature (spike-only code). A C-callable fn pointer is spelled `def(OpaquePointer[MutAnyOrigin]) thin abi("C") -> OpaquePointer[MutAnyOrigin]`, and function-typed parameters are spelled `def(T) thin -> R`.
+- **FFI:** declare each `external_call` C symbol with exactly one signature (spike-only code).
+  - The standard library declares `dlopen`, `dlsym` and `dlerror` itself (`std.sys._libc`), so declaring them again fails in any program that also uses Python ("existing function with conflicting signature"). Open libraries with `std.ffi.OwnedDLHandle` and turn `get_symbol` addresses into typed `def(...) thin abi("C") -> R` pointers (`docs/spikes.md`, "TLS through OpenSSL").
+  - A buffer C writes into goes as a typed mutable pointer (`p.unsafe_origin_cast[MutAnyOrigin]()`), never as an `Int` address: passed as `Int`, the compiler read the buffer back as its zero fill.
+  - Open a C library by absolute path: a bare `dlopen("libssl.so.3")` searches from its caller, and under AddressSanitizer (which intercepts `dlopen`) it loaded the host's OpenSSL instead of the environment's.
+  - A C-callable fn pointer is spelled `def(OpaquePointer[MutAnyOrigin]) thin abi("C") -> OpaquePointer[MutAnyOrigin]`, and function-typed parameters are spelled `def(T) thin -> R`.
 - **Stdlib traps:**
   - `String.splitlines()` also splits on `\t` (verified on 1.2.0rc2 and 1.2.0); use `split("\n")`. This matters for HTTP parsing.
   - `TestSuite.run()` rejects unknown argv, and its times are in milliseconds.

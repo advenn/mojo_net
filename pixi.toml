@@ -33,6 +33,8 @@ aarch64-check = "bash tools/check_aarch64.sh"
 ci = { depends-on = ["import-check", "api-check", "test", "nolibc-check", "examples-check"] }
 # Re-run the M1 threading/runtime/callback spikes (see docs/spikes.md).
 spikes = "bash spikes/run_spikes.sh"
+# The TLS-through-OpenSSL spike (T0): checks every recorded fact.
+spike-tls = "bash spikes/tls/run.sh"
 # rt benchmarks against tokio (rt is frozen; see bench/rt/README.md):
 # `pixi run bench build`, then `pixi run bench gate`.
 bench = "bash bench/rt/run.sh"
@@ -40,6 +42,10 @@ format = "mojo format src tests"
 
 [dependencies]
 mojo = "==1.2.0"
+# TLS comes from OpenSSL (never a TLS of our own), on its 3.5 LTS line,
+# supported to 2030-04-08; 3.6 loses fixes on 2026-11-01. Its libssl.so.3
+# is what spikes/tls (T0) and the coming `tls` package load.
+openssl = "3.5.*"
 # Test-only: differential oracles (ipaddress) and peer processes.
 python = ">=3.12"
 # Test-only: a real PostgreSQL for tests/pg (initdb, pg_ctl, psql;
