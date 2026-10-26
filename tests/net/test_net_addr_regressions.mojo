@@ -369,7 +369,7 @@ def _death_runner(tmp: String) raises -> PythonObject:
 def _run_child(runner: PythonObject, mode: StaticString) raises -> PythonObject:
     var os = Python.import_module("os")
     var subprocess = Python.import_module("subprocess")
-    var env = os.environ.copy()
+    var env = Python.import_module("builtins").dict(os.environ)  # (not .copy(): Mojo's, the same object)
     env[_DEATH_ENV] = mode
     return subprocess.run(
         runner, env=env, capture_output=True, text=True, timeout=120

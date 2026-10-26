@@ -179,7 +179,9 @@ def test_a_foreign_libcrypto_is_refused() raises:
     )
     if Int(py=built.returncode) != 0:
         raise Error(String("building the app failed: ", String(py=built.stderr)))
-    var env = os.environ.copy()
+    # A copy: `os.environ.copy()` would be Mojo's `copy`, a second reference
+    # to the same object, and the edits below would reach every later test.
+    var env = Python.import_module("builtins").dict(os.environ)
     _ = env.pop("LD_LIBRARY_PATH", None)  # (the app is not built with ASan: no instrumented OpenSSL for it)
     var plain = subprocess.run(Python.list(exe), capture_output=True, text=True, env=env)
     assert_equal(String(String(py=plain.stdout).strip()), "BUILT")
@@ -187,7 +189,11 @@ def test_a_foreign_libcrypto_is_refused() raises:
     var preloaded = subprocess.run(Python.list(exe), capture_output=True, text=True, env=env)
     _ = os.remove(exe)
     var out = String(String(py=preloaded.stdout).strip())
-    assert_true(out.startswith("REFUSED library") and "beside it" in out, out)
+    # Refused either way: by the check, when the preloaded libcrypto is a
+    # 3.5 too (it has what libssl needs); by the loader, when it is older
+    # (Ubuntu 24.04's 3.0 lacks libssl's symbol versions).
+    assert_true(out.startswith("REFUSED library") and ("beside it" in out or "cannot load libssl" in out), out)
+    assert_true(String(py=os.environ.get("LD_PRELOAD", "")) != foreign, "the test's LD_PRELOAD reached its own environment")
 
 
 def _build_error(config: ClientConfig) raises -> TlsError:
