@@ -29,7 +29,7 @@ Native Mojo networking libraries for Linux (x86_64 and aarch64, kernel 5.15+):
 Imports point downward only (`linux` ← `bytes` ← `net` ← `rt`, `net` ← `tls`, and `net` ← `http` ← `server`, with `tls` under both; `crypto` and `json` import only the standard library, `llm` builds on `http` and `json`, `pg` builds on it and `net`, and `redis` on `net`), and only `rt` may import `rt`. The protocol code of `http`, `pg`, `redis` and `tls` is sans-I/O: only their client (or stream) modules import `net`. `tls` is the only package that calls C, OpenSSL's libssl, loaded at run time. CI checks these rules. Design, package rules and shared contracts: [docs/design.md](docs/design.md).
 
 ## Use
-The libraries (all but `rt`) are one conda package, `mojo-net`, which is not published yet. Build it with `pixi run package`; `output/` is then a conda channel that another pixi project can install it from:
+The libraries (all but `rt`) are one conda package, `mojo-net`. It is not published, and it is not meant for production use. Build it with `pixi run package`; `output/` is then a conda channel that another pixi project can install it from:
 
 ```toml
 [workspace]

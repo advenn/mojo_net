@@ -59,4 +59,4 @@ about:
     clients for model APIs (llm), a PostgreSQL driver (pg), a Redis client
     (redis), and the hashes they authenticate with (crypto). Linux only,
     x86_64 and aarch64.
-  # (no licence chosen yet; one is required before publishing)
+  license: Apache-2.0
