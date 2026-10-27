@@ -64,7 +64,10 @@ The loop, per connection:
   no OpenSSL state, so sockets that send nothing, or a byte, take no
   handshake's place. Handshakes are then admitted in arrival order
   (`tls_max_handshakes` at once, at most `tls_handshake_rate` begun a
-  second; the others wait, unread). Each has one deadline from accept
+  second; the others wait, unread). While some wait, a handshake that has
+  waited `tls_client_wait` for its client since it was admitted (the
+  server's flight sent, the client silent) gives its place up and is
+  closed, oldest first. Each has one deadline from accept
   that progress does not extend (`tls_handshake_timeout`), and the
   connection's other timeouts and `min_rate` count plaintext. A graceful close sends close_notify; a
   timeout or an error does not, and after a failure only the alert
@@ -197,6 +200,11 @@ struct ServerConfig(Copyable, Movable):
     var tls_handshake_rate: Int
     """TLS: handshakes begun in a second at most (TS7; 0: no limit); the
     others wait for the next second."""
+    var tls_client_wait: Duration
+    """TLS: while ClientHellos wait for admission, how long an admitted
+    handshake may wait for its client (a round trip and its checks) before
+    it is closed to make room: clients that send a ClientHello and go
+    quiet would otherwise hold every place until their deadline."""
     var tls_reload_check: Duration
     """TLS: how often the certificate and key files are checked for a
     change (TS12; `Duration.ZERO`: never)."""
@@ -222,6 +230,7 @@ struct ServerConfig(Copyable, Movable):
         tls_max_handshakes: Int = 1024,
         tls_handshake_rate: Int = 1000,
         tls_reload_check: Duration = Duration.from_secs(10),
+        tls_client_wait: Duration = Duration.from_secs(1),
     ):
         self.max_connections = max_connections
         self.max_body = max_body
@@ -241,6 +250,7 @@ struct ServerConfig(Copyable, Movable):
         self.tls_max_handshakes = tls_max_handshakes
         self.tls_handshake_rate = tls_handshake_rate
         self.tls_reload_check = tls_reload_check
+        self.tls_client_wait = tls_client_wait
 
     def _sweep_every(self) -> Duration:
         """How often timeouts (and heartbeats, and the TLS files) are
@@ -641,6 +651,10 @@ struct _Conn(Movable):
                 self.hello_ready = True
         return None
 
+    def __deinit__(deinit self):
+        if len(self.tls) > 0:
+            self.tls[0].wipe(self.tls_in)  # (TB18: plaintext the codec never took)
+
     def start_tls(mut self, var tls: TlsServer) raises:
         """The handshake is admitted: TLS takes the first record, and the
         connection counts as a handshake from now on (if that raises, it
@@ -672,6 +686,7 @@ struct _Conn(Movable):
                 unsafe_memcpy(dest=chunk.unsafe_ptr(), src=self.tls_in.unsafe_ptr().unsafe_offset(self.tls_in_off), count=n)
                 self.tls_in_off += n
                 if self.tls_in_off == len(self.tls_in):
+                    self.tls[0].wipe(self.tls_in)  # (TB18: plaintext the codec has taken)
                     self.tls_in.clear()
                     self.tls_in_off = 0
                 return n
@@ -680,7 +695,7 @@ struct _Conn(Movable):
                 ev = self.tls[0].next_event()
             except e:
                 if e.category != Category.TRUNCATED:
-                    raise e^
+                    raise e
                 return 0  # (the client left without close_notify: its input ends)
             if ev:
                 var kind = ev.value().kind
@@ -1377,6 +1392,13 @@ struct Server[H: Handler](Movable):
     var _tls_queue_ids: List[UInt64]
     """Connections whose ClientHello came, waiting to be admitted, in
     arrival order (slot and id: a slot may be reused)."""
+    var _admitted: List[Int]
+    var _admitted_ids: List[UInt64]
+    var _admitted_at: List[Instant]
+    """Handshakes in admission order, from `_admitted_head` on (entries
+    whose handshake ended are skipped when met): the oldest is the first
+    to give its place up (`tls_client_wait`)."""
+    var _admitted_head: Int
 
     def __init__(out self, var handler: Self.H, config: ServerConfig = ServerConfig()) raises IoError:
         """`InvalidInput` for a configuration that cannot work: a
@@ -1388,7 +1410,7 @@ struct Server[H: Handler](Movable):
                 raise IoError.of_kind(op, ErrorKind.InvalidInput)
         if config.max_connections < 1 or config.max_connections > _MAX_CONNECTIONS or config.min_rate < 0:
             raise IoError.of_kind(op, ErrorKind.InvalidInput)
-        if config.tls_max_handshakes < 1 or config.tls_handshake_rate < 0:
+        if config.tls_max_handshakes < 1 or config.tls_handshake_rate < 0 or not (Duration.ZERO < config.tls_client_wait):
             raise IoError.of_kind(op, ErrorKind.InvalidInput)
         self._max_buffered = max(
             ServerConnection.DEFAULT_MAX_BUFFERED, config.limits.max_head + 16 * 1024
@@ -1426,6 +1448,10 @@ struct Server[H: Handler](Movable):
         self._rate_count = 0
         self._tls_queue = List[Int]()
         self._tls_queue_ids = List[UInt64]()
+        self._admitted = List[Int]()
+        self._admitted_ids = List[UInt64]()
+        self._admitted_at = List[Instant]()
+        self._admitted_head = 0
 
     def bind(mut self, addr: SocketAddr) raises IoError:
         """Listen on `addr` (port 0 picks one: see `local_addr`), with
@@ -1447,7 +1473,7 @@ struct Server[H: Handler](Movable):
         _ = unsetenv("SSLKEYLOGFILE")
         var c = config.copy()
         c.alpn = ["http/1.1"]
-        var ctx = c.build()
+        var ctx = c.build(sharing=self._tls[0]) if len(self._tls) > 0 else c.build()
         self._tls.clear()
         self._tls.append(ctx^)
         self._tls_files = [_FileId(c.certificate), _FileId(c.key)]
@@ -1486,7 +1512,7 @@ struct Server[H: Handler](Movable):
             return
         self._tls_files = files^
         try:
-            var ctx = c.build()
+            var ctx = c.build(sharing=self._tls[0])  # (one OpenSSL library context, however many reloads)
             self._tls[0] = ctx^
             self._reload_failed = False
             _log(String("tls: reloaded ", c.certificate))
@@ -1634,6 +1660,10 @@ struct Server[H: Handler](Movable):
             wait = Duration.ZERO
         elif len(self._tls_queue) > 0 and self._handshakes < self.config.tls_max_handshakes:
             wait = min(wait, max(Duration.ZERO, self._rate_start + Duration.from_secs(1) - self._now))
+        elif len(self._tls_queue) > 0:
+            var oldest = self._oldest_admitted()
+            if oldest:
+                wait = min(wait, max(Duration.ZERO, oldest.value() + self.config.tls_client_wait - self._now))
         var n = self._ep.wait(self._events, Optional[Duration](wait))
         var now = Instant.now()
         self._now = now
@@ -1778,7 +1808,7 @@ struct Server[H: Handler](Movable):
             if self._ids[slot] != self._tls_queue_ids[i] or not self._conns[slot] or not self._conns[slot].value().tls_waiting:
                 i += 1  # (closed meanwhile)
                 continue
-            if self._handshakes >= self.config.tls_max_handshakes:
+            if self._handshakes >= self.config.tls_max_handshakes and not self._evict_stalled(now):
                 break
             if now - self._rate_start >= Duration.from_secs(1):
                 self._rate_start = now
@@ -1805,6 +1835,11 @@ struct Server[H: Handler](Movable):
                 self._close(slot)
                 continue
             self._handshakes += 1
+            if len(self._admitted) - self._admitted_head > 2 * (self._handshakes + 64):
+                self._prune_admitted()  # (amortized: ended handshakes leave)
+            self._admitted.append(slot)
+            self._admitted_ids.append(self._ids[slot])
+            self._admitted_at.append(now)
             self._serve(slot, now)
         if i > 0:
             var rest = List[Int]()
@@ -1814,6 +1849,50 @@ struct Server[H: Handler](Movable):
                 rest_ids.append(self._tls_queue_ids[k])
             self._tls_queue = rest^
             self._tls_queue_ids = rest_ids^
+
+    def _oldest_admitted(mut self) -> Optional[Instant]:
+        """When the oldest handshake under way was admitted (entries whose
+        handshake ended are dropped on the way)."""
+        while self._admitted_head < len(self._admitted):
+            var slot = self._admitted[self._admitted_head]
+            if self._ids[slot] == self._admitted_ids[self._admitted_head] and self._conns[slot] and self._conns[slot].value().handshaking:
+                return self._admitted_at[self._admitted_head]
+            self._admitted_head += 1
+        self._admitted.clear()
+        self._admitted_ids.clear()
+        self._admitted_at.clear()
+        self._admitted_head = 0
+        return None
+
+    def _evict_stalled(mut self, now: Instant) -> Bool:
+        """Close the oldest handshake under way if it has waited
+        `tls_client_wait` since its admission (the server's flight went out
+        then: what is left is the client's turn): True if one was."""
+        var oldest = self._oldest_admitted()
+        if not oldest or now - oldest.value() < self.config.tls_client_wait:
+            return False
+        var slot = self._admitted[self._admitted_head]
+        self._admitted_head += 1
+        if self._admitted_head > 1024 and self._admitted_head * 2 > len(self._admitted):
+            self._prune_admitted()
+        self._close(slot)  # (no alert: as at its deadline, TS8)
+        return True
+
+    def _prune_admitted(mut self):
+        """Keep only the handshakes still under way, in order."""
+        var s = List[Int]()
+        var ids = List[UInt64]()
+        var at = List[Instant]()
+        for k in range(self._admitted_head, len(self._admitted)):
+            var slot = self._admitted[k]
+            if self._ids[slot] == self._admitted_ids[k] and self._conns[slot] and self._conns[slot].value().handshaking:
+                s.append(slot)
+                ids.append(self._admitted_ids[k])
+                at.append(self._admitted_at[k])
+        self._admitted = s^
+        self._admitted_ids = ids^
+        self._admitted_at = at^
+        self._admitted_head = 0
 
     def _sweep(mut self, now: Instant):
         """Apply the timeouts (see the module docs), and check the TLS

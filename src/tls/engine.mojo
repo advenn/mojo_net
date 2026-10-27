@@ -34,6 +34,18 @@ arrive without any application data in them (session tickets, key
 updates), and what reading makes OpenSSL queue to send (key update
 replies, alerts) may not take the transmit queue past `OUTPUT_LIMIT`.
 Either fails the connection.
+
+**A record at a time.** OpenSSL reads every record in its read BIO in one
+call, answering each key update on the way, so a bound checked once a
+whole feed is read could be passed by a feed's worth of records. Input is
+handed to OpenSSL one record at a time instead, with the bounds checked
+after each; what arrives behind the end of the handshake waits for the
+gate, then goes the same way.
+
+**In the middle of a peer's handshake message** (a key update or ticket
+split across records), OpenSSL can neither encrypt nor send close_notify
+until the rest arrives: `write` then takes nothing (`wants_input()` says
+why), `close` waits for it, and `has_unread_input()` is true.
 """
 
 from std.ffi import c_int
@@ -67,6 +79,7 @@ from .ffi import (
     SEAM_SSL_NEW,
     SEAM_TRANSMIT_FULL,
     SEAM_WBIO_NEW,
+    SEAM_WIPE,
     SEAM_WRITE,
     Library,
     Obj,
@@ -92,10 +105,10 @@ comptime CLIENT_HELLO_LIMIT = 32 * 1024
 """Ciphertext a client may send before the handshake ends (TS8): its
 ClientHello (a second one after a HelloRetryRequest) and Finished, which
 take a few KiB, where OpenSSL alone would read 128 KiB of ClientHello.
-It is checked once each feed is taken: a handshake still unfinished past
-it fails, so OpenSSL reads at most it plus `FEED_LIMIT`. What comes with
-the end of the handshake (a TLS 1.3 client's first data, behind its
-Finished) is not handshake, and does not count."""
+It is checked after each record: a handshake still unfinished past it
+fails, so OpenSSL reads at most it plus one record. What comes behind the
+end of the handshake (a TLS 1.3 client's first data, behind its Finished)
+is not handshake, and does not count."""
 comptime TRANSMIT_LIMIT = 256 * 1024
 """Ciphertext waiting to be sent above which `write` takes no more."""
 comptime OUTPUT_LIMIT = TRANSMIT_LIMIT + 2 * MAX_RECORD
@@ -190,7 +203,19 @@ struct Engine(Movable):
     """Ciphertext the peer may send before the handshake ends."""
     var _state: Int
     var _eof: Bool
+    """The driver called `feed_eof`."""
+    var _ended: Bool
+    """OpenSSL was told the input ended (after `_stash` is taken)."""
     var _sent_close: Bool
+    var _close_pending: Bool
+    """`close` was called; close_notify waits for the plaintext written
+    early, or for the end of a peer's handshake message."""
+    var _write_waits: Bool
+    """The last `write` stopped in the middle of a peer's handshake
+    message (until the next feed)."""
+    var _stash: List[UInt8]
+    """Ciphertext that came behind the end of the handshake, held while
+    the gate is pending (then taken a record at a time)."""
     var _failed: Optional[TlsError]
     var _events: List[TlsEvent]
     var _next: Int
@@ -242,7 +267,11 @@ struct Engine(Movable):
         self._limit = limit
         self._state = _HANDSHAKE
         self._eof = False
+        self._ended = False
         self._sent_close = False
+        self._close_pending = False
+        self._write_waits = False
+        self._stash = List[UInt8]()
         self._failed = None
         self._events = List[TlsEvent]()
         self._next = 0
@@ -314,7 +343,7 @@ struct Engine(Movable):
             return 0
         if self._state == _DONE:
             return FEED_LIMIT
-        return max(0, FEED_LIMIT - Int(self._lib[].BIO_ctrl_pending(self._rbio)) - self._held)
+        return max(0, FEED_LIMIT - Int(self._lib[].BIO_ctrl_pending(self._rbio)) - self._held - len(self._stash))
 
     def feed(mut self, data: Span[UInt8, _]) raises TlsError:
         if self._failed:
@@ -325,21 +354,69 @@ struct Engine(Movable):
             return  # (after close_notify, input is ignored)
         if len(data) > self.feed_capacity():
             raise self.fail(tls_error("tls: fed more than feed_capacity()", ErrorKind.OutOfMemory, Category.RESOURCE))
-        if self._state == _HANDSHAKE:
-            self._received += len(data)
+        self._take(data)
+
+    def _take(mut self, data: Span[UInt8, _]) raises TlsError:
+        """Hand `data` to OpenSSL a record at a time, with all the progress
+        each allows and the bounds checked after each (see the module
+        docs). What comes while the gate is pending waits in `_stash`; a
+        failure, or the peer's close_notify, drops the rest. Raises only
+        if the read BIO refuses the bytes (the failure latched too)."""
         ref L = self._lib[]
         var written = List[Int](length=1, fill=0)
-        L.ERR_clear_error()
-        var rc = L.BIO_write_ex(self._rbio, in_buf(data), len(data), size_out(written))
-        if rc != 1 or written[0] != len(data) or seam(SEAM_BIO_WRITE) != 0:
-            raise self.fail(tls_error("tls: BIO_write_ex failed", ErrorKind.OutOfMemory, Category.RESOURCE, L.drain_errors()))
-        if self._state == _OPEN:
-            self._quiet += len(data)  # (the data records in it are taken off as they are read)
-        self._frame(data)
-        self._pump()
-        if self._state == _HANDSHAKE and self._received > self._limit and not self._failed:
-            _ = self.fail(tls_error("tls: the peer's handshake is too large", ErrorKind.InvalidData, Category.RESOURCE, String(self._received, " bytes")))
-        self._check_quiet()
+        var off = 0
+        while off < len(data):
+            if self._failed or self._state == _DONE:
+                return
+            if self._state == _GATE:
+                self._stash.extend(data[off:])
+                return
+            var k = self._record_end(data, off)
+            var part = data[off : off + k]
+            off += k
+            if self._state == _HANDSHAKE:
+                self._received += k
+            L.ERR_clear_error()
+            var rc = L.BIO_write_ex(self._rbio, in_buf(part), k, size_out(written))
+            if rc != 1 or written[0] != k or seam(SEAM_BIO_WRITE) != 0:
+                raise self.fail(tls_error("tls: BIO_write_ex failed", ErrorKind.OutOfMemory, Category.RESOURCE, L.drain_errors()))
+            if self._state == _OPEN:
+                self._quiet += k  # (a data record is taken off as it is read)
+            self._write_waits = False
+            self._frame(part)
+            self._pump()
+            if self._state == _HANDSHAKE and self._received > self._limit and not self._failed:
+                _ = self.fail(tls_error("tls: the peer's handshake is too large", ErrorKind.InvalidData, Category.RESOURCE, String(self._received, " bytes")))
+            self._check_quiet()
+
+    def _record_end(self, data: Span[UInt8, _], off: Int) -> Int:
+        """Bytes of `data` from `off` to the end of the record under way (by
+        `_frame`'s count), or all the rest if it does not end in them."""
+        var hdr = self._hdr
+        var length = self._len
+        var body = self._body
+        var i = off
+        var n = len(data)
+        while i < n:
+            if body > 0:
+                var k = min(body, n - i)
+                body -= k
+                i += k
+                if body == 0:
+                    return i - off
+                continue
+            if hdr == 3:
+                length = Int(data[i]) << 8
+            elif hdr == 4:
+                length |= Int(data[i])
+            hdr += 1
+            i += 1
+            if hdr == 5:
+                hdr = 0
+                body = length
+                if body == 0:
+                    return i - off  # (an empty record ends with its header)
+        return n - off
 
     def _partial(self) -> Int:
         """Bytes fed of the record still arriving (none of it read yet)."""
@@ -358,10 +435,14 @@ struct Engine(Movable):
         if self._eof:
             return
         self._eof = True
-        if self._failed or self._state == _DONE:
-            return
-        # (TB12) The BIO holds everything received; reads past it now see
-        # the end instead of "retry".
+        if self._failed or self._state == _DONE or len(self._stash) > 0:
+            return  # (with a stash, the end comes after it: `open`)
+        self._end_input()
+
+    def _end_input(mut self):
+        """(TB12) The BIO holds everything received; reads past it now see
+        the end instead of "retry"."""
+        self._ended = True
         _ = self._lib[].BIO_ctrl(self._rbio, BIO_C_SET_BUF_MEM_EOF_RETURN, 0, 0)
         self._pump()
 
@@ -413,7 +494,29 @@ struct Engine(Movable):
         return self._wbio != 0 and Int(self._lib[].BIO_ctrl_pending(self._wbio)) > 0
 
     def has_unread_input(self) -> Bool:
-        return self._hdr > 0 or self._body > 0
+        """Part of a record has arrived (the rest still to come), or OpenSSL
+        holds part of a peer's handshake message."""
+        if self._hdr > 0 or self._body > 0 or len(self._stash) > 0:
+            return True
+        return self._state == _OPEN and self._ssl != 0 and self._lib[].SSL_in_init(self._ssl) != 0
+
+    def close_pending(self) -> Bool:
+        """`close` was called and close_notify still waits (see `close`)."""
+        return self._close_pending and not self._failed
+
+    def wipe(self, mut data: List[UInt8]):
+        """Overwrite `data` with zeros (`OPENSSL_cleanse`, which the compiler
+        cannot drop as a dead store): for plaintext taken from a DATA event,
+        before its buffer is reused or dropped (TB18)."""
+        if len(data) > 0:
+            _ = seam(SEAM_WIPE)  # (counted by tests)
+            self._lib[].OPENSSL_cleanse(buf(data), len(data))
+            _ = len(data)  # (the buffer outlives the call)
+
+    def wants_input(self) -> Bool:
+        """The last `write` took nothing because OpenSSL is in the middle of
+        a peer's handshake message: it goes on once more input is fed."""
+        return self._write_waits and not self._failed
 
     def pending_transmit(self) -> Int:
         """Ciphertext waiting to be sent, plus plaintext written early and
@@ -449,7 +552,7 @@ struct Engine(Movable):
     def write(mut self, data: Span[UInt8, _]) raises TlsError -> Int:
         if self._failed:
             raise self._failed.value().copy()
-        if self._sent_close or self._state == _DONE:
+        if self._sent_close or self._close_pending or self._state == _DONE:
             raise tls_error("tls: write after close", ErrorKind.BrokenPipe, Category.CLOSED)
         if self._state != _OPEN:
             var n = min(len(data), max(0, TRANSMIT_LIMIT - len(self._early)))
@@ -466,15 +569,32 @@ struct Engine(Movable):
             raise self.fail(e^)
 
     def close(mut self) raises TlsError:
+        """Queue close_notify, after the plaintext written early (and once
+        OpenSSL is not in the middle of a peer's handshake message)."""
         if self._failed:
             raise self._failed.value().copy()
-        if self._sent_close or self._state != _OPEN:
+        if self._sent_close or self._close_pending or self._state != _OPEN:
             return  # (never during the handshake: TB13)
+        self._close_pending = True
+        try:
+            self._flush_early()
+        except e:
+            raise self.fail(e^)
+        self._try_close()
+
+    def _try_close(mut self):
+        """Send the pending close_notify, if nothing written early is left
+        and OpenSSL can (it cannot in the middle of a peer's handshake
+        message: SSL_shutdown fails, and it is tried again after input)."""
+        if not self._close_pending or self._sent_close or self._state != _OPEN or self._early_left() > 0:
+            return
         ref L = self._lib[]
         L.ERR_clear_error()
-        _ = L.SSL_shutdown(self._ssl)  # (SSL_get_error is not consulted after it, TB13)
+        var rc = L.SSL_shutdown(self._ssl)  # (SSL_get_error is not consulted after it, TB13)
         _ = L.drain_errors()
-        self._sent_close = True
+        if rc >= 0:
+            self._sent_close = True
+            self._close_pending = False
 
     def is_established(self) -> Bool:
         return self._state == _OPEN or self._state == _DONE
@@ -499,11 +619,21 @@ struct Engine(Movable):
         self._overhead = _OVERHEAD_TLS13 if Int(L.SSL_version(self._ssl)) == TLS1_3_VERSION else _OVERHEAD_TLS12
         self._state = _OPEN
         self._events.append(TlsEvent(TlsEventKind.ESTABLISHED))
-        # What came with the end of the handshake, behind it, counts as
-        # if fed now (the records OpenSSL has not read yet).
+        # What came behind the end of the handshake counts as if fed now:
+        # what OpenSSL has not read yet, then the stash, a record at a time.
         self._quiet += Int(L.BIO_ctrl_pending(self._rbio))
         self._pump()
         self._check_quiet()
+        if len(self._stash) > 0:
+            var stash = List[UInt8]()
+            swap(stash, self._stash)
+            try:
+                self._take(Span(stash))
+            except:
+                pass  # (latched: `next_event` raises it)
+        if self._eof and not self._ended and not self._failed and self._state != _DONE:
+            self._end_input()
+            self._check_quiet()
 
     def selected_alpn(self) -> List[UInt8]:
         """The protocol ALPN chose, as the bytes on the wire (empty: none)."""
@@ -555,6 +685,8 @@ struct Engine(Movable):
             self._lib[].OPENSSL_cleanse(buf(self._early), len(self._early))
             self._early.clear()
             self._early_off = 0
+        self._stash.clear()
+        self._close_pending = False
         return e^
 
     def _drop_transmit(mut self):
@@ -579,6 +711,7 @@ struct Engine(Movable):
             if self._state == _OPEN:
                 self._flush_early()  # (before anything reading queues)
                 self._read_records()
+                self._try_close()
             if self._wbio != 0 and Int(self._lib[].BIO_ctrl_pending(self._wbio)) > OUTPUT_LIMIT:
                 raise tls_error("tls: the peer provokes more output than it reads", ErrorKind.InvalidData, Category.RESOURCE)
         except e:
@@ -617,6 +750,8 @@ struct Engine(Movable):
             self._flush_early()
         except e:
             _ = self.fail(e^)
+            return
+        self._try_close()
 
     def _handshake(mut self) raises TlsError:
         ref L = self._lib[]
@@ -627,7 +762,7 @@ struct Engine(Movable):
             self._state = _GATE
             return
         var err = L.SSL_get_error(self._ssl, rc) if forced == 0 else c_int(forced)  # (TB6: right after the call)
-        if err == SSL_ERROR_WANT_READ and not self._eof:
+        if err == SSL_ERROR_WANT_READ and not self._ended:
             return
         var refused_alpn = self._server and is_alpn_refusal(L.ERR_peek_error())
         var detail = L.drain_errors()
@@ -636,7 +771,7 @@ struct Engine(Movable):
             raise verify_error(L, code, self._peer)
         if refused_alpn:
             raise tls_error("tls: the client offered no application protocol this server speaks", ErrorKind.InvalidData, Category.ALPN, detail)
-        if self._eof:
+        if self._ended:
             raise tls_error("tls: the connection ended during the handshake", ErrorKind.UnexpectedEof, Category.TRUNCATED, detail)
         if err != SSL_ERROR_SSL and err != SSL_ERROR_SYSCALL:
             raise tls_error("tls: the handshake stopped unexpectedly", ErrorKind.Other, Category.PROTOCOL, String("SSL_get_error ", err, " ", detail))
@@ -660,7 +795,7 @@ struct Engine(Movable):
                     self._plain += got[0]
                 continue
             var err = L.SSL_get_error(self._ssl, rc) if forced == 0 else c_int(forced)  # (TB6)
-            if err == SSL_ERROR_WANT_READ and not self._eof:
+            if err == SSL_ERROR_WANT_READ and not self._ended:
                 return
             if err == SSL_ERROR_ZERO_RETURN:
                 _ = L.drain_errors()
@@ -675,9 +810,10 @@ struct Engine(Movable):
                     _ = L.SSL_shutdown(self._ssl)  # our close_notify in reply
                     _ = L.drain_errors()
                     self._sent_close = True
+                    self._close_pending = False
                 return
             var detail = L.drain_errors()
-            if self._eof:
+            if self._ended:
                 raise tls_error("tls: the connection ended without close_notify", ErrorKind.UnexpectedEof, Category.TRUNCATED, detail)
             if err != SSL_ERROR_SSL and err != SSL_ERROR_SYSCALL:
                 raise tls_error("tls: reading stopped unexpectedly", ErrorKind.Other, Category.PROTOCOL, String("SSL_get_error ", err, " ", detail))
@@ -687,7 +823,10 @@ struct Engine(Movable):
         """Encrypt `data` a record at a time while the transmit queue has
         room. A memory BIO takes every write and renegotiation is off, so
         OpenSSL never asks to retry a write (TB11): if it does, the
-        connection fails rather than resend from a moved buffer."""
+        connection fails rather than resend from a moved buffer. The one
+        exception is WANT_READ in the middle of a peer's handshake message,
+        which OpenSSL reports before it starts a record: nothing more is
+        taken until input comes (`wants_input`)."""
         ref L = self._lib[]
         var done = List[Int](length=1, fill=0)
         var taken = 0
@@ -698,6 +837,10 @@ struct Engine(Movable):
             var rc = L.SSL_write_ex(self._ssl, in_buf(data[taken : taken + n]), n, size_out(done)) if forced == 0 else c_int(0)
             if rc != 1:
                 var err = L.SSL_get_error(self._ssl, rc) if forced == 0 else c_int(forced)  # (TB6)
+                if err == SSL_ERROR_WANT_READ and L.SSL_in_init(self._ssl) != 0:
+                    _ = L.drain_errors()
+                    self._write_waits = True
+                    return taken
                 raise tls_error("tls: encrypting a record failed", ErrorKind.Other, Category.PROTOCOL, String("SSL_get_error ", err, " ", L.drain_errors()))
             taken += done[0]
         return taken

@@ -25,13 +25,35 @@ OpenSSL recorded the name it matched), the version is TLS 1.2 or later,
 no session was resumed, and the ALPN result is one that was offered (or
 none). Until then no plaintext is encrypted and no DATA is delivered
 (TC10).
+
+**A wildcard against excluded names.** OpenSSL checks a CA's name
+constraints against the certificate's names as written, so a wildcard
+(`*.corp.example`) passes a constraint that excludes one name it matches
+(`login.corp.example`): Go's CVE-2025-61727, which Go, BoringSSL and
+webpki refuse. When the name matched is a wildcard, the gate refuses the
+connection if any CA in the verified chain excludes the expected name by a
+DNS constraint (RFC 5280 4.2.1.10). Constraints that permit names need no
+such check: a wildcard within them matches only names within them.
 """
+
+from std.ffi import c_int
 
 from bytes.buffer import ByteBuffer
 from linux import ErrorKind, IoError
 
 from .config import HOST_FLAGS, ClientContext
-from .consts import SSL_CTRL_SET_TLSEXT_HOSTNAME, TLS1_2_VERSION, TLSEXT_NAMETYPE_host_name, X509_V_OK
+from .consts import (
+    GEN_DNS,
+    GENERAL_NAME_D_OFFSET,
+    GENERAL_NAME_TYPE_OFFSET,
+    NC_EXCLUDED_OFFSET,
+    NID_name_constraints,
+    SSL_CTRL_SET_TLSEXT_HOSTNAME,
+    SUBTREE_BASE_OFFSET,
+    TLS1_2_VERSION,
+    TLSEXT_NAMETYPE_host_name,
+    X509_V_OK,
+)
 from .engine import (
     EVENT_COST,
     FEED_LIMIT,
@@ -51,6 +73,8 @@ from .ffi import (
     SEAM_ALPN,
     SEAM_CHECK_HOST,
     SEAM_CHECK_IP,
+    SEAM_CONSTRAINTS,
+    SEAM_VERIFIED_CHAIN,
     SEAM_PEER_CERT,
     SEAM_PEERNAME,
     SEAM_REUSED,
@@ -58,8 +82,15 @@ from .ffi import (
     SEAM_SNI,
     SEAM_VERIFY_RESULT,
     SEAM_VERSION_LOW,
+    Library,
+    Obj,
     buf,
+    c_bytes,
     c_string,
+    from_c_string,
+    i32_out,
+    read_c_int,
+    read_obj,
     seam,
 )
 from .target import Target
@@ -162,23 +193,44 @@ struct TlsClient(Movable):
 
     def has_unread_input(self) -> Bool:
         """Whether the input fed so far ends inside a record (the rest of it
-        still to come). Told from the record framing itself: OpenSSL may
-        have taken the partial record out of its read BIO already."""
+        still to come), or inside a server's handshake message (a ticket
+        or key update split across records). Told from the record framing
+        itself: OpenSSL may have taken the partial record out of its read
+        BIO already."""
         return self._e.has_unread_input()
+
+    def wants_input(self) -> Bool:
+        """The last `write` took nothing because OpenSSL is in the middle of
+        a server's handshake message: feed more input, then write again."""
+        return self._e.wants_input()
+
+    def close_pending(self) -> Bool:
+        """`close` was called and close_notify still waits: for the
+        plaintext written early, or for the end of a server's handshake
+        message (feed input for it)."""
+        return self._e.close_pending()
+
+    def wipe(self, mut data: List[UInt8]):
+        """Zero plaintext taken from a DATA event (`OPENSSL_cleanse`), before
+        its buffer is reused or dropped (TB18)."""
+        self._e.wipe(data)
 
     # ---- the application's side -----------------------------------------
 
     def write(mut self, data: Span[UInt8, _]) raises TlsError -> Int:
         """Encrypt plaintext into records; returns how much was taken, less
         than `len(data)` only while `TRANSMIT_LIMIT` bytes wait to be sent
-        (send them, then write the rest). Before the connection is
-        established it is copied and kept, and encrypted once it is (TC10)."""
+        (send them, then write the rest) or while `wants_input()`. Before
+        the connection is established it is copied and kept, and encrypted
+        once it is (TC10)."""
         return self._e.write(data)
 
     def close(mut self) raises TlsError:
-        """Send close_notify, once. Data may still arrive until the
-        server's close_notify (a CLOSED event). Before the connection is
-        established nothing is sent (TB13): drop the connection instead."""
+        """Send close_notify, once, after any plaintext written early (and,
+        in the middle of a server's handshake message, once it ends:
+        `close_pending()`). Data may still arrive until the server's
+        close_notify (a CLOSED event). Before the connection is established
+        nothing is sent (TB13): drop the connection instead."""
         self._e.close()
 
     def is_established(self) -> Bool:
@@ -244,8 +296,16 @@ struct TlsClient(Movable):
             _ = name^
             if seam(SEAM_CHECK_HOST) != 0:
                 ok = False
-            if not ok or L.SSL_get0_peername(ssl) == 0 or seam(SEAM_PEERNAME) != 0:
+            var matched = L.SSL_get0_peername(ssl)
+            if not ok or matched == 0 or seam(SEAM_PEERNAME) != 0:
                 raise tls_error("tls: the certificate is not for this host", ErrorKind.PermissionDenied, Category.HOST_MISMATCH, self._target.name)
+            if from_c_string(matched).startswith("*") and _excluded(L, ssl, self._target.name):
+                raise tls_error(
+                    "tls: the certificate's wildcard covers a name a CA in its chain excludes",
+                    ErrorKind.PermissionDenied,
+                    Category.HOST_MISMATCH,
+                    self._target.name,
+                )
         var version = Int(L.SSL_version(ssl)) if seam(SEAM_VERSION_LOW) == 0 else 0x0301
         if version < TLS1_2_VERSION:
             raise tls_error("tls: the server negotiated a version below TLS 1.2", ErrorKind.InvalidData, Category.PROTOCOL)
@@ -261,6 +321,60 @@ struct TlsClient(Movable):
             if not known:
                 raise tls_error("tls: the server chose a protocol that was not offered", ErrorKind.InvalidData, Category.ALPN, alpn)
         self._e.alpn = alpn^
+
+
+def _excluded(L: Library, ssl: Obj, host: String) raises TlsError -> Bool:
+    """Whether a CA in the verified chain excludes `host` (normalized) by a
+    DNS name constraint. Constraints that cannot be read fail closed."""
+    var chain = L.SSL_get0_verified_chain(ssl) if seam(SEAM_VERIFIED_CHAIN) == 0 else 0
+    if chain == 0:
+        raise tls_error("tls: no verified chain to check name constraints in", ErrorKind.Other, Category.UNTRUSTED, L.drain_errors())
+    var n = Int(L.OPENSSL_sk_num(chain))
+    for i in range(1, n):  # (the CAs: the leaf is at 0)
+        var ca = L.OPENSSL_sk_value(chain, c_int(i))
+        var crit = List[Int32](length=1, fill=0)
+        var nc = L.X509_get_ext_d2i(ca, NID_name_constraints, i32_out(crit), 0) if seam(SEAM_CONSTRAINTS) == 0 else 0
+        if nc == 0:
+            if crit[0] == -1:
+                continue  # (no name constraints)
+            raise tls_error("tls: a CA's name constraints could not be read", ErrorKind.InvalidData, Category.UNTRUSTED, L.drain_errors())
+        var hit = False
+        var excluded = read_obj(nc, NC_EXCLUDED_OFFSET)
+        if excluded != 0:
+            for j in range(Int(L.OPENSSL_sk_num(excluded))):
+                var base = read_obj(L.OPENSSL_sk_value(excluded, c_int(j)), SUBTREE_BASE_OFFSET)
+                if base == 0 or read_c_int(base, GENERAL_NAME_TYPE_OFFSET) != GEN_DNS:
+                    continue
+                var s = read_obj(base, GENERAL_NAME_D_OFFSET)
+                if s != 0 and dns_within(host.as_bytes(), Span(c_bytes(L.ASN1_STRING_get0_data(s), Int(L.ASN1_STRING_length(s))))):
+                    hit = True
+        L.NAME_CONSTRAINTS_free(nc)
+        if hit:
+            return True
+    return False
+
+
+def dns_within(host: Span[UInt8, _], base: Span[UInt8, _]) -> Bool:
+    """Whether the DNS name `host` (lower-case) is within the subtree of a
+    DNS name constraint `base`, as RFC 5280 4.2.1.10 and OpenSSL's `nc_dns`
+    read it: `host` itself or a name under it, only names under it for a
+    `base` starting with a dot, and every name for an empty `base`. ASCII
+    case does not matter."""
+    var nb = len(base)
+    var nh = len(host)
+    if nb == 0:
+        return True
+    if nb > nh:
+        return False
+    for i in range(nb):
+        var c = base[i]
+        if c >= 65 and c <= 90:
+            c += 32
+        if host[nh - nb + i] != c:
+            return False
+    if nb == nh:
+        return base[0] != 46  # (".x" is not "x" itself)
+    return base[0] == 46 or host[nh - nb - 1] == 46
 
 
 def _c_name(s: String) raises TlsError -> List[UInt8]:

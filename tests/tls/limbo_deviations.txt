@@ -1,0 +1,89 @@
+# x509-limbo cases where the tls client's result differs from limbo's
+# expected one (gate TG2, tools/limbo.py; docs/tls.md, "Checks").
+# id<TAB>direction<TAB>reason. "accepted" means the client accepted a chain
+# limbo expects refused (the dangerous direction), "refused" the reverse.
+# "[openssl]" marks a case where OpenSSL 3.5.9's own limbo harness gives
+# the same wrong result (x509-limbo.com, "anomalous results").
+
+bettertls::pathbuilding::tc2	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc23	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc31	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc32	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc33	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc34	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc35	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc50	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc51	refused	the leaf fails OpenSSL's TLS server purpose check, which the client always applies (limbo's OpenSSL harness only when the case names an EKU)
+bettertls::pathbuilding::tc52	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc53	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc54	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc56	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc57	refused	the leaf fails OpenSSL's TLS server purpose check, which the client always applies (limbo's OpenSSL harness only when the case names an EKU)
+bettertls::pathbuilding::tc58	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc59	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc60	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc61	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc62	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc64	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc65	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc66	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc67	refused	[openssl] OpenSSL's verifier refuses it too
+bettertls::pathbuilding::tc68	refused	[openssl] OpenSSL's verifier refuses it too
+crl::crlnumber-critical	accepted	no revocation checking: the client reads no CRLs (TC14; docs/tls.md, "Scope")
+crl::crlnumber-missing	accepted	[openssl] no revocation checking: the client reads no CRLs (TC14; docs/tls.md, "Scope")
+crl::issuer-missing-crlsign	accepted	no revocation checking: the client reads no CRLs (TC14; docs/tls.md, "Scope")
+crl::issuer-no-keyusage-extension	refused	[openssl] OpenSSL's verifier refuses it too
+crl::revoked-certificate-with-crl	accepted	no revocation checking: the client reads no CRLs (TC14; docs/tls.md, "Scope")
+crl::structure::crl-duplicate-revoked-serial	accepted	[openssl] no revocation checking: the client reads no CRLs (TC14; docs/tls.md, "Scope")
+crl::structure::crl-invalid-signature	accepted	no revocation checking: the client reads no CRLs (TC14; docs/tls.md, "Scope")
+crl::structure::crl-unknown-critical-extension	accepted	no revocation checking: the client reads no CRLs (TC14; docs/tls.md, "Scope")
+crl::structure::crl-wrong-signing-key	accepted	no revocation checking: the client reads no CRLs (TC14; docs/tls.md, "Scope")
+crl::structure::entry-unknown-critical-extension	accepted	no revocation checking: the client reads no CRLs (TC14; docs/tls.md, "Scope")
+crl::structure::entry-unknown-noncritical-extension	accepted	no revocation checking: the client reads no CRLs (TC14; docs/tls.md, "Scope")
+cve::cve-2024-0567	refused	an intermediate among the trust anchors: the client does not set X509_V_FLAG_PARTIAL_CHAIN (TC2), limbo's OpenSSL harness does
+pathlen::max-chain-depth-0-exhausted	accepted	the case sets its own depth limit (max_chain_depth); the client keeps OpenSSL's default of 100
+pathlen::max-chain-depth-1-exhausted	accepted	the case sets its own depth limit (max_chain_depth); the client keeps OpenSSL's default of 100
+pathlen::validation-ignores-pathlen-in-leaf	refused	the leaf fails OpenSSL's TLS server purpose check, which the client always applies (limbo's OpenSSL harness only when the case names an EKU)
+rfc5280::ca-as-leaf	refused	the leaf fails OpenSSL's TLS server purpose check, which the client always applies (limbo's OpenSSL harness only when the case names an EKU)
+rfc5280::nc::invalid-dnsname-leading-period	accepted	[openssl] a name-constraint edge case OpenSSL's verifier allows (a residual risk: docs/tls.md, "Checks")
+rfc5280::nc::nc-forbids-alternate-chain-ica	refused	[openssl] OpenSSL's verifier refuses it too
+rfc5280::nc::nc-forbids-same-chain-ica	refused	[openssl] OpenSSL's verifier refuses it too
+rfc5280::nc::nc-permits-invalid-dns-san	accepted	[openssl] a name-constraint edge case OpenSSL's verifier allows (a residual risk: docs/tls.md, "Checks")
+rfc5280::nc::not-allowed-in-ee-critical	accepted	[openssl] a name-constraint edge case OpenSSL's verifier allows (a residual risk: docs/tls.md, "Checks")
+rfc5280::nc::not-allowed-in-ee-noncritical	accepted	[openssl] a name-constraint edge case OpenSSL's verifier allows (a residual risk: docs/tls.md, "Checks")
+rfc5280::nc::permitted-dns-match-noncritical	accepted	[openssl] a name-constraint edge case OpenSSL's verifier allows (a residual risk: docs/tls.md, "Checks")
+rfc5280::nc::permitted-empty-sequence-excluded-nonempty	accepted	[openssl] a name-constraint edge case OpenSSL's verifier allows (a residual risk: docs/tls.md, "Checks")
+rfc5280::nc::permitted-nonempty-excluded-empty-sequence	accepted	[openssl] a name-constraint edge case OpenSSL's verifier allows (a residual risk: docs/tls.md, "Checks")
+rfc5280::pc::ica-noncritical-pc	accepted	[openssl] a non-critical policy constraint, which OpenSSL allows
+rfc5280::root-and-intermediate-swapped	refused	an intermediate among the trust anchors: the client does not set X509_V_FLAG_PARTIAL_CHAIN (TC2), limbo's OpenSSL harness does
+rfc5280::san::underscore-dns	accepted	[openssl] an underscore in a dNSName, which OpenSSL (and the client's Target) allow
+rfc5280::serial::too-long	accepted	[openssl] an RFC 5280 or CA/B Forum issuance rule that OpenSSL's verifier does not enforce
+rfc5280::serial::zero	accepted	[openssl] an RFC 5280 or CA/B Forum issuance rule that OpenSSL's verifier does not enforce
+rfc5280::validity::notafter-fractional	refused	[openssl] OpenSSL's verifier refuses it too
+rfc9881::ml-dsa-44	refused	no ML-DSA signature algorithms in the client's list (config.SIGALGS)
+rfc9881::ml-dsa-65	refused	no ML-DSA signature algorithms in the client's list (config.SIGALGS)
+rfc9881::ml-dsa-87	refused	no ML-DSA signature algorithms in the client's list (config.SIGALGS)
+webpki::aki::root-with-aki-missing-keyidentifier	accepted	[openssl] an RFC 5280 or CA/B Forum issuance rule that OpenSSL's verifier does not enforce
+webpki::cn::case-mismatch	accepted	[openssl] a CA/B Forum rule for the subject's CN; the client never reads the CN (X509_CHECK_FLAG_NEVER_CHECK_SUBJECT), and the name it matched is in the SAN
+webpki::cn::ipv4-hex-mismatch	accepted	[openssl] a CA/B Forum rule for the subject's CN; the client never reads the CN (X509_CHECK_FLAG_NEVER_CHECK_SUBJECT), and the name it matched is in the SAN
+webpki::cn::ipv4-leading-zeros-mismatch	accepted	[openssl] a CA/B Forum rule for the subject's CN; the client never reads the CN (X509_CHECK_FLAG_NEVER_CHECK_SUBJECT), and the name it matched is in the SAN
+webpki::cn::ipv6-non-rfc5952-mismatch	accepted	[openssl] a CA/B Forum rule for the subject's CN; the client never reads the CN (X509_CHECK_FLAG_NEVER_CHECK_SUBJECT), and the name it matched is in the SAN
+webpki::cn::ipv6-uncompressed-mismatch	accepted	[openssl] a CA/B Forum rule for the subject's CN; the client never reads the CN (X509_CHECK_FLAG_NEVER_CHECK_SUBJECT), and the name it matched is in the SAN
+webpki::cn::ipv6-uppercase-mismatch	accepted	[openssl] a CA/B Forum rule for the subject's CN; the client never reads the CN (X509_CHECK_FLAG_NEVER_CHECK_SUBJECT), and the name it matched is in the SAN
+webpki::cn::not-in-san	accepted	[openssl] a CA/B Forum rule for the subject's CN; the client never reads the CN (X509_CHECK_FLAG_NEVER_CHECK_SUBJECT), and the name it matched is in the SAN
+webpki::cn::punycode-not-in-san	accepted	[openssl] a CA/B Forum rule for the subject's CN; the client never reads the CN (X509_CHECK_FLAG_NEVER_CHECK_SUBJECT), and the name it matched is in the SAN
+webpki::cn::utf8-vs-punycode-mismatch	accepted	[openssl] a CA/B Forum rule for the subject's CN; the client never reads the CN (X509_CHECK_FLAG_NEVER_CHECK_SUBJECT), and the name it matched is in the SAN
+webpki::ee-basicconstraints-ca	accepted	[openssl] an RFC 5280 or CA/B Forum issuance rule that OpenSSL's verifier does not enforce
+webpki::eku::ee-anyeku	accepted	[openssl] an RFC 5280 or CA/B Forum issuance rule that OpenSSL's verifier does not enforce
+webpki::eku::ee-critical-eku	accepted	[openssl] an RFC 5280 or CA/B Forum issuance rule that OpenSSL's verifier does not enforce
+webpki::eku::ee-without-eku	accepted	[openssl] an RFC 5280 or CA/B Forum issuance rule that OpenSSL's verifier does not enforce
+webpki::eku::root-has-eku	accepted	[openssl] an RFC 5280 or CA/B Forum issuance rule that OpenSSL's verifier does not enforce
+webpki::forbidden-dsa-root	accepted	[openssl] an RFC 5280 or CA/B Forum issuance rule that OpenSSL's verifier does not enforce
+webpki::forbidden-rsa-key-not-divisible-by-8-in-leaf	accepted	[openssl] an RFC 5280 or CA/B Forum issuance rule that OpenSSL's verifier does not enforce
+webpki::forbidden-rsa-not-divisible-by-8-in-root	accepted	[openssl] an RFC 5280 or CA/B Forum issuance rule that OpenSSL's verifier does not enforce
+webpki::malformed-aia	accepted	[openssl] an RFC 5280 or CA/B Forum issuance rule that OpenSSL's verifier does not enforce
+webpki::nc::intermediate-permitted-excluded-subtrees-both-empty-sequences	accepted	[openssl] a name-constraint edge case OpenSSL's verifier allows (a residual risk: docs/tls.md, "Checks")
+webpki::nc::intermediate-permitted-excluded-subtrees-both-null	accepted	[openssl] a name-constraint edge case OpenSSL's verifier allows (a residual risk: docs/tls.md, "Checks")
+webpki::san::public-suffix-multi-label-wildcard-san	accepted	[openssl] a wildcard over a public suffix: OpenSSL has no public suffix list
+webpki::san::public-suffix-private-namespace-wildcard-san	accepted	[openssl] a wildcard over a public suffix: OpenSSL has no public suffix list
+webpki::san::san-critical-with-nonempty-subject	accepted	[openssl] an RFC 5280 or CA/B Forum issuance rule that OpenSSL's verifier does not enforce

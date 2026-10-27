@@ -39,7 +39,7 @@ from http.headers import Headers
 from http.sse import SseEvent
 from linux import ErrorKind, IoError
 from linux.time import Deadline, Duration, sleep, unix_time_ns
-from tls import ClientConfig
+from tls import ClientConfig, ClientContext
 
 from .anthropic import VERSION as ANTHROPIC_VERSION, EventDecoder, read_messages, write_messages
 from .error import LlmError
@@ -113,9 +113,12 @@ struct Client(Movable):
         max_tool_calls: Int = DEFAULT_MAX_TOOL_CALLS,
         max_body: Int = 64 * 1024 * 1024,
         var tls: ClientConfig = ClientConfig(),
+        tls_context: Optional[ClientContext] = None,
     ) raises LlmError:
         """`base_url` up to the API's version (`https://api.openai.com/v1`,
-        `https://api.anthropic.com/v1`, `http://localhost:8000/v1`)."""
+        `https://api.anthropic.com/v1`, `http://localhost:8000/v1`).
+        `tls_context`: a context built already, with ALPN `http/1.1`, to
+        share between clients (`http.client.Client`)."""
         var end = base_url.byte_length()
         while end > 0 and base_url.as_bytes()[end - 1] == 47:  # (a trailing '/')
             end -= 1
@@ -130,7 +133,7 @@ struct Client(Movable):
         self.max_reply = max_reply
         self.max_tool_calls = max_tool_calls
         try:
-            self._http = HttpClient(timeout=timeout, max_body=max_body, user_agent="mojo-net-llm", tls=tls^)
+            self._http = HttpClient(timeout=timeout, max_body=max_body, user_agent="mojo-net-llm", tls=tls^, tls_context=tls_context)
         except e:
             raise LlmError(LlmError.USAGE, String(e))
         self._jitter = Jitter(UInt64(unix_time_ns()))

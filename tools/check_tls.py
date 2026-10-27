@@ -4,7 +4,9 @@ rules TL2, TL5, TL7 and TB14 of docs/research/tls_with_openssl.md).
 
 1. FFI stays in one module (TL7, TB16): `OwnedDLHandle`, `DLHandle`,
    `external_call`, `get_symbol`, `dlopen`, `dlsym` and `abi("C")` appear
-   in code under src/ only in src/tls/ffi.mojo.
+   in code under src/ only in src/tls/ffi.mojo; and there, C is reached
+   only through `_sym` (no `external_call`, `DLHandle`, `dlopen` or
+   `dlsym`), so every function called is in the allowlist.
 2. The binding table is an allowlist (TL5): every OpenSSL function
    src/tls/ffi.mojo binds is listed in BINDINGS below, so binding a new one
    is a reviewed change to this file. Every binding names its function as
@@ -18,7 +20,8 @@ rules TL2, TL5, TL7 and TB14 of docs/research/tls_with_openssl.md).
 5. Constants (TB14): src/tls/consts.mojo matches the headers
    (tools/gen_tls_consts.py --check).
 6. A built context is read-only (TB3): no public function in src/tls
-   outside ffi.mojo returns an OpenSSL handle (`Obj`) or the `Library`.
+   outside ffi.mojo returns an OpenSSL handle (`Obj`) or the `Library`,
+   nor returns a field declared as an `Obj` as an `Int` (`Obj` is `Int`).
 7. The package needs OpenSSL 3.5.9 or later (TL1): conda.recipe/recipe.yaml
    says `openssl >=3.5.9`.
 8. One callback (TS5): the only function in src/tls/ffi.mojo libssl may
@@ -41,6 +44,8 @@ import tempfile
 
 FFI_MODULE = os.path.join("src", "tls", "ffi.mojo")
 FFI_TOKENS = ("OwnedDLHandle", "DLHandle", "external_call", "get_symbol", "dlopen", "dlsym")
+FFI_MODULE_FORBIDDEN = ("external_call", "DLHandle", "dlopen", "dlsym")
+"""Ways to C inside ffi.mojo that would bypass BINDINGS."""
 FFI_LITERALS = ('abi("C")',)
 RECIPE = os.path.join("conda.recipe", "recipe.yaml")
 
@@ -54,6 +59,9 @@ BINDINGS = {
     "X509_VERIFY_PARAM_set_flags", "X509_VERIFY_PARAM_clear_flags", "X509_VERIFY_PARAM_get_flags",
     "X509_VERIFY_PARAM_set_hostflags", "X509_VERIFY_PARAM_get_hostflags", "X509_VERIFY_PARAM_set1_host",
     "X509_VERIFY_PARAM_set1_ip", "X509_check_host", "X509_check_ip",
+    # a CA's name constraints, against a wildcard match (the client's gate)
+    "SSL_get0_verified_chain", "X509_get_ext_d2i", "NAME_CONSTRAINTS_free", "ASN1_STRING_get0_data",
+    "ASN1_STRING_length",
     # memory BIOs
     "BIO_s_mem", "BIO_new", "BIO_write_ex", "BIO_read_ex", "BIO_ctrl", "BIO_ctrl_pending",
     # contexts
@@ -73,6 +81,7 @@ BINDINGS = {
     "SSL_get_verify_result", "SSL_get0_peer_certificate", "SSL_get0_peername", "SSL_version",
     "SSL_get_version", "SSL_get_current_cipher", "SSL_CIPHER_get_name", "SSL_get0_group_name",
     "SSL_get0_alpn_selected", "SSL_session_reused", "SSL_set_accept_state", "SSL_get_servername",
+    "SSL_in_init",  # (in the middle of a peer's handshake message: no write, no close_notify yet)
 }
 
 CALLBACKS = {"alpn_select"}
@@ -128,8 +137,10 @@ _COMMENT = re.compile(r"#.*$", re.M)
 _STRING = re.compile(r'"(?:[^"\\\n]|\\.)*"')
 _BOUND = re.compile(r'_sym\[[^\]]*\]\(\s*self\._handle\s*,\s*"(\w+)"\s*\)')
 _SYM_CALL = re.compile(r'(?<!def )\b_sym\[')
-_CALLBACK_DEF = re.compile(r'^def\s+(\w+)\([^)]*\)\s*abi\("C"\)', re.M)
+_CALLBACK_DEF = re.compile(r'^\s*def\s+(\w+)\([^)]*\)\s*abi\("C"\)', re.M)
 _HANDLE_OUT = re.compile(r'^\s*def ([A-Za-z]\w*)\(.*\)\s*(?:raises(?:\s+\w+)?\s*)?->\s*(Obj|ArcPointer\[Library\])\s*:', re.M)
+_INT_OUT = re.compile(r'^(\s*)def ([A-Za-z]\w*)\(.*\)\s*(?:raises(?:\s+\w+)?\s*)?->\s*Int\s*:', re.M)
+_OBJ_FIELD = re.compile(r'^\s*var (\w+): Obj\b', re.M)
 
 
 def _blank(m):
@@ -170,9 +181,34 @@ def mojo_files(root, top):
                 yield os.path.relpath(p, root), p
 
 
+def _int_handles(code, fields):
+    """(name, line) of public functions returning `Int` that return a field
+    declared as an `Obj` (`return x.ctx`, `return Int(self._ssl)`)."""
+    out = []
+    if not fields:
+        return out
+    field = re.compile(r"^\s*return\s+(?:Int\()?[\w\[\]\.]*\.(?:" + "|".join(sorted(fields)) + r")\)?\s*$", re.M)
+    for m in _INT_OUT.finditer(code):
+        indent = len(m.group(1))
+        rest = code[m.end() :].split("\n")[1:]
+        body = []
+        for line in rest:
+            if line.strip() and len(line) - len(line.lstrip()) <= indent:
+                break
+            body.append(line)
+        if field.search("\n".join(body)):
+            out.append((m.group(2), code[: m.start()].count("\n") + 1))
+    return out
+
+
 def check_source(root):
     """Checks 1-3; returns (violations, bound names)."""
     bad = []
+    tls_dir = os.path.join("src", "tls") + os.sep
+    fields = set()
+    for rel, path in mojo_files(root, "src"):
+        if rel.startswith(tls_dir):
+            fields.update(_OBJ_FIELD.findall(code_of(open(path, encoding="utf-8").read())))
     for rel, path in mojo_files(root, "src"):
         code = code_of(open(path, encoding="utf-8").read())
         if rel != FFI_MODULE:
@@ -187,6 +223,13 @@ def check_source(root):
                 for m in _HANDLE_OUT.finditer(code):
                     n = code[: m.start()].count("\n") + 1
                     bad.append(f"{rel}:{n}: public {m.group(1)}() hands out an OpenSSL handle ({m.group(2)}): a built context must stay read-only (TB3)")
+                for name, n in _int_handles(code, fields):
+                    bad.append(f"{rel}:{n}: public {name}() hands out an OpenSSL handle (an Obj field as Int): a built context must stay read-only (TB3)")
+        else:
+            for n, line in enumerate(code.split("\n"), 1):
+                for tok in FFI_MODULE_FORBIDDEN:
+                    if re.search(r"\b" + tok + r"\b", line):
+                        bad.append(f"{rel}:{n}: {tok} in {FFI_MODULE}: C is reached only through _sym, so BINDINGS sees every function (TL5)")
         if rel.startswith(os.path.join("src", "tls") + os.sep):
             for n, line in enumerate(code.split("\n"), 1):
                 for allowed in ALLOWED_NAMES:
@@ -252,13 +295,14 @@ def _self_test():
         "src/net/a.mojo": ('from std.ffi import external_call\n"""external_call in a docstring is prose"""\n', "external_call outside"),
         "src/tls/b.mojo": ("var x = 1  # SSL_free_buffers in a comment is fine\nL.SSL_free_buffers(s)\n", "SSL_free_buffers"),
         "src/tls/c.mojo": ('var m = "SSL_VERIFY_NONE"\n', "SSL_VERIFY_NONE"),
-        "src/tls/ffi.mojo": ('def _sym[F](h, name):\n    return h.get_symbol(name)\nself.f = _sym[F](self._handle, "SSL_new")\nself.g = _sym[F](self._handle, "SSL_CTX_set_keylog_x")\nself.h = _sym[F](self._handle, name)\ndef alpn_select(a: Int) abi("C") -> Int:\n    return 0\ndef on_info(a: Int) abi("C") -> Int:\n    return 0\nself.i = _sym[F](self._handle, "SSL_CTX_set_verify_cb")\n', "keylog"),
+        "src/tls/ffi.mojo": ('def _sym[F](h, name):\n    return h.get_symbol(name)\nself.f = _sym[F](self._handle, "SSL_new")\nself.g = _sym[F](self._handle, "SSL_CTX_set_keylog_x")\nself.h = _sym[F](self._handle, name)\ndef alpn_select(a: Int) abi("C") -> Int:\n    return 0\ndef on_info(a: Int) abi("C") -> Int:\n    return 0\nself.i = _sym[F](self._handle, "SSL_CTX_set_verify_cb")\nstruct S:\n    @staticmethod\n    def on_verify(a: Int) abi("C") -> Int:\n        return 0\nvar r = external_call["X509_STORE_add_cert", Int](0, 0)\n', "keylog"),
         "src/tls/i.mojo": ("L.SSL_CTX_set_default_passwd_cb(ctx, f)\nL.SSL_CTX_set_default_passwd_cb_userdata(ctx, p)\n", "passwd_cb"),
         "src/linux/d.mojo": ("var h = OwnedDLHandle(path)\n", "OwnedDLHandle outside"),
         "src/tls/e.mojo": ("L.SSL_set_fd(s, 3)\n", "SSL_set_fd"),
         "src/tls/f.mojo": ("var s = '#'; L.SSL_free_buffers(s)\n", "SSL_free_buffers"),
         "src/tls/g.mojo": ('comptime G = def() thin abi("C") -> None\n', 'abi("C") outside'),
         "src/tls/h.mojo": ("struct C:\n    def ssl_ctx(self) -> Obj:\n        return 0\n    def _ok(self) -> Obj:\n        return 0\n", "hands out"),
+        "src/tls/j.mojo": ("struct D:\n    var ctx: Obj\n    var n: Int\n    def count(self) -> Int:\n        return self.n\ndef ssl_ctx_of(c: D) -> Int:\n    return c.ctx\n", "ssl_ctx_of() hands out"),
         RECIPE: ("requirements:\n  run:\n    - openssl >=3.5,<4\n", "openssl must be"),
     }
     with tempfile.TemporaryDirectory() as root:
@@ -278,6 +322,12 @@ def _self_test():
             errors.append("a binding without a literal name went unreported")
         if not any("on_info is a function libssl could call" in b for b in bad) or any("alpn_select is a function" in b for b in bad):
             errors.append("a second callback went unreported, or the allowed one was reported")
+        if not any("on_verify is a function libssl could call" in b for b in bad):
+            errors.append("a callback defined inside a struct went unreported")
+        if not any(b.startswith(FFI_MODULE) and "external_call in" in b for b in bad):
+            errors.append("external_call inside ffi.mojo went unreported")
+        if any("count() hands out" in b for b in bad):
+            errors.append(f"a public Int that is no handle was reported: {bad}")
         if not any("SSL_CTX_set_verify_cb installs a callback" in b for b in bad):
             errors.append("a callback setter went unreported")
         if [b for b in bad if b.startswith("src/tls/i.mojo")] != [b for b in bad if b.startswith("src/tls/i.mojo:1:")]:

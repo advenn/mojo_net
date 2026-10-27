@@ -49,6 +49,7 @@ Package rules are in `docs/design.md`.
 - **Refusals** (OpenAI-style) are kept apart: `Reply.refusal`, and REFUSAL deltas.
 - **Embeddings come as base64** (`encoding_format: "base64"`), a quarter of the bytes of decimal text, and are decoded as little-endian float32. Each vector is placed by its `index`, which must cover every input exactly once.
 - **Keys** go in `Authorization: Bearer` or `x-api-key`, built through `http.headers`, which refuses CR and LF (no header injection). Use `https://` for any remote API: over `http://` a key travels in clear.
+- **Many clients** (one per tenant, say) should share one TLS context, built with ALPN `http/1.1` (`Client(..., tls_context=ctx)`): each context built on its own loads OpenSSL anew, and a process can hold only about 330 of those (`docs/tls.md`, "Use").
 
 ## Use
 ```mojo

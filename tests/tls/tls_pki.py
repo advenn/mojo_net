@@ -11,7 +11,9 @@ With --owner, a detached watcher removes <dir> once process <pid> has
 ended, so a test process that crashes leaves nothing behind.
 
 CAs:      root, other (unrelated), inter (signed by root, CA:TRUE),
-          inter_noca (signed by root, CA:FALSE: no CA at all)
+          inter_noca (signed by root, CA:FALSE: no CA at all),
+          nc_inter (signed by root, excludes DNS:secret.wild.test),
+          nc_perm (signed by root, permits DNS:wild.test only)
 Leaves (signed by root unless said):
   good          DNS:localhost, IP:127.0.0.1, IP:::1          (ECDSA P-256)
   rsa           the same names, RSA 2048, for TLS 1.2 ECDHE-RSA
@@ -30,8 +32,13 @@ Leaves (signed by root unless said):
   client_only   localhost, extendedKeyUsage clientAuth only
   by_other      localhost and 127.0.0.1, signed by other (an unrelated root)
   soon          localhost, valid from 47 hours ago to 1 hour from now
+  nc_wild       DNS:*.wild.test, signed by nc_inter; chain has nc_inter
+  nc_exact      DNS:secret.wild.test, signed by nc_inter; chain has it
+  nc_perm_wild  DNS:*.wild.test, signed by nc_perm; chain has nc_perm
 Other files:
   root.crl.pem  an empty CRL issued by root (a CRL is no trust anchor)
+  inter.trusted.pem  inter as a TRUSTED CERTIFICATE marked for serverAuth
+                (`openssl x509 -addtrust serverAuth -trustout`)
 """
 
 import os
@@ -140,6 +147,14 @@ def main():
     now = time.time()
     stamp = lambda t: time.strftime("%Y%m%d%H%M%SZ", time.gmtime(t))
     signed(d, "soon", "root", "/CN=localhost", LEAF_EXT + host, dates=(stamp(now - 47 * 3600), stamp(now + 3600)))
+    ca_ext = "basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\n"
+    signed(d, "nc_inter", "root", "/CN=excluding intermediate", ca_ext + "nameConstraints=critical,excluded;DNS:secret.wild.test\n")
+    signed(d, "nc_perm", "root", "/CN=permitting intermediate", ca_ext + "nameConstraints=critical,permitted;DNS:wild.test\n")
+    wild = "subjectAltName=DNS:*.wild.test\n"
+    signed(d, "nc_wild", "nc_inter", "/CN=wild", LEAF_EXT + wild, chain=("nc_inter",))
+    signed(d, "nc_exact", "nc_inter", "/CN=secret", LEAF_EXT + "subjectAltName=DNS:secret.wild.test\n", chain=("nc_inter",))
+    signed(d, "nc_perm_wild", "nc_perm", "/CN=wild", LEAF_EXT + wild, chain=("nc_perm",))
+    run("x509", "-in", os.path.join(d, "inter.pem"), "-addtrust", "serverAuth", "-trustout", "-out", os.path.join(d, "inter.trusted.pem"))
     crl(d, "root")
     if len(sys.argv) == 4 and sys.argv[2] == "--owner":
         watch(int(sys.argv[3]), d)

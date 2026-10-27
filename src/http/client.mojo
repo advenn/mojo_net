@@ -495,6 +495,8 @@ struct _Stream(Movable):
         if events & Int16(POLLIN) and self._tls[0].buffered():
             return Int16(POLLIN)
         var want = events
+        if self._tls[0].wants_input():
+            want = want | Int16(POLLIN)  # (writing waits for the end of a server's handshake message)
         var flushed: Bool
         try:
             flushed = self._tls[0].flush_ready()
@@ -503,6 +505,22 @@ struct _Stream(Movable):
         if not flushed:
             want = want | Int16(POLLOUT)
         return wait_ready(self._tls[0].tcp(), want, deadline, "Client.request")
+
+    def flush(mut self, deadline: Deadline) raises IoError:
+        """Send what a TLS stream still holds (plaintext it took waits there
+        as records until the socket takes them), waiting up to `deadline`.
+        A plain stream holds nothing: `try_write` hands bytes to the kernel."""
+        if len(self._plain) > 0:
+            return
+        while True:
+            var done: Bool
+            try:
+                done = self._tls[0].flush_ready()
+            except e:
+                raise self._io(e^)
+            if done:
+                return
+            _ = wait_ready(self._tls[0].tcp(), Int16(POLLOUT), deadline, "Client.request")
 
     def truncated(self) -> Bool:
         """Whether a TLS connection ended without close_notify."""
@@ -589,11 +607,17 @@ struct Client(Movable):
         max_idle: Duration = Duration.from_secs(60),
         user_agent: StringSlice = "mojo-net",
         var tls: ClientConfig = ClientConfig(),
+        tls_context: Optional[ClientContext] = None,
     ) raises IoError:
         """`InvalidInput` for a zero timeout or a negative limit. `tls` is
         the trust for https (system roots by default); its ALPN list is
-        replaced by `http/1.1`."""
+        replaced by `http/1.1`. `tls_context`, a context built already
+        (with ALPN `http/1.1` alone, else `InvalidInput`), is used instead:
+        clients that share one share its trust store and OpenSSL, of which
+        a process can load only about 330 at once (`tls.ClientConfig.build`)."""
         if not (Duration.ZERO < timeout) or max_body < 0 or max_idle_per_host < 0 or max_idle_conns < 0:
+            raise IoError.of_kind("Client.__init__", ErrorKind.InvalidInput)
+        if tls_context and tls_context.value().alpn() != ["http/1.1"]:
             raise IoError.of_kind("Client.__init__", ErrorKind.InvalidInput)
         self.timeout = timeout
         self.max_body = max_body
@@ -604,6 +628,8 @@ struct Client(Movable):
         tls.alpn = ["http/1.1"]
         self._tls_config = tls^
         self._tls = List[ClientContext]()
+        if tls_context:
+            self._tls.append(tls_context.value().copy())
         self._tls_error = None
         self._resolver = Resolver.system()
         self._pool = List[_Conn]()
@@ -841,6 +867,9 @@ struct Client(Movable):
                         continue
                     return r^
         if answered:
+            # The body's last records may still wait in TLS: send them, or
+            # the server, which keeps the connection, never gets the end.
+            c.stream.flush(deadline)
             return r^
         while True:
             if self._absorb(c, r, informational):

@@ -147,7 +147,13 @@ comptime SEAM_EARLY = 1029
 comptime SEAM_TIME = 1030
 """`ASN1_TIME_diff` fails."""
 comptime SEAM_SERVER_NAME = 1031
-"""The server's gate: the client's SNI reads as "unknown.invalid".
+"""The server's gate: the client's SNI reads as "unknown.invalid"."""
+comptime SEAM_VERIFIED_CHAIN = 1032
+"""`SSL_get0_verified_chain` returns NULL (the client's gate)."""
+comptime SEAM_CONSTRAINTS = 1033
+"""`X509_get_ext_d2i` cannot decode a CA's name constraints."""
+comptime SEAM_WIPE = 1034
+"""Counts each wipe of delivered plaintext (`Engine.wipe`); never fails.
 (Seams go up to 1099: `linux.fault`'s table.)"""
 
 
@@ -215,6 +221,31 @@ def from_c_string(addr: Obj) -> String:
         out.append(p[unsafe_offset=n])
         n += 1
     return String(from_utf8_lossy=Span(out))
+
+
+def read_obj(addr: Obj, offset: Int) -> Obj:
+    """The pointer stored at `addr + offset` in a C struct (0 for a NULL
+    `addr`): fields of OpenSSL's public structs, offsets from the headers
+    (`tls.consts`)."""
+    if addr == 0:
+        return 0
+    return Pointer[Int, MutAnyOrigin](unsafe_from_address=addr + offset)[]
+
+
+def read_c_int(addr: Obj, offset: Int) -> Int:
+    """The C `int` stored at `addr + offset` (`addr` not NULL)."""
+    return Int(Pointer[Int32, MutAnyOrigin](unsafe_from_address=addr + offset)[])
+
+
+def c_bytes(addr: Obj, n: Int) -> List[UInt8]:
+    """A copy of `n` bytes C owns at `addr` (none for NULL or `n <= 0`)."""
+    var out = List[UInt8]()
+    if addr == 0 or n <= 0:
+        return out^
+    var p = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=addr)
+    for i in range(n):
+        out.append(p[unsafe_offset=i])
+    return out^
 
 
 def is_alpn_refusal(e: UInt64) -> Bool:
@@ -344,6 +375,7 @@ comptime _F_i_ol = def(Obj, Int) thin abi("C") -> c_int
 comptime _F_u32_o = def(Obj) thin abi("C") -> UInt32
 comptime _F_i_ccoo = def(I32Out, I32Out, Obj, Obj) thin abi("C") -> c_int
 comptime _F_v_oao = def(Obj, AlpnSelect, Obj) thin abi("C") -> None
+comptime _F_o_oico = def(Obj, c_int, I32Out, Obj) thin abi("C") -> Obj
 
 
 struct Library(Movable):
@@ -398,6 +430,10 @@ struct Library(Movable):
     var X509_get0_notAfter: _F_o_o
     var ASN1_TIME_diff: _F_i_ccoo
     var OPENSSL_cleanse: _F_v_bl
+    var X509_get_ext_d2i: _F_o_oico
+    var NAME_CONSTRAINTS_free: _F_v_o
+    var ASN1_STRING_get0_data: _F_o_o
+    var ASN1_STRING_length: _F_i_o
     var BIO_s_mem: _F_o
     var BIO_new: _F_o_o
     var BIO_write_ex: _F_i_obls
@@ -461,6 +497,8 @@ struct Library(Movable):
     var SSL_get0_group_name: _F_o_o
     var SSL_get0_alpn_selected: _F_v_osu
     var SSL_session_reused: _F_i_o
+    var SSL_get0_verified_chain: _F_o_o
+    var SSL_in_init: _F_i_o
 
     def __init__(out self, path: String) raises IoError:
         """Open `path` (libssl.so.3), check its version, initialise it
@@ -573,6 +611,12 @@ struct Library(Movable):
         self.SSL_get0_group_name = _sym[_F_o_o](self._handle, "SSL_get0_group_name")
         self.SSL_get0_alpn_selected = _sym[_F_v_osu](self._handle, "SSL_get0_alpn_selected")
         self.SSL_session_reused = _sym[_F_i_o](self._handle, "SSL_session_reused")
+        self.SSL_get0_verified_chain = _sym[_F_o_o](self._handle, "SSL_get0_verified_chain")
+        self.SSL_in_init = _sym[_F_i_o](self._handle, "SSL_in_init")
+        self.X509_get_ext_d2i = _sym[_F_o_oico](self._handle, "X509_get_ext_d2i")
+        self.NAME_CONSTRAINTS_free = _sym[_F_v_o](self._handle, "NAME_CONSTRAINTS_free")
+        self.ASN1_STRING_get0_data = _sym[_F_o_o](self._handle, "ASN1_STRING_get0_data")
+        self.ASN1_STRING_length = _sym[_F_i_o](self._handle, "ASN1_STRING_length")
         var forced = seam(SEAM_LIBCTX)
         self.libctx = self.OSSL_LIB_CTX_new() if forced != 1 else 0
         if self.libctx == 0:

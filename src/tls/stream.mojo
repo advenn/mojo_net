@@ -55,6 +55,9 @@ struct TlsStream(Movable, Writable):
     """A send that failed (it may have sent part of a record): every later
     write, flush or close raises it, since the stream is corrupt."""
 
+    def __deinit__(deinit self):
+        self._tls.wipe(self._data)  # (TB18; the fields are dropped after)
+
     @staticmethod
     def connect(host: StringSlice, port: UInt16, context: ClientContext, timeout: Duration) raises TlsError -> TlsStream:
         """Connect to `host` (a name or an IP literal) and port and complete
@@ -138,7 +141,8 @@ struct TlsStream(Movable, Writable):
             if not first and self._tcp.read_deadline().is_expired():
                 raise TlsError(IoError.of_kind("TlsStream.read", ErrorKind.TimedOut))  # (as TCP raises it)
             first = False
-            self._flush_by(self._tcp.read_deadline())  # (a key update's reply)
+            if not self._broken:  # (after a failed send, reading still works)
+                self._flush_by(self._tcp.read_deadline())  # (a key update's reply)
             try:
                 self._receive()
             except e:
@@ -156,14 +160,18 @@ struct TlsStream(Movable, Writable):
 
     def write_all(mut self, data: Span[UInt8, _]) raises TlsError:
         """Encrypt and send all of `data` (under the write deadline). A
-        failed send leaves the stream unusable: every later write, flush or
-        close raises the same error."""
+        failed send leaves the stream unusable for sending: every later
+        write, flush or close raises the same error. Reading still works,
+        so what the server sent before (an early 413, say) can be read."""
         if self._broken:
             raise self._broken.value().copy()
         var off = 0
         while off < len(data):
-            off += self._tls.write(data[off:])
+            var n = self._tls.write(data[off:])
+            off += n
             self._flush()
+            if n == 0 and self._tls.wants_input():
+                self._receive_for_write()  # (the rest of a server's handshake message)
 
     # ---- readiness loops -------------------------------------------------
 
@@ -184,7 +192,8 @@ struct TlsStream(Movable, Writable):
                 continue
             if self._tls.is_closed():
                 return 0
-            _ = self.flush_ready()  # (a key update's reply)
+            if not self._broken:  # (after a failed send, reading still works)
+                _ = self.flush_ready()  # (a key update's reply)
             var room = min(self._tls.feed_capacity(), len(self._in))
             if room <= 0:
                 raise tls_error("tls: the connection cannot take input", ErrorKind.Other, Category.PROTOCOL)
@@ -207,16 +216,29 @@ struct TlsStream(Movable, Writable):
     def try_write(mut self, data: Span[UInt8, _]) raises TlsError -> Optional[Int]:
         """For readiness loops, as `TcpStream.try_write`: how many bytes of
         `data` were taken, without waiting and ignoring the write deadline;
-        None while earlier ciphertext still waits for the socket. Taken
-        bytes may still wait as ciphertext: when the socket is writable,
-        call `flush_ready()` (or this again) until `pending_output()` is 0."""
+        None while earlier ciphertext still waits for the socket, or while
+        the server's handshake message in progress has not ended
+        (`wants_input()`: wait for the socket to be readable). Taken bytes
+        may still wait as ciphertext: when the socket is writable, call
+        `flush_ready()` (or this again) until `pending_output()` is 0."""
         if not self.flush_ready():
             return None
         if len(data) == 0:
             return 0
         var n = self._tls.write(data)
+        if n == 0 and self._tls.wants_input():
+            self._pull()
+            n = self._tls.write(data)
+            if n == 0:
+                return None
         _ = self.flush_ready()
         return n
+
+    def wants_input(self) -> Bool:
+        """Writing waits for input: the server's handshake message in
+        progress (a ticket or key update split across records) must end
+        before OpenSSL encrypts more."""
+        return self._tls.wants_input()
 
     def flush_ready(mut self) raises TlsError -> Bool:
         """Send queued ciphertext without waiting: True once none is left."""
@@ -292,8 +314,19 @@ struct TlsStream(Movable, Writable):
         without close_notify: an abortive end."""
         if self._broken:
             raise self._broken.value().copy()
+        self._tls.wipe(self._data)
         self._tls.close()
         self._flush()
+        if self._tls.close_pending():
+            # In the middle of a server's handshake message: its rest lets
+            # close_notify go (best effort, within the linger).
+            self._tcp.set_read_deadline(Deadline.after(linger))
+            try:
+                while self._tls.close_pending():
+                    self._receive()
+                    self._flush()
+            except:
+                pass
         try:
             self._tcp.shutdown(Shutdown.WRITE)
             self._tcp.set_read_deadline(Deadline.after(linger))
@@ -359,6 +392,7 @@ struct TlsStream(Movable, Writable):
         if not ev:
             return False
         if ev.value().kind == TlsEventKind.DATA:
+            self._tls.wipe(self._data)  # (the last record's plaintext, dropped with the event)
             swap(self._data, ev.value().data)
             self._data_off = 0
         elif ev.value().kind == TlsEventKind.CLOSED:
@@ -424,6 +458,36 @@ struct TlsStream(Movable, Writable):
         except:
             pass
         self._out.clear()
+
+    def _receive_for_write(mut self) raises TlsError:
+        """`_receive` under the write deadline, for a write that waits for
+        input."""
+        var rd = self._tcp.read_deadline()
+        self._tcp.set_read_deadline(self._tcp.write_deadline())
+        try:
+            self._receive()
+        except e:
+            self._tcp.set_read_deadline(rd)
+            raise e^
+        self._tcp.set_read_deadline(rd)
+
+    def _pull(mut self) raises TlsError:
+        """What the socket has now, into the TLS state machine, without
+        waiting (EOF included)."""
+        var room = min(self._tls.feed_capacity(), len(self._in))
+        if room <= 0:
+            return
+        var got: Optional[Int]
+        try:
+            got = self._tcp.try_read(Span(self._in)[0:room])
+        except e:
+            raise TlsError(e)
+        if not got:
+            return
+        if got.value() == 0:
+            self._tls.feed_eof()
+        else:
+            self._tls.feed(Span(self._in)[0 : got.value()])
 
     def _receive(mut self) raises TlsError:
         """One receive into the TLS state machine (EOF included)."""

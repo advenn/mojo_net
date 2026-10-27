@@ -15,105 +15,23 @@ finding (docs/tls.md, "Review"):
 And certificate compression, which a libssl built with a compressor would
 turn on unasked: off both ways.
 
-Live clients are libssl itself, as in tests/tls/test_server_pair.mojo, and
-Python's `ssl` (tests/tls/tls_client_peer.py)."""
+Live clients are libssl itself, as in tests/tls/test_server_pair.mojo (the
+in-memory pair is tests/tls/tls_pair.mojo), and Python's `ssl`
+(tests/tls/tls_client_peer.py)."""
 
-from std.ffi import OwnedDLHandle, c_int
 from std.testing import TestSuite, assert_equal, assert_false, assert_true
 
-from bytes.buffer import ByteBuffer
-from tls import Category, TlsClient, TlsError, TlsEventKind, TlsServer
+from tls import Category, TlsError, TlsServer
 from tls.config import OPTIONS
 from tls.consts import SSL_OP_NO_RX_CERTIFICATE_COMPRESSION, SSL_OP_NO_TX_CERTIFICATE_COMPRESSION
 from tls.engine import CLIENT_HELLO_LIMIT, CLIENT_QUIET_LIMIT, FEED_LIMIT
+from tls_pair import Pair, flow, flow_c
 from tls_util import ServerDriver, client_peer, listener, opts, pattern, serving, trusting
-
-comptime _KeyUpdate = def(Int, c_int) thin abi("C") -> c_int
-
-
-def _key_update_fn(path: String) raises -> _KeyUpdate:
-    """libssl's `SSL_key_update` (test code may bind what `tls` does not)."""
-    var h = OwnedDLHandle(path)
-    var p = h.get_symbol[NoneType]("SSL_key_update")
-    if not p:
-        raise Error("no SSL_key_update")
-    var addr = Int(p.value())
-    return Pointer(to=addr).unsafe_bitcast[_KeyUpdate]()[]
-
-
-def _drop(mut src: ByteBuffer, n: Int):
-    try:
-        src.consume(n)
-    except:
-        pass
-
-
-def _flow(mut src: ByteBuffer, mut dst: TlsServer, mut got: Int) raises TlsError:
-    """Move `src` into the server, as much as it takes, counting the data
-    it delivers."""
-    while len(src) > 0 and dst.feed_capacity() > 0:
-        var n = min(len(src), dst.feed_capacity())
-        dst.feed(src.readable_span()[0:n])
-        _drop(src, n)
-        while True:
-            var ev = dst.next_event()
-            if not ev:
-                break
-            if ev.value().kind == TlsEventKind.DATA:
-                got += len(ev.value().data)
-
-
-def _flow_c(mut src: ByteBuffer, mut dst: TlsClient) raises TlsError:
-    while len(src) > 0 and dst.feed_capacity() > 0:
-        var n = min(len(src), dst.feed_capacity())
-        dst.feed(src.readable_span()[0:n])
-        _drop(src, n)
-    while dst.next_event():
-        pass
-
-
-struct _Pair(Movable):
-    var c: TlsClient
-    var s: TlsServer
-    var a: ByteBuffer
-    """Client to server."""
-    var b: ByteBuffer
-    """Server to client."""
-    var got: Int
-    """Data the server delivered."""
-
-    def __init__(out self) raises:
-        self.c = TlsClient(trusting(), "localhost")
-        self.s = TlsServer(serving(alpn=[]))
-        self.a = ByteBuffer()
-        self.b = ByteBuffer()
-        self.got = 0
-
-    def handshake(mut self) raises:
-        for _ in range(20):
-            _ = self.c.poll_transmit(self.a)
-            _flow(self.a, self.s, self.got)
-            _ = self.s.poll_transmit(self.b)
-            _flow_c(self.b, self.c)
-        assert_true(self.c.is_established() and self.s.is_established())
-
-    def to_server(mut self) raises TlsError:
-        _ = self.c.poll_transmit(self.a)
-        _flow(self.a, self.s, self.got)
-        _ = self.s.poll_transmit(self.b)
-        self.b.clear()  # (the server's replies: the client would read them)
-
-    def key_update(mut self, requested: Bool) raises:
-        ref L = self.c._e._lib[]
-        var f = _key_update_fn(L.path)
-        assert_equal(f(self.c._e._ssl, c_int(1 if requested else 0)), 1)
-        _ = L.SSL_do_handshake(self.c._e._ssl)  # (queues it)
-
 
 def _flood(every: Int, requested: Bool) raises -> String:
     """Key updates with one byte of data after every `every`: how the
     server failed ("" if it took 5,000 of them)."""
-    var p = _Pair()
+    var p = Pair()
     p.handshake()
     var one = List[UInt8](length=1, fill=120)
     for i in range(5000):
@@ -144,11 +62,11 @@ def test_1_key_updates_between_data_bytes_fail() raises:
 def test_1_key_updates_behind_the_finished_count() raises:
     """Queued behind the client's Finished, in the same flight: they are
     counted from the moment the server is established."""
-    var p = _Pair()
+    var p = Pair()
     _ = p.c.poll_transmit(p.a)  # (ClientHello)
-    _flow(p.a, p.s, p.got)
+    flow(p.a, p.s, p.got)
     _ = p.s.poll_transmit(p.b)  # (the server's flight)
-    _flow_c(p.b, p.c)  # (the client is established, its Finished queued)
+    flow_c(p.b, p.c)  # (the client is established, its Finished queued)
     assert_true(p.c.is_established())
     for _ in range(400):  # (10,800 bytes)
         p.key_update(True)
@@ -164,7 +82,7 @@ def test_1_key_updates_behind_the_finished_count() raises:
 def test_1_honest_traffic_stays_within_the_budget() raises:
     """16 KiB records, records of one byte, and a key update now and then
     (one per 64 KiB): never refused, all delivered."""
-    var p = _Pair()
+    var p = Pair()
     p.handshake()
     var big = pattern(16384)
     var want = 0
@@ -188,7 +106,7 @@ def test_1_honest_traffic_stays_within_the_budget() raises:
 def test_1_data_earns_little_budget() raises:
     """4 MiB of data adds 1 KiB to the budget (a byte per 4 KiB): the
     1,000 key updates that follow it (27 KB) still fail."""
-    var p = _Pair()
+    var p = Pair()
     p.handshake()
     var big = pattern(16384)
     for _ in range(256):
@@ -211,7 +129,7 @@ def test_2_data_behind_the_finished_is_not_handshake() raises:
     """A TLS 1.3 client's first 64 KiB, sent right behind its Finished
     and fed in `feed_capacity()` pieces, are all delivered."""
     for size in [40000, 65536, 200000]:
-        var p = _Pair()
+        var p = Pair()
         var body = pattern(size)
         var taken = 0
         while taken < size:  # (kept until the client is established)
@@ -221,9 +139,9 @@ def test_2_data_behind_the_finished_is_not_handshake() raises:
             taken += n
         for _ in range(20):
             _ = p.c.poll_transmit(p.a)
-            _flow(p.a, p.s, p.got)
+            flow(p.a, p.s, p.got)
             _ = p.s.poll_transmit(p.b)
-            _flow_c(p.b, p.c)
+            flow_c(p.b, p.c)
             while taken < size:
                 var n = p.c.write(Span(body)[taken:])
                 if n == 0:

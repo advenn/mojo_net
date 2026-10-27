@@ -4,7 +4,10 @@ anything doubtful (RFC 9525; rules TC4, TC5 and TC7 of
 docs/research/tls_with_openssl.md).
 
 - **IP:** a strict IPv4 or IPv6 literal (`net.addr.IpAddr`), checked as
-  octets against the certificate's IP SANs; no SNI is sent (RFC 6066).
+  octets against the certificate's IP SANs; no SNI is sent (RFC 6066). An
+  IPv4-mapped IPv6 literal (`::ffff:a.b.c.d`) is the IPv4 address it
+  reaches, as Go's `net.IP.Equal` has it: a dual-stack socket sends its
+  bytes to `a.b.c.d`, so that is the identity checked (and constrained).
 - **DNS:** ASCII letters, digits, `-` and `_`, in labels of 1 to 63 bytes
   that neither start nor end with `-` (RFC 1123), 253 at most in all;
   lower-cased, and one trailing dot dropped. Sent as
@@ -48,7 +51,7 @@ struct Target(Copyable, Movable, Writable):
             self.name = String(text)
             self.is_ip = True
             self.ip = List[UInt8]()
-            var a = addr.value()
+            var a = addr.value().to_canonical()  # (an IPv4-mapped address: its IPv4 address)
             if a.is_ipv4():
                 var o = a.v4().octets()
                 for i in range(4):

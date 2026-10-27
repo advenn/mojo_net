@@ -103,19 +103,33 @@ struct TlsServer(Movable):
         return self._e.pending_transmit()
 
     def has_unread_input(self) -> Bool:
-        """Whether the input fed so far ends inside a record."""
+        """Whether the input fed so far ends inside a record, or inside a
+        client's handshake message (a key update split across records)."""
         return self._e.has_unread_input()
+
+    def wants_input(self) -> Bool:
+        """The last `write` took nothing because OpenSSL is in the middle of
+        a client's handshake message: write again after more input."""
+        return self._e.wants_input()
+
+    def wipe(self, mut data: List[UInt8]):
+        """Zero plaintext taken from a DATA event (`OPENSSL_cleanse`), before
+        its buffer is reused or dropped (TB18)."""
+        self._e.wipe(data)
 
     # ---- the application's side -----------------------------------------
 
     def write(mut self, data: Span[UInt8, _]) raises TlsError -> Int:
         """Encrypt plaintext into records; returns how much was taken (less
-        while `TRANSMIT_LIMIT` bytes wait to be sent). Before the
-        connection is established it is kept, and sent once it is."""
+        while `TRANSMIT_LIMIT` bytes wait to be sent, or while
+        `wants_input()`). Before the connection is established it is kept,
+        and sent once it is."""
         return self._e.write(data)
 
     def close(mut self) raises TlsError:
-        """Send close_notify, once; nothing during the handshake."""
+        """Send close_notify, once, after any plaintext written early (in the
+        middle of a client's handshake message, once it ends); nothing
+        during the handshake."""
         self._e.close()
 
     def is_established(self) -> Bool:

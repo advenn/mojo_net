@@ -29,6 +29,9 @@ tls-asan = "bash tools/check_tls_asan.sh"
 # Gate TG8: the same tests against an OpenSSL built with ASan from source
 # (downloaded once, pinned; not in ci, since it needs the network once).
 tls-asan-openssl = "bash tools/check_tls_asan_openssl.sh"
+# Gate TG2: the x509-limbo corpus through the client's verification, in
+# real handshakes (downloaded once, pinned; weekly, not in ci).
+tls-limbo = "bash tools/check_tls_limbo.sh"
 # Whether pixi.lock's openssl and ca-certificates are current (gate TG14;
 # daily in .github/workflows/freshness.yml, not in `ci`).
 tls-freshness = "python3 tools/check_freshness.py"

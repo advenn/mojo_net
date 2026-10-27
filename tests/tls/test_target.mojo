@@ -69,7 +69,10 @@ def test_addresses_match_python() raises:
         var t = Target(a)
         assert_true(t.is_ip, a)
         assert_equal(t.name, a)
-        var packed = ipaddress.ip_address(a).packed
+        var parsed = ipaddress.ip_address(a)
+        if Bool(py=Python.evaluate("lambda a: getattr(a, 'ipv4_mapped', None) is not None")(parsed)):
+            parsed = parsed.ipv4_mapped  # (the IPv4 address it reaches)
+        var packed = parsed.packed
         assert_equal(len(t.ip), Int(py=Python.evaluate("len")(packed)))
         for i in range(len(t.ip)):
             assert_equal(Int(t.ip[i]), Int(py=packed[i]))

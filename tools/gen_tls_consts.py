@@ -111,9 +111,19 @@ CONSTS = [
     # a server's ALPN selection callback (TS5)
     ("SSL_TLSEXT_ERR_OK", "c_int", ""),
     ("SSL_TLSEXT_ERR_ALERT_FATAL", "c_int", ""),
+    # name constraints, read by the client's gate (a wildcard against an
+    # excluded name): the structs are public in x509v3.h, their offsets
+    # checked here on each architecture
+    ("NID_name_constraints", "c_int", "the nameConstraints extension"),
+    ("GEN_DNS", "Int", "a GENERAL_NAME's dNSName"),
+    ("NC_EXCLUDED_OFFSET", "Int", "NAME_CONSTRAINTS.excludedSubtrees", "offsetof(NAME_CONSTRAINTS, excludedSubtrees)"),
+    ("SUBTREE_BASE_OFFSET", "Int", "GENERAL_SUBTREE.base", "offsetof(GENERAL_SUBTREE, base)"),
+    ("GENERAL_NAME_TYPE_OFFSET", "Int", "GENERAL_NAME.type (an int)", "offsetof(GENERAL_NAME, type)"),
+    ("GENERAL_NAME_D_OFFSET", "Int", "GENERAL_NAME.d (the union's pointer)", "offsetof(GENERAL_NAME, d)"),
 ]
 
-PROGRAM = """#include <stdio.h>
+PROGRAM = """#include <stddef.h>
+#include <stdio.h>
 #include <openssl/opensslv.h>
 #include <openssl/crypto.h>
 #include <openssl/ssl.h>
@@ -132,7 +142,7 @@ def run_headers():
     prefix = os.environ.get("CONDA_PREFIX")
     if not prefix:
         sys.exit("gen_tls_consts.py: run it through pixi (CONDA_PREFIX is unset)")
-    lines = "\n".join(f'  printf("%llu\\n", (unsigned long long)({name}));' for name, _, _ in CONSTS)
+    lines = "\n".join(f'  printf("%llu\\n", (unsigned long long)({c[3] if len(c) > 3 else c[0]}));' for c in CONSTS)
     with tempfile.TemporaryDirectory() as d:
         src, exe = os.path.join(d, "consts.c"), os.path.join(d, "consts")
         with open(src, "w") as f:
@@ -153,7 +163,7 @@ def render(version_text, values):
         "from std.ffi import c_int, c_uint",
         "",
     ]
-    for (name, ty, comment), v in zip(CONSTS, values):
+    for (name, ty, comment, *_), v in zip(CONSTS, values):
         if name == "OPENSSL_VERSION_NUMBER":
             v = v & 0xFFF00000  # the major.minor line, not the patch (the check survives 3.5.x updates)
             comment = "the major.minor line of the headers"

@@ -49,7 +49,7 @@ from linux.fs import is_regular, stat_path
 from linux.nr import SYS_geteuid
 from linux.syscall import syscall0
 
-from .config import HOST_FLAGS, _check, _configure, _cs, alpn_wire
+from .config import HOST_FLAGS, ClientContext, _check, _configure, _cs, alpn_wire
 from .consts import SSL_FILETYPE_PEM
 from .error import Category, TlsError, tls_error
 from .ffi import (
@@ -104,13 +104,24 @@ struct ServerConfig(Copyable, Movable):
     def build(self) raises TlsError -> ServerContext:
         """Load OpenSSL, make and configure an `SSL_CTX` with the
         credentials, and refuse it if any setting did not take or any
-        check fails."""
+        check fails. Each call loads OpenSSL into a library context of its
+        own, of which a process can hold about 330 (`ClientConfig.build`):
+        build the next one (a reload) with `build(sharing=...)`."""
         var lib: ArcPointer[Library]
         try:
             lib = Library.load()
         except e:
             raise TlsError(e, Category.LIBRARY, "")
         return ServerContext(_ServerContext(lib, self))
+
+    def build(self, sharing: ServerContext) raises TlsError -> ServerContext:
+        """`build()` on the OpenSSL that `sharing` was built on: no library
+        context of its own. Nothing else is shared."""
+        return ServerContext(_ServerContext(sharing._library(), self))
+
+    def build(self, sharing: ClientContext) raises TlsError -> ServerContext:
+        """The same, sharing a client context's OpenSSL."""
+        return ServerContext(_ServerContext(sharing._library(), self))
 
 
 struct _ServerContext(Movable):

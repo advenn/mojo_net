@@ -169,15 +169,26 @@ struct ClientConfig(Copyable, Movable):
         self.alpn = alpn^
 
     def build(self) raises TlsError -> ClientContext:
-        """Load OpenSSL (once per call: share the returned context), make
-        and configure an `SSL_CTX`, and refuse it if any setting did not
-        take or the trust store is empty."""
+        """Load OpenSSL, make and configure an `SSL_CTX`, and refuse it if
+        any setting did not take or the trust store is empty.
+
+        Each call loads OpenSSL into a library context of its own, which
+        takes 3 of the process's 1,024 thread-specific keys (pthread_key_t)
+        while it lives: a process can hold about 330 such contexts at once,
+        and then every build fails, as would other code that needs a key.
+        Share a built context (copies are cheap), or build the others with
+        `build(sharing=...)`."""
         var lib: ArcPointer[Library]
         try:
             lib = Library.load()
         except e:
             raise TlsError(e, Category.LIBRARY, "")
         return ClientContext(_Context(lib, self))
+
+    def build(self, sharing: ClientContext) raises TlsError -> ClientContext:
+        """`build()` on the OpenSSL that `sharing` was built on: no library
+        context of its own (see `build()`). Nothing else is shared."""
+        return ClientContext(_Context(sharing._library(), self))
 
 
 struct _Context(Movable):
