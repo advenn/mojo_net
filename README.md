@@ -70,6 +70,32 @@ In `examples/pg/`: `query`, which runs SQL against PostgreSQL from a `postgresql
 
 And in `examples/http/`: `http_get`, a small `curl` built on `http.client.Client`; `sse_events`, which prints a URL's server-sent events as they arrive (as from an LLM API); `hello_server`, an epoll server driving one `ServerConnection` per connection (over 1M pipelined requests per second on one core). In `examples/server/`: `hello`, the same on `server.Server`; `sse_tokens`, tokens streamed as server-sent events the way an OpenAI-compatible server sends them; `workers`, one supervised worker process per CPU on one port, stopped gracefully by SIGTERM or Ctrl-C; `files`, a static file server.
 
+## Benchmark
+`server` against Go (`net/http` and fasthttp), Rust (hyper) and nginx, on TechEmpower's plaintext test (`GET /plaintext` → `Hello, World!`), loaded by wrk over loopback:
+- each server in its fastest usual form: Go with PGO, fasthttp with one process per CPU, hyper with fat LTO and `target-cpu=native`;
+- each run 60 s long, one server at a time, the whole set twice (the second time in reverse order);
+- one laptop, an i5-1145G7 (4 cores, 8 threads), on 2026-10-27.
+
+Requests per second, the mean of the two runs:
+
+| Scenario | mojo `server` | hyper | fasthttp | nginx | Go `net/http` |
+|---|---|---|---|---|---|
+| 1 CPU, 64 keep-alive connections | 156k | 181k | 164k | 175k | 86k |
+| 1 CPU, 256 connections, 16 pipelined | 762k | 1,169k | 1,067k | 191k | 102k |
+| 1 CPU, 1024 keep-alive connections | 132k | 144k | 124k | 141k | 70k |
+| 4 CPUs, 256 keep-alive connections | 301k | 350k | 319k | 327k | 155k |
+| 4 CPUs, 256 connections, 16 pipelined | 1,326k | 2,115k | 1,967k | 410k | 182k |
+
+- **Keep-alive:** mojo is 8–14% behind hyper, and close to fasthttp and nginx. Most of each request's time there is the kernel's loopback TCP, the same for every server. With 4 CPUs, wrk itself was the limit (83–92% of its CPU).
+- **Pipelined:** mojo is 30–37% behind hyper and fasthttp, and well ahead of nginx and `net/http`.
+
+**Why mojo is slower:** its kernel time per request is the same as hyper's, but its own code does about twice the work. A callgrind profile, pipelined on one CPU, counts 9,644 instructions a request against hyper's 4,565:
+- **Headers:** most of the extra is the `http` library's handling of header fields. Each request and response head is walked several times, for parsing, validation, framing and encoding, and the checks go a byte at a time where httparse uses SIMD.
+- **Bounds checks:** the Mojo standard library checks indexes at run time, about 5% of the time.
+- **Not the cause:** the server's loop is 7% of the instructions, and mojo allocates nothing per request (hyper spends 10% of its instructions in `malloc` and `free`).
+
+The method, every run's numbers, the full profile and how to run it all yourself (`pixi run -e bench bench-server build`, `check`, `run`) are in [bench/server/README.md](bench/server/README.md).
+
 ## Develop
 Everything runs through [pixi](https://pixi.sh):
 

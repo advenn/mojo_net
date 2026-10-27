@@ -52,6 +52,7 @@ pixi run tls-freshness             # pixi.lock's openssl / ca-certificates vs co
 pixi run gen-tls                   # regenerate src/tls/consts.mojo from the OpenSSL headers
 pixi run bench build               # rt benchmarks (bench/rt/README.md)
 pixi run -e bench bench-server run  # HTTP server vs Go (net/http, fasthttp), hyper and nginx under wrk, 60 s runs (bench/server/README.md)
+pixi run -e bench bench-profile     # mojo and hyper under callgrind: user-space instructions per request, by file and function
 ```
 
 **Stability and packaging** (`docs/design.md`):

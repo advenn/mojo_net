@@ -411,7 +411,7 @@ server.run()
     - one CPU, 16 pipelined: hyper 1.17M, fasthttp 1.07M, mojo 762k (1.31 µs a request against hyper's 0.85), nginx 191k, net/http 102k;
     - one CPU, 1024 connections: hyper 144k, nginx 141k, mojo 132k, fasthttp 124k, net/http 70k;
     - four CPUs (two cores), 16 pipelined: hyper 2.12M, fasthttp 1.97M, mojo 1.33M, nginx 410k, net/http 182k. Without pipelining, wrk was the limit (83–92% of its CPU) at 300–350k;
-    - **Lead:** mojo's gap to hyper is user time, about 0.5–0.9 µs a request on one CPU: the server layer above the codec.
+    - **Why mojo is slower** (`bench/server/README.md`): the kernel's time per request is the same as hyper's; mojo's user time is about twice hyper's (9,644 instructions a request pipelined, against 4,565). Most of it is `http`'s handling of header fields: each head is walked several times and checked a byte at a time, plus the standard library's bounds checks (5%). The server loop is 7%, and nothing is allocated per request.
   - **The independent review:** three reviewers, one each for protocol and security, resources and the loop, and processes and signals. They reported 35 distinct findings and found no request smuggling, desync, client-driven header injection or path escape. Every finding that could be reproduced was, first by a regression test failing on the old code:
     - `tests/server/test_server_regressions.mojo`;
     - `tests/server/test_static_regressions.mojo`;
