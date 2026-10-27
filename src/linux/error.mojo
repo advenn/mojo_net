@@ -182,8 +182,14 @@ struct ErrorKind(TrivialRegisterPassable, Equatable, Writable):
 
 
 @fieldwise_init
-struct IoError(TrivialRegisterPassable, Writable):
-    """An I/O failure: what kind, which errno (0 if none), during which op."""
+struct IoError(Copyable, ImplicitlyCopyable, Movable, Writable):
+    """An I/O failure: what kind, which errno (0 if none), during which op.
+
+    Passed in memory, not in registers: as `TrivialRegisterPassable`, Mojo
+    1.2 split its `op` pointer into bytes in every typed-raise result, so
+    each raising call cost its success path ~85 instructions (the error
+    built without a branch, then reassembled by the caller); in memory a
+    success is a flag test (HR3, bench/http/README.md)."""
 
     var kind: ErrorKind
     var errno: Errno

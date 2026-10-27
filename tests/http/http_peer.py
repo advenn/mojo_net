@@ -305,6 +305,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except OSError:
                 pass
             self.close_connection = True
+        elif path == "/partial-rst":
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\npartial")
+            self.wfile.flush()
+            time.sleep(0.1)
+            self.close_connection = True
+            _reset(self.connection)
+        elif path in ("/te-gzip", "/te-http10"):
+            # A body under a coding the client does not decode, or with
+            # Transfer-Encoding in HTTP/1.0 (RFC 9112 6.1: faulty framing).
+            version, te = {
+                "/te-gzip": (b"1.1", b"gzip, chunked"),
+                "/te-http10": (b"1.0", b"chunked"),
+            }[path]
+            self.wfile.write(b"HTTP/" + version + b" 200 OK\r\nTransfer-Encoding: " + te + b"\r\n\r\n")
+            if self.command != "HEAD":
+                self.wfile.write(b"5\r\nhello\r\n0\r\n\r\n")
+            self.close_connection = True
+        elif path == "/huge-cl":
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: 1073741824\r\n\r\n")
+            self.wfile.flush()
+            time.sleep(5)  # (the body never comes)
+            self.close_connection = True
         elif path == "/stale408":
             if self.served > 1:
                 self.wfile.write(b"HTTP/1.1 408 Request Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")

@@ -142,9 +142,10 @@ comptime _CLOSED = 3
 
 
 @fieldwise_init
-struct CloseReason(TrivialRegisterPassable, Writable):
+struct CloseReason(Copyable, ImplicitlyCopyable, Movable, Writable):
     """Why a connection closed: who started it, and the error if any.
-    Compare `code` with the constants (`reason.code == CloseReason.IDLE`)."""
+    Compare `code` with the constants (`reason.code == CloseReason.IDLE`).
+    (Not register-passable: `IoError` no longer is, linux.error.)"""
 
     var code: UInt8
     var err: IoError

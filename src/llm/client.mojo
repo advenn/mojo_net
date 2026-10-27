@@ -10,8 +10,9 @@ SDKs' retries (`llm.retry`). One client speaks one dialect (`Provider`):
         if d.kind == DeltaKind.TEXT:
             print(d.text, end="")
 
-- **Paths** are appended to `base_url`: `/chat/completions` and
-  `/embeddings` (OpenAI-style), `/messages` (Anthropic).
+- **Paths** are appended to `base_url`'s path: `/chat/completions` and
+  `/embeddings` (OpenAI-style), `/messages` (Anthropic). A query in
+  `base_url` (Azure's `?api-version=...`) stays after the path.
 - **Headers:** `Authorization: Bearer` (OpenAI-style, when there is a
   key) or `x-api-key` with `anthropic-version` (Anthropic), plus the
   caller's `headers`.
@@ -31,7 +32,11 @@ SDKs' retries (`llm.retry`). One client speaks one dialect (`Provider`):
   request id (`x-request-id`, or Anthropic's `request-id`); API for an
   error event in a stream (with the stream's request id); PROTOCOL;
   TRANSPORT (a connection dropped mid-stream is TRANSPORT, UnexpectedEof);
-  USAGE. A stream's first error is final: `next` raises it again.
+  USAGE. A stream's first error is final: `next` raises it again. A TLS
+  failure's TRANSPORT error says why (`http.client.Client.last_tls_error`).
+- **Connections** are kept alive and reused. A stream's goes back to the
+  pool through `release` once it is `complete()`; dropping a stream
+  closes its connection.
 """
 
 from http.client import Client as HttpClient, EventStream, Response, StreamedResponse
@@ -50,6 +55,10 @@ from .types import ChatRequest, Delta, DeltaKind, Embeddings, Reply
 comptime DEFAULT_MAX_REPLY = 16 * 1024 * 1024
 comptime DEFAULT_MAX_TOOL_CALLS = 128
 comptime _MAX_ERROR_BODY = 64 * 1024
+comptime _MAX_TAIL = 64 * 1024
+"""What `Client.release` reads after a stream's last event (the end of
+its body), at most, before giving up on the connection."""
+comptime _TAIL_WAIT = Duration.from_secs(1)
 
 
 struct Provider(Equatable, TrivialRegisterPassable, Writable):
@@ -119,11 +128,13 @@ struct Client(Movable):
         `https://api.anthropic.com/v1`, `http://localhost:8000/v1`).
         `tls_context`: a context built already, with ALPN `http/1.1`, to
         share between clients (`http.client.Client`)."""
-        var end = base_url.byte_length()
-        while end > 0 and base_url.as_bytes()[end - 1] == 47:  # (a trailing '/')
+        var q = base_url.find("?")
+        var end = q if q >= 0 else base_url.byte_length()
+        while end > 0 and base_url.as_bytes()[end - 1] == 47:  # (a trailing '/' of the path)
             end -= 1
         self.provider = provider
-        self.base_url = String(base_url[byte=:end])
+        var query = String(base_url[byte=q:]) if q >= 0 else String()
+        self.base_url = String(base_url[byte=:end]) + query
         self.api_key = String(api_key)
         self.headers = Headers()
         self.retry = retry
@@ -169,6 +180,31 @@ struct Client(Movable):
             raise err^
         return ReplyStream(events^, self.provider, id, retries, self.max_reply, self.max_tool_calls)
 
+    def release(mut self, var s: ReplyStream):
+        """Give a finished stream's connection back to the pool, so the next
+        call skips a new TCP connection and TLS handshake. Only for a stream
+        that is `complete()`: what its body has after the last event (the
+        last chunk, at most 64 KiB) is read first, within 1 s. Otherwise,
+        and if that fails, the connection is closed, as dropping the
+        stream does."""
+        if not s.complete():
+            return
+        var r = s^.into_events().into_response()
+        r.limit_total(Deadline.after(_TAIL_WAIT))
+        var buf = List[UInt8](length=4096, fill=0)
+        var rest = 0
+        try:
+            while True:
+                var n = r.read(Span(buf))
+                if n == 0:
+                    break
+                rest += n
+                if rest > _MAX_TAIL:
+                    return
+        except:
+            return
+        self._http.release(r^)
+
     def embed(mut self, model: StringSlice, inputs: List[String], *, dimensions: Int = 0) raises LlmError -> Embeddings:
         """The embeddings of `inputs` (OpenAI-style APIs; fetched as base64
         float32)."""
@@ -205,10 +241,26 @@ struct Client(Movable):
 
     def _io_error(self, e: IoError, retries: Int) -> LlmError:
         """`InvalidInput` from `http` is the caller's (a header http frames
-        itself, a bad URL): USAGE. Everything else is TRANSPORT."""
-        var err = LlmError(LlmError.USAGE, String("llm: the request cannot be sent: ", e)) if e.kind == ErrorKind.InvalidInput else LlmError.transport(e)
+        itself, a bad URL): USAGE. Everything else is TRANSPORT, with the
+        TLS failure's reason if there was one (a refused certificate is a
+        bare PermissionDenied otherwise)."""
+        if e.kind == ErrorKind.InvalidInput:
+            var err = LlmError(LlmError.USAGE, String("llm: the request cannot be sent: ", e))
+            err.retries = retries
+            return err^
+        var err = LlmError.transport(e)
+        var why = self._http.last_tls_error()
+        if why:
+            err.message = String(err.message, " (", why.value(), ")")
         err.retries = retries
         return err^
+
+    def _url(self, path: StringSlice) -> String:
+        """`base_url` with `path` appended to its path: before a query."""
+        var q = self.base_url.find("?")
+        if q < 0:
+            return self.base_url + path
+        return String(self.base_url[byte=:q], path, self.base_url[byte=q:])
 
     def _wait(mut self, d: Duration, deadline: Deadline) raises LlmError -> Bool:
         """Sleep `d` if the deadline leaves room for it and an attempt after
@@ -235,15 +287,15 @@ struct Client(Movable):
         """POST `body` to `path` and read the whole response, retrying as
         the policy says within one deadline; a status of 400 or more raises
         HTTP."""
-        var url = self.base_url + path
+        var url = self._url(path)
         var h = self._request_headers(False)
         var deadline = Deadline.after(self.timeout)
         var retries = 0
         while True:
-            self._http.timeout = self._attempt_timeout(deadline, retries)
+            var left = self._attempt_timeout(deadline, retries)
             var r: Response
             try:
-                r = self._http.request("POST", url, h, Span(body))
+                r = self._http.request("POST", url, h, Span(body), timeout=left)
             except e:
                 if e.kind == ErrorKind.TimedOut and deadline.is_expired():
                     raise _timed_out(retries)
@@ -265,14 +317,16 @@ struct Client(Movable):
         """POST for a stream and return at its head, retrying (as `_call`)
         only until a head of 2xx comes, within one deadline. An error's
         body is read under that deadline too."""
-        var url = self.base_url + path
+        var url = self._url(path)
         var h = self._request_headers(True)
         var deadline = Deadline.after(self.timeout)
         while True:
-            self._http.timeout = self._attempt_timeout(deadline, retries)
+            var left = self._attempt_timeout(deadline, retries)
             var r: StreamedResponse
             try:
-                r = self._http.stream("POST", url, h, Span(body), idle_timeout=self.stream_idle, total=self.stream_total)
+                r = self._http.stream(
+                    "POST", url, h, Span(body), idle_timeout=self.stream_idle, total=self.stream_total, timeout=left
+                )
             except e:
                 if e.kind == ErrorKind.TimedOut and deadline.is_expired():
                     raise _timed_out(retries)
@@ -289,12 +343,15 @@ struct Client(Movable):
                 errbody = r.read_all(_MAX_ERROR_BODY)
             except:
                 errbody = List[UInt8]()
-            if retryable_status(r.status, r.headers) and retries < self.retry.max_retries:
-                var d = wait_before_retry(self.retry, retries, r.headers, unix_time_ns() // 1_000_000_000, self._jitter.next())
+            var status = r.status
+            var headers = r.headers.copy()
+            self._http.release(r^)  # (read whole: the retry may reuse it)
+            if retryable_status(status, headers) and retries < self.retry.max_retries:
+                var d = wait_before_retry(self.retry, retries, headers, unix_time_ns() // 1_000_000_000, self._jitter.next())
                 if self._wait(d, deadline):
                     retries += 1
                     continue
-            raise self._error(r.status, r.headers, Span(errbody), retries)
+            raise self._error(status, headers, Span(errbody), retries)
 
 
 struct ReplyStream(Movable):
@@ -411,6 +468,10 @@ struct ReplyStream(Movable):
                 raise LlmError(LlmError.PROTOCOL, "llm: the reply starts more than max_tool_calls calls")
             self._queue = fresh^
             self._ended = self._anthropic.done if self._provider == Provider.ANTHROPIC else self._openai.done
+
+    def into_events(deinit self) -> EventStream:
+        """The event stream under the deltas (`Client.release`)."""
+        return self._events^
 
     def reply(self) -> Reply:
         """The reply put together from what has come so far."""

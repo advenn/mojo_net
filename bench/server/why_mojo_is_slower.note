@@ -6,6 +6,14 @@ Notes for whoever takes on the gap. Measured on 2026-10-27 at commit
 hyper 1.12.0). Everything here can be measured again with the commands in
 section 2. Facts are marked as measured; estimates say so.
 
+Update, later on 2026-10-27 (the third http review, HR3): the codecs'
+instructions per request fell by 32-42% (bench/http/codec.mojo; the
+details are in bench/http/README.md). Most of the "line 0" cost in
+section 3 was IoError: passed in registers, it made every typed raise
+cost ~85 instructions on success. It is passed in memory now. The figures
+below are from before that work; the server's profile is to be taken
+again with it.
+
 
 1. The short version
 --------------------

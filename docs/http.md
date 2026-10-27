@@ -8,7 +8,7 @@ HTTP/1.1 for Mojo on Linux, per RFC 9110 (semantics) and RFC 9112 (message synta
 
 It is the base of the HTTP server (roadmap step 3). Package rules and the shared contracts are in `docs/design.md`; the transport is `net` (`docs/net.md`).
 
-**Status: H1–H6 and H8 done.** Core types, the header map, the head parser, body framing, the connection codecs and a blocking client, independently reviewed and tuned; `https://` (H8). Next is H7, a streaming response API with server-sent events.
+**Status: H1–H8 done.** Core types, the header map, the head parser, body framing, the connection codecs and a blocking client, independently reviewed three times and tuned; `https://` (H8) and streamed responses with server-sent events (H7).
 
 ## Scope
 **In scope:**
@@ -71,17 +71,19 @@ def main() raises:
     print(p.status)  # same host and port again: the connection is reused
 ```
 
-- **Errors are `IoError`s:**
-  - `InvalidInput` for a bad URL, method or header;
-  - for https, the `IoError` of the TLS failure: `PermissionDenied` for a certificate that is refused, `InvalidData` for a failed handshake; `client.last_tls_error()` has the category, OpenSSL's verify code and its text;
+- **Errors are `IoError`s**, whose `op` names the reason (the `E_*` constants of `http.client`, `http.connection` and `http.body`):
+  - `InvalidInput` for a bad URL (`E_URL_SCHEME`, `E_URL_HOST`, `E_URL_PORT`, `E_URL_USERINFO`, ...), method (`E_METHOD`) or header (`E_FRAMING_FIELD`, `E_HOST`);
+  - for https, the `IoError` of the TLS failure: `PermissionDenied` for a certificate that is refused, `InvalidData` for a failed handshake; `client.last_tls_error()` has the category, OpenSSL's verify code and its text (the last request's: None when it had no TLS failure);
   - `TimedOut` past the deadline (`e.is_deadline()`);
-  - `InvalidData` for a malformed response, or one larger than `max_body`;
+  - `InvalidData` for a malformed response, one larger than `max_body` (`E_TOO_LARGE`, at the head when its Content-Length says so), more than 32 1xx (`E_TOO_MANY_1XX`), or a body under a transfer coding other than chunked (`E_TE_UNSUPPORTED`);
   - otherwise the transport's error, for example `ConnectionRefused`.
 - **Status codes are not errors:** a 404 is a `Response` with `status == 404`.
-- **What the client sends:** it sets Host, User-Agent and Content-Length. It refuses a caller's Content-Length or Transfer-Encoding, because it frames the body itself.
-- **Retries:** if a reused connection was closed before any byte of the response, or answered 408 (its idle timeout raced the request), an idempotent request (GET, HEAD, OPTIONS, TRACE, PUT, DELETE) is sent again on a new connection, once. Other methods raise, or get the 408, because the server may have acted on them.
+- **What the client sends:** it sets Host, User-Agent, `Accept-Encoding: identity` (each unless the caller gives one) and Content-Length. It refuses a caller's Content-Length or Transfer-Encoding, because it frames the body itself, and a `TE` other than `trailers`.
+- **Per request:** `request(..., timeout=..., max_body=...)` (and `stream`) replace the client's two for one request.
+- **Codings:** the body is delivered as sent, its `Content-Encoding` the caller's to undo. A transfer coding other than chunked is refused rather than delivered still coded, as Go does, and so is `Transfer-Encoding` in an HTTP/1.0 response (RFC 9112 6.1: faulty framing).
+- **Retries:** if a reused connection was closed before any byte of the response, or answered 408 (its idle timeout raced the request), an idempotent request (GET, HEAD, OPTIONS, TRACE, PUT, DELETE) is sent again on a new connection, once: never another pooled one, which the server may have dropped as well. Other methods raise, or get the 408, because the server may have acted on them.
 - **Early responses** (RFC 9112 9.5): a response that arrives while the body is still being sent stops the body if it is 300 or more, or closes the connection. Below 300 and keeping the connection, the body is sent to the end first. If sending fails (the server reset the connection), a response is returned only when it is complete by its own framing; a response delimited by the close raises the send error, since a reset may have cut it short.
-- **The pool:** at most `max_idle_per_host` idle connections per scheme, host and port, and `max_idle_conns` (32) in all, the oldest going first.
+- **The pool:** at most `max_idle_per_host` idle connections per scheme, host and port, and `max_idle_conns` (32) in all, the oldest going first; those idle past `max_idle` are closed whenever a connection is taken or given back. A client pools only connections it made: `release` closes another client's, verified under another trust.
 - **HTTPS:** `Client(tls=ClientConfig(trust=Trust.ca_file("ca.pem")))` trusts a private CA instead of the system roots; nothing loosens verification (`docs/tls.md`). The certificate must hold the URL's host, or its IP address. ALPN offers `http/1.1`. OpenSSL loads on the first `https://` request. Clients can share one context instead, built with ALPN `http/1.1` alone (`Client(tls_context=ctx)`): its trust store is loaded once, and a process can hold only about 330 contexts with an OpenSSL of their own (`docs/tls.md`, "Use"). Over TLS an upload's last records are sent before an early 2xx returns, and a response the server sent before a send failed (an early 413) is read, as over plain HTTP (TR3).
 - **The end of a TLS connection** (RFC 9112 9.8): a response complete by its Content-Length or its last chunk stands when the server then ends the connection without close_notify, as many do. A response delimited by the end of the connection needs close_notify, or it raises `UnexpectedEof`: without close_notify, it may have been cut short.
 
@@ -123,7 +125,9 @@ The whole program is `examples/http/sse_events.mojo`.
   - all of the body must arrive within `total` (unlimited by default).
   - Either one raises `TimedOut`.
 - **Cancelling:** drop the `StreamedResponse` or `EventStream`. That closes its connection, so the server's next write fails.
-- **Reuse:** `client.release(r^)` pools the connection of a response read to its end. A response not read to its end is closed instead.
+- **Reuse:** `client.release(r^)` pools the connection of a response whose body has ended: the read that returns its last bytes takes the end too (`is_done()`). A response not read to its end is closed instead. An event stream that has ended (`next` returned False) gives its response back with `events^.into_response()`.
+- **Failures are final:** after a transport or protocol error, every later `read` raises it again (`TimedOut` excepted, so reading may go on), as Go's body does; a reset can never turn into a clean end.
+- **Uploads:** a body is still sent after a 2xx head that keeps the connection, and the response body that arrives meanwhile is read and held for `read`, up to `max_body` (`E_TOO_LARGE` beyond): a server that answers as it reads (an echo) cannot deadlock the upload.
 - **`EventStream`** needs the media type `text/event-stream`, in any case, with or without parameters. Each `next(ev)` refills `ev`, and returns False at the end of the stream. `last_event_id()` gives the value to send as `Last-Event-ID` when reconnecting. The parser is `http.sse.SseParser`, which also parses event streams on its own.
 - **`http.retry`:**
   - `retry_after(headers, now_unix)` reads `retry-after-ms` (OpenAI's API sends it) first, then `Retry-After` as seconds or as an HTTP-date. A date in the past gives 0. A malformed value gives None.
@@ -275,6 +279,19 @@ while True:
     - a `HeadParser` given less input than it already scanned raises instead of reading past it;
     - unworkable `Limits` are refused when the connection is made;
     - `Headers(capacity=-1)` no longer aborts.
+- **Third review (HR3, 2026-10-27)**, by three independent reviewers (parsing and framing as an attacker; the client, its pool and `llm`'s use of it; the codecs' cost per request, from a callgrind profile). Nothing critical or high; no smuggling, splitting or desync found. Every finding was reproduced by a regression test that fails on the old code (`tests/http/test_http_review3_regressions.mojo`, `test_http_client_review3_regressions.mojo`, `tests/llm/test_llm_review3_regressions.mojo`), and each fix was then reverted on its own to check that a test catches it: 24 of 25 plants were caught, and the 25th reverted a line that changed nothing (a second check for a body's end in `release`), now removed. The findings:
+  - **PAR-1: the SSE parser searched a line still arriving from its first byte on every feed.** A server sending one long line in 1-byte chunks made the client's work quadratic: 256 KiB took 44 s of CPU. The search now resumes where it stopped: 7 ms.
+  - **PAR-2: `retry-after-ms` wrapped** past Int's nanoseconds (`18446744073710` read as 0.45 ms, so `llm` retried at once), and `Retry-After: 00000000005` read as "forever". Both saturate now, and leading zeros are not digits of the value.
+  - **CLI-1: `stream()` with a body deadlocked against a server that answers as it reads.** After a 2xx head during the upload, the client only waited to write; an echo filled both directions and the request timed out. The body that comes meanwhile is read and held, up to `max_body`.
+  - **CLI-2:** `release` pooled a connection another client made, verified under that client's trust.
+  - **CLI-3:** a streamed response did not keep its failure: after a reset, the next `read` saw the kernel's 0 and ended a close-delimited body cleanly.
+  - **CLI-4:** the retry after a dropped reused connection took another pooled one, which the server had dropped too.
+  - **CLI-5:** a body read to its last byte was not `is_done()`, so `release` closed it.
+  - **CLI-6:** `last_tls_error()` kept an earlier request's reason.
+  - **CLI-8:** `llm` appended the API's path after a query in `base_url` (Azure's `?api-version=`).
+  - **Smaller:** a body under `gzip, chunked` was delivered still coded; a Content-Length over `max_body` waited for the body; no `Accept-Encoding`, which lets a server pick any coding.
+  - **The codecs' cost per request** (PERF; `bench/http/codec.mojo`, `bench/http/README.md`): 42% fewer instructions for wrk's GET (8,277 to 4,821), 32% for a browser's, 41% for a client exchange. Most of it was not `http`: `IoError`, passed in registers, made every typed raise cost ~85 instructions on success; it is passed in memory now (`linux`, `docs/design.md` "Stability"), which every library gains from. The rest: the head encoders in one pass, bounds checks the loops already prove, cheaper case-insensitive compares, a bitmap host check, and a reused head's method and target kept when unchanged. Each rewritten predicate is tested against its old definition, and bugs planted in them are caught.
+  - **Added on the way:** errors whose op names the reason; per-request `timeout` and `max_body` (`llm` no longer changes the http client's timeout per attempt); `EventStream.into_response` and `llm`'s `Client.release`, so a streamed call's connection is reused; the reason of a TLS failure in `llm`'s TRANSPORT errors; idle connections pruned when one is given back too.
 - **H7: streaming responses and server-sent events.** Done (after H8).
   - `Client.stream` returns at the response head. `StreamedResponse.read` takes the body as it arrives, under `idle_timeout` per read and `total` for all of it; `read_all` reads it whole. Dropping the response cancels it, and `release` pools one read to its end.
   - `EventStream` reads server-sent events from a streamed response of type `text/event-stream`.
@@ -299,4 +316,4 @@ while True:
   - Truncation per RFC 9112 9.8 (above); `last_tls_error()` for the reason of a TLS failure.
   - **Tested** (`tests/http/test_https.mojo`) against `http_peer.py --tls`: bodies by length, chunked, to close_notify, 3 MB down and 2 MB up, full duplex, an early 413; reuse with session tickets; an `http://` request to the same host and port never given the pooled TLS connection; a POST after the server closed the idle connection with close_notify; the retry of a dropped connection and of a 408; the ends of a connection with and without close_notify; an untrusted CA, a certificate for another name and for another address.
   - **Planted bugs**, each caught: a pool check that always reuses, no retry after a truncated end, a truncated end taken as the end of a close-delimited body, a pool key without the scheme.
-- **Later:** redirects, content codings.
+- **Later:** redirects (opt-in), explicit proxies (CONNECT for https), streamed request bodies, content codings.

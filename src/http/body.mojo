@@ -253,6 +253,18 @@ def _transfer_codings(headers: Headers) raises IoError -> Optional[_Codings]:
     return c
 
 
+def transfer_coding_is_chunked(headers: Headers) -> Bool:
+    """Whether the Transfer-Encoding fields name exactly one coding,
+    `chunked`, well formed and without parameters: a body under them,
+    dechunked, is the bytes as sent. A client that decodes no other coding
+    refuses a body under any other."""
+    try:
+        var c = _transfer_codings(headers)
+        return Bool(c) and c.value().count == 1 and c.value().chunked == 1
+    except:
+        return False
+
+
 def _parameters(v: Span[UInt8, _], start: Int, end: Int) -> Int:
     """Transfer-coding parameters `*( OWS ";" OWS token BWS "=" BWS ( token
     / quoted-string ) )` in `v[start:end]` (RFC 9110 10.1.4): how many, or
@@ -471,7 +483,8 @@ struct BodyDecoder(Copyable, Movable):
         self._remaining = framing.length if framing.kind == BodyKind.LENGTH else 0
         self._state = _SIZE
         self._scanned = 0
-        self._trailers.reset()
+        if framing.kind == BodyKind.CHUNKED:
+            self._trailers.reset()  # (only a chunked body has trailers)
         self._done = framing.kind == BodyKind.NONE or (
             framing.kind == BodyKind.LENGTH and framing.length == 0
         )

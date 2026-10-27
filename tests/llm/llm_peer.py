@@ -109,7 +109,7 @@ class Handler(BaseHTTPRequestHandler):
             body = None
         with LOCK:
             LOG.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": body})
-        parts = self.path.split("/")
+        parts = self.path.split("?")[0].split("/")  # (a query, Azure's api-version, is logged only)
         scenario = parts[1] if len(parts) > 2 else ""
         endpoint = "/" + "/".join(parts[3:])
         if scenario.startswith("rate-") or scenario.startswith("fail-") or scenario.startswith("retrybroken-"):

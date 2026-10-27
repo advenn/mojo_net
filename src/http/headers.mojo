@@ -73,10 +73,12 @@ def is_tchar(b: UInt8) -> Bool:
 
 def is_token(s: Span[UInt8, _]) -> Bool:
     """`s` is a token: one or more tchars (methods, field names, codings)."""
-    if len(s) == 0:
+    var n = len(s)
+    if n == 0:
         return False
-    for b in s:
-        if not is_tchar(b):
+    var p = s.unsafe_ptr()
+    for i in range(n):
+        if not is_tchar(p[unsafe_offset=i]):
             return False
     return True
 
@@ -104,14 +106,68 @@ def lower_ascii(b: UInt8) -> UInt8:
 def eq_ignore_case(a: Span[UInt8, _], b: Span[UInt8, _]) -> Bool:
     """ASCII-case-insensitive equality (only A-Z fold; other bytes, UTF-8
     included, must match exactly)."""
-    if len(a) != len(b):
+    var n = len(a)
+    if n != len(b):
         return False
-    for i in range(len(a)):
-        var x = a[i]
-        var y = b[i]
-        if x != y and lower_ascii(x) != lower_ascii(y):
+    var p = a.unsafe_ptr()
+    var q = b.unsafe_ptr()
+    for i in range(n):
+        var x = p[unsafe_offset=i]
+        var d = x ^ q[unsafe_offset=i]
+        if d != 0:
+            # Only the case bit may differ, and only in a letter.
+            var l = x | 0x20
+            if d != 0x20 or l < 97 or l > 122:
+                return False
+    return True
+
+
+@inline(.always)
+def eq_lower(s: Span[UInt8, _], lit: StaticString) -> Bool:
+    """`s` equals `lit` ignoring ASCII case, for `s` made of field bytes
+    (`is_field_byte`: a name or a value as `Headers` holds them) and `lit`
+    of lowercase letters, digits and `-`. Each byte of `s` OR 0x20 is then
+    exactly its fold: the only other bytes that give a letter, a digit or
+    `-` that way are controls (CR, 0x10..0x19), never field bytes."""
+    var l = lit.as_bytes()
+    var n = len(l)
+    if len(s) != n:
+        return False
+    var p = s.unsafe_ptr()
+    var q = l.unsafe_ptr()
+    for i in range(n):
+        if (p[unsafe_offset=i] | 0x20) != q[unsafe_offset=i]:
             return False
     return True
+
+
+def _field_bytes(s: Span[UInt8, _]) -> Bool:
+    """Every byte of `s` may be in a field value (`is_field_byte`)."""
+    var p = s.unsafe_ptr()
+    for i in range(len(s)):
+        if not is_field_byte(p[unsafe_offset=i]):
+            return False
+    return True
+
+
+@inline(.always)
+def _tail(mut out: ByteBuffer) -> Pointer[UInt8, MutAnyOrigin]:
+    """Where `out`'s writable bytes start, for stores before a `commit`."""
+    return out.writable_span().unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+
+
+@inline(.always)
+def _put(dst: Pointer[UInt8, MutAnyOrigin], at: Int, s: Span[UInt8, _]) -> Int:
+    """Store `s` at `dst + at`; return the index after it."""
+    unsafe_memcpy(dest=dst.unsafe_offset(at), src=s.unsafe_ptr(), count=len(s))
+    return at + len(s)
+
+
+@inline(.always)
+def _put_crlf(dst: Pointer[UInt8, MutAnyOrigin], at: Int) -> Int:
+    dst[unsafe_offset=at] = _CR
+    dst[unsafe_offset=at + 1] = _LF
+    return at + 2
 
 
 @fieldwise_init
@@ -313,11 +369,8 @@ struct Headers(Copyable, Defaultable, Movable, Sized, Writable):
     def _checked(
         name: Span[UInt8, _], value: Span[UInt8, _], op: StaticString
     ) raises IoError -> Bounds:
-        if not is_token(name):
+        if not is_token(name) or not _field_bytes(value):
             raise IoError.of_kind(op, ErrorKind.InvalidInput)
-        for b in value:
-            if not is_field_byte(b):
-                raise IoError.of_kind(op, ErrorKind.InvalidInput)
         return trim_ows(value)
 
     @inline(.always)
@@ -454,18 +507,24 @@ struct Headers(Copyable, Defaultable, Movable, Sized, Writable):
 
     @inline(.always)
     def _bytes(self, at: Int, n: Int) -> Span[UInt8, origin_of(self._data)]:
-        return Span(self._data)[at : at + n]
+        """Arena bytes `[at, at + n)` of a record (in range by construction:
+        records are only made over bytes the arena holds)."""
+        return Span[UInt8, origin_of(self._data)](unsafe_ptr=self._data.unsafe_ptr().unsafe_offset(at), length=n)
 
     @inline(.always)
     def _text(self, at: Int, n: Int) -> StringSlice[origin_of(self._data)]:
-        return StringSlice(unsafe_from_utf8=Span(self._data)[at : at + n])
+        return StringSlice(unsafe_from_utf8=self._bytes(at, n))
+
+    @inline(.always)
+    def _field(self, i: Int) -> _Field:
+        """Record `i`, for `0 <= i < len(self._fields)` (unchecked)."""
+        return self._fields.unsafe_ptr()[unsafe_offset=i]
 
     def _find(self, name: Span[UInt8, _], start: Int) -> Int:
+        var n = len(name)
         for i in range(max(start, 0), len(self._fields)):
-            var f = self._fields[i]
-            if f.name_len == len(name) and eq_ignore_case(
-                self._bytes(f.name, f.name_len), name
-            ):
+            var f = self._field(i)
+            if f.name_len == n and eq_ignore_case(self._bytes(f.name, n), name):
                 return i
         return -1
 
@@ -555,9 +614,9 @@ struct Headers(Copyable, Defaultable, Movable, Sized, Writable):
     # ---- by index ---------------------------------------------------------
 
     def _at(self, i: Int, op: StaticString) raises IoError -> _Field:
-        if i < 0 or i >= len(self._fields):
+        if UInt(i) >= UInt(len(self._fields)):
             raise IoError.of_kind(op, ErrorKind.InvalidInput)
-        return self._fields[i]
+        return self._field(i)
 
     def name(self, i: Int) raises IoError -> StringSlice[origin_of(self._data)]:
         """Field line `i`'s name, as given. `InvalidInput` out of range."""
@@ -582,9 +641,14 @@ struct Headers(Copyable, Defaultable, Movable, Sized, Writable):
         (and nothing appended) if `out` cannot hold them all."""
         var total = self.encoded_len()
         out.ensure_writable(total)
-        var dst = out.writable_span().unsafe_ptr()
+        out.commit(self._encode_into(_tail(out), 0))
+
+    @inline(.always)
+    def _encode_into(self, dst: Pointer[UInt8, MutAnyOrigin], start: Int) -> Int:
+        """`encode` at `dst + start`, where `encoded_len()` bytes are
+        writable; returns the index after them."""
         var src = self._data.unsafe_ptr()
-        var at = 0
+        var at = start
         for f in self._fields:
             unsafe_memcpy(
                 dest=dst.unsafe_offset(at),
@@ -604,7 +668,7 @@ struct Headers(Copyable, Defaultable, Movable, Sized, Writable):
             dst[unsafe_offset=at] = _CR
             dst[unsafe_offset=at + 1] = _LF
             at += 2
-        out.commit(total)
+        return at
 
     def _encode_except(self, mut out: ByteBuffer, name: StringSlice) raises IoError:
         """`encode` without the `name` fields."""

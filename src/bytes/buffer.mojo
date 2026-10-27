@@ -238,19 +238,16 @@ struct ByteBuffer(Copyable, Defaultable, Movable, Sized, Writable):
         Raises `InvalidInput` for `n < 0` and `OutOfMemory` when the readable
         bytes plus `n` would exceed `max_size()`; the buffer is unchanged
         when it raises."""
-        if n <= self.writable():
-            if n < 0:
-                raise IoError.of_kind(
-                    "ByteBuffer.ensure_writable", ErrorKind.InvalidInput
-                )
-        else:
+        if UInt(n) > UInt(self.writable()):  # (a negative n is huge: refused there)
             self._make_room(n)
         comptime if CHECK_SPANS:
             self._relocate()
 
     @no_inline
     def _make_room(mut self, n: Int) raises IoError:
-        """Slow path of `ensure_writable`: `writable() < n` here."""
+        """Slow path of `ensure_writable`: `n < 0` or `writable() < n`."""
+        if n < 0:
+            raise IoError.of_kind("ByteBuffer.ensure_writable", ErrorKind.InvalidInput)
         var used = self._w - self._r
         if n > self._max - used:
             raise IoError.of_kind(
@@ -341,7 +338,7 @@ struct ByteBuffer(Copyable, Defaultable, Movable, Sized, Writable):
         """Mark `n` bytes of the writable tail as written (after a `recv`
         into `writable_span()`). `InvalidInput` unless
         `0 <= n <= writable()`."""
-        if n < 0 or n > self.writable():
+        if UInt(n) > UInt(self.writable()):
             raise IoError.of_kind("ByteBuffer.commit", ErrorKind.InvalidInput)
         self._w += n
         comptime if CHECK_SPANS:
@@ -349,6 +346,7 @@ struct ByteBuffer(Copyable, Defaultable, Movable, Sized, Writable):
 
     # ---- writing -------------------------------------------------------------
 
+    @inline(.always)
     def write_bytes(mut self, data: Span[UInt8, _]) raises IoError:
         """Append `data`. `OutOfMemory` (buffer unchanged) if it would
         exceed `max_size()`."""
@@ -375,7 +373,7 @@ struct ByteBuffer(Copyable, Defaultable, Movable, Sized, Writable):
     def consume(mut self, n: Int) raises IoError:
         """Drop `n` readable bytes. `InvalidInput` unless
         `0 <= n <= readable()`. Draining the buffer resets both indices."""
-        if n < 0 or n > self._w - self._r:
+        if UInt(n) > UInt(self._w - self._r):
             raise IoError.of_kind("ByteBuffer.consume", ErrorKind.InvalidInput)
         comptime if CHECK_SPANS:
             _poison(self._buf, self._r, self._r + n)

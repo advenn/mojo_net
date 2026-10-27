@@ -42,7 +42,7 @@ from std.memory import pack_bits
 from bytes.buffer import ByteBuffer
 from linux import ErrorKind, IoError
 
-from .headers import Headers, is_field_byte, is_ows, is_tchar, is_token
+from .headers import Headers, _put, _put_crlf, _tail, is_field_byte, is_ows, is_tchar, is_token
 from .types import Version, check_status
 
 comptime _HTAB: UInt8 = 9
@@ -141,15 +141,17 @@ struct RequestHead(Copyable, Defaultable, Movable, Writable):
         var t = self.target.as_bytes()
         if not is_token(m) or not _is_target(t) or not _version_ok(self.version):
             raise IoError.of_kind("RequestHead.encode", ErrorKind.InvalidInput)
-        out.ensure_writable(self.encoded_len())
-        out.write_bytes(m)
-        out.write_byte(_SP)
-        out.write_bytes(t)
-        out.write_byte(_SP)
-        _write_version(self.version, out)
-        _write_crlf(out)
-        self.headers.encode(out)
-        _write_crlf(out)
+        # (One capacity test and one commit, raw stores between.)
+        var n = self.encoded_len()
+        out.ensure_writable(n)
+        var dst = _tail(out)
+        var at = _put(dst, 0, m)
+        dst[unsafe_offset=at] = _SP
+        at = _put(dst, at + 1, t)
+        dst[unsafe_offset=at] = _SP
+        at = _put_crlf(dst, _put_version(dst, at + 1, self.version))
+        at = _put_crlf(dst, self.headers._encode_into(dst, at))
+        out.commit(at)
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write(
@@ -197,17 +199,16 @@ struct ResponseHead(Copyable, Defaultable, Movable, Writable):
                 raise IoError.of_kind("ResponseHead.encode", ErrorKind.InvalidInput)
         if not _version_ok(self.version):
             raise IoError.of_kind("ResponseHead.encode", ErrorKind.InvalidInput)
-        out.ensure_writable(self.encoded_len())
-        _write_version(self.version, out)
-        out.write_byte(_SP)
-        out.write_byte(UInt8(48 + self.status // 100))
-        out.write_byte(UInt8(48 + self.status // 10 % 10))
-        out.write_byte(UInt8(48 + self.status % 10))
-        out.write_byte(_SP)
-        out.write_bytes(r)
-        _write_crlf(out)
-        self.headers.encode(out)
-        _write_crlf(out)
+        var n = self.encoded_len()
+        out.ensure_writable(n)
+        var dst = _tail(out)
+        var at = _put_version(dst, 0, self.version)
+        dst[unsafe_offset=at] = _SP
+        _put_status_digits(dst, at + 1, self.status)
+        dst[unsafe_offset=at + 4] = _SP
+        at = _put_crlf(dst, _put(dst, at + 5, r))
+        at = _put_crlf(dst, self.headers._encode_into(dst, at))
+        out.commit(at)
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write(
@@ -220,18 +221,40 @@ def _version_ok(v: Version) -> Bool:
     return v.major >= 0 and v.major <= 9 and v.minor >= 0 and v.minor <= 9
 
 
-def _write_version(v: Version, mut out: ByteBuffer) raises IoError:
-    for b in "HTTP/".as_bytes():
-        out.write_byte(b)
-    out.write_byte(UInt8(48 + v.major))
-    out.write_byte(UInt8(46))
-    out.write_byte(UInt8(48 + v.minor))
+@inline(.always)
+def _assign(mut s: String, b: ImmSpan[UInt8, _]):
+    """Make `s` hold the bytes `b` (ASCII, checked by the caller), keeping
+    it when it holds them already."""
+    var have = s.as_bytes()
+    var n = len(b)
+    if len(have) == n:
+        var p = have.unsafe_ptr()
+        var q = b.unsafe_ptr()
+        var i = 0
+        while i < n and p[unsafe_offset=i] == q[unsafe_offset=i]:
+            i += 1
+        if i == n:
+            return
+    s = String(StringSlice(unsafe_from_utf8=b))
 
 
 @inline(.always)
-def _write_crlf(mut out: ByteBuffer) raises IoError:
-    out.write_byte(_CR)
-    out.write_byte(_LF)
+def _put_version(dst: Pointer[UInt8, MutAnyOrigin], at: Int, v: Version) -> Int:
+    """`HTTP/<major>.<minor>` (8 bytes, `_version_ok`) at `dst + at`."""
+    var i = _put(dst, at, "HTTP/".as_bytes())
+    dst[unsafe_offset=i] = UInt8(48 + v.major)
+    dst[unsafe_offset=i + 1] = 46
+    dst[unsafe_offset=i + 2] = UInt8(48 + v.minor)
+    return i + 3
+
+
+@inline(.always)
+def _put_status_digits(dst: Pointer[UInt8, MutAnyOrigin], at: Int, status: Int):
+    """A status of 100..999 as its three digits at `dst + at`."""
+    var s = UInt(status)
+    dst[unsafe_offset=at] = UInt8(48 + s // 100)
+    dst[unsafe_offset=at + 1] = UInt8(48 + s // 10 % 10)
+    dst[unsafe_offset=at + 2] = UInt8(48 + s % 10)
 
 
 # ---- byte classes and scanning ----------------------------------------------------
@@ -565,7 +588,7 @@ struct HeadParser(Copyable, Movable):
     @inline(.always)
     def _start_end(self, data: ImmSpan[UInt8, _]) -> Int:
         """End of the start line's content (its LF, less a CR)."""
-        var lf = self._ends[0]
+        var lf = self._end(0)
         if data.unsafe_ptr()[unsafe_offset=lf - 1] == _CR:
             return lf - 1  # lf > start: the start line is not empty
         return lf
@@ -586,8 +609,10 @@ struct HeadParser(Copyable, Movable):
         var v = _version_at(data, te + 1)
         if not v:
             raise self._fail(400, E_REQUEST_LINE)
-        head.method = String(StringSlice(unsafe_from_utf8=data[start:m]))
-        head.target = String(StringSlice(unsafe_from_utf8=data[t:te]))
+        # (A reused head usually holds these bytes already: same method,
+        # often the same target. Kept then, which saves building Strings.)
+        _assign(head.method, data[start:m])
+        _assign(head.target, data[t:te])
         head.version = v.value()
 
     def _parse_status_line(
@@ -623,14 +648,20 @@ struct HeadParser(Copyable, Movable):
     # ---- field lines ----------------------------------------------------
 
     @inline(.always)
+    def _end(self, k: Int) -> Int:
+        """The LF of line `k`, for `0 <= k < len(self._ends)` (unchecked: the
+        callers' indexes come from the scan that filled `_ends`)."""
+        return self._ends.unsafe_ptr()[unsafe_offset=k]
+
+    @inline(.always)
     def _line_start(self, k: Int) -> Int:
-        return self._ends[k - 1] + 1
+        return self._end(k - 1) + 1
 
     @inline(.always)
     def _content_end(self, data: ImmSpan[UInt8, _], k: Int) -> Int:
         """End of line `k`'s content: its LF, less a CR. Only for a line
         that is not empty, so the byte before the LF is in it."""
-        var lf = self._ends[k]
+        var lf = self._end(k)
         if data.unsafe_ptr()[unsafe_offset=lf - 1] == _CR:
             return lf - 1
         return lf

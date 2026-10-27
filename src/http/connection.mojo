@@ -106,8 +106,8 @@ from .body import (
     request_framing,
     response_framing,
 )
-from .headers import Headers, eq_ignore_case, is_field_byte, next_element
-from .parse import HeadParser, Limits, RequestHead, ResponseHead
+from .headers import Headers, _put, _put_crlf, _tail, eq_ignore_case, eq_lower, is_field_byte, next_element
+from .parse import HeadParser, Limits, RequestHead, ResponseHead, _put_status_digits
 from .types import Version, check_status, reason
 
 comptime E_VERSION = "http: unsupported HTTP version"
@@ -119,6 +119,9 @@ comptime E_CONNECT_BODY = "http: CONNECT with a body"
 comptime E_TARGET = "http: request target not allowed for this method"
 comptime E_EARLY_SWITCH = "http: protocol switch before the request was sent"
 
+comptime _TE_CHUNKED = "Transfer-Encoding: chunked\r\n"
+comptime _CONN_CLOSE = "Connection: close\r\n"
+comptime _CONN_KEEP = "Connection: keep-alive\r\n"
 comptime _DRAIN_LIMIT = 256 * 1024
 """The request body a server keeps reading after an early response
 (answered before the body ended) to keep the connection; beyond this it
@@ -334,17 +337,18 @@ struct _Summary(TrivialRegisterPassable):
 
 
 def _summarize(headers: Headers) -> _Summary:
+    # (Names and values in `Headers` are field bytes: `eq_lower` is exact.)
     var s = _Summary(0, -1, 0, -1, False, False, False, False, False, False, False)
     for i in range(len(headers._fields)):
-        var f = headers._fields[i]
+        var f = headers._field(i)
         var name = headers._bytes(f.name, f.name_len)
         var n = len(name)
         if n == 4:
-            if eq_ignore_case(name, "host".as_bytes()):
+            if eq_lower(name, "host"):
                 s.hosts += 1
                 s.host_at = i
         elif n == 10:
-            if eq_ignore_case(name, "connection".as_bytes()):
+            if eq_lower(name, "connection"):
                 var v = headers._bytes(f.value, f.value_len)
                 var pos = 0
                 while True:
@@ -353,25 +357,25 @@ def _summarize(headers: Headers) -> _Summary:
                         break
                     var b = e.value()
                     var t = v[b.start : b.end]
-                    if eq_ignore_case(t, "close".as_bytes()):
+                    if eq_lower(t, "close"):
                         s.conn_close = True
-                    elif eq_ignore_case(t, "keep-alive".as_bytes()):
+                    elif eq_lower(t, "keep-alive"):
                         s.conn_keep_alive = True
-                    elif eq_ignore_case(t, "upgrade".as_bytes()):
+                    elif eq_lower(t, "upgrade"):
                         s.conn_upgrade = True
         elif n == 14:
-            if eq_ignore_case(name, "content-length".as_bytes()):
+            if eq_lower(name, "content-length"):
                 s.has_cl = True
                 s.cls += 1
                 s.cl_at = i
         elif n == 17:
-            if eq_ignore_case(name, "transfer-encoding".as_bytes()):
+            if eq_lower(name, "transfer-encoding"):
                 s.has_te = True
         elif n == 7:
-            if eq_ignore_case(name, "upgrade".as_bytes()):
+            if eq_lower(name, "upgrade"):
                 s.has_upgrade = True
         elif n == 6:
-            if eq_ignore_case(name, "expect".as_bytes()):
+            if eq_lower(name, "expect"):
                 var v = headers._bytes(f.value, f.value_len)
                 var pos = 0
                 while True:
@@ -379,7 +383,7 @@ def _summarize(headers: Headers) -> _Summary:
                     if not e:
                         break
                     var b = e.value()
-                    if eq_ignore_case(v[b.start : b.end], "100-continue".as_bytes()):
+                    if eq_lower(v[b.start : b.end], "100-continue"):
                         s.expect_continue = True
     return s
 
@@ -443,11 +447,12 @@ def _valid_host(v: Span[UInt8, _]) -> Bool:
     uri-host [ ":" port ], where uri-host is an IP literal in brackets or a
     reg-name (unreserved, percent-encoded or sub-delims bytes)."""
     var n = len(v)
+    var p = v.unsafe_ptr()  # (every index below is tested against n first)
     var i = 0
-    if n > 0 and v[0] == 91:  # "["
+    if n > 0 and p[unsafe_offset=0] == 91:  # "["
         i = 1
-        while i < n and v[i] != 93:  # "]"
-            var c = v[i]
+        while i < n and p[unsafe_offset=i] != 93:  # "]"
+            var c = p[unsafe_offset=i]
             if not (_is_hex(c) or c == 58 or c == 46 or c == 118 or c == 86):  # : . v V
                 return False
             i += 1
@@ -455,21 +460,23 @@ def _valid_host(v: Span[UInt8, _]) -> Bool:
             return False
         i += 1
     else:
-        while i < n and v[i] != 58:  # up to ":"
-            var c = v[i]
-            if c == 37:  # "%" HEXDIG HEXDIG
-                if i + 2 >= n or not _is_hex(v[i + 1]) or not _is_hex(v[i + 2]):
-                    return False
-                i += 3
+        while i < n:
+            var c = p[unsafe_offset=i]
+            if _is_reg_name_byte(c):
+                i += 1
                 continue
-            if not _is_reg_name_byte(c):
+            if c != 37:
+                break  # ":" or a byte no host has: decided below
+            # "%" HEXDIG HEXDIG
+            if i + 2 >= n or not _is_hex(p[unsafe_offset=i + 1]) or not _is_hex(p[unsafe_offset=i + 2]):
                 return False
-            i += 1
+            i += 3
     if i < n:
-        if v[i] != 58:
+        if p[unsafe_offset=i] != 58:
             return False
         for k in range(i + 1, n):
-            if v[k] < 48 or v[k] > 57:
+            var d = p[unsafe_offset=k]
+            if d < 48 or d > 57:
                 return False
     return True
 
@@ -479,17 +486,21 @@ def _is_hex(c: UInt8) -> Bool:
     return (c >= 48 and c <= 57) or ((c | 0x20) >= 97 and (c | 0x20) <= 102)
 
 
+# unreserved and sub-delims (RFC 3986 2.2, 2.3) as a 128-bit set, like
+# headers' tchar set: ALPHA DIGIT - . _ ~ ! $ & ' ( ) * + , ; =
+# (tests/http/test_http_review3_regressions.mojo checks it byte by byte).
+comptime _REG_NAME_LO: UInt64 = 0x2BFF7FD200000000
+comptime _REG_NAME_HI: UInt64 = 0x47FFFFFE87FFFFFE
+
+
 @inline(.always)
 def _is_reg_name_byte(c: UInt8) -> Bool:
     """unreserved and sub-delims (RFC 3986 2.2, 2.3)."""
-    if (c >= 48 and c <= 57) or ((c | 0x20) >= 97 and (c | 0x20) <= 122):
-        return True
-    return (
-        c == 45 or c == 46 or c == 95 or c == 126  # - . _ ~
-        or c == 33 or c == 36 or c == 38 or c == 39  # ! $ & '
-        or c == 40 or c == 41 or c == 42 or c == 43  # ( ) * +
-        or c == 44 or c == 59 or c == 61  # , ; =
-    )
+    if c < 64:
+        return ((_REG_NAME_LO >> UInt64(c)) & 1) != 0
+    if c < 128:
+        return ((_REG_NAME_HI >> UInt64(c - 64)) & 1) != 0
+    return False
 
 
 def _content_length(headers: Headers, s: _Summary) raises IoError -> Optional[Int]:
@@ -562,17 +573,17 @@ def _status_line(mut out: ByteBuffer, status: Int, phrase: StringSlice) raises I
 def _status_line_bytes(mut out: ByteBuffer, status: Int, phrase: Span[UInt8, _]) raises IoError:
     var n = 13 + len(phrase) + 2
     out.ensure_writable(n)
-    var dst = out.writable_span().unsafe_ptr()
-    var lead = "HTTP/1.1 ".as_bytes()
-    unsafe_memcpy(dest=dst, src=lead.unsafe_ptr(), count=9)
-    dst[unsafe_offset=9] = UInt8(48 + status // 100)
-    dst[unsafe_offset=10] = UInt8(48 + status // 10 % 10)
-    dst[unsafe_offset=11] = UInt8(48 + status % 10)
-    dst[unsafe_offset=12] = 32
-    unsafe_memcpy(dest=dst.unsafe_offset(13), src=phrase.unsafe_ptr(), count=len(phrase))
-    dst[unsafe_offset=13 + len(phrase)] = _CR
-    dst[unsafe_offset=14 + len(phrase)] = _LF
-    out.commit(n)
+    out.commit(_put_status_line(_tail(out), 0, status, phrase))
+
+
+@inline(.always)
+def _put_status_line(dst: Pointer[UInt8, MutAnyOrigin], at: Int, status: Int, phrase: Span[UInt8, _]) -> Int:
+    """`HTTP/1.1 <status> <phrase>` CRLF (15 bytes and the phrase) at
+    `dst + at`; returns the index after it."""
+    var i = _put(dst, at, "HTTP/1.1 ".as_bytes())
+    _put_status_digits(dst, i, status)
+    dst[unsafe_offset=i + 3] = 32
+    return _put_crlf(dst, _put(dst, i + 4, phrase))
 
 
 # ---- ServerConnection ---------------------------------------------------------------
@@ -670,8 +681,9 @@ struct ServerConnection(Codec, Copyable):
     def _note_blank(mut self):
         """Extend `_blank` over the line ends that follow it."""
         var s = self._rx.readable_span()
+        var p = s.unsafe_ptr()
         var i = self._blank
-        while i < len(s) and (s[i] == _CR or s[i] == _LF):
+        while i < len(s) and (p[unsafe_offset=i] == _CR or p[unsafe_offset=i] == _LF):
             i += 1
         self._blank = i
 
@@ -945,23 +957,40 @@ struct ServerConnection(Codec, Copyable):
             and not self._version.at_least_1_1()
             and not sum.conn_keep_alive
         )
-        self._tx.ensure_writable(
-            16 + head.reason.byte_length() + head.headers.encoded_len() + 64
-        )
-        _status_line(self._tx, status, head.reason)
         if add_close and sum.conn_keep_alive:
             # The application's keep-alive no longer holds: drop its
             # Connection fields rather than send contradictory ones.
+            self._tx.ensure_writable(16 + head.reason.byte_length() + head.headers.encoded_len() + 64)
+            _status_line(self._tx, status, head.reason)
             head.headers._encode_except(self._tx, "connection")
-        else:
-            head.headers.encode(self._tx)
-        if add_te:
-            _write_str(self._tx, "Transfer-Encoding: chunked\r\n")
-        if add_close:
             _write_str(self._tx, "Connection: close\r\n")
-        if add_keep:
-            _write_str(self._tx, "Connection: keep-alive\r\n")
-        _crlf(self._tx)
+            _crlf(self._tx)
+        else:
+            # (One capacity test and one commit, raw stores between.)
+            var own = head.reason.byte_length() > 0
+            var registered = reason(status)
+            var n = 15 + (head.reason.byte_length() if own else registered.byte_length()) + head.headers.encoded_len() + 2
+            if add_te:
+                n += _TE_CHUNKED.byte_length()
+            if add_close:
+                n += _CONN_CLOSE.byte_length()
+            if add_keep:
+                n += _CONN_KEEP.byte_length()
+            self._tx.ensure_writable(n)
+            var dst = _tail(self._tx)
+            var at: Int
+            if own:
+                at = _put_status_line(dst, 0, status, head.reason.as_bytes())
+            else:
+                at = _put_status_line(dst, 0, status, registered.as_bytes())
+            at = head.headers._encode_into(dst, at)
+            if add_te:
+                at = _put(dst, at, _TE_CHUNKED.as_bytes())
+            if add_close:
+                at = _put(dst, at, _CONN_CLOSE.as_bytes())
+            if add_keep:
+                at = _put(dst, at, _CONN_KEEP.as_bytes())
+            self._tx.commit(_put_crlf(dst, at))
         if switch:
             self._out = _OUT_NONE
             self._in = _UPGRADED
@@ -1410,8 +1439,9 @@ struct ClientConnection(Codec, Copyable):
     def _note_blank(mut self):
         """Extend `_blank` over the line ends that follow it."""
         var s = self._rx.readable_span()
+        var p = s.unsafe_ptr()
         var i = self._blank
-        while i < len(s) and (s[i] == _CR or s[i] == _LF):
+        while i < len(s) and (p[unsafe_offset=i] == _CR or p[unsafe_offset=i] == _LF):
             i += 1
         self._blank = i
 

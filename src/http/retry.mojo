@@ -10,6 +10,9 @@ from linux.time import Duration
 
 from .headers import Headers
 
+comptime _FOREVER = Duration.from_secs(Int(UInt32.MAX))
+"""What an absurdly long wait reads as (136 years): "do not retry"."""
+comptime _FOREVER_MS = Int(UInt32.MAX) * 1000
 comptime _MONTHS = "JanFebMarAprMayJunJulAugSepOctNovDec"
 comptime _DAYS = "MonTueWedThuFriSatSun"
 comptime _LONG_DAYS: List[StaticString] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -32,9 +35,12 @@ def retry_after(headers: Headers, now_unix: Int) -> Optional[Duration]:
     var text = String(ra.value()).strip()
     var b = text.as_bytes()
     if len(b) > 0 and _all_digits(b):
-        if len(b) > 10:
-            return Duration.from_secs(Int(UInt32.MAX))  # (absurdly long: wait "forever")
-        return Duration.from_secs(_num(b, 0, len(b)))
+        var k = 0
+        while k < len(b) - 1 and b[k] == 48:
+            k += 1  # (leading zeros: "005" is 5 s)
+        if len(b) - k > 10:
+            return _FOREVER  # (absurdly long: wait "forever")
+        return Duration.from_secs(_num(b, k, len(b) - k))
     var at = parse_http_date(text)
     if not at:
         return None
@@ -177,7 +183,7 @@ def _millis(text: String) -> Optional[Duration]:
     """A non-negative decimal number of milliseconds ("1500", "20.5")."""
     var t = text.strip()
     var b = t.as_bytes()
-    if len(b) == 0 or len(b) > 15:
+    if len(b) == 0:
         return None
     var whole = 0
     var frac_ns = 0
@@ -192,10 +198,13 @@ def _millis(text: String) -> Optional[Duration]:
             return None
         digits += 1
         if not dot:
-            whole = whole * 10 + Int(c) - 48
+            if whole < _FOREVER_MS:  # (saturates: no wrap-around past Int's nanoseconds)
+                whole = whole * 10 + Int(c) - 48
         elif scale >= 1:
             frac_ns += (Int(c) - 48) * scale
             scale //= 10
     if digits == 0:
         return None
+    if whole >= _FOREVER_MS:
+        return _FOREVER  # (as an absurdly long Retry-After)
     return Duration.from_nanos(whole * 1_000_000 + frac_ns)

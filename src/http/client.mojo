@@ -37,13 +37,22 @@ connections alive in a small pool. It drives
   (Content-Length or chunked): a response delimited by the close cannot be
   told from one the reset cut short, so the send error is raised.
 - Responses are read whole, up to `max_body` bytes (default 16 MiB);
-  `InvalidData` beyond, and the connection is dropped. At most 32 1xx
-  responses may come before the final one.
+  `InvalidData` beyond (`E_TOO_LARGE`, at the head when its Content-Length
+  says so), and the connection is dropped. At most 32 1xx responses may
+  come before the final one (`E_TOO_MANY_1XX`). `timeout` and `max_body`
+  can be given per request too.
+- Transfer codings: only `chunked`. A response with a body under any
+  other (`gzip, chunked`) is refused (`E_TE_UNSUPPORTED`), as Go does,
+  rather than delivered still coded; a caller's `TE` other than
+  `trailers` is refused. `Accept-Encoding: identity` is sent unless the
+  caller sends the field (RFC 9110 12.5.3: without it, any coding is
+  acceptable), and a response's content coding is the caller's to undo.
 - Headers: the client sends Host (unless the caller gives one),
-  User-Agent (likewise), and Content-Length when there is a body or the
-  method usually has one (POST, PUT, PATCH). The caller's headers follow,
-  in order. A caller's Content-Length or Transfer-Encoding is refused
-  (`InvalidInput`): the client frames the body.
+  User-Agent (likewise), Accept-Encoding (likewise), and Content-Length
+  when there is a body or the method usually has one (POST, PUT, PATCH).
+  The caller's headers follow, in order. A caller's Content-Length or
+  Transfer-Encoding is refused (`InvalidInput`, `E_FRAMING_FIELD`): the
+  client frames the body.
 - Connections are kept per scheme, host and port, at most `max_idle_per_host` of
   them and `max_idle_conns` in all (the oldest goes first), and reused only
   after `max_idle` at most, if `idle_state()` still says EMPTY and the
@@ -52,7 +61,10 @@ connections alive in a small pool. It drives
   server (a race no check avoids). If that happens before any byte of the
   response, or the server answers 408 (it timed the idle connection out
   as the request arrived), an idempotent request (GET, HEAD, OPTIONS,
-  TRACE, PUT, DELETE) is sent again, once, on a new connection.
+  TRACE, PUT, DELETE) is sent again, once, on a new connection (never
+  another pooled one, which the server may have dropped as well).
+- Errors carry the reason in their op: the `E_*` constants here and in
+  `http.connection` and `http.body`.
 - Not done: redirects (a 3xx is returned as is), cookies, content codings,
   CONNECT and upgrades (a request with an `Upgrade` field: `InvalidInput`),
   proxies.
@@ -62,6 +74,7 @@ from bytes.buffer import ByteBuffer
 from linux import ErrorKind, IoError
 from linux.consts import POLLERR, POLLHUP, POLLIN, POLLOUT
 from linux.poll import wait_ready
+from linux.random import random_u64
 from linux.time import Deadline, Duration, Instant
 from net.addr import IpAddr
 from net.blocking import IdleState
@@ -71,8 +84,9 @@ from tls import Category, ClientConfig, ClientContext, TlsError
 from tls.stream import TlsStream
 from tls.target import Target
 
-from .connection import E_NO_RESPONSE, ClientConnection, ClientEvent, EventKind
-from .headers import Headers, is_token, lower_ascii
+from .body import E_TE_UNSUPPORTED, BodyKind, transfer_coding_is_chunked
+from .connection import E_HOST, E_NO_RESPONSE, ClientConnection, ClientEvent, EventKind
+from .headers import Headers, eq_ignore_case, is_token, lower_ascii, next_element
 from .parse import RequestHead
 from .sse import SseEvent, SseParser
 from .types import Version
@@ -83,6 +97,19 @@ comptime _WRITE_PIECE = 64 * 1024
 streamed without a copy of all of it."""
 comptime _MAX_INFORMATIONAL = 32
 """1xx responses accepted before the final one."""
+
+comptime E_URL = "http: malformed URL (scheme://host[:port][/path])"
+comptime E_URL_SCHEME = "http: URL scheme not http or https"
+comptime E_URL_HOST = "http: bad host in URL"
+comptime E_URL_PORT = "http: bad port in URL"
+comptime E_URL_USERINFO = "http: user info in URL"
+comptime E_URL_TARGET = "http: URL path not visible ASCII (percent-encode it)"
+comptime E_METHOD = "http: method not a token, or CONNECT"
+comptime E_FRAMING_FIELD = "http: Content-Length, Transfer-Encoding, TE or Upgrade from the caller"
+comptime E_TOO_LARGE = "http: response body over max_body"
+comptime E_TOO_MANY_1XX = "http: too many 1xx responses"
+comptime E_SWITCH = "http: protocol switch not asked for"
+comptime E_TLS_HOST = "http: host not a name or address TLS can check"
 
 
 # ---- URLs -------------------------------------------------------------------------
@@ -112,7 +139,6 @@ struct Url(Copyable, Movable, Writable):
         scheme, user info, an empty host or one with characters outside
         letters, digits and `-._~`, a port outside 1..65535, or bytes in the
         path that are not visible ASCII (percent-encode them first)."""
-        comptime op = "Url.parse"
         var b = text.as_bytes()
         var n = len(b)
         var sep = -1
@@ -121,12 +147,12 @@ struct Url(Copyable, Movable, Writable):
                 sep = i
                 break
         if sep <= 0:
-            raise IoError.of_kind(op, ErrorKind.InvalidInput)
+            raise IoError.of_kind(E_URL, ErrorKind.InvalidInput)
         var scheme = String()
         for i in range(sep):
             scheme += chr(Int(lower_ascii(b[i])))
         if scheme != "http" and scheme != "https":
-            raise IoError.of_kind(op, ErrorKind.InvalidInput)
+            raise IoError.of_kind(E_URL_SCHEME, ErrorKind.InvalidInput)
         var tls = scheme == "https"
         var a = sep + 3
         var e = a
@@ -140,13 +166,13 @@ struct Url(Copyable, Movable, Writable):
             while close < e and b[close] != 93:
                 close += 1
             if close == e:
-                raise IoError.of_kind(op, ErrorKind.InvalidInput)
+                raise IoError.of_kind(E_URL_HOST, ErrorKind.InvalidInput)
             host_lo = a + 1
             host_hi = close
             for i in range(host_lo, host_hi):
                 var c = b[i]
                 if not (_is_hex(c) or c == 58 or c == 46):  # hex, ":", "." (v4-mapped)
-                    raise IoError.of_kind(op, ErrorKind.InvalidInput)
+                    raise IoError.of_kind(E_URL_HOST, ErrorKind.InvalidInput)
             # ... and an IPv6 address: `[127.0.0.1]` or `[1234]` would
             # otherwise reach the resolver, or connect over IPv4, while a
             # URL check elsewhere saw an IPv6 literal.
@@ -156,16 +182,16 @@ struct Url(Copyable, Movable, Writable):
             except:
                 v6 = False
             if not v6:
-                raise IoError.of_kind(op, ErrorKind.InvalidInput)
+                raise IoError.of_kind(E_URL_HOST, ErrorKind.InvalidInput)
             if close + 1 < e:
                 if b[close + 1] != 58:
-                    raise IoError.of_kind(op, ErrorKind.InvalidInput)
+                    raise IoError.of_kind(E_URL_HOST, ErrorKind.InvalidInput)
                 port = _port(b, close + 2, e)
         else:
             var colon = -1
             for i in range(a, e):
                 if b[i] == 64:  # "@": user info
-                    raise IoError.of_kind(op, ErrorKind.InvalidInput)
+                    raise IoError.of_kind(E_URL_USERINFO, ErrorKind.InvalidInput)
                 if b[i] == 58:
                     colon = i
                     break
@@ -174,9 +200,9 @@ struct Url(Copyable, Movable, Writable):
                 port = _port(b, colon + 1, e)
             for i in range(host_lo, host_hi):
                 if not _is_host_byte(b[i]):
-                    raise IoError.of_kind(op, ErrorKind.InvalidInput)
+                    raise IoError.of_kind(E_URL_HOST, ErrorKind.InvalidInput)
         if host_hi <= host_lo or port < 1:
-            raise IoError.of_kind(op, ErrorKind.InvalidInput)
+            raise IoError.of_kind(E_URL_HOST, ErrorKind.InvalidInput)
         var f = e
         while f < n and b[f] != 35:  # up to the fragment
             f += 1
@@ -186,7 +212,7 @@ struct Url(Copyable, Movable, Writable):
         for i in range(e, f):
             var c = b[i]
             if c <= 0x20 or c >= 0x7F:
-                raise IoError.of_kind(op, ErrorKind.InvalidInput)
+                raise IoError.of_kind(E_URL_TARGET, ErrorKind.InvalidInput)
         target += String(StringSlice(unsafe_from_utf8=b[e:f]))
         return Url(StringSlice(unsafe_from_utf8=b[host_lo:host_hi]), UInt16(port), target, tls)
 
@@ -225,16 +251,19 @@ def _is_host_byte(c: UInt8) -> Bool:
 
 
 def _port(b: Span[UInt8, _], lo: Int, hi: Int) raises IoError -> Int:
+    for i in range(lo, hi):
+        if b[i] == 64:  # ("host:80@evil": user info)
+            raise IoError.of_kind(E_URL_USERINFO, ErrorKind.InvalidInput)
     if hi <= lo or hi - lo > 5:
-        raise IoError.of_kind("Url.parse", ErrorKind.InvalidInput)
+        raise IoError.of_kind(E_URL_PORT, ErrorKind.InvalidInput)
     var p = 0
     for i in range(lo, hi):
         var c = b[i]
         if c < 48 or c > 57:
-            raise IoError.of_kind("Url.parse", ErrorKind.InvalidInput)
+            raise IoError.of_kind(E_URL_PORT, ErrorKind.InvalidInput)
         p = p * 10 + Int(c) - 48
     if p < 1 or p > 65535:
-        raise IoError.of_kind("Url.parse", ErrorKind.InvalidInput)
+        raise IoError.of_kind(E_URL_PORT, ErrorKind.InvalidInput)
     return p
 
 
@@ -270,7 +299,9 @@ struct Response(Movable, Writable):
 struct StreamedResponse(Movable, Writable):
     """A response whose body is read as it arrives (`Client.stream`). It
     owns its connection: dropping it closes the connection (the way to
-    cancel a stream), and `Client.release` pools a finished one."""
+    cancel a stream), and `Client.release` pools a finished one. A
+    transport or protocol failure is final: every later `read` raises it
+    again (`TimedOut` excepted: reading may go on)."""
 
     var status: Int
     var reason: String
@@ -288,31 +319,52 @@ struct StreamedResponse(Movable, Writable):
     var _done: Bool
     var _idle: Duration
     var _total: Deadline
+    var _failure: Optional[IoError]
+    """The first failure, raised again by every later `read`."""
 
-    def __init__(out self, var r: Response, var conn: List[_Conn], idle: Duration, total: Deadline):
+    def __init__(out self, var r: Response, var conn: List[_Conn], idle: Duration, total: Deadline, ended: Bool):
+        """`r` with the body that came while the request was still being
+        sent (`ended` if all of it did)."""
         self.status = r.status
         self.reason = r.reason
         self.version = r.version
         self.headers = Headers()
         swap(self.headers, r.headers)
         self.trailers = Headers()
+        if ended:
+            swap(self.trailers, r.trailers)
         self._conn = conn^
         self._ev = ClientEvent(EventKind.END)
         self._buf = List[UInt8](length=_READ_SIZE, fill=0)
         self._piece = List[UInt8]()
+        swap(self._piece, r.body)
         self._off = 0
-        self._done = False
+        self._done = ended
         self._idle = idle
         self._total = total
+        self._failure = None
+        self._settle()
 
     def read(mut self, buf: MutSpan[UInt8, _]) raises IoError -> Int:
         """Body bytes into `buf` as they arrive: how many, 0 at the end (or
         for an empty `buf`). `TimedOut` after `idle_timeout` without any, or
         past `total`; the transport's error if the connection fails. A
         body delimited by the end of a TLS connection must end with
-        close_notify (`UnexpectedEof` otherwise: RFC 9112 9.8)."""
+        close_notify (`UnexpectedEof` otherwise: RFC 9112 9.8). The read
+        that returns the body's last bytes also takes its end if it has
+        come (`is_done()`)."""
+        if self._failure:
+            raise self._failure.value()
         if len(buf) == 0:
             return 0
+        try:
+            return self._read(buf)
+        except e:
+            if e.kind != ErrorKind.TimedOut:
+                self._failure = e
+            raise e
+
+    def _read(mut self, buf: MutSpan[UInt8, _]) raises IoError -> Int:
         while True:
             var left = len(self._piece) - self._off
             if left > 0:
@@ -320,20 +372,13 @@ struct StreamedResponse(Movable, Writable):
                 for i in range(n):
                     buf[i] = self._piece[self._off + i]
                 self._off += n
+                self._settle()
                 return n
             if self._done or len(self._conn) == 0:
                 return 0
-            ref c = self._conn[0]
-            if c.codec.poll(self._ev):
-                if self._ev.kind == EventKind.DATA:
-                    swap(self._piece, self._ev.data)
-                    self._off = 0
-                elif self._ev.kind == EventKind.END:
-                    self.trailers = self._ev.take_trailers()
-                    self._done = True
-                else:  # (no 1xx or switch after the final head)
-                    raise IoError.of_kind("StreamedResponse.read", ErrorKind.InvalidData)
+            if self._take():
                 continue
+            ref c = self._conn[0]
             var deadline = Deadline.after(self._idle).earliest(self._total)
             if self._total.is_expired():
                 raise IoError.of_kind("StreamedResponse.read", ErrorKind.TimedOut)
@@ -356,6 +401,32 @@ struct StreamedResponse(Movable, Writable):
             if len(out) + n > max_bytes:
                 raise IoError.of_kind("StreamedResponse.read_all", ErrorKind.InvalidData)
             out.extend(Span(buf)[0:n])
+
+    def _take(mut self) raises IoError -> Bool:
+        """The codec's next event, without I/O: a piece of the body (with
+        the last one read out) or its end. False if none has come."""
+        if not self._conn[0].codec.poll(self._ev):
+            return False
+        if self._ev.kind == EventKind.DATA:
+            swap(self._piece, self._ev.data)
+            self._off = 0
+        elif self._ev.kind == EventKind.END:
+            self.trailers = self._ev.take_trailers()
+            self._done = True
+        else:  # (no 1xx or switch after the final head)
+            raise IoError.of_kind("StreamedResponse.read", ErrorKind.InvalidData)
+        return True
+
+    def _settle(mut self):
+        """With the piece read out, take what has come already (`_take`):
+        a body read to its last byte is then `is_done()`, and `release`
+        pools its connection. A failure waits for the next `read`."""
+        if self._done or len(self._conn) == 0 or self._off < len(self._piece) or self._failure:
+            return
+        try:
+            _ = self._take()
+        except e:
+            self._failure = e
 
     def is_done(self) -> Bool:
         """Whether the body has been read to its end."""
@@ -424,6 +495,12 @@ struct EventStream(Movable):
     def last_event_id(self) -> String:
         """For a reconnection's Last-Event-ID."""
         return self.parser.last_event_id()
+
+    def into_response(deinit self) -> StreamedResponse:
+        """The response under the events, for `Client.release` once `next`
+        has returned False (the stream ended cleanly): the connection then
+        serves the next request instead of a new one being made."""
+        return self.response^
 
 
 # ---- the client ------------------------------------------------------------------
@@ -538,12 +615,16 @@ struct _Conn(Movable):
     """A connection and its protocol state, pooled together."""
 
     var key: String
+    var owner: UInt64
+    """The `Client` that made it (`Client._id`): only that one pools it,
+    since only that one's trust verified it."""
     var stream: _Stream
     var codec: ClientConnection
     var idle_since: Instant
 
-    def __init__(out self, key: String, var stream: _Stream) raises IoError:
+    def __init__(out self, key: String, owner: UInt64, var stream: _Stream) raises IoError:
         self.key = key
+        self.owner = owner
         self.stream = stream^
         self.codec = ClientConnection()
         self.idle_since = Instant.now()
@@ -558,6 +639,23 @@ def _idempotent(method: StringSlice) -> Bool:
         or method == "PUT"
         or method == "DELETE"
     )
+
+
+def _te_trailers_only(headers: Headers) raises IoError -> Bool:
+    """Every element of every TE field is `trailers` (the one transfer
+    coding this client takes is chunked, which TE never names)."""
+    var at = headers.find("te")
+    while at:
+        var v = headers.value_bytes(at.value())
+        var pos = 0
+        while True:
+            var e = next_element(v, pos)
+            if not e:
+                break
+            if not eq_ignore_case(v[e.value().start : e.value().end], "trailers".as_bytes()):
+                return False
+        at = headers.find("te", at.value() + 1)
+    return True
 
 
 def _retryable(e: IoError) -> Bool:
@@ -596,6 +694,12 @@ struct Client(Movable):
     """Reused for every event (`ClientConnection.poll`)."""
     var _head_only: Bool
     """`stream`: a response counts as come at its final head."""
+    var _ended: Bool
+    """`stream`: the body ended while the request was still being sent."""
+    var _limit: Int
+    """The request's `max_body`."""
+    var _id: UInt64
+    """Stamped on each connection made (`_Conn.owner`)."""
 
     def __init__(
         out self,
@@ -636,6 +740,9 @@ struct Client(Movable):
         self._buf = List[UInt8](length=_READ_SIZE, fill=0)
         self._ev = ClientEvent(EventKind.END)
         self._head_only = False
+        self._ended = False
+        self._limit = max_body
+        self._id = random_u64()
 
     # ---- requests --------------------------------------------------------
 
@@ -658,13 +765,17 @@ struct Client(Movable):
         url: StringSlice,
         headers: Headers = Headers(),
         body: Span[UInt8, _] = Span[UInt8, ImmStaticOrigin](),
+        *,
+        timeout: Optional[Duration] = None,
+        max_body: Optional[Int] = None,
     ) raises IoError -> Response:
         """Send `method` to `url` with `headers` and `body`, and read the
-        whole response. Errors: `InvalidInput` for a bad URL, method or
+        whole response. `timeout` and `max_body` replace the client's for
+        this request. Errors: `InvalidInput` for a bad URL, method or
         header set; `TimedOut` past the deadline; `InvalidData` for a
         malformed response or one over `max_body`; the transport's errors."""
         var kept = List[_Conn]()
-        return self._perform(method, url, headers, body, kept, False)
+        return self._perform(method, url, headers, body, kept, False, timeout, max_body)
 
     def stream(
         mut self,
@@ -675,6 +786,8 @@ struct Client(Movable):
         *,
         idle_timeout: Duration = Duration.from_secs(60),
         total: Duration = Duration.MAX,
+        timeout: Optional[Duration] = None,
+        max_body: Optional[Int] = None,
     ) raises IoError -> StreamedResponse:
         """Send the request as `request` does, and return as soon as the
         response's head has come (within `timeout`): read the body as it
@@ -683,19 +796,29 @@ struct Client(Movable):
         `idle_timeout` for more of the body, and all of it must come
         within `total` (no limit by default). Dropping the response closes
         the connection, which is how a client cancels; `release` gives a
-        finished one back to the pool."""
+        finished one back to the pool.
+
+        A body is still sent after a head of 2xx that keeps the
+        connection; what the response's body brings meanwhile is read and
+        held (up to `max_body`, `InvalidData` beyond) for `read`, so a
+        server that answers as it reads cannot deadlock the upload."""
         if not (Duration.ZERO < idle_timeout):
             raise IoError.of_kind("Client.stream", ErrorKind.InvalidInput)
         var kept = List[_Conn]()
-        var r = self._perform(method, url, headers, body, kept, True)
+        var r = self._perform(method, url, headers, body, kept, True, timeout, max_body)
         var d = Deadline.none() if total == Duration.MAX else Deadline.after(total)
-        return StreamedResponse(r^, kept^, idle_timeout, d)
+        return StreamedResponse(r^, kept^, idle_timeout, d, self._ended)
 
     def release(mut self, var r: StreamedResponse):
         """Return a streamed response's connection to the pool, if its body
-        was read to the end and the connection is fit for reuse (dropping
-        the response closes it instead)."""
-        if len(r._conn) == 0 or not r._done:
+        has ended (`is_done()`, its last bytes perhaps unread), nothing
+        failed, the connection is fit for reuse, and this client made it
+        (another's was verified under another trust). Otherwise it is
+        closed, as dropping the response does."""
+        if len(r._conn) == 0:
+            return
+        # (`read` and the constructor have taken an END the codec holds.)
+        if not r._done or r._failure or r._conn[0].owner != self._id:
             return
         var c = r._conn.pop()
         if c.codec.is_idle():
@@ -709,46 +832,61 @@ struct Client(Movable):
         body: Span[UInt8, _],
         mut kept: List[_Conn],
         head_only: Bool,
+        timeout: Optional[Duration],
+        max_body: Optional[Int],
     ) raises IoError -> Response:
         """`request`, or with `head_only`, up to the final head: the
         connection then goes to `kept` with the rest of the response."""
-        comptime op = "Client.request"
         var u = Url.parse(url)
+        if not is_token(method.as_bytes()) or method == "CONNECT":
+            raise IoError.of_kind(E_METHOD, ErrorKind.InvalidInput)
         if (
-            not is_token(method.as_bytes())
-            or method == "CONNECT"
-            or headers.contains("upgrade")  # (the docs promise it: no protocol switch)
+            headers.contains("upgrade")  # (the docs promise it: no protocol switch)
             or headers.contains("content-length")
             or headers.contains("transfer-encoding")
-            or headers.count("host") > 1
+            or not _te_trailers_only(headers)
         ):
-            raise IoError.of_kind(op, ErrorKind.InvalidInput)
+            raise IoError.of_kind(E_FRAMING_FIELD, ErrorKind.InvalidInput)
+        if headers.count("host") > 1:
+            raise IoError.of_kind(E_HOST, ErrorKind.InvalidInput)
+        var wait = timeout.value() if timeout else self.timeout
+        var limit = max_body.value() if max_body else self.max_body
+        if not (Duration.ZERO < wait) or limit < 0:
+            raise IoError.of_kind("Client.request", ErrorKind.InvalidInput)
         var head = RequestHead(method, u.target)
         if not headers.contains("host"):
             head.headers.add("Host", u.authority())
         if not headers.contains("user-agent") and self.user_agent.byte_length() > 0:
             head.headers.add("User-Agent", self.user_agent)
+        if not headers.contains("accept-encoding"):
+            head.headers.add("Accept-Encoding", "identity")
         if len(body) > 0 or method == "POST" or method == "PUT" or method == "PATCH":
             head.headers.add("Content-Length", String(len(body)))
         for i in range(len(headers)):
             head.headers._push(
                 headers.name(i).as_bytes(), headers.value_bytes(i), utf8=False
             )
-        var deadline = Deadline.after(self.timeout)
+        var deadline = Deadline.after(wait)
         # (TC17: one TLS context per Client, so the scheme is all the pool
-        # key needs to keep TLS and plain connections apart.)
+        # key needs to keep TLS and plain connections apart; `release`
+        # keeps other clients' connections out.)
         var key = String("https " if u.tls else "http ", u.host, " ", u.port)
         var retried = False
         while True:
+            self._tls_error = None  # (this attempt's, if any)
             var reused = False
-            var conn = self._checkout(key)
+            # (A retry takes a new connection: the server that dropped one
+            # may have dropped every other it held for us too.)
+            var conn = self._checkout(key) if not retried else Optional[_Conn](None)
             if conn:
                 reused = True
             else:
-                conn = _Conn(key, self._connect(u, deadline))
+                conn = _Conn(key, self._id, self._connect(u, deadline))
             var c = conn.take()
             var started = False
             self._head_only = head_only
+            self._ended = False
+            self._limit = limit
             try:
                 var r = self._exchange(c, head, body, deadline, started)
                 self._head_only = False
@@ -782,7 +920,7 @@ struct Client(Movable):
             try:
                 _ = Target(u.host)
             except e:
-                raise IoError.of_kind("Client.request", ErrorKind.InvalidInput)
+                raise IoError.of_kind(E_TLS_HOST, ErrorKind.InvalidInput)
         var tcp = TcpStream.connect_host_deadline(u.host, u.port, deadline, self._resolver)
         if not u.tls:
             return _Stream(tcp^)
@@ -855,9 +993,14 @@ struct Client(Movable):
             if wrote:
                 out.consume(wrote.value())
                 continue
-            var events = POLLOUT if answered else (POLLIN | POLLOUT)
+            # (Answered, a stream's body goes on arriving while the request's
+            # is sent: it is read meanwhile, into `r.body`, up to its END.)
+            var reading = not answered or (self._head_only and not self._ended)
+            var events = (POLLIN | POLLOUT) if reading else POLLOUT
             var rev = c.stream.wait(Int16(events), deadline)
-            if not answered and rev & Int16(POLLIN | POLLHUP | POLLERR):
+            if answered and reading and rev & Int16(POLLIN | POLLHUP | POLLERR):
+                _ = self._read_ready(c, r, started, informational, deadline)
+            elif not answered and rev & Int16(POLLIN | POLLHUP | POLLERR):
                 if self._read_ready(c, r, started, informational, deadline):
                     if r.status < 300 and not c.codec.should_close():
                         # The server took the request and keeps the
@@ -900,16 +1043,19 @@ struct Client(Movable):
         while True:
             if deadline.is_expired():
                 raise IoError.of_kind("Client.request", ErrorKind.TimedOut)
+            # (What the codec holds first: a stream's body left in it at the
+            # head may fill its buffer, and an empty read would look like
+            # the end of the input.)
+            if self._absorb(c, r, informational):
+                return True
             var got = c.stream.try_read(Span(self._buf)[0 : min(_READ_SIZE, c.codec.feed_capacity())])
             if not got:
-                return self._absorb(c, r, informational)
+                return False
             if got.value() == 0:
                 c.codec.feed_eof()
                 return self._absorb(c, r, informational)
             started = True
             c.codec.feed(Span(self._buf)[0 : got.value()])
-            if self._absorb(c, r, informational):
-                return True
 
     def _after_write_error(
         mut self,
@@ -952,6 +1098,16 @@ struct Client(Movable):
             ref ev = self._ev
             if ev.kind == EventKind.HEAD:
                 ref h = ev.head()
+                var kind = ev.framing.kind
+                if (kind != BodyKind.NONE and kind != BodyKind.TUNNEL and h.headers.contains("transfer-encoding")) and not (
+                    kind == BodyKind.CHUNKED and transfer_coding_is_chunked(h.headers)
+                ):
+                    # A coding other than chunked (`gzip, chunked`), or
+                    # Transfer-Encoding in HTTP/1.0 (RFC 9112 6.1: faulty
+                    # framing): the body would be delivered still coded.
+                    raise IoError.of_kind(E_TE_UNSUPPORTED, ErrorKind.InvalidData)
+                if not self._head_only and kind == BodyKind.LENGTH and ev.framing.length > self._limit:
+                    raise IoError.of_kind(E_TOO_LARGE, ErrorKind.InvalidData)  # (said at the head)
                 r.status = h.status
                 r.reason = h.reason
                 r.version = h.version
@@ -959,18 +1115,19 @@ struct Client(Movable):
                 if self._head_only:
                     return True  # (the body stays in the codec, for the stream)
             elif ev.kind == EventKind.DATA:
-                if len(r.body) + len(ev.data) > self.max_body:
-                    raise IoError.of_kind("Client.request", ErrorKind.InvalidData)
+                if len(r.body) + len(ev.data) > self._limit:
+                    raise IoError.of_kind(E_TOO_LARGE, ErrorKind.InvalidData)
                 r.body.extend(Span(ev.data))
             elif ev.kind == EventKind.END:
                 r.trailers = ev.take_trailers()
+                self._ended = True
                 return True
             elif ev.kind == EventKind.UPGRADE:
-                raise IoError.of_kind("Client.request", ErrorKind.InvalidData)
+                raise IoError.of_kind(E_SWITCH, ErrorKind.InvalidData)
             else:  # INFORMATIONAL: skipped, but not without end
                 informational += 1
                 if informational > _MAX_INFORMATIONAL:
-                    raise IoError.of_kind("Client.request", ErrorKind.InvalidData)
+                    raise IoError.of_kind(E_TOO_MANY_1XX, ErrorKind.InvalidData)
         return False
 
     # ---- the pool --------------------------------------------------------
@@ -979,13 +1136,8 @@ struct Client(Movable):
         """The most recently returned idle connection for `key` that still
         looks reusable. Connections idle past `max_idle`, for any key, and
         stale ones for `key` are dropped (closed) on the way."""
-        var now = Instant.now()
+        self._prune()
         var i = len(self._pool) - 1
-        while i >= 0:
-            if self.max_idle < now - self._pool[i].idle_since:
-                _ = self._pool.pop(i)
-            i -= 1
-        i = len(self._pool) - 1
         while i >= 0:
             if self._pool[i].key == key:
                 var c = self._pool.pop(i)
@@ -994,7 +1146,18 @@ struct Client(Movable):
             i -= 1
         return None
 
+    def _prune(mut self):
+        """Close the connections idle past `max_idle`, whatever their host
+        (a server has likely closed them: each holds a socket meanwhile)."""
+        var now = Instant.now()
+        var i = len(self._pool) - 1
+        while i >= 0:
+            if self.max_idle < now - self._pool[i].idle_since:
+                _ = self._pool.pop(i)
+            i -= 1
+
     def _checkin(mut self, var c: _Conn):
+        self._prune()
         var same = 0
         for i in range(len(self._pool)):
             if self._pool[i].key == c.key:

@@ -44,11 +44,13 @@ Package rules are in `docs/design.md`.
   - **HTTP:** the API's message (cut to 4 KiB), type, code and request id (`x-request-id`, or Anthropic's `request-id`).
   - **API:** an error event inside a stream, with the stream's request id.
   - **PROTOCOL:** a body that is not the API's JSON, or a field of the wrong type.
-  - **TRANSPORT:** the network's `IoError` is kept in `io`.
+  - **TRANSPORT:** the network's `IoError` is kept in `io`; after a TLS failure the message also says why (the category, OpenSSL's verify code and text), where `io` alone would be a bare `PermissionDenied`.
   - **USAGE:** a request that cannot be sent as given: no model, an unknown role, a schema that is not a JSON object, an extra field the request writes itself, NaN, a header `http` frames itself (`Content-Length`), or empty content for Anthropic, which refuses it.
 - **Refusals** (OpenAI-style) are kept apart: `Reply.refusal`, and REFUSAL deltas.
 - **Embeddings come as base64** (`encoding_format: "base64"`), a quarter of the bytes of decimal text, and are decoded as little-endian float32. Each vector is placed by its `index`, which must cover every input exactly once.
 - **Keys** go in `Authorization: Bearer` or `x-api-key`, built through `http.headers`, which refuses CR and LF (no header injection). Use `https://` for any remote API: over `http://` a key travels in clear.
+- **Connections are reused.** `chat` and `embed` give theirs back to `http`'s pool; a stream's goes back through `c.release(s^)` once it is `complete()` (what its body has after the last event, the last chunk, is read first: at most 64 KiB within 1 s). In an agent's loop of streamed calls that saves a TCP connection and a TLS handshake per call. A stream dropped, or released before it is complete, closes its connection.
+- **`base_url`** is the API's root up to its version. The paths are appended to its path, before a query: Azure OpenAI's `.../deployments/d?api-version=2024-10-21` works.
 - **Many clients** (one per tenant, say) should share one TLS context, built with ALPN `http/1.1` (`Client(..., tls_context=ctx)`): each context built on its own loads OpenSSL anew, and a process can hold only about 330 of those (`docs/tls.md`, "Use").
 
 ## Use
@@ -65,6 +67,7 @@ var d = Delta()
 while s.next(d):
     if d.kind == DeltaKind.TEXT:
         print(d.text, end="")
+c.release(s^)                                                      # the connection, for the next call
 ```
 `examples/llm/chat.mojo` streams an answer from any of the servers above, or from Anthropic's API.
 

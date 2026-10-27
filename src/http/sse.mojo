@@ -66,6 +66,10 @@ struct SseParser(Codec, Copyable):
     var max_data: Int
     var _buf: ByteBuffer
     """Input not yet split into lines (a line still arriving)."""
+    var _scanned: Int
+    """Bytes at the start of `_buf` already searched for a line end (the
+    line still arriving), so each byte is searched once however the input
+    is split."""
     var _skip_lf: Bool
     """The last line ended with a CR: an LF right after belongs to it."""
     var _started: Bool
@@ -90,6 +94,7 @@ struct SseParser(Codec, Copyable):
         self.max_line = max_line
         self.max_data = max_data
         self._buf = ByteBuffer()
+        self._scanned = 0
         self._skip_lf = False
         self._started = False
         self._data = List[UInt8]()
@@ -136,6 +141,7 @@ struct SseParser(Codec, Copyable):
         if len(self._buf) > 0 or self._has_data or len(self._type) > 0:
             self._discarded = True
         self._buf.clear()
+        self._scanned = 0
 
     def next_event(mut self) raises IoError -> Optional[SseEvent]:
         if self._next < len(self._events):
@@ -195,6 +201,7 @@ struct SseParser(Codec, Copyable):
         if not self._failed:
             self._failed = e
         self._buf.clear()
+        self._scanned = 0
         return e
 
     def _lines(mut self) raises IoError:
@@ -227,6 +234,7 @@ struct SseParser(Codec, Copyable):
                 i += 1
             self._skip_lf = False
         var start = i
+        i = max(i, self._scanned)  # (the line still arriving: searched already)
         while i < n:
             var c = b[i]
             if c == _LF or c == _CR:
@@ -248,6 +256,7 @@ struct SseParser(Codec, Copyable):
         if n - start > self.max_line:
             raise self._fail(ErrorKind.InvalidData)
         buf.consume(start)
+        self._scanned = n - start
 
     def _line(mut self, line: Span[UInt8, _]):
         """One line, by the standard's rules."""

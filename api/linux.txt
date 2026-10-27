@@ -635,7 +635,7 @@ struct ErrorKind(Copyable, Deinitable, Equatable, ImplicitlyCopyable, Movable, R
     def name(self) -> StaticString
     static def of(e: Errno) -> Self
     def write_to(self, mut writer: T)
-struct IoError(Copyable, Deinitable, ImplicitlyCopyable, Movable, RegisterPassable, TrivialRegisterPassable, Writable)
+struct IoError(Copyable, Deinitable, ImplicitlyCopyable, Movable, Writable)
     var errno: Errno
     var kind: ErrorKind
     var op: StaticString
