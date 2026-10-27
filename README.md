@@ -94,7 +94,7 @@ Requests per second, the mean of the two runs:
 - **Bounds checks:** the Mojo standard library checks indexes at run time, about 5% of the time.
 - **Not the cause:** the server's loop is 7% of the instructions, and mojo allocates nothing per request (hyper spends 10% of its instructions in `malloc` and `free`).
 
-The method, every run's numbers, the full profile and how to run it all yourself (`pixi run -e bench bench-server build`, `check`, `run`) are in [bench/server/README.md](bench/server/README.md).
+The method, every run's numbers, the full profile and how to run it all yourself (`pixi run -e bench bench-server build`, `check`, `run`) are in [bench/server/README.md](bench/server/README.md). Notes for closing the gap, with every hot spot's file and line: [bench/server/why_mojo_is_slower.note](bench/server/why_mojo_is_slower.note).
 
 ## Develop
 Everything runs through [pixi](https://pixi.sh):

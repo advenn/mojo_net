@@ -12,6 +12,7 @@ pixi run -e bench bench-server check    # each answers one request, and 16 pipel
 pixi run -e bench bench-server run      # 5 scenarios x 5 servers, 60 s each, one at a time: ~35 min
 pixi run -e bench bench-server summary bench/server/out/<time>.json
 pixi run -e bench bench-profile         # mojo and hyper under callgrind: instructions per request (~3 min)
+pixi run -e bench bench-profile --analyze bench/server/out/callgrind.mojo.<time>.1 --requests <n>   # its report again
 ```
 
 - **Options for `run`:**
@@ -153,7 +154,7 @@ The likely reasons, from the functions and lines that cost the most:
 3. **Bounds checks.** Mojo's standard library checks every `Span` and `List` index at run time: 470 instructions a request, 4.9%. Rust checks too, but its iterators skip most checks. Turning them off is worth 5% pipelined (Settings tried, above).
 4. **Small copies and loops through the standard library.** `memory.mojo` (copies of a few bytes, 647), `range` loops (383) and `String` building (444) are 15% of the total.
 
-**Leads, not yet tried:**
+**Leads, not yet tried** ([why_mojo_is_slower.note](why_mojo_is_slower.note) has them in detail, with every hot spot's file and line, the baseline to compare against, and what must not change):
 - Write the server's fields and constant fields straight into the output. Date and Server are already pushed without checks; Content-Type is not.
 - Summarize the framing fields while parsing, in the same pass.
 - Check field bytes with SIMD, as `_find_end` finds the end of the head.

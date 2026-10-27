@@ -1,0 +1,323 @@
+Why mojo_net's HTTP server is slower than hyper, and where to start fixing it
+===========================================================================
+
+Notes for whoever takes on the gap. Measured on 2026-10-27 at commit
+28616bf, on an i5-1145G7 laptop (Linux 6.12, Mojo 1.2.0, rustc 1.99.1,
+hyper 1.12.0). Everything here can be measured again with the commands in
+section 2. Facts are marked as measured; estimates say so.
+
+
+1. The short version
+--------------------
+
+- With keep-alive on one CPU, mojo is 14% behind hyper (156k against
+  181k req/s). Pipelined, it is 35% behind (762k against 1,169k req/s).
+  Source: bench/server/README.md, 60 s runs.
+- The kernel's time per request is the same for both (measured): 3.59
+  against 3.57 us with keep-alive, 0.33 and 0.33 us pipelined. Both make
+  the same system calls.
+- mojo's own code takes about twice hyper's time (measured): user time
+  1.63 against 0.97 us with keep-alive, 0.99 against 0.52 us pipelined.
+- In instructions (measured, callgrind, pipelined, one CPU), mojo runs
+  9,644 user-space instructions a request and hyper 4,565.
+- The server loop is not the cause: src/server/server.mojo is 699 of
+  mojo's instructions (7%).
+- Memory allocation is not the cause: mojo allocates nothing per request.
+  hyper spends 469 instructions a request in malloc and free.
+- The cause is src/http: 5,385 instructions a request. That is more than
+  all of hyper's work, for this one request and response.
+  - Each head is walked several times.
+  - Header names are compared one byte at a time, folding case.
+  - Field bytes are checked one byte at a time.
+  - Short pieces are copied through the vectorized memcpy's scalar tail.
+  - The standard library's bounds checks run in the hot loops.
+
+
+2. How to measure (before and after a change)
+---------------------------------------------
+
+The primary metric is instructions per request. callgrind counts them,
+nearly the same from run to run, so a change of 1% shows. Time-based
+benchmarks on this shared laptop vary by several percent.
+
+    pixi run -e bench bench-profile                  # builds, runs mojo and hyper, ~3 min
+    pixi run -e bench bench-profile --servers mojo   # mojo only
+    pixi run -e bench bench-profile --analyze bench/server/out/callgrind.mojo.<time>.1 --requests <n>
+
+- bench-profile runs bench/server/plaintext_profile.mojo under callgrind:
+  - one CPU;
+  - 16 connections, 16 pipelined requests per write;
+  - 3 s of warm-up, then 10 s counted.
+- It prints instructions per request: by object, by source file, and by
+  function with each function's costliest lines.
+- It writes out/profile-<time>.json, which keeps the requests counted. The
+  callgrind file stays in out/.
+- callgrind_annotate cannot read Mojo's symbols: everything lands under
+  "(below main)". Use profile.py's report, or kcachegrind.
+- plaintext_profile.mojo has to keep the same handler as plaintext.mojo.
+  It exists because valgrind cannot load the program that Stop
+  re-executes.
+- Both servers are built for x86-64-v3 for the profile, since valgrind has
+  no AVX-512. Line numbers in optimized code are approximate, and line 0
+  means no line information.
+
+Then confirm in time:
+
+    pixi run -e bench bench-server build
+    pixi run -e bench bench-server run --scenarios 1cpu-pipelined,1cpu-keepalive --servers mojo,hyper --duration 20
+
+For an A/B of two mojo builds, alternate them in one session. Build the
+old one to another path, then swap the binary path. The A/B notes in
+bench/server/README.md, under "Settings tried", show the method. The
+machine is shared, so look at the "others" column, and expect ±3% noise
+between runs.
+
+Before committing a change to http or server, run:
+
+    pixi run test http/
+    pixi run test server/
+    pixi run ci
+
+The differential oracles (tests/http/head_oracle.py, chunked_oracle.py)
+and the regression tests (tests/http/test_*_regressions*.mojo,
+tests/server/test_server_regressions*.mojo) guard the strictness rules
+below.
+
+
+3. What runs for each request (pipelined, instructions a request)
+-----------------------------------------------------------------
+
+These are self costs, from out/profile-20261027-150833.json (342,160
+requests). Inlined code is counted in the function it was inlined into.
+
+Request side: the codec takes a request out of its input.
+
+  _Conn.dispatch (server.mojo:916)                                    1,553
+      inlined: the codec's poll (server.mojo:928), the HeadParser calls
+      (parse.mojo:527, 532), the body decoder's restart
+      (connection.mojo:793), swap of the event (swap.mojo, ~130)
+  HeadParser._find_end (parse.mojo)                                     397
+      finds the blank line, already with SIMD (_first, parse.mojo:310)
+  HeadParser._parse_fields (parse.mojo)                                 598
+      splits the fields, checks every name byte (tchar) and value byte
+  _summarize (connection.mojo:336), called at connection.mojo:768       ~340
+      walks the fields again for Host, Connection, Content-Length,
+      Transfer-Encoding, Upgrade and Expect; it compares names with
+      eq_ignore_case (headers.mojo:105), one byte at a time with
+      lower_ascii (headers.mojo:98-99: 201 instructions a request)
+  _valid_host (connection.mojo:441), called at connection.mojo:773      593
+      a byte loop over "127.0.0.1:<port>" (about 15 bytes, so about 40
+      instructions a byte); bounds checks are 150 of the 593
+      (check_bounds.mojo:62-65, span.mojo:362)
+  two Strings for method and target, built from the head's bytes
+      (String.__init__ with two _iadd each; with ResponseHead's reason,
+      three Strings a request cost ~290 together: lead H)
+
+Response side: the handler, then the server, then the codec.
+
+  Response.text -> Response.bytes (server.mojo:387, 396)
+    Headers.set("Content-Type", ...) (headers.mojo:294)                 269
+      _checked (headers.mojo:313): is_token over the name, and
+      is_field_byte over the value, a byte at a time                    707
+      (headers.mojo:79: 156, 89: 125, 319: 100)
+      _find: searches existing fields with eq_ignore_case
+      _store (headers.mojo:357): two small unsafe_memcpy                547
+    body.extend(body): a copy of the 13-byte body
+  _Conn.send (server.mojo:1119)                                         567
+    ResponseHead(status, reason): copies the reason into a String, even
+      when it is empty (parse.mojo:182)
+    _scan (server.mojo:1184): walks the fields for Date, Server and
+      framing, with eq_ignore_case again
+    Date and Server pushed without checks (_push: good), and
+      Content-Length by _push_decimal (server.mojo:1202), unchecked
+  ServerConnection.send_response (connection.mojo:883)                  908
+    _check_reason; then _summarize(head.headers) again                 ~340
+      (connection.mojo:897; that is the other half of _summarize's 684)
+    _content_length: parses the Content-Length the server just wrote
+    String == "CONNECT", == "HEAD" comparisons (two a request)
+    _status_line_bytes (connection.mojo:562)                            328
+    Headers.encode (headers.mojo:579)                                   819
+      encoded_len walks the fields, then two unsafe_memcpy per field
+      (memory.mojo:182-183, vectorize.mojo:127, range.mojo:129: the
+      vectorized copy's scalar tail, run for every short piece)
+  send_body (connection.mojo:986)                                       236
+  end_response (connection.mojo:1006)                                   154
+  ByteBuffer.write_bytes (buffer.mojo:352)                              291
+
+The standard library adds, across all of the above:
+
+  memory.mojo (copies)                    647
+  check_bounds.mojo (index checks)        470
+  string.mojo (String building)           444
+  range.mojo (range loops)                383
+  span.mojo                               218
+  list.mojo                               179
+  vectorize.mojo                          169
+  swap.mojo                               130
+
+hyper, for comparison:
+
+  httparse (head parsing)                ~270
+  HeaderMap (building the response's fields)  ~850
+  hyper's h1 role, conn, dispatch and io ~850
+  the tokio task                          ~930
+  malloc and free                          469
+
+hyper does not parse the Host field. Its standard header names
+(CONTENT_TYPE) are constants, never checked at run time, and its Date
+field comes from a cache (as mojo's DateCache does).
+
+
+4. Leads, roughly in order of instructions saved per unit of risk
+-----------------------------------------------------------------
+
+The savings are estimates from the profile. None of these has been tried.
+
+A. Do not check, search or re-summarize what is valid by construction.
+   - Response.bytes calls headers.set("Content-Type", content_type) for
+     every response, so the default content type is checked and searched
+     each time.
+     - Fix: push a known-valid default without checks.
+     - Fix: check a caller's content type, but only once (or only when it
+       differs from the last one).
+     - Saves up to ~1,000 (set's search and _checked); _store's copy
+       stays.
+   - _Conn.send's _scan and send_response's _summarize walk the same
+     response fields, one after the other. send_response also parses the
+     Content-Length the server just wrote.
+     - Fix: let the server hand the codec what it knows. One option is an
+       internal send_response variant that takes the framing (length or
+       chunked) and the fields' summary.
+     - The public send_response must keep checking a caller's head.
+     - Saves ~400-500.
+   - ResponseHead(status, reason) copies an empty reason into a String.
+     - Fix: skip the copy when it is empty, or keep a StringSlice to a
+       static phrase.
+     - Saves ~100.
+
+B. One pass over the request head.
+   - _summarize is a second walk, done after _parse_fields. The parser
+     already looks at every name; it could note the framing fields as it
+     stores them.
+   - Fix: compare names by length first, as _summarize does. Fill a
+     _Summary in _parse_fields, or keep a small "known field" id per
+     field.
+   - _summarize, _scan and Headers._find then become integer compares
+     wherever the id is known.
+   - Saves ~300-600 on the request; the same ids also help A.
+   - Keep: the summary's rules (duplicate Host, duplicate Content-Length,
+     Transfer-Encoding with Content-Length, and so on) are the request
+     smuggling defence. Same decisions, fewer walks; the oracles must
+     agree.
+
+C. Faster case-insensitive name comparison (eq_ignore_case,
+   headers.mojo:105).
+   - Each name byte costs several instructions: lower_ascii on both
+     sides, a bounds check on each index, and the loop. _summarize is 684
+     a request for about 20 compared name bytes, over its two calls.
+   - Fix: compare bytes exactly first (most names arrive in canonical
+     case, the literals do not). Or compare 8 bytes at a time with
+     (x ^ y) & 0xDF... and confirm the differing bytes are letters.
+   - Or: lowercase the literal at compile time and fold only the input.
+   - This helps _summarize, _scan and _find everywhere.
+
+D. _valid_host (connection.mojo:441).
+   - 593 instructions for 15 bytes.
+   - Fix: index through the pointer, as parse.mojo does; the loop bound
+     already makes it safe. Test reg-name bytes with a 256-bit mask, as
+     is_tchar does (_TCHAR_LO/_TCHAR_HI).
+   - Probably ~100 after that.
+   - Also: on a keep-alive connection, Host rarely changes. Remembering
+     the last valid Host bytes per connection and comparing them (a
+     memcmp) would skip the parse. The check must still run whenever the
+     bytes differ.
+
+E. Small copies.
+   - unsafe_memcpy with a run-time count goes through vectorize. For the
+     4 to 30-byte pieces of a head, that is its scalar tail, one byte at a
+     time: memory.mojo (647 a request) and vectorize.mojo (169), with part
+     of range.mojo's 383, spread over encode, _store and write_bytes.
+   - Fix: a copy helper for short lengths, with fixed 8/16/32-byte
+     overlapping loads and stores (the destination has room:
+     ensure_writable came first).
+   - Or: avoid the copies. Pre-encode the server's constant field lines
+     ("Server: mojo-net\r\n", and Content-Type when it is the default)
+     once, and write the line whole.
+   - The Date line can come from DateCache already encoded, as a whole
+     line.
+
+F. SIMD field checks.
+   - _checked and _parse_fields test is_field_byte and is_tchar one byte
+     at a time.
+   - is_field_byte is two vector compares:
+     b >= 0x20 and b != 0x7F, or b == 0x09.
+   - is_tchar needs a table lookup (the nibble-shuffle method) or a range
+     test.
+   - parse.mojo's _first[stop_v, stop_b] (parse.mojo:310) already pairs a
+     vector predicate with a scalar one: reuse it.
+   - Most fields are short (under 32 bytes), so measure: the win is in
+     longer values (cookies, user agents), less in this benchmark.
+
+G. Bounds checks in hot loops.
+   - check_bounds.mojo: 470 a request (4.9%).
+   - Measured: -D ASSERT=none for the whole program is 5% faster
+     pipelined. It was left on: Rust keeps its checks, and this repo
+     prefers safety by default.
+   - Fix: in the loops above, where the loop bound proves the index safe,
+     use p[unsafe_offset=i] on unsafe_ptr(), as parse.mojo does.
+   - Keep the checks wherever an index comes from input.
+
+H. Strings per request.
+   - Three are built per request: method and target in RequestHead, and
+     ResponseHead.reason. Each goes through String(...) with two appends.
+   - Fix: the method could be an enum, or a small inline value.
+   - Fix: the target could be a span into the connection's input
+     (careful: the input buffer is compacted and reused; see CLAUDE.md on
+     lifetimes).
+   - Changing RequestHead is an http API change: docs/http.md, and every
+     user.
+
+A rough ceiling, an estimate only: A to E together might remove about
+3,000 of the 9,644 instructions, about 30%. That would put mojo's user
+time near 0.65-0.7 us pipelined and the total near 1.0 us. That is about
+1M req/s on one CPU, still behind hyper's 0.85 us. With keep-alive the
+same savings apply per request, but the kernel's ~3.6 us dominates there,
+so the gain would be ~10%.
+
+
+5. What must not change
+-----------------------
+
+- docs/http.md's strictness rules:
+  - Host checked;
+  - one Content-Length, and no Transfer-Encoding beside it;
+  - no obs-fold;
+  - control bytes refused;
+  - methods and names must be tokens;
+  - and the rest listed there.
+  These are what keep request smuggling and response splitting out. A
+  faster path must reach the same decisions; the differential oracles in
+  tests/http compare them.
+- Values that come from a handler (Headers.set/add from application code)
+  must stay checked. Only the server's own fields, and values the server
+  checked once before, can skip the checks.
+- The public APIs of http (Headers, ServerConnection, RequestHead,
+  ResponseHead) are used by server, llm and the examples. An internal fast
+  path is cheaper than an API change.
+- Do not turn off bounds checks globally (-D ASSERT=none) in the
+  benchmark or the package: it was measured (5%) and declined.
+
+
+6. Mojo 1.2 traps that matter here (more in CLAUDE.md)
+------------------------------------------------------
+
+- An Optional of a large struct is slow: its destructor rebuilds the
+  value byte by byte, about 100-260 ns per Optional destroyed. The codec
+  already fills a reused event (poll(mut ev)); keep it that way.
+- Field reassignment in a loop corrupts memory: a local struct with heap
+  fields, whose fields are reassigned in a loop after another field's
+  last use. Keep the struct alive past the loop.
+- Values are destroyed after their last use. A raw pointer into a buffer
+  does not keep the buffer alive.
+- comptime for unrolls, and runtime indexes into a wide SIMD are slow.
+  Keep vectors in registers and index them with constants.

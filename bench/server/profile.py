@@ -6,6 +6,7 @@ it found.
 
     pixi run -e bench bench-profile [--servers mojo,hyper] [--seconds 10]
                                     [--connections 16] [--pipelined 16]
+    pixi run -e bench bench-profile --analyze bench/server/out/callgrind.mojo.<time>.1 --requests <n>
 
 Each server is built for x86-64-v3 (valgrind has no AVX-512) with line
 tables, run on one CPU under callgrind, warmed up for 3 s with wrk, its
@@ -91,8 +92,10 @@ def callgrind(kind, args, server_cpu, wrk_cpus, stamp):
 
 
 def self_costs(path):
-    """Instructions by (object, function) and by (file, line), each counted
-    where it ran (self cost), from a callgrind out file."""
+    """Instructions by (object, function), by (file, line) and by
+    (function, file, line), each counted where it ran (self cost), from a
+    callgrind out file. (callgrind_annotate cannot read Mojo's: its
+    symbols put every cost under "(below main)".)"""
     names = {"fn": {}, "ob": {}, "fl": {}}
 
     def resolve(kind, val):
@@ -103,7 +106,7 @@ def self_costs(path):
             names[kind][m.group(1)] = m.group(2)
         return names[kind].get(m.group(1), val)
 
-    by_fn, by_line = collections.Counter(), collections.Counter()
+    by_fn, by_line, by_fn_line = collections.Counter(), collections.Counter(), collections.Counter()
     fn = ob = fl = None
     line_no, after_calls = 0, False
     for line in open(path, errors="replace"):
@@ -138,7 +141,8 @@ def self_costs(path):
             continue
         by_fn[(ob, fn)] += int(parts[1])
         by_line[(fl, line_no)] += int(parts[1])
-    return by_fn, by_line
+        by_fn_line[(fn, fl, line_no)] += int(parts[1])
+    return by_fn, by_line, by_fn_line
 
 
 def _short_file(f):
@@ -149,8 +153,17 @@ def _short_file(f):
     return f
 
 
-def report(kind, path, n, top):
-    by_fn, by_line = self_costs(path)
+def _short_fn(f):
+    """A Mojo or Rust symbol without its parameters and arguments."""
+    f = f or "?"
+    for cut in ("[", "(", "::<"):
+        if cut in f and not f.startswith("<"):
+            f = f.split(cut, 1)[0]
+    return f[:110]
+
+
+def report(kind, path, n, top, lines=4):
+    by_fn, by_line, by_fn_line = self_costs(path)
     total = sum(by_fn.values())
     by_ob, by_file = collections.Counter(), collections.Counter()
     for (o, _), c in by_fn.items():
@@ -163,15 +176,22 @@ def report(kind, path, n, top):
         print("  by %s:" % title)
         for name, c in counter.most_common(top):
             print("    %7.0f  %5.1f%%  %s" % (per(c), 100 * c / total, name))
-    print("  by function:")
+    hot = collections.defaultdict(list)  # (function: its lines, costliest first)
+    for (f, fl, l), c in by_fn_line.most_common():
+        hot[f].append(("%s:%d" % (_short_file(fl), l), c))
+    print("  by function (with its costliest lines, each at least 0.5%):")
     for (o, f), c in by_fn.most_common(top):
-        print("    %7.0f  %5.1f%%  %s" % (per(c), 100 * c / total, (f or "?")[:110]))
+        print("    %7.0f  %5.1f%%  %s" % (per(c), 100 * c / total, _short_fn(f)))
+        for where, lc in hot[f][:lines]:
+            if lc >= total * 0.005:
+                print("             %7.0f  %s" % (per(lc), where))
     return {
         "requests": n,
         "instructions_per_request": per(total),
         "by_object": {k: per(c) for k, c in by_ob.most_common(top)},
         "by_file": {k: per(c) for k, c in by_file.most_common(top)},
-        "by_function": [[f, per(c)] for (o, f), c in by_fn.most_common(top)],
+        "by_function": [[f, per(c), [[w, per(lc)] for w, lc in hot[f][:lines] if lc >= total * 0.005]]
+                        for (o, f), c in by_fn.most_common(top)],
         "by_line": [["%s:%d" % (_short_file(f), l), per(c)] for (f, l), c in by_line.most_common(top)],
         "callgrind_file": os.path.relpath(path, ROOT),
     }
@@ -185,7 +205,15 @@ def main():
     ap.add_argument("--pipelined", type=int, default=16)
     ap.add_argument("--top", type=int, default=20)
     ap.add_argument("--no-build", action="store_true")
+    ap.add_argument("--analyze", metavar="CALLGRIND_FILE",
+                    help="only print the report of a profile taken before (out/callgrind.<server>.<time>.1)")
+    ap.add_argument("--requests", type=int, help="with --analyze: the requests it counted (in its profile-<time>.json)")
     args = ap.parse_args()
+    if args.analyze:
+        if not args.requests:
+            sys.exit("--analyze needs --requests")
+        report(os.path.basename(args.analyze), args.analyze, args.requests, args.top)
+        return
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     os.makedirs(OUT, exist_ok=True)
     if not args.no_build:
