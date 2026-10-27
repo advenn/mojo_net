@@ -12,6 +12,9 @@ from bytes.base64 import base64_decode, base64_encode
 from crypto.sha256 import sha256
 from http.parse import HeadParser, RequestHead
 from json import Writer, format_float, parse
+from llm import ChatRequest, Message
+from llm.client import Client, Provider
+from llm.openai import read_chat, write_chat
 from linux.time import Deadline, Duration
 from net.addr import SocketAddr
 from net.tcp import TcpListener, TcpStream
@@ -62,6 +65,15 @@ def _json() raises:
     w.end_object()
     assert_equal(String(unsafe_from_utf8=Span(w.take())), '{"temperature":0.1}')
     assert_equal(format_float(Float64(0.1) + Float64(0.2)), "0.30000000000000004")
+
+
+def _llm() raises:
+    """`llm`: a chat request written and a reply read (no network)."""
+    var body = write_chat(ChatRequest("m", [Message.user("hi")]))
+    assert_equal(String(unsafe_from_utf8=Span(body)), '{"model":"m","messages":[{"role":"user","content":"hi"}]}')
+    var reply = read_chat('{"choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}'.as_bytes())
+    assert_equal(reply.text, "hello")
+    _ = Client(Provider.OPENAI, "http://localhost:8000/v1")  # (the client compiles here too)
 
 
 def _protocols() raises:
@@ -123,5 +135,6 @@ def main() raises:
     _tls()
     _bytes_and_crypto()
     _json()
+    _llm()
     _protocols()
     print("mojo-net: every library imports and works")

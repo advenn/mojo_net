@@ -361,6 +361,12 @@ struct StreamedResponse(Movable, Writable):
         """Whether the body has been read to its end."""
         return self._done and self._off >= len(self._piece)
 
+    def limit_total(mut self, deadline: Deadline):
+        """Make the rest of the body due by `deadline` too (the earlier of
+        it and the one the stream has): for a caller whose own deadline
+        covers reading this body, such as an error's."""
+        self._total = self._total.earliest(deadline)
+
     def last_tls_error(self) -> Optional[TlsError]:
         if len(self._conn) == 0:
             return None

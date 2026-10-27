@@ -39,6 +39,7 @@ ALLOWED = {
     "server": {"linux", "bytes", "net", "http", "tls", "server"},
     "crypto": {"crypto"},
     "json": {"json"},
+    "llm": {"linux", "bytes", "net", "tls", "http", "json", "llm"},
     "pg": {"linux", "bytes", "net", "crypto", "pg"},
     "redis": {"linux", "bytes", "net", "redis"},
     "tls": {"linux", "bytes", "net", "tls"},
@@ -50,6 +51,7 @@ SANS_IO = {
     "http": {"client.mojo"},
     "pg": {"client.mojo"},
     "redis": {"client.mojo"},
+    "llm": {"client.mojo"},
     # (tls.target parses addresses with net.addr, which does no I/O.)
     "tls": {"stream.mojo", "target.mojo"},
 }

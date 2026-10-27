@@ -4,7 +4,7 @@ channels = ["https://conda.modular.com/max", "conda-forge"]
 name = "mojo_net"
 platforms = ["linux-64", "linux-aarch64"]
 version = "0.1.0"
-description = "Native Mojo networking libraries for Linux: raw syscalls (linux), bytes, TCP/UDP sockets (net), TLS through OpenSSL (tls), HTTP/1.1 (http, server), JSON (json), PostgreSQL (pg), Redis (redis); and an experimental, frozen event-loop runtime (rt)."
+description = "Native Mojo networking libraries for Linux: raw syscalls (linux), bytes, TCP/UDP sockets (net), TLS through OpenSSL (tls), HTTP/1.1 (http, server), JSON (json), model API clients (llm), PostgreSQL (pg), Redis (redis); and an experimental, frozen event-loop runtime (rt)."
 
 [tasks]
 # Run all tests, or those whose path contains the given filter: `pixi run test net/`.
