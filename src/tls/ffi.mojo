@@ -110,7 +110,8 @@ comptime SEAM_CHECK_IP = 1012
 comptime SEAM_PEERNAME = 1013
 """The gate: `SSL_get0_peername` returns NULL."""
 comptime SEAM_VERSION_LOW = 1014
-"""The gate: `SSL_version` says TLS 1.0."""
+"""The gate: `SSL_version` says TLS 1.0 (fired with 1), or the version
+it fires with (0x0303: TLS 1.2, for a `tls13_only` server)."""
 comptime SEAM_REUSED = 1015
 """The gate: `SSL_session_reused` says a session was resumed."""
 comptime SEAM_ALPN = 1016

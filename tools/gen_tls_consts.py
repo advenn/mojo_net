@@ -74,6 +74,8 @@ CONSTS = [
     ("SSL_OP_ENABLE_MIDDLEBOX_COMPAT", "UInt64", ""),
     ("SSL_OP_NO_TICKET", "UInt64", ""),
     ("SSL_OP_CLEANSE_PLAINTEXT", "UInt64", "wipe OpenSSL's own copies of plaintext (TB18)"),
+    ("SSL_OP_NO_TX_CERTIFICATE_COMPRESSION", "UInt64", "send no compressed certificates (RFC 8879)"),
+    ("SSL_OP_NO_RX_CERTIFICATE_COMPRESSION", "UInt64", "offer to take none"),
     ("SSL_MODE_AUTO_RETRY", "Int", ""),
     ("SSL_MODE_RELEASE_BUFFERS", "Int", ""),
     ("SSL_MODE_NO_AUTO_CHAIN", "Int", "a server sends exactly the chain configured (TS3)"),

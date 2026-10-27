@@ -48,6 +48,7 @@ from .consts import (
     SSL_ERROR_SYSCALL,
     SSL_ERROR_WANT_READ,
     SSL_ERROR_ZERO_RETURN,
+    TLS1_3_VERSION,
     X509_V_ERR_CA_KEY_TOO_SMALL,
     X509_V_ERR_CA_MD_TOO_WEAK,
     X509_V_ERR_CERT_HAS_EXPIRED,
@@ -90,7 +91,11 @@ OpenSSL's 100 KiB limit on a certificate chain)."""
 comptime CLIENT_HELLO_LIMIT = 32 * 1024
 """Ciphertext a client may send before the handshake ends (TS8): its
 ClientHello (a second one after a HelloRetryRequest) and Finished, which
-take a few KiB, where OpenSSL alone would read 128 KiB of ClientHello."""
+take a few KiB, where OpenSSL alone would read 128 KiB of ClientHello.
+It is checked once each feed is taken: a handshake still unfinished past
+it fails, so OpenSSL reads at most it plus `FEED_LIMIT`. What comes with
+the end of the handshake (a TLS 1.3 client's first data, behind its
+Finished) is not handshake, and does not count."""
 comptime TRANSMIT_LIMIT = 256 * 1024
 """Ciphertext waiting to be sent above which `write` takes no more."""
 comptime OUTPUT_LIMIT = TRANSMIT_LIMIT + 2 * MAX_RECORD
@@ -98,9 +103,23 @@ comptime OUTPUT_LIMIT = TRANSMIT_LIMIT + 2 * MAX_RECORD
 plus one record at most, so more means the peer provokes output (key
 update replies, alerts) faster than it reads it."""
 comptime QUIET_LIMIT = 256 * 1024
-"""Ciphertext a peer may send once established without any application
-data in it: a few session tickets and key updates are normal; a flood of
-them would keep a reader working past its deadline."""
+"""Ciphertext a server may send, once established, that carries no data
+(session tickets, key updates, padding), over the whole connection: a
+few tickets are normal; a flood of them would keep a reader working past
+its deadline. Data does not reset it; each `QUIET_REFILL` bytes of data
+add one byte to it."""
+comptime CLIENT_QUIET_LIMIT = 4 * 1024
+"""The same from a client, which has nothing to send without data but a
+rare key update and its close_notify: each key update it asks the server
+to answer costs the server about 25 times what its bytes of data would
+(a reply, two key derivations), so that a client sending them between
+bytes of data would keep a server core busy."""
+comptime QUIET_REFILL = 4096
+"""Bytes of application data that add a byte to the quiet budget."""
+comptime _OVERHEAD_TLS13 = 22
+"""A TLS 1.3 record's bytes besides its data: header, content type, tag."""
+comptime _OVERHEAD_TLS12 = 29
+"""A TLS 1.2 AEAD record's, at most (header, explicit nonce, tag)."""
 comptime EVENT_COST = 64
 """Bytes each undelivered DATA event counts against the feed room, on top
 of its data: a peer sending tiny records cannot make a driver that does
@@ -191,7 +210,14 @@ struct Engine(Movable):
     """Plaintext in undelivered DATA events, plus `EVENT_COST` each
     (counted against the feed room)."""
     var _quiet: Int
-    """Ciphertext fed since the last application data (QUIET_LIMIT)."""
+    """Ciphertext taken once established, less what the data records in
+    it account for (their data and overhead): what carried no data
+    (`QUIET_LIMIT`), records still arriving included."""
+    var _quiet_limit: Int
+    var _plain: Int
+    """Application data delivered (it refills the quiet budget)."""
+    var _overhead: Int
+    """A data record's bytes besides its data, for the version in use."""
     var _hdr: Int
     """Bytes of the current record's 5-byte header fed so far."""
     var _len: Int
@@ -227,6 +253,9 @@ struct Engine(Movable):
         self._received = 0
         self._held = 0
         self._quiet = 0
+        self._quiet_limit = CLIENT_QUIET_LIMIT if server else QUIET_LIMIT
+        self._plain = 0
+        self._overhead = _OVERHEAD_TLS12
         self._hdr = 0
         self._len = 0
         self._body = 0
@@ -298,8 +327,6 @@ struct Engine(Movable):
             raise self.fail(tls_error("tls: fed more than feed_capacity()", ErrorKind.OutOfMemory, Category.RESOURCE))
         if self._state == _HANDSHAKE:
             self._received += len(data)
-            if self._received > self._limit:
-                raise self.fail(tls_error("tls: the peer's handshake is too large", ErrorKind.InvalidData, Category.RESOURCE))
         ref L = self._lib[]
         var written = List[Int](length=1, fill=0)
         L.ERR_clear_error()
@@ -307,14 +334,25 @@ struct Engine(Movable):
         if rc != 1 or written[0] != len(data) or seam(SEAM_BIO_WRITE) != 0:
             raise self.fail(tls_error("tls: BIO_write_ex failed", ErrorKind.OutOfMemory, Category.RESOURCE, L.drain_errors()))
         if self._state == _OPEN:
-            self._quiet += len(data)  # (application data read resets it)
+            self._quiet += len(data)  # (the data records in it are taken off as they are read)
         self._frame(data)
         self._pump()
+        if self._state == _HANDSHAKE and self._received > self._limit and not self._failed:
+            _ = self.fail(tls_error("tls: the peer's handshake is too large", ErrorKind.InvalidData, Category.RESOURCE, String(self._received, " bytes")))
         self._check_quiet()
 
+    def _partial(self) -> Int:
+        """Bytes fed of the record still arriving (none of it read yet)."""
+        if self._body > 0:
+            return 5 + self._len - self._body
+        return self._hdr
+
     def _check_quiet(mut self):
-        if self._state == _OPEN and self._quiet > QUIET_LIMIT:
-            _ = self.fail(tls_error("tls: the peer sent too much without any data in it", ErrorKind.InvalidData, Category.PROTOCOL, String(self._quiet, " bytes")))
+        if self._state != _OPEN:
+            return
+        var quiet = self._quiet - self._partial()
+        if quiet > self._quiet_limit + self._plain // QUIET_REFILL:
+            _ = self.fail(tls_error("tls: the peer sent too much without any data in it", ErrorKind.InvalidData, Category.PROTOCOL, String(quiet, " bytes")))
 
     def feed_eof(mut self) raises TlsError:
         if self._eof:
@@ -458,8 +496,12 @@ struct Engine(Movable):
         self.version = from_c_string(L.SSL_get_version(self._ssl))
         self.cipher = from_c_string(L.SSL_CIPHER_get_name(L.SSL_get_current_cipher(self._ssl)))
         self.group = from_c_string(L.SSL_get0_group_name(self._ssl))
+        self._overhead = _OVERHEAD_TLS13 if Int(L.SSL_version(self._ssl)) == TLS1_3_VERSION else _OVERHEAD_TLS12
         self._state = _OPEN
         self._events.append(TlsEvent(TlsEventKind.ESTABLISHED))
+        # What came with the end of the handshake, behind it, counts as
+        # if fed now (the records OpenSSL has not read yet).
+        self._quiet += Int(L.BIO_ctrl_pending(self._rbio))
         self._pump()
         self._check_quiet()
 
@@ -614,7 +656,8 @@ struct Engine(Movable):
                 if got[0] > 0:
                     self._events.append(TlsEvent(TlsEventKind.DATA, List[UInt8](Span(self._rbuf)[0 : got[0]])))
                     self._held += got[0] + EVENT_COST
-                    self._quiet = 0
+                    self._quiet = max(0, self._quiet - got[0] - self._overhead)  # (one record, read whole)
+                    self._plain += got[0]
                 continue
             var err = L.SSL_get_error(self._ssl, rc) if forced == 0 else c_int(forced)  # (TB6)
             if err == SSL_ERROR_WANT_READ and not self._eof:

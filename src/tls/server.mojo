@@ -34,7 +34,7 @@ out (`poll_transmit`), and the driver then closes the socket.
 from bytes.buffer import ByteBuffer
 from linux import ErrorKind
 
-from .consts import TLS1_2_VERSION, TLSEXT_NAMETYPE_host_name
+from .consts import TLS1_2_VERSION, TLS1_3_VERSION, TLSEXT_NAMETYPE_host_name
 from .engine import (
     CLIENT_HELLO_LIMIT,
     Engine,
@@ -157,9 +157,12 @@ struct TlsServer(Movable):
     def _gate(mut self) raises TlsError:
         ref L = self._e._lib[]
         var ssl = self._e._ssl
-        var version = Int(L.SSL_version(ssl)) if seam(SEAM_VERSION_LOW) == 0 else 0x0301
+        var forced = seam(SEAM_VERSION_LOW)
+        var version = Int(L.SSL_version(ssl)) if forced == 0 else (0x0301 if forced == 1 else forced)
         if version < TLS1_2_VERSION:
             raise tls_error("tls: the client negotiated a version below TLS 1.2", ErrorKind.InvalidData, Category.PROTOCOL)
+        if self._context._tls13_only() and version < TLS1_3_VERSION:
+            raise tls_error("tls: the client negotiated a version below TLS 1.3, which this server requires", ErrorKind.InvalidData, Category.PROTOCOL)
         if L.SSL_session_reused(ssl) != 0 or seam(SEAM_REUSED) != 0:
             raise tls_error("tls: a session was resumed, though resumption is off", ErrorKind.InvalidData, Category.PROTOCOL)
         var sni = from_c_string(L.SSL_get_servername(ssl, Int32(TLSEXT_NAMETYPE_host_name))) if seam(SEAM_SERVER_NAME) == 0 else String("unknown.invalid")

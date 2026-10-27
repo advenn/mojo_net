@@ -131,6 +131,9 @@ struct _ServerContext(Movable):
     var key: String
     var lifetime: Int
     """The leaf's validity period, in seconds."""
+    var tls13_only: Bool
+    """For the gate, which checks the version again (OpenSSL's minimum
+    is the first layer)."""
 
     def __init__(out self, lib: ArcPointer[Library], config: ServerConfig) raises TlsError:
         ref L = lib[]
@@ -190,6 +193,7 @@ struct _ServerContext(Movable):
         self.certificate = config.certificate
         self.key = config.key
         self.lifetime = lifetime
+        self.tls13_only = config.tls13_only
 
     def __deinit__(deinit self):
         if self.ctx != 0:
@@ -211,6 +215,9 @@ struct ServerContext(Copyable, Movable, Writable):
 
     def _ssl_ctx(self) -> Obj:
         return self._inner[].ctx
+
+    def _tls13_only(self) -> Bool:
+        return self._inner[].tls13_only
 
     def _serves(self, name: String) -> Bool:
         """Whether `name` (normalized) is one of the DNS names."""
@@ -301,7 +308,10 @@ def _load_credentials(L: Library, ctx: Obj, certificate: String, key: String) ra
     _ = k^
     if not ok:
         raise tls_error(
-            "tls: the private key did not load (encrypted keys are not supported)", ErrorKind.InvalidData, Category.CREDENTIALS, key + ": " + L.drain_errors()
+            "tls: the private key did not load (not a key, a key that does not match the certificate, or an encrypted key, which is not supported)",
+            ErrorKind.InvalidData,
+            Category.CREDENTIALS,
+            key + ": " + L.drain_errors(),
         )
     if L.SSL_CTX_check_private_key(ctx) != 1 or seam(SEAM_KEY_MATCH) != 0:
         raise tls_error("tls: the private key does not match the certificate", ErrorKind.InvalidData, Category.CREDENTIALS, key + ": " + L.drain_errors())

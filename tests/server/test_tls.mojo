@@ -136,10 +136,33 @@ elif mode == "junk":
     except (ConnectionResetError, BrokenPipeError):
         out.append("reset")
     out.append(f"sent<100k={sent < 100 * 1024}")
-elif mode == "idle4":
-    # Four connections that never say a word, held until told.
-    socks = [socket.create_connection(("127.0.0.1", port), timeout=20) for _ in range(4)]
-    print("OPEN", flush=True)
+elif mode in ("hellos", "hello4"):
+    # Connections that send their ClientHello and then wait, held until
+    # told: "hello4" opens four at once; "hellos" two, then two more, then
+    # closes the first two, one step per line from the test.
+    def hello_conn():
+        b_in, b_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+        obj = ctx().wrap_bio(b_in, b_out, server_hostname="localhost")
+        try:
+            obj.do_handshake()
+        except ssl.SSLWantReadError:
+            pass
+        raw = socket.create_connection(("127.0.0.1", port), timeout=20)
+        raw.sendall(b_out.read())
+        return raw
+    if mode == "hello4":
+        socks = [hello_conn() for _ in range(4)]
+        print("OPEN", flush=True)
+    else:
+        socks = [hello_conn() for _ in range(2)]
+        print("FIRST", flush=True)
+        sys.stdin.readline()
+        socks += [hello_conn() for _ in range(2)]
+        print("SECOND", flush=True)
+        sys.stdin.readline()
+        socks[0].close()
+        socks[1].close()
+        print("CLOSED", flush=True)
     sys.stdin.readline()
     out.append("held")
 elif mode == "reload":
@@ -380,31 +403,43 @@ def test_a_client_hello_that_never_ends_is_closed() raises:
 
 
 def test_handshakes_at_once_are_capped() raises:
-    """TS7: with room for two handshakes, four silent connections get two
-    accepted; the others wait in the kernel's queue, and are taken when
-    the first two end."""
-    var s = _server(ServerConfig(tls_max_handshakes=2, tls_handshake_timeout=Duration.from_millis(600)))
-    var c = _client(s, "idle4")
-    _until_line(s, c, "OPEN")
+    """TS7: with room for two handshakes, the next two ClientHellos wait,
+    unread, and are admitted in order when the first two end; accepting
+    never stops."""
+    var s = _server(ServerConfig(tls_max_handshakes=2))
+    var c = _client(s, "hellos")
+    _until_line(s, c, "FIRST")
+    _steps(s, Duration.from_millis(200))
+    assert_equal(s.handshakes(), 2)
+    _say(c)
+    _until_line(s, c, "SECOND")
+    _steps(s, Duration.from_millis(200))
+    assert_equal(s.connections(), 4)
+    assert_equal(s.handshakes(), 2)
+    assert_equal(s.tls_waiting(), 2)
+    _say(c)
+    _until_line(s, c, "CLOSED")  # (the first two left)
     _steps(s, Duration.from_millis(200))
     assert_equal(s.connections(), 2)
     assert_equal(s.handshakes(), 2)
-    _steps(s, Duration.from_millis(700))  # (their deadline: the next two come in)
-    assert_equal(s.connections(), 2)
+    assert_equal(s.tls_waiting(), 0)
     _say(c)
-    _ = _finish(s, c, "idle4")
+    _ = _finish(s, c, "hellos")
 
 
 def test_handshakes_begun_per_second_are_capped() raises:
-    var s = _server(ServerConfig(tls_handshake_rate=3, tls_handshake_timeout=Duration.from_secs(5)))
-    var c = _client(s, "idle4")
+    var s = _server(ServerConfig(tls_handshake_rate=3))
+    var c = _client(s, "hello4")
     _until_line(s, c, "OPEN")
     _steps(s, Duration.from_millis(300))
-    assert_equal(s.connections(), 3)
-    _steps(s, Duration.from_millis(1000))  # (the next second)
     assert_equal(s.connections(), 4)
+    assert_equal(s.handshakes(), 3)
+    assert_equal(s.tls_waiting(), 1)
+    _steps(s, Duration.from_millis(1000))  # (the next second)
+    assert_equal(s.handshakes(), 4)
+    assert_equal(s.tls_waiting(), 0)
     _say(c)
-    _ = _finish(s, c, "idle4")
+    _ = _finish(s, c, "hello4")
 
 
 # ---- reloading, shutdown ---------------------------------------------------------------

@@ -390,7 +390,7 @@ def _flood_error(drain: Bool) raises -> TlsError:
 
 def test_a_key_update_flood_fails_the_server_connection() raises:
     """Each KeyUpdate asks for one back, and carries no data: the server
-    fails once QUIET_LIMIT has arrived without data. Its replies, the same
+    fails once CLIENT_QUIET_LIMIT has arrived without data. Its replies, the same
     size as the requests, stay below OUTPUT_LIMIT until then even when the
     driver sends none of them."""
     var drained = _flood_error(True)

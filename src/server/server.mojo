@@ -57,12 +57,16 @@ The loop, per connection:
   connection, and a reset can destroy the last response before the
   client reads it. Other connections close at once.
 - TLS (`serve_tls`, S7): each connection runs a `tls.TlsServer` between
-  the socket and the codec, with ALPN `http/1.1`. Handshakes are admitted
-  before OpenSSL sees a byte (`tls_max_handshakes` at once, at most
-  `tls_handshake_rate` begun a second: accepting pauses beyond either),
-  each has one deadline from accept that progress does not extend
-  (`tls_handshake_timeout`), and the connection's other timeouts and
-  `min_rate` count plaintext. A graceful close sends close_notify; a
+  the socket and the codec, with ALPN `http/1.1`. Accepting never waits
+  for TLS: a connection gets its `TlsServer`, and counts as a handshake,
+  only once its first record (the ClientHello) has arrived whole, which
+  must happen within `tls_hello_timeout` of accept; until then it holds
+  no OpenSSL state, so sockets that send nothing, or a byte, take no
+  handshake's place. Handshakes are then admitted in arrival order
+  (`tls_max_handshakes` at once, at most `tls_handshake_rate` begun a
+  second; the others wait, unread). Each has one deadline from accept
+  that progress does not extend (`tls_handshake_timeout`), and the
+  connection's other timeouts and `min_rate` count plaintext. A graceful close sends close_notify; a
   timeout or an error does not, and after a failure only the alert
   OpenSSL queued goes out. A request whose host is not the name the
   client asked for in SNI gets 421. The certificate and key files are
@@ -181,14 +185,18 @@ struct ServerConfig(Copyable, Movable):
     var heartbeat: Duration
     """How long a paused event stream (`Response.event_stream`) may send
     nothing before a comment line goes out (`Duration.ZERO`: never)."""
+    var tls_hello_timeout: Duration
+    """TLS: from accept until the client's first record (its ClientHello)
+    has arrived whole; until then the connection holds no TLS state."""
     var tls_handshake_timeout: Duration
     """TLS: from accept to the end of the handshake, whatever progress is
     made on the way (TS8)."""
     var tls_max_handshakes: Int
-    """TLS: handshakes under way at once; accepting pauses at it (TS7)."""
+    """TLS: handshakes under way at once (TS7); connections whose
+    ClientHello came beyond it wait, unread, in arrival order."""
     var tls_handshake_rate: Int
-    """TLS: handshakes begun in a second at most; accepting pauses for the
-    rest of the second beyond it (TS7; 0: no limit)."""
+    """TLS: handshakes begun in a second at most (TS7; 0: no limit); the
+    others wait for the next second."""
     var tls_reload_check: Duration
     """TLS: how often the certificate and key files are checked for a
     change (TS12; `Duration.ZERO`: never)."""
@@ -209,6 +217,7 @@ struct ServerConfig(Copyable, Movable):
         server_name: StringSlice = "",
         limits: Limits = Limits(),
         heartbeat: Duration = Duration.from_secs(15),
+        tls_hello_timeout: Duration = Duration.from_secs(5),
         tls_handshake_timeout: Duration = Duration.from_secs(10),
         tls_max_handshakes: Int = 1024,
         tls_handshake_rate: Int = 1000,
@@ -227,6 +236,7 @@ struct ServerConfig(Copyable, Movable):
         self.server_name = String(server_name)
         self.limits = limits
         self.heartbeat = heartbeat
+        self.tls_hello_timeout = tls_hello_timeout
         self.tls_handshake_timeout = tls_handshake_timeout
         self.tls_max_handshakes = tls_max_handshakes
         self.tls_handshake_rate = tls_handshake_rate
@@ -238,7 +248,7 @@ struct ServerConfig(Copyable, Movable):
         10 ms."""
         var t = min(
             min(min(self.header_timeout, self.idle_timeout), self.linger_timeout),
-            min(min(self.read_timeout, self.write_timeout), self.tls_handshake_timeout),
+            min(min(self.read_timeout, self.write_timeout), min(self.tls_handshake_timeout, self.tls_hello_timeout)),
         )
         if Duration.ZERO < self.heartbeat:
             t = min(t, self.heartbeat)
@@ -539,6 +549,17 @@ struct _Conn(Movable):
     arrived with it, then stop taking requests."""
     var tls_eof: Bool
     """The end of the client's ciphertext was fed to TLS."""
+    var tls_wanted: Bool
+    """TLS, not begun yet: the first record is still coming (`hello`), or
+    it came and the server has not admitted the handshake yet."""
+    var hello: List[UInt8]
+    """The client's first record as it arrives (TLS, before admission)."""
+    var hello_ready: Bool
+    """That record is whole: the server may admit the handshake."""
+    var tls_waiting: Bool
+    """It is in the server's queue of handshakes to admit."""
+    var hello_deadline: Instant
+    """When the first record must have arrived whole."""
 
     def __init__(
         out self,
@@ -548,7 +569,7 @@ struct _Conn(Movable):
         config: ServerConfig,
         max_buffered: Int,
         now: Instant,
-        var tls: List[TlsServer],
+        tls: Bool,
     ) raises IoError:
         self.stream = stream^
         self.http = ServerConnection(limits=config.limits, max_buffered=max_buffered)
@@ -578,8 +599,8 @@ struct _Conn(Movable):
         self.body_window = 0
         self.writing = False
         self.write_window = 0
-        self.handshaking = len(tls) > 0
-        self.tls = tls^
+        self.handshaking = False
+        self.tls = List[TlsServer]()
         self.tls_plain = ByteBuffer()
         self.tls_in = List[UInt8]()
         self.tls_in_off = 0
@@ -589,6 +610,48 @@ struct _Conn(Movable):
         self.notified = False
         self.stop_after_handshake = False
         self.tls_eof = False
+        self.tls_wanted = tls
+        self.hello = List[UInt8]()
+        self.hello_ready = False
+        self.tls_waiting = False
+        self.hello_deadline = now + min(config.tls_hello_timeout, config.tls_handshake_timeout)
+
+    def _read_hello(mut self, mut chunk: List[UInt8]) raises -> Optional[Int]:
+        """Read the client's first record into `hello`, and no further
+        (None: it is not whole yet, or now it is (`hello_ready`); 0: the
+        client left). Anything but a TLS handshake record of at most
+        2^14 bytes (plaintext HTTP, SSLv2's hello) is refused at once."""
+        while not self.hello_ready:
+            var have = len(self.hello)
+            var need = 5
+            if have >= 5:
+                need = 5 + (Int(self.hello[3]) << 8 | Int(self.hello[4]))
+            var got = self.stream.try_read(Span(chunk)[0 : need - have])
+            if not got:
+                return None
+            if got.value() == 0:
+                return 0
+            self.moved += got.value()
+            self.hello.extend(Span(chunk)[0 : got.value()])
+            if have < 5 and len(self.hello) >= 5:
+                var n = Int(self.hello[3]) << 8 | Int(self.hello[4])
+                if self.hello[0] != 22 or self.hello[1] != 3 or n > 16384:
+                    raise Error("tls: the first record is not a TLS handshake record")
+            if len(self.hello) >= 5 and len(self.hello) == 5 + (Int(self.hello[3]) << 8 | Int(self.hello[4])):
+                self.hello_ready = True
+        return None
+
+    def start_tls(mut self, var tls: TlsServer) raises:
+        """The handshake is admitted: TLS takes the first record, and the
+        connection counts as a handshake from now on (if that raises, it
+        never did)."""
+        self.tls.append(tls^)
+        self.tls_wanted = False
+        self.hello_ready = False
+        var hello = List[UInt8]()
+        swap(hello, self.hello)
+        self.tls[0].feed(Span(hello))
+        self.handshaking = True
 
     def _recv(mut self, mut chunk: List[UInt8], room: Int) raises -> Optional[Int]:
         """Input for the codec, at most `room` bytes into `chunk`: what the
@@ -596,6 +659,8 @@ struct _Conn(Movable):
         end). With TLS it reads ciphertext until a record yields data, the
         socket would block, or the slice is used up (`again`); records
         without data count against the slice too."""
+        if self.tls_wanted:
+            return self._read_hello(chunk)
         if len(self.tls) == 0:
             var got = self.stream.try_read(Span(chunk)[0:room])
             if got:
@@ -708,7 +773,7 @@ struct _Conn(Movable):
                 return True  # wait for the next writable edge
             if self.state == _LINGERING:
                 return self.linger(chunk)
-            if self.stop_after_handshake and not self.handshaking:
+            if self.stop_after_handshake and not self.handshaking and not self.tls_wanted:
                 self.stop_after_handshake = False
                 self.absorb(chunk, config, now)
                 self.http.close_gracefully()
@@ -982,7 +1047,10 @@ struct _Conn(Movable):
         swap(self.req.headers, h.headers)
         self.req.body.clear()
         self.req.trailers.clear()
-        _origin_form(self.req)
+        if not _origin_form(self.req):
+            self.rejected = True
+            self.http.send_error(400, date.current())
+            return True
         if self.sni.byte_length() > 0 and not _same_host(self.req.host(), self.sni):
             # (TS6) Not the name the client asked for: 421 Misdirected
             # Request, and the connection closes after it.
@@ -1225,22 +1293,31 @@ struct _FileId(Copyable, Movable, Equatable):
         return self.ino == other.ino and self.size == other.size and self.sec == other.sec and self.nsec == other.nsec
 
 
-def _origin_form(mut req: Request):
+def _origin_form(mut req: Request) -> Bool:
     """An absolute-form target becomes its path and query, its authority
-    kept for `host()` (RFC 9112 3.2.2)."""
+    kept for `host()` and put in the Host field, which the server must
+    ignore then (RFC 9112 3.2.2): so a handler, or a proxy it passes the
+    fields to, sees the host that was checked. False if that cannot be done
+    (the request is refused)."""
     req._authority = String()
     var t = req.target.as_bytes()
     if len(t) == 0 or t[0] == 47 or req.method == "CONNECT":  # "/", or authority-form
-        return
+        return True
     var at = req.target.find("://")
     if at < 0:
-        return  # "*"
+        return True  # "*"
     var i = at + 3
     while i < len(t) and t[i] != 47 and t[i] != 63:  # to "/" or "?"
         i += 1
     req._authority = String(req.target[byte = at + 3 : i])
     var rest = String(req.target[byte=i:])
     req.target = rest^ if rest.startswith("/") else String("/", rest)
+    if req._authority.byte_length() > 0:
+        try:
+            req.headers.set("Host", req._authority)
+        except:
+            return False
+    return True
 
 
 # ---- the server -------------------------------------------------------------------------
@@ -1288,12 +1365,18 @@ struct Server[H: Handler](Movable):
     var _tls_files: List[_FileId]
     """The certificate's and the key's, when the context was built."""
     var _next_reload: Instant
+    var _reload_failed: Bool
+    """The last reload failed: the next check tries again."""
     var _next_alarm: Instant
     var _handshakes: Int
     """TLS handshakes under way."""
     var _rate_start: Instant
     var _rate_count: Int
     """TLS handshakes begun since `_rate_start` (a one-second window)."""
+    var _tls_queue: List[Int]
+    var _tls_queue_ids: List[UInt64]
+    """Connections whose ClientHello came, waiting to be admitted, in
+    arrival order (slot and id: a slot may be reused)."""
 
     def __init__(out self, var handler: Self.H, config: ServerConfig = ServerConfig()) raises IoError:
         """`InvalidInput` for a configuration that cannot work: a
@@ -1336,10 +1419,13 @@ struct Server[H: Handler](Movable):
         self._tls_config = List[TlsConfig]()
         self._tls_files = List[_FileId]()
         self._next_reload = self._now
+        self._reload_failed = False
         self._next_alarm = self._now
         self._handshakes = 0
         self._rate_start = self._now
         self._rate_count = 0
+        self._tls_queue = List[Int]()
+        self._tls_queue_ids = List[UInt64]()
 
     def bind(mut self, addr: SocketAddr) raises IoError:
         """Listen on `addr` (port 0 picks one: see `local_addr`), with
@@ -1365,6 +1451,7 @@ struct Server[H: Handler](Movable):
         self._tls.clear()
         self._tls.append(ctx^)
         self._tls_files = [_FileId(c.certificate), _FileId(c.key)]
+        self._reload_failed = False
         self._tls_config.clear()
         self._tls_config.append(c^)
         self._next_reload = Instant.now() + self.config.tls_reload_check
@@ -1377,25 +1464,40 @@ struct Server[H: Handler](Movable):
         return self._tls[0].copy()
 
     def handshakes(self) -> Int:
-        """TLS handshakes under way."""
+        """TLS handshakes under way (admitted, not established yet)."""
         return self._handshakes
+
+    def tls_waiting(self) -> Int:
+        """TLS connections whose ClientHello came, waiting to be admitted."""
+        var n = 0
+        for i in range(len(self._tls_queue)):
+            var slot = self._tls_queue[i]
+            if self._ids[slot] == self._tls_queue_ids[i] and self._conns[slot] and self._conns[slot].value().tls_waiting:
+                n += 1
+        return n
 
     def _reload(mut self, now: Instant):
         """(TS12) When the certificate or key file changed, build a new
         context for new connections; on failure keep the old one."""
         ref c = self._tls_config[0]
         var files: List[_FileId] = [_FileId(c.certificate), _FileId(c.key)]
-        if files[0] == self._tls_files[0] and files[1] == self._tls_files[1]:
+        var changed = not (files[0] == self._tls_files[0] and files[1] == self._tls_files[1])
+        if not changed and not self._reload_failed:
             return
-        self._tls_files = files^  # (a failure waits for the next change)
+        self._tls_files = files^
         try:
             var ctx = c.build()
             self._tls[0] = ctx^
+            self._reload_failed = False
             _log(String("tls: reloaded ", c.certificate))
             self._next_alarm = now
             self._alarm(now)
         except e:
-            _log(String("tls: the reload failed, the previous certificate serves on: ", e))
+            # Tried again at every check until it works: what fixes it (a
+            # chmod, fds freed) need not change what `_FileId` compares.
+            if changed or not self._reload_failed:
+                _log(String("tls: the reload failed, the previous certificate serves on: ", e))
+            self._reload_failed = True
 
     def _alarm(mut self, now: Instant):
         """Say on stderr, once a day, that the certificate's renewal is
@@ -1478,7 +1580,7 @@ struct Server[H: Handler](Movable):
         for slot in range(len(self._conns)):
             if not self._conns[slot]:
                 continue
-            if self._conns[slot].value().handshaking:
+            if self._conns[slot].value().handshaking or self._conns[slot].value().tls_wanted:
                 # (TS10) Its handshake finishes under its deadline; what
                 # comes with its end is taken in, then no more.
                 self._conns[slot].value().stop_after_handshake = True
@@ -1530,6 +1632,8 @@ struct Server[H: Handler](Movable):
             wait = min(wait, self._stop_deadline - self._now)
         if len(self._again) > 0:
             wait = Duration.ZERO
+        elif len(self._tls_queue) > 0 and self._handshakes < self.config.tls_max_handshakes:
+            wait = min(wait, max(Duration.ZERO, self._rate_start + Duration.from_secs(1) - self._now))
         var n = self._ep.wait(self._events, Optional[Duration](wait))
         var now = Instant.now()
         self._now = now
@@ -1565,6 +1669,8 @@ struct Server[H: Handler](Movable):
             accept_now = True  # the edge may have come while paused
         if (accept_now or self._backlog) and self._listener:
             self._accept(now)
+        if len(self._tls_queue) > 0:
+            self._admit(now)
         if asked and self._stop:
             var what = self._stop.value().requested()
             if what != Stop.NONE:
@@ -1576,6 +1682,8 @@ struct Server[H: Handler](Movable):
         if now >= self._next_sweep:
             self._sweep(now)
             self._next_sweep = now + self.config._sweep_every()
+            if len(self._tls_queue) > 0:
+                self._admit(now)  # (the sweep may have freed handshakes)
 
     def _serve(mut self, slot: Int, now: Instant, hangup: Bool = False):
         var alive: Bool
@@ -1592,6 +1700,10 @@ struct Server[H: Handler](Movable):
         self._take_wakes()
         if not alive:
             self._close(slot)
+        elif self._conns[slot].value().hello_ready and not self._conns[slot].value().tls_waiting:
+            self._conns[slot].value().tls_waiting = True
+            self._tls_queue.append(slot)
+            self._tls_queue_ids.append(self._ids[slot])
         elif self._conns[slot].value().again:
             self._conns[slot].value().again = False
             self._again.append(slot)  # its slice ran out: next turn
@@ -1624,18 +1736,6 @@ struct Server[H: Handler](Movable):
             if limit and self._live >= self.config.max_connections:
                 self._backlog = True  # take the rest when one closes
                 return
-            if len(self._tls) > 0 and limit:
-                # (TS7) Admission, before OpenSSL sees a byte: handshakes
-                # under way, and begun this second.
-                if self._handshakes >= self.config.tls_max_handshakes:
-                    self._backlog = True  # take the rest when one ends
-                    return
-                if now - self._rate_start >= Duration.from_secs(1):
-                    self._rate_start = now
-                    self._rate_count = 0
-                if self.config.tls_handshake_rate > 0 and self._rate_count >= self.config.tls_handshake_rate:
-                    self._paused_until = self._rate_start + Duration.from_secs(1)
-                    return
             var acc: Optional[TcpAccepted]
             try:
                 acc = self._listener.value().try_accept()
@@ -1661,22 +1761,59 @@ struct Server[H: Handler](Movable):
             var id = (self._next_id << UInt64(_SLOT_BITS)) | UInt64(slot)
             self._next_id += 1
             self._ids[slot] = id
-            var tls = List[TlsServer]()
-            if len(self._tls) > 0:
-                try:
-                    tls.append(TlsServer(self._tls[0]))
-                except:
-                    self._free.append(slot)  # (out of memory: drop this one)
-                    continue
-                self._rate_count += 1
             try:
                 self._ep.add(stream, UInt32(EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET), UInt64(slot))
-                self._conns[slot] = _Conn(stream^, peer, id, self.config, self._max_buffered, now, tls^)
+                self._conns[slot] = _Conn(stream^, peer, id, self.config, self._max_buffered, now, len(self._tls) > 0)
                 self._live += 1
-                if self._conns[slot].value().handshaking:
-                    self._handshakes += 1
             except:
                 self._free.append(slot)  # (the stream closes here)
+
+    def _admit(mut self, now: Instant):
+        """(TS7) Begin the waiting handshakes, in arrival order, while
+        `tls_max_handshakes` and `tls_handshake_rate` allow: each one's
+        `TlsServer` takes its first record, and it is served again."""
+        var i = 0
+        while i < len(self._tls_queue):
+            var slot = self._tls_queue[i]
+            if self._ids[slot] != self._tls_queue_ids[i] or not self._conns[slot] or not self._conns[slot].value().tls_waiting:
+                i += 1  # (closed meanwhile)
+                continue
+            if self._handshakes >= self.config.tls_max_handshakes:
+                break
+            if now - self._rate_start >= Duration.from_secs(1):
+                self._rate_start = now
+                self._rate_count = 0
+            if self.config.tls_handshake_rate > 0 and self._rate_count >= self.config.tls_handshake_rate:
+                break  # (the next second: `step` wakes for it)
+            i += 1
+            ref c = self._conns[slot].value()
+            c.tls_waiting = False
+            var ok = True
+            var tls = List[TlsServer]()
+            try:
+                tls.append(TlsServer(self._tls[0]))
+            except:
+                ok = False  # (out of memory)
+            if ok:
+                try:
+                    c.start_tls(tls.pop())
+                except:
+                    ok = False  # (its first record refused)
+            self._rate_count += 1
+            if not ok:
+                self._conns[slot].value().flush_alert()
+                self._close(slot)
+                continue
+            self._handshakes += 1
+            self._serve(slot, now)
+        if i > 0:
+            var rest = List[Int]()
+            var rest_ids = List[UInt64]()
+            for k in range(i, len(self._tls_queue)):
+                rest.append(self._tls_queue[k])
+                rest_ids.append(self._tls_queue_ids[k])
+            self._tls_queue = rest^
+            self._tls_queue_ids = rest_ids^
 
     def _sweep(mut self, now: Instant):
         """Apply the timeouts (see the module docs), and check the TLS
@@ -1690,8 +1827,12 @@ struct Server[H: Handler](Movable):
             if not self._conns[slot]:
                 continue
             ref c = self._conns[slot].value()
-            if c.handshaking and now >= c.tls_deadline:
+            if (c.handshaking or c.hello_ready) and now >= c.tls_deadline:
                 self._close(slot)  # (TS8: no alert, no close_notify)
+                continue
+            if c.tls_wanted and not c.hello_ready:
+                if now >= c.hello_deadline:
+                    self._close(slot)  # (its first record never came whole)
                 continue
             if c.blocked:
                 if now >= c.write_deadline:

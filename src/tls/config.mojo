@@ -47,7 +47,9 @@ from .consts import (
     SSL_OP_ENABLE_MIDDLEBOX_COMPAT,
     SSL_OP_NO_COMPRESSION,
     SSL_OP_NO_RENEGOTIATION,
+    SSL_OP_NO_RX_CERTIFICATE_COMPRESSION,
     SSL_OP_NO_TICKET,
+    SSL_OP_NO_TX_CERTIFICATE_COMPRESSION,
     SSL_SESS_CACHE_OFF,
     SSL_VERIFY_PEER,
     TLS1_2_VERSION,
@@ -83,10 +85,20 @@ comptime TLS13_SUITES = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACH
 comptime GROUPS = "X25519MLKEM768:X25519:P-256:P-384"
 comptime SIGALGS = "ECDSA+SHA256:ECDSA+SHA384:ECDSA+SHA512:ed25519:ed448:rsa_pss_pss_sha256:rsa_pss_pss_sha384:rsa_pss_pss_sha512:rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:RSA+SHA256:RSA+SHA384:RSA+SHA512"
 """SHA-2 and EdDSA only (no SHA-1, no MD5)."""
-comptime OPTIONS: UInt64 = SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION | SSL_OP_ENABLE_MIDDLEBOX_COMPAT | SSL_OP_CLEANSE_PLAINTEXT
+comptime OPTIONS: UInt64 = (
+    SSL_OP_NO_COMPRESSION
+    | SSL_OP_NO_RENEGOTIATION
+    | SSL_OP_ENABLE_MIDDLEBOX_COMPAT
+    | SSL_OP_CLEANSE_PLAINTEXT
+    | SSL_OP_NO_TX_CERTIFICATE_COMPRESSION
+    | SSL_OP_NO_RX_CERTIFICATE_COMPRESSION
+)
 """Exactly the options a context has (TC13). CLEANSE_PLAINTEXT makes
 OpenSSL wipe its own copies of plaintext when it frees them (TB18): with
-RELEASE_BUFFERS it frees its read buffer after every idle read."""
+RELEASE_BUFFERS it frees its read buffer after every idle read.
+Certificate compression (RFC 8879) is off both ways: this OpenSSL has no
+compressor built in, but one that had would turn it on unasked, and a
+decompressor is more code a peer's bytes reach."""
 comptime MODES = SSL_MODE_AUTO_RETRY | SSL_MODE_RELEASE_BUFFERS
 comptime SERVER_OPTIONS: UInt64 = OPTIONS | SSL_OP_NO_TICKET
 """A server's: no session tickets, alongside `SSL_CTX_set_num_tickets(0)`
