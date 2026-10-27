@@ -13,6 +13,7 @@ from .consts import (
     AT_EMPTY_PATH,
     AT_FDCWD,
     O_CLOEXEC,
+    O_NOCTTY,
     O_NONBLOCK,
     O_PATH,
     O_RDONLY,
@@ -45,7 +46,9 @@ def read_file(
     op: StaticString,
     max_bytes: Int = DEFAULT_MAX_FILE,
 ) raises IoError -> List[UInt8]:
-    """The whole file at `path` (O_RDONLY | O_CLOEXEC; EINTR retried).
+    """The whole file at `path` (O_RDONLY | O_CLOEXEC | O_NOCTTY; EINTR
+    retried: O_NOCTTY so that a session leader reading a terminal device
+    does not make it its controlling terminal).
 
     Errors carry `op`: a missing file is `NotFound` (ENOENT), unreadable
     `PermissionDenied`; a file longer than `max_bytes` raises `InvalidData`
@@ -59,7 +62,7 @@ def read_file(
     cpath.append(0)
     var r: Int
     while True:
-        r = _openat(Span(cpath), O_RDONLY | O_CLOEXEC)
+        r = _openat(Span(cpath), O_RDONLY | O_CLOEXEC | O_NOCTTY)
         if not (is_err(r) and Errno(err_of(r)) == Errno.EINTR):
             break
     var fd = OwnedFd(unsafe_from_raw=Int32(check(op, r)))
@@ -121,7 +124,11 @@ def open_beneath[F: AsFd](dir: F, path: StringSlice) raises IoError -> OwnedFd:
     leaving it: openat2 with RESOLVE_BENEATH (no "..", absolute path or
     symlink out of it) and RESOLVE_NO_MAGICLINKS (no /proc links). Opened
     O_NONBLOCK, so that a FIFO cannot block the caller (check the type
-    with `stat_fd`; reading a regular file never waits on that flag).
+    with `stat_fd`; reading a regular file never waits on that flag), and
+    O_NOCTTY: without it, a session leader with no controlling terminal
+    (a container's PID 1, anything run under setsid) that opens a terminal
+    device takes it as its controlling terminal, and a hangup on that line
+    later sends it SIGHUP.
     `NotFound` for a missing file, `PermissionDenied`, and EXDEV
     (`InvalidInput`) for a path that would leave `dir`.
 
@@ -133,7 +140,9 @@ def open_beneath[F: AsFd](dir: F, path: StringSlice) raises IoError -> OwnedFd:
     comptime op = "openat2"
     var cpath = _cpath(path, op)
     var how = OpenHow(
-        UInt64(O_RDONLY | O_CLOEXEC | O_NONBLOCK), 0, UInt64(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)
+        UInt64(O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOCTTY),
+        0,
+        UInt64(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS),
     )
     var r: Int
     var tries = 0

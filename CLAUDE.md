@@ -102,13 +102,13 @@ pixi run -e bench bench-profile     # mojo and hyper under callgrind: user-space
 - **`net` modules:**
   - `addr`: addresses.
   - `socket`: L1, every socket option, no policy.
-  - `blocking`, `tcp`, `unix`: L2 blocking streams. Nonblocking internally: try → EAGAIN → `wait_ready` → retry, with absolute per-direction deadlines.
+  - `blocking`, `tcp`, `unix`: L2 blocking streams. Nonblocking internally: try → EAGAIN → `wait_ready` → retry, with absolute per-direction deadlines. Every L2 send and receive passes MSG_DONTWAIT (O_NONBLOCK is shared by every dup of the fd). A TCP socket that connected to itself (a local port with no listener) is refused (`_connected_to_itself`).
   - `reader`: the `Read` trait and `BufReader`. Frame reads are bounded (`max_bytes`, `max_size`) and all or nothing: on any error nothing is consumed.
   - `dns` (sans-I/O DNS messages), `resolv` (resolv.conf, hosts, search list), `resolver` (`Resolver.lookup_ip`, `Lookup`): name resolution without libc.
-  - `dial`: `TcpStream.connect_host` (Happy Eyeballs v2 over `Lookup`) and `HostPort`.
+  - `dial`: `TcpStream.connect_host` (Happy Eyeballs v2 over `Lookup`) and `HostPort`. At most `MAX_ADDRESSES` (32) per family and `MAX_IN_FLIGHT` (8) open attempts; unspecified answers (0.0.0.0, ::) skipped.
   - Long-lived connections: `TcpStream.detect_dead_peers()` (keepalive + `TCP_USER_TIMEOUT`) and `idle_state()` (in `blocking`, on both streams).
   - Readiness loops: `try_read` / `try_write` / `try_accept` never wait (None instead); `TcpListener.bind_reuseport`; see `examples/net/epoll_echo.mojo`.
-  - `udp`: `UdpSocket` (blocking with deadlines, or `try_*`), `Datagram` (truncation via MSG_TRUNC: `size > len`), multicast (`join_multicast_v4`/`v6`; mind `IP_MULTICAST_ALL`), `DatagramBatch` (`recvmmsg`/`sendmmsg`).
+  - `udp`: `UdpSocket` (blocking with deadlines, or `try_*`), `Datagram` (truncation via MSG_TRUNC: `size > len`), multicast (`join_multicast_v4`/`v6`; mind `IP_MULTICAST_ALL`), `DatagramBatch` (`recvmmsg`/`sendmmsg`; headers rebuilt only where the last call changed them). Wildcard-bound servers: `receive_destination()`, `recv_from_to` → `Arrival` (destination address, interface), `send_from` (IP_PKTINFO / IPV6_PKTINFO). `connect` discards what was queued before it; `from_socket` refuses UDP_GRO.
   - `buffer` / `codec`: re-exports of `bytes.buffer` / `bytes.codec`.
 - **Syscalls:**
   - All of them go through `linux/syscall.mojo` (the only inline asm), via the typed wrappers in `linux/sys.mojo` or module-local wrappers.

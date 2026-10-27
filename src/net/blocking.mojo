@@ -54,12 +54,24 @@ POLLHUP). When the syscall says EAGAIN again after a wakeup:
   reports nothing to a writer waiting for room, while the send itself
   answers EPIPE (`BrokenPipe`), as a TCP send would.
 
+Every send and receive here passes MSG_DONTWAIT, so neither the deadlines
+nor the `try_*` forms depend on the descriptor's O_NONBLOCK flag. That flag
+belongs to the open file, and every duplicate shares it: a `try_clone`
+whose socket was set blocking, or another holder of an adopted descriptor,
+would otherwise make a deadline-bounded call wait in the kernel past its
+deadline. `accept4` and `connect` cannot take the flag and still rely on
+O_NONBLOCK.
+
 The `try_*` forms never wait, so they cannot tell a finished endpoint from
 an idle one: where the blocking forms raise above (a shut-down AF_UNIX
 listener, a UDP socket after `shutdown_read`), they keep answering None (or
 0) while epoll keeps reporting the descriptor readable, with EPOLLHUP or
 EPOLLRDHUP. A readiness loop that sees None together with either of those
-should treat the endpoint as done instead of waiting for it again.
+should treat the endpoint as done instead of waiting for it again. And an
+AF_UNIX writer whose peer shut down its receive side (shutdown(SHUT_RD))
+gets no event at all, neither EPOLLOUT nor EPOLLHUP nor EPOLLRDHUP: a loop
+waiting for room after `try_write` returned None should retry it on a timer
+or bound its wait (the send then raises `BrokenPipe`).
 
 `op` names the operation in raised errors ("read", "write", "peek", ...).
 This module does not import `rt` (blocking layer).
@@ -67,28 +79,33 @@ This module does not import `rt` (blocking layer).
 
 from linux import Epoll, Errno, ErrorKind, IoError, OwnedFd
 from linux import sys
-from linux.abi import EpollEvent
+from linux.abi import EpollEvent, Pollfd
 from linux.consts import (
+    AF_INET,
+    AF_INET6,
     EPOLLET,
     F_GETFD,
     F_SETFD,
     FD_CLOEXEC,
+    IPPROTO_TCP,
     MSG_DONTWAIT,
     MSG_NOSIGNAL,
     MSG_PEEK,
     POLLERR,
     POLLHUP,
     POLLIN,
+    POLLNVAL,
     POLLOUT,
+    POLLPRI,
     POLLRDHUP,
     SOCK_CLOEXEC,
     SOCK_NONBLOCK,
 )
-from linux.poll import wait_ready
+from linux.poll import ppoll, wait_ready
 from linux.syscall import err_of, is_err
 from linux.time import Deadline, Duration
 
-from .addr import RawSockaddr
+from .addr import RawSockaddr, SocketAddr
 from .socket import Domain, SockType, Socket, TcpKeepalive
 
 comptime DEFAULT_BACKLOG = 1024
@@ -234,7 +251,7 @@ def _recv(
     mut w: _Waiter,
 ) raises IoError -> Int:
     while True:
-        var r = sys.recv(sock, buf, flags)
+        var r = sys.recv(sock, buf, flags | MSG_DONTWAIT)
         if r >= 0:
             w.progressed()
             return r
@@ -253,7 +270,7 @@ def _send(
     mut w: _Waiter,
 ) raises IoError -> Int:
     while True:
-        var r = sys.send(sock, buf, MSG_NOSIGNAL)
+        var r = sys.send(sock, buf, MSG_NOSIGNAL | MSG_DONTWAIT)
         if r >= 0:
             w.progressed()
             return r
@@ -407,7 +424,7 @@ def send_vectored_with_deadline[
     var w = _Waiter(POLLOUT, Errno.EPIPE)
     while True:
         try:
-            return sock.send_vectored(bufs)
+            return sock.send_vectored_with_flags(bufs, MSG_DONTWAIT)
         except e:
             if e.errno == Errno.EAGAIN:
                 w.wait(sock, deadline, op)
@@ -433,7 +450,7 @@ def recv_vectored_with_deadline[
     var w = _Waiter(POLLIN, Errno.ENOTCONN)
     while True:
         try:
-            return sock.recv_vectored(bufs)
+            return sock.recv_vectored_with_flags(bufs, MSG_DONTWAIT)[0]
         except e:
             if e.errno == Errno.EAGAIN:
                 w.wait(sock, deadline, op)
@@ -503,14 +520,14 @@ def try_accept(
 def try_recv(
     sock: Socket, buf: MutSpan[UInt8, _], op: StaticString
 ) raises IoError -> Optional[Int]:
-    """One recv that never waits (the socket is O_NONBLOCK): the bytes read,
+    """One recv(MSG_DONTWAIT) that never waits: the bytes read,
     0 at EOF (and for an empty `buf`), or None when nothing is queued
     (EAGAIN). EINTR retries; anything else raises, tagged with `op`. (None
     with EPOLLHUP or EPOLLRDHUP reported: see the module docs.)"""
     if len(buf) == 0:
         return 0
     while True:
-        var r = sys.recv(sock, buf, 0)
+        var r = sys.recv(sock, buf, MSG_DONTWAIT)
         if r >= 0:
             return r
         var e = Errno(err_of(r))
@@ -523,14 +540,14 @@ def try_recv(
 def try_send(
     sock: Socket, buf: Span[UInt8, _], op: StaticString
 ) raises IoError -> Optional[Int]:
-    """One send(MSG_NOSIGNAL) that never waits: the bytes queued (possibly
-    fewer than `len(buf)`; 0 for an empty `buf`), or None when the send
-    buffer is full (EAGAIN). EINTR retries; a vanished peer raises
-    `BrokenPipe` / `ConnectionReset`."""
+    """One send(MSG_NOSIGNAL | MSG_DONTWAIT) that never waits: the bytes
+    queued (possibly fewer than `len(buf)`; 0 for an empty `buf`), or None
+    when the send buffer is full (EAGAIN). EINTR retries; a vanished peer
+    raises `BrokenPipe` / `ConnectionReset`."""
     if len(buf) == 0:
         return 0
     while True:
-        var r = sys.send(sock, buf, MSG_NOSIGNAL)
+        var r = sys.send(sock, buf, MSG_NOSIGNAL | MSG_DONTWAIT)
         if r >= 0:
             return r
         var e = Errno(err_of(r))
@@ -553,9 +570,13 @@ def connect_with_deadline(
     ENOTCONN) waits again, unless ppoll reported HUP/ERR: then the attempt
     is over and raises `NotConnected`; once the deadline has passed it
     raises `TimedOut` instead of waiting again. Timing out leaves the attempt
-    running; the caller closes the socket to abort it."""
+    running; the caller closes the socket to abort it.
+
+    A TCP socket that connected to itself raises `ConnectionRefused`
+    (`_connected_to_itself`)."""
     var r = sys.connect(sock, addr.storage, addr.socklen())
     if r == 0:
+        _refuse_self(sock)
         return
     var e = Errno(err_of(r))
     if e != Errno.EINPROGRESS and e != Errno.EINTR:
@@ -568,6 +589,8 @@ def connect_with_deadline(
         var name = RawSockaddr()
         var g = sys.getpeername(sock, name.storage, name.len)
         if g == 0:
+            if _connected_to_itself(sock, name):
+                raise IoError.from_errno("connect", Errno.ECONNREFUSED)
             return
         var ge = Errno(err_of(g))
         if ge != Errno.ENOTCONN:
@@ -576,6 +599,43 @@ def connect_with_deadline(
             raise IoError.from_errno("connect", Errno.ENOTCONN)
         if deadline.is_expired():
             raise IoError.of_kind("connect", ErrorKind.TimedOut)
+
+
+def _connected_to_itself(sock: Socket) -> Bool:
+    """`_connected_to_itself(sock, peer)`, reading the peer's name first."""
+    var peer = RawSockaddr()
+    if sys.getpeername(sock, peer.storage, peer.len) != 0:
+        return False
+    return _connected_to_itself(sock, peer)
+
+
+def _connected_to_itself(sock: Socket, peer: RawSockaddr) -> Bool:
+    """Whether a connected TCP socket's peer (`peer`, its getpeername) is
+    the socket itself.
+
+    A connect to a local port that nothing listens on can meet itself:
+    when the port is in the ephemeral range, the kernel may pick that very
+    port as the source, and the SYN then answers itself (a simultaneous
+    open). The connect succeeds, and the stream reads back what it writes.
+    Local and peer address are then the same; for any other connection
+    they differ. Go checks the same thing (golang.org/issue/2690)."""
+    var local = RawSockaddr()
+    if sys.getsockname(sock, local.storage, local.len) != 0:
+        return False
+    var f = local.family()
+    if (f != AF_INET and f != AF_INET6) or local.len != peer.len:
+        return False
+    try:
+        return SocketAddr.from_raw(local) == SocketAddr.from_raw(peer)
+    except:
+        return False
+
+
+def _refuse_self(sock: Socket) raises IoError:
+    """`ConnectionRefused` for a socket that connected to itself: nothing
+    listens on that port, which is what a refusal says."""
+    if _connected_to_itself(sock):
+        raise IoError.from_errno("connect", Errno.ECONNREFUSED)
 
 
 # ---- adopting sockets --------------------------------------------------------
@@ -593,6 +653,11 @@ def _set_cloexec(sock: Socket) raises IoError:
         raise IoError.from_errno("fcntl(F_SETFD)", Errno(err_of(r)))
 
 
+comptime _IPPROTO_MPTCP = 262
+"""(linux/in.h) Multipath TCP: a TCP stream to the wrappers (TCP_NODELAY
+and the keepalive options work on it)."""
+
+
 def adopt_stream_socket(
     var sock: Socket, *, unix: Bool, listener: Bool, op: StaticString
 ) raises IoError -> Socket:
@@ -600,7 +665,9 @@ def adopt_stream_socket(
     socket) for an L2 wrapper, checking first that it is one:
 
     - SO_DOMAIN AF_UNIX (`unix`) or AF_INET/AF_INET6, SO_TYPE SOCK_STREAM,
-      and SO_ACCEPTCONN equal to `listener`. Anything else (or not a
+      SO_PROTOCOL TCP or MPTCP for the IP families (an SCTP stream socket
+      is a SOCK_STREAM too, and every TCP option the wrappers set fails on
+      it), and SO_ACCEPTCONN equal to `listener`. Anything else (or not a
       socket) raises `InvalidInput` tagged with `op` before any connection
       is accepted or any flag changed. Like every failure here, it closes
       `sock` (it was moved in).
@@ -616,6 +683,9 @@ def adopt_stream_socket(
             ok = d == Domain.UNIX
         else:
             ok = d == Domain.IPV4 or d == Domain.IPV6
+            if ok:
+                var proto = sock.protocol().value
+                ok = proto == IPPROTO_TCP or proto == _IPPROTO_MPTCP
         ok = ok and sock.socket_type() == SockType.STREAM
         ok = ok and sock.is_listener() == listener
     except e:
@@ -695,7 +765,10 @@ struct IdleState(Equatable, TrivialRegisterPassable, Writable):
 
 def idle_state(sock: Socket) -> IdleState:
     """One recv(MSG_PEEK | MSG_DONTWAIT) of a byte: never waits and
-    consumes nothing (a pending socket error is read and cleared)."""
+    consumes nothing (a pending socket error is read and cleared). When it
+    finds nothing, a zero-timeout poll looks for input a peek skips: an
+    out-of-band byte (AF_UNIX MSG_OOB, TCP urgent data) or data past
+    SO_PEEK_OFF, which are DATA; a hangup or error is CLOSED."""
     var b = List[UInt8](length=1, fill=0)
     while True:
         var r = sys.recv(sock, Span(b), MSG_PEEK | MSG_DONTWAIT)
@@ -707,5 +780,22 @@ def idle_state(sock: Socket) -> IdleState:
         if e == Errno.EINTR:
             continue
         if e == Errno.EAGAIN:
-            return IdleState.EMPTY
+            return _idle_by_poll(sock)
         return IdleState.CLOSED
+
+
+def _idle_by_poll(sock: Socket) -> IdleState:
+    var fds = List[Pollfd]()
+    fds.append(Pollfd(sock.raw_fd(), Int16(POLLIN | POLLPRI | POLLRDHUP), 0))
+    while True:
+        var n = ppoll(Span(fds), Duration.ZERO)
+        if is_err(n) and Errno(err_of(n)) == Errno.EINTR:
+            continue
+        if n <= 0:
+            return IdleState.EMPTY
+        var ev = Int(fds[0].revents)
+        if (ev & (POLLHUP | POLLERR | POLLRDHUP | POLLNVAL)) != 0:
+            return IdleState.CLOSED
+        if (ev & (POLLIN | POLLPRI)) != 0:
+            return IdleState.DATA
+        return IdleState.EMPTY

@@ -7,6 +7,18 @@ epoll, receiving and sending in batches with recvmmsg/sendmmsg).
 ADDR defaults to 127.0.0.1:7979 (port 0 picks one; the bound address is
 printed); MODE is `blocking` (default) or `epoll`; MAX > 0 exits after
 echoing that many datagrams. Try it with examples/net/udp_ping.mojo.
+
+A reply can fail for reasons the sender controls: a datagram from port 0
+cannot be answered (EINVAL), nor one from a broadcast address (EACCES),
+and its source can be forged. So a failed reply drops that datagram and
+the server goes on; a server that let it raise could be stopped by one
+crafted packet.
+
+Bound to a wildcard address (0.0.0.0 or [::]) on a host with several
+addresses, a reply leaves from the address the route back chooses, which
+may not be the one the client sent to: a connected client then drops it.
+`recv_from_to` and `send_from` answer from the address each datagram came
+to (`UdpSocket.receive_destination`).
 """
 
 from std.sys import argv, exit, stderr
@@ -39,8 +51,11 @@ def blocking(mut sock: UdpSocket, max: Int) raises -> Int:
         sock.set_read_deadline(Deadline.after(Duration.from_secs(10)))
         try:
             var d = sock.recv_from(Span(buf))
-            _ = sock.send_to(Span(buf)[0 : d.len], d.sender)
-            echoed += 1
+            try:
+                _ = sock.send_to(Span(buf)[0 : d.len], d.sender)
+                echoed += 1
+            except:
+                pass  # this one cannot be answered: drop it
         except e:
             if not e.is_deadline():
                 raise e
@@ -66,8 +81,14 @@ def readiness_loop(sock: UdpSocket, max: Int) raises -> Int:
             out.clear()
             for i in range(n):
                 out.push(inb.payload(i), inb.datagram(i).sender)
-            # Blocking here bounds memory: a full send buffer waits.
-            echoed += sock.send_batch(out)
+            # Blocking here bounds memory: a full send buffer waits. A
+            # datagram that cannot be answered is skipped, the rest sent.
+            while out.pending() > 0:
+                try:
+                    _ = sock.send_batch(out)
+                except:
+                    out.skip()
+            echoed += out.sent()
     return echoed
 
 

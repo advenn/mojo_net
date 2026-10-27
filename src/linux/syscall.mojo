@@ -185,7 +185,7 @@ def _asm0(nr: Int) -> Int:
         ](nr)
     else:
         return inlined_assembly[
-            "svc #0", Int, constraints="={x0},{x8},~{memory}"
+            "svc #0", Int, constraints="={x0},{x8},~{memory},~{p0},~{p1},~{p2},~{p3},~{p4},~{p5},~{p6},~{p7},~{p8},~{p9},~{p10},~{p11},~{p12},~{p13},~{p14},~{p15},~{ffr}"
         ](nr)
 
 
@@ -199,7 +199,7 @@ def _asm1(nr: Int, a1: Int) -> Int:
         ](nr, a1)
     else:
         return inlined_assembly[
-            "svc #0", Int, constraints="={x0},{x8},{x0},~{memory}"
+            "svc #0", Int, constraints="={x0},{x8},{x0},~{memory},~{p0},~{p1},~{p2},~{p3},~{p4},~{p5},~{p6},~{p7},~{p8},~{p9},~{p10},~{p11},~{p12},~{p13},~{p14},~{p15},~{ffr}"
         ](nr, a1)
 
 
@@ -213,7 +213,7 @@ def _asm2(nr: Int, a1: Int, a2: Int) -> Int:
         ](nr, a1, a2)
     else:
         return inlined_assembly[
-            "svc #0", Int, constraints="={x0},{x8},{x0},{x1},~{memory}"
+            "svc #0", Int, constraints="={x0},{x8},{x0},{x1},~{memory},~{p0},~{p1},~{p2},~{p3},~{p4},~{p5},~{p6},~{p7},~{p8},~{p9},~{p10},~{p11},~{p12},~{p13},~{p14},~{p15},~{ffr}"
         ](nr, a1, a2)
 
 
@@ -229,7 +229,7 @@ def _asm3(nr: Int, a1: Int, a2: Int, a3: Int) -> Int:
         return inlined_assembly[
             "svc #0",
             Int,
-            constraints="={x0},{x8},{x0},{x1},{x2},~{memory}",
+            constraints="={x0},{x8},{x0},{x1},{x2},~{memory},~{p0},~{p1},~{p2},~{p3},~{p4},~{p5},~{p6},~{p7},~{p8},~{p9},~{p10},~{p11},~{p12},~{p13},~{p14},~{p15},~{ffr}",
         ](nr, a1, a2, a3)
 
 
@@ -247,7 +247,7 @@ def _asm4(nr: Int, a1: Int, a2: Int, a3: Int, a4: Int) -> Int:
         return inlined_assembly[
             "svc #0",
             Int,
-            constraints="={x0},{x8},{x0},{x1},{x2},{x3},~{memory}",
+            constraints="={x0},{x8},{x0},{x1},{x2},{x3},~{memory},~{p0},~{p1},~{p2},~{p3},~{p4},~{p5},~{p6},~{p7},~{p8},~{p9},~{p10},~{p11},~{p12},~{p13},~{p14},~{p15},~{ffr}",
         ](nr, a1, a2, a3, a4)
 
 
@@ -266,7 +266,7 @@ def _asm5(nr: Int, a1: Int, a2: Int, a3: Int, a4: Int, a5: Int) -> Int:
         return inlined_assembly[
             "svc #0",
             Int,
-            constraints="={x0},{x8},{x0},{x1},{x2},{x3},{x4},~{memory}",
+            constraints="={x0},{x8},{x0},{x1},{x2},{x3},{x4},~{memory},~{p0},~{p1},~{p2},~{p3},~{p4},~{p5},~{p6},~{p7},~{p8},~{p9},~{p10},~{p11},~{p12},~{p13},~{p14},~{p15},~{ffr}",
         ](nr, a1, a2, a3, a4, a5)
 
 
@@ -287,5 +287,5 @@ def _asm6(
         return inlined_assembly[
             "svc #0",
             Int,
-            constraints="={x0},{x8},{x0},{x1},{x2},{x3},{x4},{x5},~{memory}",
+            constraints="={x0},{x8},{x0},{x1},{x2},{x3},{x4},{x5},~{memory},~{p0},~{p1},~{p2},~{p3},~{p4},~{p5},~{p6},~{p7},~{p8},~{p9},~{p10},~{p11},~{p12},~{p13},~{p14},~{p15},~{ffr}",
         ](nr, a1, a2, a3, a4, a5, a6)

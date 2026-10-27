@@ -35,9 +35,22 @@ Two modes:
 return what is queued or raise `NotConnected`).
 
 Connected sockets (`connect`): the kernel fixes the destination, drops
-datagrams from any other sender, and reports ICMP errors. After a "port
+datagrams from any other sender, and reports ICMP errors (`connect` also
+discards what was queued before it). After a "port
 unreachable" the next send or receive raises `ConnectionRefused`. An
-unconnected socket never sees ICMP errors.
+unconnected socket sees no ICMP errors (unless IP_RECVERR / IPV6_RECVERR
+was turned on through `socket()`: then they are queued for the error
+queue, which this module does not read).
+
+Servers on a wildcard address (`0.0.0.0`, `[::]`): a reply sent with
+`send_to` leaves from the address the route back chooses, which on a host
+with several addresses (secondary IPs, VIPs, IPv6 temporary addresses,
+127.0.0.x) may not be the one the client sent to, and a connected client
+drops it. `receive_destination()` makes `recv_from_to` report each
+datagram's destination (`Arrival.local`), and `send_from` replies from it.
+A reply can also fail for reasons the sender controls (a forged source,
+port 0, a broadcast address): a server should drop that datagram, not
+stop.
 
 Multicast: bind the group's port (usually on the wildcard address), then
 `join_multicast_v4` / `join_multicast_v6`; senders choose the interface,
@@ -56,11 +69,31 @@ from std.memory import unsafe_memcpy
 from std.sys import size_of
 
 from linux import AsFd, Errno, ErrorKind, IoError, sys
-from linux.abi import Iovec, Mmsghdr, Msghdr, SockaddrStorage
+from linux.abi import (
+    CMSG_DATA_OFFSET,
+    Cmsghdr,
+    In6Pktinfo,
+    InPktinfo,
+    Iovec,
+    Mmsghdr,
+    Msghdr,
+    SockaddrStorage,
+    cmsg_align,
+    cmsg_len,
+    cmsg_space,
+    hton32,
+    ntoh32,
+)
 from linux.consts import (
     IOV_MAX,
+    IP_PKTINFO,
+    IPPROTO_IP,
+    IPPROTO_IPV6,
+    IPV6_PKTINFO,
+    IPV6_RECVPKTINFO,
     IPPROTO_UDP,
     IPPROTO_UDPLITE,
+    MSG_DONTWAIT,
     MSG_NOSIGNAL,
     MSG_PEEK,
     MSG_TRUNC,
@@ -127,7 +160,9 @@ def _recv(
     var w = _Waiter(POLLIN, Errno.ENOTCONN, rdhup_ends=True)
     while True:
         var raw = RawSockaddr()
-        var r = sys.recvfrom(sock, buf, flags | MSG_TRUNC, raw.storage, raw.len)
+        var r = sys.recvfrom(
+            sock, buf, flags | MSG_TRUNC | MSG_DONTWAIT, raw.storage, raw.len
+        )
         if r >= 0:
             w.progressed()
             return _datagram(r, len(buf), raw)
@@ -145,7 +180,9 @@ def _try_recv(
     EAGAIN."""
     while True:
         var raw = RawSockaddr()
-        var r = sys.recvfrom(sock, buf, flags | MSG_TRUNC, raw.storage, raw.len)
+        var r = sys.recvfrom(
+            sock, buf, flags | MSG_TRUNC | MSG_DONTWAIT, raw.storage, raw.len
+        )
         if r >= 0:
             return _datagram(r, len(buf), raw)
         var e = Errno(err_of(r))
@@ -159,8 +196,10 @@ def _try_recv(
 def _sendto(sock: Socket, buf: Span[UInt8, _], dest: Optional[SocketAddr]) -> Int:
     if dest:
         var raw = dest.value().to_raw()
-        return sys.sendto(sock, buf, MSG_NOSIGNAL, raw.storage, raw.socklen())
-    return sys.send(sock, buf, MSG_NOSIGNAL)
+        return sys.sendto(
+            sock, buf, MSG_NOSIGNAL | MSG_DONTWAIT, raw.storage, raw.socklen()
+        )
+    return sys.send(sock, buf, MSG_NOSIGNAL | MSG_DONTWAIT)
 
 
 def _send(
@@ -199,6 +238,181 @@ def _try_send(
             raise IoError.from_errno(op, e)
 
 
+# ---- destinations (PKTINFO) ---------------------------------------------------
+
+
+@fieldwise_init
+struct Arrival(Copyable, Movable, Writable):
+    """What `recv_from_to` returns: the datagram, and the address it was
+    sent to."""
+
+    var datagram: Datagram
+    var local: Optional[IpAddr]
+    """The datagram's destination: the one of this host's addresses the
+    sender chose (or a multicast or broadcast address), IPv4-mapped on an
+    IPv6 socket as `Datagram.sender` is. None when the kernel reported
+    none (`UdpSocket.receive_destination` was not turned on)."""
+    var interface: UInt32
+    """The index of the interface it came in on (0 if not reported)."""
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("Arrival(", self.datagram, ", local=")
+        if self.local:
+            writer.write(self.local.value())
+        else:
+            writer.write("None")
+        writer.write(", interface=", self.interface, ")")
+
+
+comptime _CONTROL_WORDS = 16
+"""The control buffer for PKTINFO, in 8-byte words (cmsg data must be
+8-aligned): 128 bytes, room for both IP_PKTINFO (32) and IPV6_PKTINFO
+(40)."""
+
+
+def _recv_to_once(
+    sock: Socket, buf: MutSpan[UInt8, _]
+) -> Tuple[Int, Optional[Arrival]]:
+    """One recvmsg(MSG_TRUNC | MSG_DONTWAIT) with a control buffer: the
+    raw result, and the arrival when it is not an error."""
+    var raw = RawSockaddr()
+    var control = Array[UInt64, _CONTROL_WORDS](fill=0)
+    var iov = Iovec(Int(buf.unsafe_ptr()), UInt(len(buf)))
+    var msg = Msghdr(
+        Int(Pointer(to=raw.storage)),
+        raw.len,
+        Int(Pointer(to=iov)),
+        1,
+        Int(Pointer(to=control)),
+        UInt(_CONTROL_WORDS * 8),
+        0,
+    )
+    var r = sys.recvmsg(sock, msg, MSG_TRUNC | MSG_DONTWAIT)
+    sys.keep_alive(iov)
+    sys.keep_alive(raw)
+    sys.keep_alive(control)
+    if r < 0:
+        return (r, Optional[Arrival](None))
+    raw.len = msg.namelen
+    var local: Optional[IpAddr] = None
+    var interface = UInt32(0)
+    # The control messages: only within what the kernel wrote, each
+    # header's length checked before its data is read.
+    var n = min(Int(msg.controllen), _CONTROL_WORDS * 8)
+    var base = Pointer(to=control).unsafe_bitcast[UInt8]()
+    var off = 0
+    while off + CMSG_DATA_OFFSET <= n:
+        var h = base.unsafe_offset(off).unsafe_bitcast[Cmsghdr]()[].copy()
+        var clen = Int(h.len)
+        if clen < CMSG_DATA_OFFSET or clen > n - off:
+            break
+        var data = base.unsafe_offset(off + CMSG_DATA_OFFSET)
+        if (
+            Int(h.level) == IPPROTO_IP
+            and Int(h.type) == IP_PKTINFO
+            and clen >= cmsg_len(size_of[InPktinfo]())
+        ):
+            var info = data.unsafe_bitcast[InPktinfo]()[].copy()
+            local = IpAddr(Ipv4Addr(bits=ntoh32(info.addr)))
+            interface = UInt32(info.ifindex)
+        elif (
+            Int(h.level) == IPPROTO_IPV6
+            and Int(h.type) == IPV6_PKTINFO
+            and clen >= cmsg_len(size_of[In6Pktinfo]())
+        ):
+            var info = data.unsafe_bitcast[In6Pktinfo]()[].copy()
+            local = IpAddr(Ipv6Addr.from_octets(info.addr))
+            interface = UInt32(info.ifindex)
+        off += cmsg_align(clen)
+    return (r, Optional(Arrival(_datagram(r, len(buf), raw), local, interface)))
+
+
+def _recv_to(
+    sock: Socket, buf: MutSpan[UInt8, _], deadline: Deadline, op: StaticString
+) raises IoError -> Arrival:
+    """`_recv_to_once` that waits up to `deadline`."""
+    var w = _Waiter(POLLIN, Errno.ENOTCONN, rdhup_ends=True)
+    while True:
+        var t = _recv_to_once(sock, buf)
+        if t[0] >= 0:
+            w.progressed()
+            return t[1].value().copy()
+        var e = Errno(err_of(t[0]))
+        if e == Errno.EAGAIN:
+            w.wait(sock, deadline, op)
+        elif e != Errno.EINTR:
+            raise IoError.from_errno(op, e)
+
+
+def _try_recv_to(
+    sock: Socket, buf: MutSpan[UInt8, _], op: StaticString
+) raises IoError -> Optional[Arrival]:
+    while True:
+        var t = _recv_to_once(sock, buf)
+        if t[0] >= 0:
+            return t[1].copy()
+        var e = Errno(err_of(t[0]))
+        if e == Errno.EAGAIN:
+            return None
+        if e != Errno.EINTR:
+            raise IoError.from_errno(op, e)
+
+
+def _send_from_once(
+    sock: Socket,
+    buf: Span[UInt8, _],
+    dest: SocketAddr,
+    local: IpAddr,
+    interface: UInt32,
+) -> Int:
+    """One sendmsg(MSG_NOSIGNAL | MSG_DONTWAIT) to `dest` from `local`.
+    An IPv6 `dest` (the form an IPv6 socket's senders have, IPv4 ones
+    mapped) takes IPV6_PKTINFO, an IPv4 one IP_PKTINFO; -EINVAL when
+    `local` is IPv6 and `dest` IPv4."""
+    var control = Array[UInt64, _CONTROL_WORDS](fill=0)
+    var base = Pointer(to=control).unsafe_bitcast[UInt8]()
+    var clen: Int
+    if dest.is_ipv6():
+        base.unsafe_bitcast[Cmsghdr]()[] = Cmsghdr(
+            UInt(cmsg_len(size_of[In6Pktinfo]())),
+            Int32(IPPROTO_IPV6),
+            Int32(IPV6_PKTINFO),
+        )
+        base.unsafe_offset(CMSG_DATA_OFFSET).unsafe_bitcast[In6Pktinfo]()[] = (
+            In6Pktinfo(local.v6().octets(), Int32(interface))
+        )
+        clen = cmsg_space(size_of[In6Pktinfo]())
+    else:
+        var v4 = local.to_canonical().as_v4()
+        if not v4:
+            return -Int(Errno.EINVAL.value)
+        base.unsafe_bitcast[Cmsghdr]()[] = Cmsghdr(
+            UInt(cmsg_len(size_of[InPktinfo]())),
+            Int32(IPPROTO_IP),
+            Int32(IP_PKTINFO),
+        )
+        base.unsafe_offset(CMSG_DATA_OFFSET).unsafe_bitcast[InPktinfo]()[] = (
+            InPktinfo(Int32(interface), hton32(v4.value().bits()), 0)
+        )
+        clen = cmsg_space(size_of[InPktinfo]())
+    var raw = dest.to_raw()
+    var iov = Iovec(Int(buf.unsafe_ptr()), UInt(len(buf)))
+    var msg = Msghdr(
+        Int(Pointer(to=raw.storage)),
+        UInt32(raw.socklen()),
+        Int(Pointer(to=iov)),
+        1,
+        Int(Pointer(to=control)),
+        UInt(clen),
+        0,
+    )
+    var r = sys.sendmsg(sock, msg, MSG_NOSIGNAL | MSG_DONTWAIT)
+    sys.keep_alive(iov)
+    sys.keep_alive(raw)
+    sys.keep_alive(control)
+    return r
+
+
 # ---- batches -----------------------------------------------------------------
 
 
@@ -232,6 +446,12 @@ struct DatagramBatch(Movable, Sized):
     var _next: Int
     """Index of the next datagram to send."""
     var _sent: Int
+    var _dirty: Int
+    """Headers `[0, _dirty)` are not in receive form: the kernel wrote
+    their name lengths (a receive), or a send pointed them at payloads.
+    The rest still are, as `__init__` built them: their pointers never
+    change (the lists are never resized, and moving the batch keeps their
+    buffers), so a receive rebuilds only these."""
 
     def __init__(out self, capacity: Int, max_datagram: Int = 2048) raises IoError:
         """`InvalidInput` unless `1 <= capacity <= MAX_BATCH` and
@@ -254,6 +474,7 @@ struct DatagramBatch(Movable, Sized):
         self._count = 0
         self._next = 0
         self._sent = 0
+        self._dirty = capacity
 
     @inline(.always)
     def __len__(self) -> Int:
@@ -364,12 +585,13 @@ struct DatagramBatch(Movable, Sized):
         self._count = 0
         self._next = 0
         self._sent = 0
-        var cap = self.capacity()
-        for i in range(cap):
+        for i in range(self._dirty):
             self._header(i, self._slot, UInt32(size_of[SockaddrStorage]()))
-        var r = sys.recvmmsg(sock, Span(self._hdrs), MSG_TRUNC)
+        self._dirty = 0
+        var r = sys.recvmmsg(sock, Span(self._hdrs), MSG_TRUNC | MSG_DONTWAIT)
         if r <= 0:
             return r
+        self._dirty = r
         for i in range(r):
             var size = Int(self._hdrs[i].len)
             self._sizes[i] = size
@@ -383,9 +605,39 @@ struct DatagramBatch(Movable, Sized):
         -errno."""
         for i in range(self._next, self._count):
             self._header(i, self._lens[i], self._namelens[i])
+        self._dirty = max(self._dirty, self._count)
         return sys.sendmmsg(
-            sock, Span(self._hdrs)[self._next : self._count], MSG_NOSIGNAL
+            sock,
+            Span(self._hdrs)[self._next : self._count],
+            MSG_NOSIGNAL | MSG_DONTWAIT,
         )
+
+
+def _discard_queued(sock: Socket):
+    """Drop every datagram queued (MSG_TRUNC into one byte: each costs one
+    call), until nothing is left or a pending error ends it."""
+    var b = List[UInt8](length=1, fill=0)
+    while True:
+        var r = sys.recv(sock, Span(b), MSG_TRUNC | MSG_DONTWAIT)
+        if r >= 0:
+            continue
+        if Errno(err_of(r)) != Errno.EINTR:
+            return
+
+
+comptime _UDP_GRO = 104
+"""(linux/udp.h) Receive-side coalescing: several datagrams of one flow
+come out of one receive, their segment size in a control message."""
+
+
+def _gro_on(sock: Socket) raises IoError -> Bool:
+    """Whether UDP_GRO is on (ENOPROTOOPT: a kernel without it, so off)."""
+    try:
+        return sock.get_option_int(IPPROTO_UDP, _UDP_GRO) != 0
+    except e:
+        if e.errno == Errno.ENOPROTOOPT:
+            return False
+        raise e
 
 
 # ---- UdpSocket ---------------------------------------------------------------
@@ -413,9 +665,11 @@ struct UdpSocket(AsFd, Movable, Writable):
     @staticmethod
     def bind(addr: SocketAddr) raises IoError -> UdpSocket:
         """A socket bound to `addr`; port 0 picks a free port (read it back
-        with `local_addr`). `0.0.0.0` / `[::]` receive on every address. An
-        IPv6 socket keeps the system's IPV6_V6ONLY default; build it with
-        L1 and `from_socket` to choose."""
+        with `local_addr`). `0.0.0.0` / `[::]` receive on every address; to
+        answer from the address each datagram came to (a host with several
+        addresses), turn on `receive_destination` and reply with
+        `send_from`. An IPv6 socket keeps the system's IPV6_V6ONLY default;
+        build it with L1 and `from_socket` to choose."""
         var sock = Socket.new(
             Domain.for_address(addr), SockType.DGRAM, nonblocking=True
         )
@@ -439,8 +693,10 @@ struct UdpSocket(AsFd, Movable, Writable):
     def from_socket(var sock: Socket) raises IoError -> UdpSocket:
         """Adopt an AF_INET/AF_INET6 SOCK_DGRAM UDP (or UDP-Lite) socket
         (socket activation, a tuned L1 socket), else `InvalidInput` (op
-        "UdpSocket.from_socket"; the socket is closed). Sets FD_CLOEXEC and
-        O_NONBLOCK."""
+        "UdpSocket.from_socket"; the socket is closed). A socket with
+        UDP_GRO on is refused too: the kernel then hands over several
+        datagrams as one receive, with nothing in the return value to say
+        so. Sets FD_CLOEXEC and O_NONBLOCK."""
         comptime op = "UdpSocket.from_socket"
         var ok: Bool
         try:
@@ -452,6 +708,7 @@ struct UdpSocket(AsFd, Movable, Writable):
             # MSG_TRUNC, which would make truncation silent.
             var proto = sock.protocol().value
             ok = ok and (proto == IPPROTO_UDP or proto == IPPROTO_UDPLITE)
+            ok = ok and not _gro_on(sock)
         except e:
             if e.errno == Errno.ENOTSOCK:
                 raise IoError(ErrorKind.InvalidInput, e.errno, op)
@@ -518,8 +775,15 @@ struct UdpSocket(AsFd, Movable, Writable):
         """Fix the peer: `send` / `recv` then talk to `addr` only, datagrams
         from anyone else are dropped, and ICMP errors are reported. Sends
         no packet; it only fails for local reasons (no route,
-        `NetworkUnreachable`). Calling it again changes the peer."""
+        `NetworkUnreachable`). Calling it again changes the peer.
+
+        Datagrams queued before the call are discarded: the kernel filters
+        only what arrives after it, so on a socket bound first, anyone's
+        datagram sent in between would otherwise come out of `recv` as if
+        from the peer. (The source address of a datagram can be forged:
+        "from the peer" means "claims to be".)"""
         self._sock.connect(addr)
+        _discard_queued(self._sock)
 
     @inline(.always)
     def into_socket(deinit self) -> Socket:
@@ -597,6 +861,80 @@ struct UdpSocket(AsFd, Movable, Writable):
         """`recv_from` for a connected socket (only its peer's datagrams
         arrive)."""
         return _recv(self._sock, buf, 0, self._rd, "recv")
+
+    def receive_destination(self, on: Bool = True) raises IoError:
+        """Have the kernel report each datagram's destination address,
+        which `recv_from_to` returns (IP_PKTINFO on an IPv4 socket,
+        IPV6_RECVPKTINFO on an IPv6 one, which reports IPv4 traffic as
+        mapped addresses).
+
+        A socket bound to a wildcard address on a host with several
+        addresses needs it to answer correctly: a reply sent with
+        `send_to` leaves from whichever address the route back picks,
+        and a connected client drops a reply that is not from the address
+        it sent to. `send_from(payload, a.datagram.sender, a.local.value())`
+        replies from the right one."""
+        if self._sock.domain() == Domain.IPV6:
+            self._sock.set_option_int(IPPROTO_IPV6, IPV6_RECVPKTINFO, Int(on))
+        else:
+            self._sock.set_option_int(IPPROTO_IP, IP_PKTINFO, Int(on))
+
+    def recv_from_to(self, buf: MutSpan[UInt8, _]) raises IoError -> Arrival:
+        """`recv_from`, plus the address the datagram was sent to and the
+        interface it came in on (`receive_destination` must be on, else
+        `local` is None)."""
+        return _recv_to(self._sock, buf, self._rd, "recv_from_to")
+
+    def try_recv_from_to(
+        self, buf: MutSpan[UInt8, _]
+    ) raises IoError -> Optional[Arrival]:
+        """`recv_from_to` without waiting: None when nothing is queued."""
+        return _try_recv_to(self._sock, buf, "recv_from_to")
+
+    def send_from(
+        self,
+        buf: Span[UInt8, _],
+        dest: SocketAddr,
+        local: IpAddr,
+        interface: UInt32 = 0,
+    ) raises IoError -> Int:
+        """`send_to` with `local` as the source address (one of this
+        host's unicast addresses; usually `Arrival.local`), through
+        `interface` (0: by route). Waits up to the write deadline for
+        buffer space. A `local` the host does not have raises
+        (`AddrNotAvailable` or `InvalidInput`), and so does a multicast or
+        broadcast one: answer a datagram sent to a group or a broadcast
+        address with `send_to`."""
+        var w = _Waiter(POLLOUT, Errno.EPIPE)
+        while True:
+            var r = _send_from_once(self._sock, buf, dest, local, interface)
+            if r >= 0:
+                w.progressed()
+                return r
+            var e = Errno(err_of(r))
+            if e == Errno.EAGAIN:
+                w.wait(self._sock, self._wr, "send_from")
+            elif e != Errno.EINTR:
+                raise IoError.from_errno("send_from", e)
+
+    def try_send_from(
+        self,
+        buf: Span[UInt8, _],
+        dest: SocketAddr,
+        local: IpAddr,
+        interface: UInt32 = 0,
+    ) raises IoError -> Optional[Int]:
+        """`send_from` without waiting: None when the send buffer is
+        full."""
+        while True:
+            var r = _send_from_once(self._sock, buf, dest, local, interface)
+            if r >= 0:
+                return r
+            var e = Errno(err_of(r))
+            if e == Errno.EAGAIN:
+                return None
+            if e != Errno.EINTR:
+                raise IoError.from_errno("send_from", e)
 
     def peek_from(self, buf: MutSpan[UInt8, _]) raises IoError -> Datagram:
         """Like `recv_from`, but the datagram stays queued (MSG_PEEK). With

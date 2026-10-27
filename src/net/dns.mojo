@@ -19,8 +19,10 @@ Accepting a response (RFC 5452's rules against forged answers):
 
 Parsing is defensive. Every length and offset is bounds-checked, labels are
 at most 63 bytes, names at most 255 bytes, and a compression pointer must
-point strictly before itself, so following pointers always terminates; at
-most `MAX_POINTERS` are followed per name, which bounds the work.
+point backward, before itself. That alone does not end a chain (two
+pointers can point back at each other's labels); what does is that at most
+`MAX_POINTERS` are followed per name and a name may not pass 255 bytes,
+which also bounds the work.
 Whatever does not fit raises `InvalidData` (op "dns"). Names are compared
 in wire form (length-prefixed labels, ASCII lowercase), never as dotted
 text, so a label that contains a `.` cannot alias two labels.

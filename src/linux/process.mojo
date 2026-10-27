@@ -52,7 +52,7 @@ from .nr import (
 )
 from .signal import SignalSet
 from .sys import keep_alive
-from .syscall import err_of, is_err, syscall1, syscall2, syscall3, syscall4, syscall5
+from .syscall import _asm1, _asm3, _asm4, err_of, is_err, syscall1, syscall2, syscall3, syscall4, syscall5
 
 comptime _CPU_WORDS = 16
 """Affinity masks start at 1024 CPUs: `allowed_cpus` doubles its mask
@@ -290,16 +290,19 @@ struct Child(AsFd, Movable, Writable):
 
 def _child(path: Int, argv: Int, envp: Int, keep: Int, cpus: Int, cpu_bytes: Int, mask: Int):
     """The new child, until execve: raw syscalls on prepared memory only
-    (see the module docs). Never returns."""
+    (see the module docs). Never returns. The bare `_asmN`, not `syscallN`:
+    in a fault-seam build `syscallN` first looks up the fault plan through
+    the Mojo runtime, whose lock a thread that does not exist in the child
+    may hold, and would apply the parent's rules in the child."""
     if cpus != 0:
-        _ = syscall3(SYS_sched_setaffinity, 0, cpu_bytes, cpus)
+        _ = _asm3(SYS_sched_setaffinity, 0, cpu_bytes, cpus)
     if keep >= 0:
-        _ = syscall3(SYS_fcntl, keep, F_SETFD, 0)  # survives execve
+        _ = _asm3(SYS_fcntl, keep, F_SETFD, 0)  # survives execve
     if mask != 0:
-        _ = syscall4(SYS_rt_sigprocmask, SIG_SETMASK, mask, 0, 8)
-    _ = syscall3(SYS_execve, path, argv, envp)
+        _ = _asm4(SYS_rt_sigprocmask, SIG_SETMASK, mask, 0, 8)
+    _ = _asm3(SYS_execve, path, argv, envp)
     while True:
-        _ = syscall1(SYS_exit_group, 127)
+        _ = _asm1(SYS_exit_group, 127)
 
 
 def spawn(

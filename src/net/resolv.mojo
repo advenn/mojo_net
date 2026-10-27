@@ -81,6 +81,28 @@ def _fields(line: Span[UInt8, _]) -> List[String]:
     return out^
 
 
+def _keyword_at_start(line: Span[UInt8, _], keyword: StringSlice) -> Bool:
+    """glibc's `MATCH`: the keyword starts the line (no leading blanks)
+    and a space or tab follows it. Anything else ignores the line, as
+    glibc does (`  nameserver x`, `nameserver\rx`)."""
+    var k = keyword.byte_length()
+    return len(line) > k and line[0] == keyword.as_bytes()[0] and (line[k] == 32 or line[k] == 9)
+
+
+def _glibc_value(line: Span[UInt8, _], keyword_len: Int) -> String:
+    """A nameserver line's value as glibc takes it: past the keyword and
+    its spaces and tabs, up to the next space, tab or end. A `\r` (a
+    CRLF file) stays in it, and glibc then rejects the address."""
+    var i = keyword_len
+    var n = len(line)
+    while i < n and (line[i] == 32 or line[i] == 9):
+        i += 1
+    var start = i
+    while i < n and line[i] != 32 and line[i] != 9:
+        i += 1
+    return String(from_utf8_lossy=line[start:i])
+
+
 def _lines(text: Span[UInt8, _]) -> List[Tuple[Int, Int]]:
     """(start, end) of each `\\n`-separated line."""
     var out = List[Tuple[Int, Int]]()
@@ -174,11 +196,11 @@ struct ResolvConf(Copyable, Movable):
             if len(line) == 0 or line[0] == 35 or line[0] == 59:
                 continue
             var f = _fields(line)
-            if len(f) == 0:
+            if len(f) == 0 or not _keyword_at_start(line, f[0]):
                 continue
             if f[0] == "nameserver" and len(f) > 1:
                 if len(conf.nameservers) < MAX_NAMESERVERS:
-                    var ns = _nameserver(f[1])
+                    var ns = _nameserver(_glibc_value(line, f[0].byte_length()))
                     if ns:
                         conf.nameservers.append(ns.value())
             elif (f[0] == "search" or f[0] == "domain") and len(f) > 1:

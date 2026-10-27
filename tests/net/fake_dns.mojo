@@ -84,6 +84,12 @@ def answer(server, tcp, data):
             soa = rr('test', 6, wire('ns.test') + wire('host.test') + struct.pack('!IIIII', 1, 2, 3, 4, 5))
             return [(0, reply(qid, q, 0, (), flags=0x8500, auth=(soa,)))]  # QR AA RD
         return ok(v4(name, '192.0.2.30')) if qtype == A else ok()
+    if name == 'chain.test':  # every leg answered late, chaining legs
+        if qtype != A or server == 1:
+            return ok(v4(name, '192.0.2.50')) if qtype == A else ok()
+        if not tcp:
+            return [(0.9, reply(qid, q, 0, (), tc=True))]
+        return [(0.9, reply(qid, q, 1 if edns else 2))]  # FORMERR, then SERVFAIL
     if name == 'noedns.test':
         if edns:
             return [(0, reply(qid, q, 1))]  # FORMERR

@@ -359,6 +359,30 @@ struct Ipv6Mreq(Copyable, Movable):
 
 
 @fieldwise_init
+struct InPktinfo(Copyable, Movable):
+    """`struct in_pktinfo` (12 bytes): the IP_PKTINFO control message. On
+    receive, `addr` is the datagram's destination address and `ifindex`
+    the interface it came in on; on send, `spec_dst` is the source address
+    to use and `ifindex` the interface (0: by route)."""
+
+    var ifindex: Int32
+    var spec_dst: UInt32
+    """Network order."""
+    var addr: UInt32
+    """Network order."""
+
+
+@fieldwise_init
+struct In6Pktinfo(Copyable, Movable):
+    """`struct in6_pktinfo` (20 bytes): the IPV6_PKTINFO control message.
+    On receive, the datagram's destination address and its interface; on
+    send, the source address and interface (0: by route)."""
+
+    var addr: Array[UInt8, 16]
+    var ifindex: Int32
+
+
+@fieldwise_init
 struct Mmsghdr(Copyable, Movable):
     """`struct mmsghdr` (64 bytes): one message of sendmmsg/recvmmsg."""
 

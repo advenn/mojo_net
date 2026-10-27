@@ -101,9 +101,10 @@ def test_dial_never_reissues_a_connect_after_eintr() raises:
     # address. An injected EINTR is a connect that never started (the seam
     # skips the syscall): the attempt must end with NotConnected, not pass
     # for connected because the socket polls writable, and the next
-    # address still gets its turn.
+    # address still gets its turn. (Two distinct addresses: a repeated one
+    # is tried once.)
     fault.clear()
-    var l = TcpListener.bind(SocketAddr.parse("127.0.0.1:0"))
+    var l = TcpListener.bind(SocketAddr.parse("0.0.0.0:0"))
     var port = l.local_addr().port()
     var only = _hosts_resolver("127.0.0.1 eintr.test\n")
     fault.clear()
@@ -117,12 +118,12 @@ def test_dial_never_reissues_a_connect_after_eintr() raises:
     fault.clear()
     assert_equal(kind, "NotConnected")
     assert_equal(connects, 1)
-    var two = _hosts_resolver("127.0.0.1 eintr2.test\n127.0.0.1 eintr2.test\n")
+    var two = _hosts_resolver("127.0.0.1 eintr2.test\n127.0.0.2 eintr2.test\n")
     fault.inject(SYS_connect, Errno.EINTR, times=1)
     var s = TcpStream.connect_host_deadline("eintr2.test", port, _secs(5), two)
     var connects2 = fault.calls(SYS_connect)
     fault.clear()
-    assert_equal(String(s.peer_addr()), String("127.0.0.1:", port))
+    assert_equal(String(s.peer_addr()), String("127.0.0.2:", port))
     assert_equal(connects2, 2)  # one per address
     sys.keep_alive(l)
 

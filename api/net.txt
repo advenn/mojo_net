@@ -172,6 +172,8 @@ struct IdleState(Copyable, Deinitable, Equatable, ImplicitlyCopyable, Movable, R
 
 # net.dial
 comptime ATTEMPT_DELAY = Duration.from_millis(Int(250))
+comptime MAX_ADDRESSES = 32
+comptime MAX_IN_FLIGHT = 8
 comptime RESOLUTION_DELAY = Duration.from_millis(Int(50))
 def dial_tcp(host: StringSpan, port: UInt16, deadline: Deadline) raises -> Socket
 def dial_tcp(resolver: Resolver, host: StringSpan, port: UInt16, deadline: Deadline) raises -> Socket
@@ -594,6 +596,11 @@ struct TcpStream(AsFd, Deinitable, Movable, Read, Writable)
 
 # net.udp
 comptime MAX_BATCH = IOV_MAX
+struct Arrival(Copyable, Deinitable, Movable, Writable)
+    var datagram: Datagram
+    var interface: UInt32
+    var local: Optional[IpAddr]
+    def write_to(self, mut writer: T)
 struct Datagram(Copyable, Deinitable, ImplicitlyCopyable, Movable, RegisterPassable, TrivialRegisterPassable, Writable)
     var len: Int
     var sender: SocketAddr
@@ -634,11 +641,14 @@ struct UdpSocket(AsFd, Deinitable, Movable, Writable)
     def peer_addr(self) raises -> SocketAddr
     def raw_fd(self) -> Int32
     def read_deadline(self) -> Deadline
+    def receive_destination(self, on: Bool = True) raises
     def recv(self, buf: Span[UInt8]) raises -> Datagram
     def recv_batch(self, mut batch: DatagramBatch) raises -> Int
     def recv_from(self, buf: Span[UInt8]) raises -> Datagram
+    def recv_from_to(self, buf: Span[UInt8]) raises -> Arrival
     def send(self, buf: Span[UInt8]) raises -> Int
     def send_batch(self, mut batch: DatagramBatch) raises -> Int
+    def send_from(self, buf: Span[UInt8], dest: SocketAddr, local: IpAddr, interface: UInt32 = UInt32(0)) raises -> Int
     def send_to(self, buf: Span[UInt8], addr: SocketAddr) raises -> Int
     def set_broadcast(self, on: Bool) raises
     def set_deadline(mut self, deadline: Deadline)
@@ -657,8 +667,10 @@ struct UdpSocket(AsFd, Deinitable, Movable, Writable)
     def try_recv(self, buf: Span[UInt8]) raises -> Optional[Datagram]
     def try_recv_batch(self, mut batch: DatagramBatch) raises -> Int
     def try_recv_from(self, buf: Span[UInt8]) raises -> Optional[Datagram]
+    def try_recv_from_to(self, buf: Span[UInt8]) raises -> Optional[Arrival]
     def try_send(self, buf: Span[UInt8]) raises -> Optional[Int]
     def try_send_batch(self, mut batch: DatagramBatch) raises -> Int
+    def try_send_from(self, buf: Span[UInt8], dest: SocketAddr, local: IpAddr, interface: UInt32 = UInt32(0)) raises -> Optional[Int]
     def try_send_to(self, buf: Span[UInt8], addr: SocketAddr) raises -> Optional[Int]
     def write_deadline(self) -> Deadline
     def write_to(self, mut writer: T)

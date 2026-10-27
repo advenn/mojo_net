@@ -39,6 +39,13 @@ struct Ifreq(Copyable, Deinitable, Movable)
     var ifindex: Int32
     var name: Array[UInt8, Int(16)]
     def __init__(out self)
+struct In6Pktinfo(Copyable, Deinitable, Movable)
+    var addr: Array[UInt8, Int(16)]
+    var ifindex: Int32
+struct InPktinfo(Copyable, Deinitable, Movable)
+    var addr: UInt32
+    var ifindex: Int32
+    var spec_dst: UInt32
 struct Iovec(Copyable, Deinitable, Movable)
     var base: Int
     var len: UInt
@@ -213,6 +220,8 @@ comptime IPV6_MULTICAST_ALL = Int(29)
 comptime IPV6_MULTICAST_HOPS = Int(18)
 comptime IPV6_MULTICAST_IF = Int(17)
 comptime IPV6_MULTICAST_LOOP = Int(19)
+comptime IPV6_PKTINFO = Int(50)
+comptime IPV6_RECVPKTINFO = Int(49)
 comptime IPV6_TCLASS = Int(67)
 comptime IPV6_UNICAST_HOPS = Int(16)
 comptime IPV6_V6ONLY = Int(26)
@@ -222,6 +231,7 @@ comptime IP_MULTICAST_ALL = Int(49)
 comptime IP_MULTICAST_IF = Int(32)
 comptime IP_MULTICAST_LOOP = Int(34)
 comptime IP_MULTICAST_TTL = Int(33)
+comptime IP_PKTINFO = Int(8)
 comptime IP_TOS = Int(1)
 comptime IP_TTL = Int(2)
 comptime MAP_ANONYMOUS = Int(32)
@@ -240,6 +250,7 @@ comptime MSG_TRUNC = Int(32)
 comptime MSG_WAITALL = Int(256)
 comptime MSG_ZEROCOPY = Int(67108864)
 comptime O_CLOEXEC = Int(524288)
+comptime O_NOCTTY = Int(256)
 comptime O_NONBLOCK = Int(2048)
 comptime O_PATH = Int(2097152)
 comptime O_RDONLY = Int(0)

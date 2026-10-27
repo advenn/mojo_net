@@ -98,6 +98,9 @@ comptime IP_TTL: Int = 2
 comptime IPV6_V6ONLY: Int = 26
 comptime IPV6_TCLASS: Int = 67
 comptime IPV6_UNICAST_HOPS: Int = 16
+comptime IP_PKTINFO: Int = 8
+comptime IPV6_RECVPKTINFO: Int = 49
+comptime IPV6_PKTINFO: Int = 50
 
 # Multicast
 comptime IP_MULTICAST_IF: Int = 32
@@ -179,6 +182,7 @@ comptime O_WRONLY: Int = 1
 comptime O_RDWR: Int = 2
 comptime O_NONBLOCK: Int = 2048
 comptime O_CLOEXEC: Int = 524288
+comptime O_NOCTTY: Int = 256
 comptime AT_FDCWD: Int = -100
 comptime F_DUPFD_CLOEXEC: Int = 1030
 comptime F_GETFD: Int = 1

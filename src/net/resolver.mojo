@@ -29,8 +29,10 @@ DNS queries:
 - **EDNS(0).** `options edns0` advertises 1232-byte UDP answers; a server
   that answers that with FORMERR or NOTIMP is asked again without it.
 - **Servers.** In order (from a random one with `options rotate`), for
-  `attempts` rounds; each try waits `timeout`. SERVFAIL, REFUSED, FORMERR,
-  NOTIMP, a lame referral (no answer from a server that is neither
+  `attempts` rounds; each try waits `timeout`, and once more over TCP
+  after a truncated answer (Go's rule): at most twice `timeout`, however
+  its legs chain (TCP, the EDNS fallback, truncated again). SERVFAIL,
+  REFUSED, FORMERR, NOTIMP, a lame referral (no answer from a server that is neither
   authoritative nor recursive), a malformed answer, an ICMP port
   unreachable (ECONNREFUSED) and a failed send move to the next server at
   once. NXDOMAIN and NOERROR (with or without addresses) end the query for
@@ -125,6 +127,9 @@ struct _Query(Movable):
     """Whether `msg` carries an OPT record."""
     var tries: Int
     var try_deadline: Deadline
+    var tcp_leg: Bool
+    """Whether the current try has had its TCP leg (after a truncated
+    answer), with the one fresh timer a try gets."""
     var outcome: Int
     var saw_timeout: Bool
 
@@ -141,6 +146,7 @@ struct _Query(Movable):
         self.edns = False
         self.tries = 0
         self.try_deadline = Deadline.none()
+        self.tcp_leg = False
         self.outcome = 0
         self.saw_timeout = False
 
@@ -352,11 +358,13 @@ struct Lookup(Movable):
         self._next_try(i, deadline)
 
     def _send(
-        mut self, i: Int, edns: Bool, deadline: Deadline
+        mut self, i: Int, edns: Bool, deadline: Deadline, new_try: Bool = True
     ) raises IoError -> Bool:
         """Send query `i` with a fresh ID to its current server, over UDP
         (or TCP with `use-vc`). False if that failed at once (no route,
-        refused, IPv6 off, ...); local resource errors raise."""
+        refused, IPv6 off, ...); local resource errors raise. `new_try`
+        starts the try's timer; the EDNS fallback (`new_try=False`) runs
+        within the try's time."""
         var server = self._servers[self._queries[i].server]
         var id = List[UInt8](length=2, fill=0)
         fill_random(Span(id))
@@ -367,9 +375,11 @@ struct Lookup(Movable):
             edns,
         )
         self._queries[i].edns = edns
-        self._queries[i].try_deadline = deadline.earliest(
-            Deadline.after(self._timeout)
-        )
+        if new_try:
+            self._queries[i].try_deadline = deadline.earliest(
+                Deadline.after(self._timeout)
+            )
+            self._queries[i].tcp_leg = False
         self._queries[i].close()
         self._queries[i].state = _WAITING
         if self._tcp:
@@ -521,15 +531,20 @@ struct Lookup(Movable):
             if from_tcp:
                 self._fail_try(i, deadline)
                 return
-            # The same server again over TCP, with a fresh try timeout (no
-            # new exchange after the caller's deadline).
+            # The same server again over TCP (no new exchange after the
+            # caller's deadline). The first TCP leg of a try gets a fresh
+            # timeout, as Go's resolver gives it; a later one (a server
+            # that truncates again after the EDNS fallback) runs within
+            # the time left, so a try lasts at most twice `timeout`.
             if deadline.is_expired():
                 self._fail_try(i, deadline)
                 return
             self._queries[i].close()
-            self._queries[i].try_deadline = deadline.earliest(
-                Deadline.after(self._timeout)
-            )
+            if not self._queries[i].tcp_leg:
+                self._queries[i].tcp_leg = True
+                self._queries[i].try_deadline = deadline.earliest(
+                    Deadline.after(self._timeout)
+                )
             if not self._start_tcp(i):
                 self._fail_try(i, deadline)
             return
@@ -538,7 +553,9 @@ struct Lookup(Movable):
         ) and self._queries[i].edns:
             # Perhaps no EDNS(0) support: the same server, without OPT (no
             # new exchange after the caller's deadline).
-            if deadline.is_expired() or not self._send(i, False, deadline):
+            if deadline.is_expired() or not self._send(
+                i, False, deadline, new_try=False
+            ):
                 self._fail_try(i, deadline)
             return
         ref q = self._queries[i]
@@ -750,8 +767,8 @@ def precedence(ip: IpAddr) -> Int:
     for i in range(6):
         if s[i] != 0:
             compat = False
-    if compat and ip.v6() != Ipv6Addr.from_bits(0):
-        return 1  # IPv4-compatible ::a.b.c.d
+    if compat:
+        return 1  # ::/96: IPv4-compatible ::a.b.c.d, and :: itself
     if s[0] == 0 and s[1] == 0 and s[2] == 0 and s[3] == 0 and s[4] == 0 and s[5] == 0xFFFF:
         return 35  # IPv4-mapped ::ffff:0:0/96, as IPv4 itself
     return 40

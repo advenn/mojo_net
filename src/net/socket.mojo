@@ -1057,7 +1057,11 @@ struct Socket(AsFd, Movable, Writable):
         like `recv`, 0 meaning EOF. It is also `None` when the sender is
         not an IP address (use `recv_from_unix` on Unix sockets). Nothing
         raises once the kernel has handed over the data, so code shared
-        between UDP and TCP never loses bytes here."""
+        between UDP and TCP never loses bytes here.
+
+        On a datagram socket a datagram longer than `buf` is cut, and
+        nothing here says so (no MSG_TRUNC, no flags returned): use
+        `net.udp.UdpSocket`, whose `Datagram.size` tells."""
         return self._recv_from(buf, 0, "recvfrom")
 
     def peek_from(

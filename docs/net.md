@@ -93,7 +93,9 @@ var d = sock.recv(Span(buf))        # d.len bytes in buf; d.truncated()?
 - **Datagrams are whole.** A receive returns one datagram. One longer than the buffer is cut, and `Datagram.size > len` says so, so it is never silent. Empty datagrams are valid; there is no EOF. A peek into an empty buffer tells the next datagram's size.
 - **Servers.**
   - `UdpSocket.bind(addr)`, plus `bind_reuseport` for one socket per core.
-  - Reply with `send_to(payload, d.sender)`.
+  - Reply with `send_to(payload, d.sender)`. Bound to a wildcard address on a host with several addresses, turn on `receive_destination()` and reply with `send_from(payload, a.datagram.sender, a.local.value())` from `recv_from_to`'s `Arrival`: otherwise the reply leaves from whichever address the route back picks, and a connected client drops it.
+  - A reply can fail for reasons the sender controls (port 0, a broadcast source, a forged one): drop that datagram and go on, never stop.
+  - `connect` discards what was queued before it; after it, every datagram claims to be from the peer.
   - `examples/net/udp_echo.mojo` shows a blocking loop and an edge-triggered batched loop.
 - **Multicast:** `join_multicast_v4` / `v6` on a socket bound to the group's port. Mind `IP_MULTICAST_ALL`.
 - **Names:** `UdpSocket.connect_host` resolves without libc and uses the first address in RFC 6724 order. There is no Happy Eyeballs for UDP: try the next `Resolver.lookup_ip` address to fail over.
@@ -241,4 +243,27 @@ These names and their documented behavior are stable for v1.
     - Closer to glibc: nameserver lines take inet_aton's forms (checked against glibc's inet_aton through Python), option values are clamped atoi-style, `no-tld-query` and `no-aaaa` work, and a name the hosts file lists only in the other family is looked up in DNS.
     - RFC fixes: IPv4-mapped addresses have precedence 35; a TTL with its top bit set is 0; an extended RCODE (BADVERS) is a failure.
     - Documented: `Resolver.system()` reads the configuration once.
+- **Third review (2026-10-27)** of `net` and the syscall layer under it, by four independent reviewers (DNS and dialing as an attacker sees them; TCP and Unix streams, sockets, addresses and the buffered reader; UDP; the syscall layer). Nothing critical or high. Every finding was reproduced by a regression test that fails on the old code (`tests/net/test_net_review3_regressions.mojo`, `tests/linux/test_linux_review3_regressions*.mojo`), and each test was checked against a planted copy of the bug:
+  - **A TCP connect could connect to itself** (two reviewers found it). A connect to a local port nothing listens on, in the ephemeral range, can pick that very port as its source; the SYN answers itself, and the stream reads back its own writes. Both connect paths now refuse it as `ConnectionRefused` (local address equal to peer address, as Go checks). The test pins the source port with `IP_LOCAL_PORT_RANGE`.
+  - **Deadlines rested on O_NONBLOCK**, a flag every duplicate of the descriptor shares: a clone set blocking made deadline-bounded reads wait in the kernel, and `try_recv_batch` wait for a full batch. Every L2 send and receive now passes MSG_DONTWAIT.
+  - **Dialing**:
+    - A hostile zone could answer with thousands of addresses, and a dial kept every attempt open (a socket per 250 ms until its deadline, enough to exhaust the process's descriptors). Now at most 32 addresses per family are tried, repeats once, and at most 8 attempts stay open (the oldest is abandoned when the next is due).
+    - Answers of 0.0.0.0 or :: (hosts files use 0.0.0.0 to block a name) connected to this host; they are skipped. `::` had RFC 6724 precedence 40, above IPv4; it is 1.
+  - **DNS**: a truncated answer and the EDNS fallback each restarted a try's timer, so a server answering every leg late chained one try to four timeouts; a try now lasts at most two (UDP, then one TCP leg, Go's rule). resolv.conf lines are taken as glibc takes them: a keyword at the start of the line followed by a space or tab, and a nameserver value with a trailing CR (a CRLF file) rejected.
+  - **Adoption**: `TcpListener.from_socket` and `TcpStream.from_socket` took SCTP stream sockets (every accept then dropped its connection); they require TCP or MPTCP. `UdpSocket.from_socket` took a socket with UDP_GRO on, whose receives merge datagrams silently.
+  - **`idle_state()`** said EMPTY with out-of-band input pending (an AF_UNIX MSG_OOB byte, TCP urgent data), which a peek skips; a zero-timeout poll now finds it.
+  - **UDP**:
+    - A server bound to a wildcard address could not reply from the address a datagram came to, so on a host with several addresses a connected client dropped its replies. `receive_destination`, `recv_from_to` (an `Arrival`: the datagram, its destination address and interface) and `send_from` do it with IP_PKTINFO / IPV6_PKTINFO.
+    - `connect` kept datagrams queued before it, which then came out of `recv` as if from the peer; it now discards them.
+    - `examples/net/udp_echo.mojo` stopped on one crafted datagram (a reply to port 0 is EINVAL); it drops what it cannot answer.
+    - A batch receive rewrote every header (up to 1024) each call; it now rewrites those the last call changed.
+  - **The syscall layer**:
+    - `open_beneath` and `read_file` open with O_NOCTTY: a session leader without a terminal (a container's PID 1) that opened a terminal device took it as its controlling terminal (a hangup then sends SIGHUP).
+    - The clone child issues raw syscalls even in fault-seam builds, where `syscallN` went through the Mojo runtime's global lookup.
+    - The aarch64 `svc` clobbers include the SVE predicates and FFR, which the kernel zeroes (hardening; no current code keeps a value there).
+  - **Documented**:
+    - an AF_UNIX writer in a readiness loop gets no event after its peer's shutdown(SHUT_RD);
+    - L1 `recv_from` cuts long datagrams silently;
+    - an unconnected UDP socket sees ICMP errors once IP_RECVERR is on;
+    - DNS compression chains end by the pointer and length caps, not by pointing backward.
 - **Later:** sendfile, vectored helpers, TLS integration points.

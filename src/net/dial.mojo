@@ -15,6 +15,13 @@ How `dial_tcp` connects:
 - **Racing.** A new attempt starts every `ATTEMPT_DELAY` (250 ms) while no
   attempt has connected, and at once when one fails (section 5). Attempts
   run in parallel; the first to connect wins and the others are closed.
+- **Bounds.** At most `MAX_ADDRESSES` (32) addresses per family are tried,
+  repeats once, and at most `MAX_IN_FLIGHT` (8) attempts are pending at
+  once: the oldest is abandoned when the next is due. A hostile zone's
+  answer of thousands of addresses costs at most that many sockets.
+- **Unspecified answers** (0.0.0.0, ::, ::ffff:0.0.0.0) are skipped: the
+  kernel would connect them to this host. An IP literal connects as asked.
+  A TCP socket that connected to itself counts as refused.
 - **One deadline** bounds resolving and connecting together. Expiry raises
   `TimedOut` (op "connect", errno 0: `is_deadline()`).
 - **Failure.** When every address has failed and nothing more can come,
@@ -38,7 +45,7 @@ from linux.syscall import err_of, is_err
 from linux.time import Deadline, Duration, Instant
 
 from .addr import IpAddr, RawSockaddr, SocketAddr, SocketAddrV6
-from .blocking import connect_with_deadline
+from .blocking import connect_with_deadline, _connected_to_itself
 from .dns import TYPE_AAAA
 from .resolver import Lookup, Resolver, precedence
 from .socket import Domain, SockType, Socket
@@ -47,6 +54,15 @@ comptime ATTEMPT_DELAY = Duration.from_millis(250)
 """RFC 8305's recommended Connection Attempt Delay."""
 comptime RESOLUTION_DELAY = Duration.from_millis(50)
 """RFC 8305's recommended Resolution Delay."""
+comptime MAX_ADDRESSES = 32
+"""Addresses tried per family, at most: whoever controls a name's zone can
+answer with thousands, and each would cost an attempt (a socket and a SYN
+to an address of their choosing)."""
+comptime MAX_IN_FLIGHT = 8
+"""Attempts left connecting at once, at most. When the next one is due
+with this many still pending, the oldest is abandoned (as timed out), so
+that a run of black-holed addresses neither stalls the dial nor holds more
+than this many descriptors."""
 
 
 # ---- host:port ---------------------------------------------------------------
@@ -240,6 +256,9 @@ def dial_tcp(
     var last_start: Optional[Instant] = None
     var kick = False  # an attempt failed: start the next one now
     var v4_waiting_since: Optional[Instant] = None
+    var seen = List[SocketAddr]()
+    var taken6 = 0
+    var taken4 = 0
 
     while True:
         var now = Instant.now()
@@ -247,14 +266,31 @@ def dial_tcp(
             raise IoError.of_kind("connect", ErrorKind.TimedOut)
 
         # New answers join the queues, each kept in RFC 6724 precedence
-        # order (stable: answer order among equals).
+        # order (stable: answer order among equals). An unspecified
+        # address (0.0.0.0, ::) would reach this host, so it is skipped:
+        # hosts files use 0.0.0.0 to block a name. Repeats are dropped,
+        # and each family keeps at most MAX_ADDRESSES.
         var got = List[IpAddr]()
         lk.take(got)
         for ip in got:
+            if ip.is_unspecified():
+                continue
+            var addr = SocketAddr(ip, port)
+            var repeat = False
+            for k in range(len(seen)):
+                if seen[k] == addr:
+                    repeat = True
+                    break
+            if repeat:
+                continue
+            seen.append(addr)
             if ip.is_ipv6():
-                _insert_by_precedence(v6, SocketAddr(ip, port))
-            else:
-                _insert_by_precedence(v4, SocketAddr(ip, port))
+                if taken6 < MAX_ADDRESSES:
+                    taken6 += 1
+                    _insert_by_precedence(v6, addr)
+            elif taken4 < MAX_ADDRESSES:
+                taken4 += 1
+                _insert_by_precedence(v4, addr)
 
         # Resolution delay: IPv4 waits briefly for a pending AAAA answer
         # before the very first attempt.
@@ -291,6 +327,9 @@ def dial_tcp(
             next_v6 = not addr.is_ipv6()
             last_start = now
             kick = False
+            if len(attempts) >= MAX_IN_FLIGHT:
+                _ = attempts.pop(0)  # the oldest (start order): closed
+                errors.add(IoError.of_kind("connect", ErrorKind.TimedOut))
             var connected = False
             var sock = _start(addr, errors, connected)
             if sock:
@@ -348,7 +387,8 @@ def _settle(
     getpeername decides. Writability alone proves nothing, since a socket
     whose connect never started also polls POLLOUT|POLLHUP with no error;
     ENOTCONN with HUP/ERR means the attempt is over, without them the
-    wakeup was spurious and the attempt keeps waiting."""
+    wakeup was spurious and the attempt keeps waiting. A socket that
+    connected to itself is refused (`_connected_to_itself`)."""
     var failed = List[Int]()
     for i in range(len(attempts)):
         var ev = revents[i].revents
@@ -362,6 +402,10 @@ def _settle(
         var peer = RawSockaddr()
         var g = sys.getpeername(attempts[i].sock, peer.storage, peer.len)
         if g == 0:
+            if _connected_to_itself(attempts[i].sock, peer):
+                errors.add(IoError.from_errno("connect", Errno.ECONNREFUSED))
+                failed.append(i)
+                continue
             return i
         var ge = Errno(err_of(g))
         if ge != Errno.ENOTCONN:
@@ -407,6 +451,9 @@ def _start(
     var raw = addr.to_raw()
     var r = sys.connect(sock, raw.storage, raw.socklen())
     if r == 0:
+        if _connected_to_itself(sock):
+            errors.add(IoError.from_errno("connect", Errno.ECONNREFUSED))
+            return None
         connected = True
         return sock^
     var e = Errno(err_of(r))
