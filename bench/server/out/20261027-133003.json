@@ -1,0 +1,1877 @@
+{
+ "versions": {
+  "cpu": "model name\t: 11th Gen Intel(R) Core(TM) i5-1145G7 @ 2.60GHz",
+  "kernel": "6.12.111+deb13-amd64",
+  "governor": "powersave",
+  "server_cpus": "2,3,6,7",
+  "wrk_cpus": "0,1,4,5",
+  "mojo": "Mojo 1.2.0 (2016d0cd)",
+  "nginx": "nginx version: nginx/1.31.8",
+  "go": "go version go1.27.3 linux/amd64",
+  "goamd64": "v4",
+  "fasthttp": {
+   "github.com/valyala/fasthttp": "1.77.0"
+  },
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "hyper": {
+   "hyper": "1.12.0",
+   "tokio": "1.54.1"
+  },
+  "wrk": "wrk d40fce9-dirty [epoll] Copyright (C) 2012 Will Glozer"
+ },
+ "duration_s": 60,
+ "warmup_s": 5,
+ "cooldown_s": 15,
+ "runs": [
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:33033/plaintext\n  4 threads and 64 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   419.63us  149.00us  11.13ms   94.23%\n    Req/Sec    38.65k     4.74k  127.09k    77.76%\n  Latency Distribution\n     50%  399.00us\n     75%  430.00us\n     90%  489.00us\n     99%  730.00us\n  9233555 requests in 1.00m, 1.27GB read\nRequests/sec: 153637.71\nTransfer/sec:     21.69MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 399.0,
+    "75%": 430.0,
+    "90%": 489.0,
+    "99%": 730.0
+   },
+   "requests": 9233555,
+   "rps": 153637.71,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 79.90989499999999,
+   "server_mhz": {
+    "mean": 3393.3564666666666,
+    "min": 2800.0,
+    "max": 4000.0
+   },
+   "pkg_celsius": {
+    "mean": 71.16666666666667,
+    "max": 78.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.8,
+   "server_us_per_req": 6.476378816176434,
+   "server_cpu_share": 0.9966666666666666,
+   "wrk_cpu_share": 0.3329578958333333,
+   "others_cpus": 0.5473350833333335,
+   "load": 2.2451171875,
+   "server": "mojo",
+   "scenario": "1cpu-keepalive",
+   "rep": 0,
+   "start": "2026-10-27 13:30:06",
+   "background_cpus": 0.5,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:44693/plaintext\n  4 threads and 64 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   738.94us  436.46us  10.44ms   64.36%\n    Req/Sec    22.04k     1.61k   31.71k    78.92%\n  Latency Distribution\n     50%  741.00us\n     75%    1.06ms\n     90%    1.27ms\n     99%    1.74ms\n  5264338 requests in 1.00m, 637.60MB read\nRequests/sec:  87691.37\nTransfer/sec:     10.62MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 741.0,
+    "75%": 1060.0,
+    "90%": 1270.0,
+    "99%": 1740.0
+   },
+   "requests": 5264338,
+   "rps": 87691.37,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 41.443103,
+   "server_mhz": {
+    "mean": 3638.3326666666667,
+    "min": 3300.0,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 72.41666666666667,
+    "max": 78.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.72,
+   "server_us_per_req": 11.344256390832047,
+   "server_cpu_share": 0.9953333333333333,
+   "wrk_cpu_share": 0.17267959583333334,
+   "others_cpus": 0.41444828333333333,
+   "load": 3.171875,
+   "server": "go",
+   "scenario": "1cpu-keepalive",
+   "rep": 0,
+   "start": "2026-10-27 13:31:26",
+   "background_cpus": 0.5026666666666667,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:43265/plaintext\n  4 threads and 64 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   387.72us  234.99us   9.27ms   66.02%\n    Req/Sec    41.93k     4.31k  140.36k    84.05%\n  Latency Distribution\n     50%  385.00us\n     75%  554.00us\n     90%  674.00us\n     99%    0.88ms\n  10016160 requests in 1.00m, 1.24GB read\nRequests/sec: 166661.54\nTransfer/sec:     21.14MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 385.0,
+    "75%": 554.0,
+    "90%": 674.0,
+    "99%": 880.0
+   },
+   "requests": 10016160,
+   "rps": 166661.54,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 88.20334500000003,
+   "server_mhz": {
+    "mean": 3436.7920166666668,
+    "min": 3107.531,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 70.9,
+    "max": 79.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.8,
+   "server_us_per_req": 5.970351911311321,
+   "server_cpu_share": 0.9966666666666666,
+   "wrk_cpu_share": 0.3675139375000001,
+   "others_cpus": 0.34161091666666626,
+   "load": 2.08447265625,
+   "server": "fasthttp",
+   "scenario": "1cpu-keepalive",
+   "rep": 0,
+   "start": "2026-10-27 13:32:46",
+   "background_cpus": 0.4246666666666667,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:55729/plaintext\n  4 threads and 64 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   348.14us   99.11us   7.99ms   96.89%\n    Req/Sec    46.36k     4.44k  152.41k    85.71%\n  Latency Distribution\n     50%  341.00us\n     75%  358.00us\n     90%  385.00us\n     99%  538.00us\n  11073363 requests in 1.00m, 1.34GB read\nRequests/sec: 184250.03\nTransfer/sec:     22.84MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 341.0,
+    "75%": 358.0,
+    "90%": 385.0,
+    "99%": 538.0
+   },
+   "requests": 11073363,
+   "rps": 184250.03,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 100.37629499999997,
+   "server_mhz": {
+    "mean": 3349.6995,
+    "min": 2999.992,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 70.85,
+    "max": 79.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.82,
+   "server_us_per_req": 5.402152896098502,
+   "server_cpu_share": 0.997,
+   "wrk_cpu_share": 0.41823456249999985,
+   "others_cpus": 0.27606175000000044,
+   "load": 2.37158203125,
+   "server": "hyper",
+   "scenario": "1cpu-keepalive",
+   "rep": 0,
+   "start": "2026-10-27 13:34:06",
+   "background_cpus": 0.48666666666666664,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:34747/plaintext\n  4 threads and 64 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   368.13us   80.30us   6.75ms   96.89%\n    Req/Sec    43.73k     3.63k   76.87k    81.60%\n  Latency Distribution\n     50%  366.00us\n     75%  381.00us\n     90%  404.00us\n     99%  526.00us\n  10451461 requests in 1.00m, 1.57GB read\nRequests/sec: 173901.40\nTransfer/sec:     26.70MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 366.0,
+    "75%": 381.0,
+    "90%": 404.0,
+    "99%": 526.0
+   },
+   "requests": 10451461,
+   "rps": 173901.4,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 90.30836300000004,
+   "server_mhz": {
+    "mean": 3516.6661,
+    "min": 3299.991,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 71.28333333333333,
+    "max": 77.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.82,
+   "server_us_per_req": 5.723601705063053,
+   "server_cpu_share": 0.997,
+   "wrk_cpu_share": 0.3762848458333335,
+   "others_cpus": 0.22152728333333252,
+   "load": 2.0869140625,
+   "server": "nginx",
+   "scenario": "1cpu-keepalive",
+   "rep": 0,
+   "start": "2026-10-27 13:35:27",
+   "background_cpus": 0.31533333333333335,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:54567/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     2.93ms    1.53ms  12.27ms   59.24%\n    Req/Sec   193.69k    11.97k  384.16k    72.92%\n  Latency Distribution\n     50%    2.91ms\n     75%    4.20ms\n     90%    4.97ms\n     99%    5.71ms\n  46261184 requests in 1.00m, 6.38GB read\nRequests/sec: 769790.01\nTransfer/sec:    108.65MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 2910.0,
+    "75%": 4200.0,
+    "90%": 4970.0,
+    "99%": 5710.0
+   },
+   "requests": 46261184,
+   "rps": 769790.01,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 36.94346500000006,
+   "server_mhz": {
+    "mean": 3777.33415,
+    "min": 3500.0,
+    "max": 4281.629
+   },
+   "pkg_celsius": {
+    "mean": 74.1,
+    "max": 78.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.82,
+   "server_us_per_req": 1.2930927146179398,
+   "server_cpu_share": 0.997,
+   "wrk_cpu_share": 0.15393110416666692,
+   "others_cpus": 0.3107755833333324,
+   "load": 2.423828125,
+   "server": "mojo",
+   "scenario": "1cpu-pipelined",
+   "rep": 0,
+   "start": "2026-10-27 13:36:47",
+   "background_cpus": 0.33066666666666666,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:57073/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency    29.05ms   19.09ms 150.93ms   62.86%\n    Req/Sec    25.55k     2.47k   31.22k    78.46%\n  Latency Distribution\n     50%   25.61ms\n     75%   43.07ms\n     90%   56.36ms\n     99%   76.73ms\n  6102108 requests in 1.00m, 739.07MB read\nRequests/sec: 101599.23\nTransfer/sec:     12.31MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 25610.0,
+    "75%": 43070.0,
+    "90%": 56360.0,
+    "99%": 76730.0
+   },
+   "requests": 6102108,
+   "rps": 101599.23,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 27.39418299999997,
+   "server_mhz": {
+    "mean": 3776.346016666667,
+    "min": 3300.0,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 73.01666666666667,
+    "max": 76.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.8,
+   "server_us_per_req": 9.799892102860191,
+   "server_cpu_share": 0.9966666666666666,
+   "wrk_cpu_share": 0.11414242916666655,
+   "others_cpus": 0.34343028333333386,
+   "load": 1.76513671875,
+   "server": "go",
+   "scenario": "1cpu-pipelined",
+   "rep": 0,
+   "start": "2026-10-27 13:38:08",
+   "background_cpus": 0.4873333333333333,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:37923/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     2.38ms    1.53ms  24.75ms   68.53%\n    Req/Sec   264.55k    37.70k  385.29k    79.12%\n  Latency Distribution\n     50%    2.13ms\n     75%    3.29ms\n     90%    4.38ms\n     99%    7.10ms\n  63168640 requests in 1.00m, 7.82GB read\nRequests/sec: 1051756.47\nTransfer/sec:    133.40MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 2130.0,
+    "75%": 3290.0,
+    "90%": 4380.0,
+    "99%": 7100.0
+   },
+   "requests": 63168640,
+   "rps": 1051756.47,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 55.75646800000004,
+   "server_mhz": {
+    "mean": 3481.7258333333334,
+    "min": 2500.006,
+    "max": 4000.0
+   },
+   "pkg_celsius": {
+    "mean": 71.25,
+    "max": 77.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.72,
+   "server_us_per_req": 0.9454058216228812,
+   "server_cpu_share": 0.9953333333333333,
+   "wrk_cpu_share": 0.23231861666666684,
+   "others_cpus": 0.6352255333333328,
+   "load": 1.7060546875,
+   "server": "fasthttp",
+   "scenario": "1cpu-pipelined",
+   "rep": 0,
+   "start": "2026-10-27 13:39:28",
+   "background_cpus": 0.4873333333333333,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:43725/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.84ms    0.91ms  12.66ms   55.90%\n    Req/Sec   305.45k    19.16k  407.60k    79.71%\n  Latency Distribution\n     50%    2.00ms\n     75%    2.81ms\n     90%    3.35ms\n     99%    0.00us\n  72945264 requests in 1.00m, 8.83GB read\nRequests/sec: 1214275.33\nTransfer/sec:    150.54MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 2000.0,
+    "75%": 2810.0,
+    "90%": 3350.0,
+    "99%": 0.0
+   },
+   "requests": 72945264,
+   "rps": 1214275.33,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 57.486840000000086,
+   "server_mhz": {
+    "mean": 3560.4852333333333,
+    "min": 3300.0,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 73.28333333333333,
+    "max": 78.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.76,
+   "server_us_per_req": 0.8192444131808201,
+   "server_cpu_share": 0.996,
+   "wrk_cpu_share": 0.23952850000000037,
+   "others_cpus": 0.28921933333333194,
+   "load": 1.68359375,
+   "server": "hyper",
+   "scenario": "1cpu-pipelined",
+   "rep": 0,
+   "start": "2026-10-27 13:40:48",
+   "background_cpus": 0.43466666666666665,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:40131/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency    11.84ms    7.89ms 512.28ms   76.16%\n    Req/Sec    48.82k     4.22k   79.54k    75.33%\n  Latency Distribution\n     50%   11.53ms\n     75%   16.65ms\n     90%   19.94ms\n     99%   27.51ms\n  11659225 requests in 1.00m, 1.75GB read\nRequests/sec: 194006.12\nTransfer/sec:     29.79MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 11530.0,
+    "75%": 16650.0,
+    "90%": 19940.0,
+    "99%": 27510.0
+   },
+   "requests": 11659225,
+   "rps": 194006.12,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 67.31391199999996,
+   "server_mhz": {
+    "mean": 3495.0021666666667,
+    "min": 3000.007,
+    "max": 4000.12
+   },
+   "pkg_celsius": {
+    "mean": 71.41666666666667,
+    "max": 78.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.74,
+   "server_us_per_req": 5.123839706326964,
+   "server_cpu_share": 0.9956666666666667,
+   "wrk_cpu_share": 0.28047463333333317,
+   "others_cpus": 0.3282681333333341,
+   "load": 2.00927734375,
+   "server": "nginx",
+   "scenario": "1cpu-pipelined",
+   "rep": 0,
+   "start": "2026-10-27 13:42:08",
+   "background_cpus": 0.44133333333333336,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:53877/plaintext\n  4 threads and 1024 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     7.55ms  653.70us  17.73ms   86.14%\n    Req/Sec    34.09k     2.16k   43.78k    72.91%\n  Latency Distribution\n     50%    7.53ms\n     75%    7.74ms\n     90%    7.98ms\n     99%    9.99ms\n  8127157 requests in 1.00m, 1.12GB read\nRequests/sec: 135346.71\nTransfer/sec:     19.10MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 7530.0,
+    "75%": 7740.0,
+    "90%": 7980.0,
+    "99%": 9990.0
+   },
+   "requests": 8127157,
+   "rps": 135346.71,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 63.86952400000001,
+   "server_mhz": {
+    "mean": 3658.3341333333333,
+    "min": 3300.0,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 71.71666666666667,
+    "max": 76.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.73,
+   "server_us_per_req": 7.349433510389918,
+   "server_cpu_share": 0.9954999999999999,
+   "wrk_cpu_share": 0.2661230166666667,
+   "others_cpus": 0.3513412666666665,
+   "load": 1.8251953125,
+   "server": "mojo",
+   "scenario": "1cpu-1024conns",
+   "rep": 0,
+   "start": "2026-10-27 13:43:29",
+   "background_cpus": 0.3106666666666667,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:59683/plaintext\n  4 threads and 1024 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency    14.21ms    2.56ms  31.20ms   82.16%\n    Req/Sec    18.10k     0.94k   30.17k    76.75%\n  Latency Distribution\n     50%   13.93ms\n     75%   15.22ms\n     90%   17.46ms\n     99%   20.28ms\n  4315907 requests in 1.00m, 522.73MB read\nRequests/sec:  71830.03\nTransfer/sec:      8.70MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 13930.0,
+    "75%": 15220.0,
+    "90%": 17460.0,
+    "99%": 20280.0
+   },
+   "requests": 4315907,
+   "rps": 71830.03,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 38.16964799999988,
+   "server_mhz": {
+    "mean": 3812.3235833333333,
+    "min": 3600.0,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 72.28333333333333,
+    "max": 76.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.76,
+   "server_us_per_req": 13.846452205758835,
+   "server_cpu_share": 0.996,
+   "wrk_cpu_share": 0.1590401999999995,
+   "others_cpus": 0.25383920000000193,
+   "load": 1.8037109375,
+   "server": "go",
+   "scenario": "1cpu-1024conns",
+   "rep": 0,
+   "start": "2026-10-27 13:44:49",
+   "background_cpus": 0.32,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:53611/plaintext\n  4 threads and 1024 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     8.09ms    0.87ms  19.71ms   75.90%\n    Req/Sec    31.80k     1.87k   57.79k    72.87%\n  Latency Distribution\n     50%    8.04ms\n     75%    8.60ms\n     90%    9.03ms\n     99%   10.42ms\n  7579756 requests in 1.00m, 0.94GB read\nRequests/sec: 126271.29\nTransfer/sec:     16.02MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 8039.999999999999,
+    "75%": 8600.0,
+    "90%": 9030.0,
+    "99%": 10420.0
+   },
+   "requests": 7579756,
+   "rps": 126271.29,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 68.51502599999992,
+   "server_mhz": {
+    "mean": 3657.59235,
+    "min": 3499.991,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 70.98333333333333,
+    "max": 76.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.77,
+   "server_us_per_req": 7.88547810773856,
+   "server_cpu_share": 0.9961666666666668,
+   "wrk_cpu_share": 0.28547927499999964,
+   "others_cpus": 0.288249566666668,
+   "load": 1.400390625,
+   "server": "fasthttp",
+   "scenario": "1cpu-1024conns",
+   "rep": 0,
+   "start": "2026-10-27 13:46:09",
+   "background_cpus": 0.31,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:32917/plaintext\n  4 threads and 1024 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     6.91ms  586.88us  17.25ms   80.94%\n    Req/Sec    37.23k     2.63k   97.23k    73.04%\n  Latency Distribution\n     50%    6.93ms\n     75%    7.11ms\n     90%    7.33ms\n     99%    8.73ms\n  8877015 requests in 1.00m, 1.07GB read\nRequests/sec: 147809.87\nTransfer/sec:     18.33MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 6930.0,
+    "75%": 7110.0,
+    "90%": 7330.0,
+    "99%": 8730.0
+   },
+   "requests": 8877015,
+   "rps": 147809.87,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 72.22716699999978,
+   "server_mhz": {
+    "mean": 3594.99985,
+    "min": 3300.008,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 71.51666666666667,
+    "max": 76.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.78,
+   "server_us_per_req": 6.734245689570199,
+   "server_cpu_share": 0.9963333333333334,
+   "wrk_cpu_share": 0.30094652916666575,
+   "others_cpus": 0.33671388333333707,
+   "load": 1.615234375,
+   "server": "hyper",
+   "scenario": "1cpu-1024conns",
+   "rep": 0,
+   "start": "2026-10-27 13:47:29",
+   "background_cpus": 0.2733333333333333,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:44661/plaintext\n  4 threads and 1024 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     7.14ms  531.82us  29.76ms   78.28%\n    Req/Sec    36.03k     2.08k   43.92k    69.28%\n  Latency Distribution\n     50%    7.14ms\n     75%    7.35ms\n     90%    7.60ms\n     99%    8.99ms\n  8591611 requests in 1.00m, 1.29GB read\nRequests/sec: 143100.66\nTransfer/sec:     21.97MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 7140.0,
+    "75%": 7350.0,
+    "90%": 7600.0,
+    "99%": 8990.0
+   },
+   "requests": 8591611,
+   "rps": 143100.66,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 66.83230400000002,
+   "server_mhz": {
+    "mean": 3667.9122166666666,
+    "min": 3100.0,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 71.25,
+    "max": 76.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.72,
+   "server_us_per_req": 6.9509664718293225,
+   "server_cpu_share": 0.9953333333333333,
+   "wrk_cpu_share": 0.2784679333333334,
+   "others_cpus": 0.31529493333333297,
+   "load": 1.6494140625,
+   "server": "nginx",
+   "scenario": "1cpu-1024conns",
+   "rep": 0,
+   "start": "2026-10-27 13:48:50",
+   "background_cpus": 0.3893333333333333,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:58011/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     0.88ms  753.93us  36.24ms   95.54%\n    Req/Sec    75.72k     9.35k  123.26k    81.27%\n  Latency Distribution\n     50%  758.00us\n     75%    0.88ms\n     90%    1.02ms\n     99%    4.39ms\n  18073083 requests in 1.00m, 2.49GB read\nRequests/sec: 300732.34\nTransfer/sec:     42.45MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 758.0,
+    "75%": 880.0,
+    "90%": 1020.0,
+    "99%": 4390.0
+   },
+   "requests": 18073083,
+   "rps": 300732.34,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 201.87186399999996,
+   "server_mhz": {
+    "mean": 2704.788433333333,
+    "min": 2499.99975,
+    "max": 2800.007
+   },
+   "pkg_celsius": {
+    "mean": 68.66666666666667,
+    "max": 70.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 231.52,
+   "server_us_per_req": 12.81021063202111,
+   "server_cpu_share": 0.9646666666666667,
+   "wrk_cpu_share": 0.8411327666666665,
+   "others_cpus": 0.5294689333333338,
+   "load": 1.42822265625,
+   "server": "mojo",
+   "scenario": "4cpu-keepalive",
+   "rep": 0,
+   "start": "2026-10-27 13:50:10",
+   "background_cpus": 0.5266666666666667,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:48759/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.80ms    1.47ms  34.46ms   75.74%\n    Req/Sec    39.18k     3.53k   69.17k    92.21%\n  Latency Distribution\n     50%    1.58ms\n     75%    2.49ms\n     90%    3.53ms\n     99%    6.74ms\n  9357074 requests in 1.00m, 1.11GB read\nRequests/sec: 155693.28\nTransfer/sec:     18.86MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1580.0,
+    "75%": 2490.0,
+    "90%": 3530.0,
+    "99%": 6740.0
+   },
+   "requests": 9357074,
+   "rps": 155693.28,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 106.53599199999996,
+   "server_mhz": {
+    "mean": 2869.796675,
+    "min": 2699.99825,
+    "max": 3106.53075
+   },
+   "pkg_celsius": {
+    "mean": 68.95,
+    "max": 75.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 231.54,
+   "server_us_per_req": 24.744914916778473,
+   "server_cpu_share": 0.96475,
+   "wrk_cpu_share": 0.44389996666666653,
+   "others_cpus": 0.32806680000000055,
+   "load": 5.060546875,
+   "server": "go",
+   "scenario": "4cpu-keepalive",
+   "rep": 0,
+   "start": "2026-10-27 13:51:31",
+   "background_cpus": 0.38333333333333336,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:41559/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   798.48us  623.91us  17.97ms   84.77%\n    Req/Sec    81.39k     7.44k  162.13k    87.74%\n  Latency Distribution\n     50%  723.00us\n     75%    1.06ms\n     90%    1.35ms\n     99%    3.44ms\n  19423030 requests in 1.00m, 2.41GB read\nRequests/sec: 323348.39\nTransfer/sec:     41.01MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 723.0,
+    "75%": 1060.0,
+    "90%": 1350.0,
+    "99%": 3440.0
+   },
+   "requests": 19423030,
+   "rps": 323348.39,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 211.05085799999983,
+   "server_mhz": {
+    "mean": 2716.297416666667,
+    "min": 2599.9965,
+    "max": 2800.00525
+   },
+   "pkg_celsius": {
+    "mean": 68.96666666666667,
+    "max": 71.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 234.91,
+   "server_us_per_req": 12.094405455791398,
+   "server_cpu_share": 0.9787916666666666,
+   "wrk_cpu_share": 0.8793785749999993,
+   "others_cpus": 0.37465236666666946,
+   "load": 4.45556640625,
+   "server": "fasthttp",
+   "scenario": "4cpu-keepalive",
+   "rep": 0,
+   "start": "2026-10-27 13:52:51",
+   "background_cpus": 0.31799999999999995,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:47751/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   702.28us  650.04us  36.86ms   96.51%\n    Req/Sec    89.60k     8.10k  144.00k    89.03%\n  Latency Distribution\n     50%  616.00us\n     75%  688.00us\n     90%  785.00us\n     99%    3.94ms\n  21374751 requests in 1.00m, 2.59GB read\nRequests/sec: 355761.94\nTransfer/sec:     44.11MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 616.0,
+    "75%": 688.0,
+    "90%": 785.0,
+    "99%": 3940.0
+   },
+   "requests": 21374751,
+   "rps": 355761.94,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 223.97452599999986,
+   "server_mhz": {
+    "mean": 2661.5781458333336,
+    "min": 2599.99625,
+    "max": 2700.00475
+   },
+   "pkg_celsius": {
+    "mean": 69.33333333333333,
+    "max": 71.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 227.15,
+   "server_us_per_req": 10.6270243803074,
+   "server_cpu_share": 0.9464583333333334,
+   "wrk_cpu_share": 0.933227191666666,
+   "others_cpus": 0.39992456666666903,
+   "load": 6.45263671875,
+   "server": "hyper",
+   "scenario": "4cpu-keepalive",
+   "rep": 0,
+   "start": "2026-10-27 13:54:11",
+   "background_cpus": 0.336,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:34163/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   764.21us  548.90us  20.40ms   96.40%\n    Req/Sec    83.83k     8.84k  155.37k    89.42%\n  Latency Distribution\n     50%  698.00us\n     75%  809.00us\n     90%    0.88ms\n     99%    3.57ms\n  20023693 requests in 1.00m, 3.00GB read\nRequests/sec: 333237.87\nTransfer/sec:     51.17MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 698.0,
+    "75%": 809.0,
+    "90%": 880.0,
+    "99%": 3570.0
+   },
+   "requests": 20023693,
+   "rps": 333237.87,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 217.24619699999982,
+   "server_mhz": {
+    "mean": 2723.5119,
+    "min": 2599.9965,
+    "max": 2800.0035
+   },
+   "pkg_celsius": {
+    "mean": 69.35,
+    "max": 72.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 233.77,
+   "server_us_per_req": 11.674669602655214,
+   "server_cpu_share": 0.9740416666666667,
+   "wrk_cpu_share": 0.9051924874999993,
+   "others_cpus": 0.38689671666666975,
+   "load": 6.5185546875,
+   "server": "nginx",
+   "scenario": "4cpu-keepalive",
+   "rep": 0,
+   "start": "2026-10-27 13:55:31",
+   "background_cpus": 0.376,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:56875/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.69ms    0.91ms  15.99ms   61.16%\n    Req/Sec   335.23k    22.91k  510.38k    92.92%\n  Latency Distribution\n     50%    1.67ms\n     75%    2.42ms\n     90%    2.90ms\n     99%    3.36ms\n  80054624 requests in 1.00m, 11.03GB read\nRequests/sec: 1332491.13\nTransfer/sec:    188.07MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1670.0,
+    "75%": 2420.0,
+    "90%": 2900.0,
+    "99%": 3360.0
+   },
+   "requests": 80054624,
+   "rps": 1332491.13,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 95.30982299999982,
+   "server_mhz": {
+    "mean": 2895.7868541666667,
+    "min": 2693.23825,
+    "max": 3999.99975
+   },
+   "pkg_celsius": {
+    "mean": 69.95,
+    "max": 86.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 239.45,
+   "server_us_per_req": 2.991082688740128,
+   "server_cpu_share": 0.9977083333333333,
+   "wrk_cpu_share": 0.39712426249999927,
+   "others_cpus": 0.3091696166666696,
+   "load": 6.30078125,
+   "server": "mojo",
+   "scenario": "4cpu-pipelined",
+   "rep": 0,
+   "start": "2026-10-27 13:56:52",
+   "background_cpus": 0.33,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:51205/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency    32.89ms   28.15ms 421.25ms   73.26%\n    Req/Sec    46.49k     4.86k   94.08k    79.12%\n  Latency Distribution\n     50%   26.94ms\n     75%   48.02ms\n     90%   68.37ms\n     99%  127.47ms\n  11101777 requests in 1.00m, 1.31GB read\nRequests/sec: 184729.85\nTransfer/sec:     22.37MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 26940.0,
+    "75%": 48020.0,
+    "90%": 68370.0,
+    "99%": 127470.0
+   },
+   "requests": 11101777,
+   "rps": 184729.85,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 69.47405299999991,
+   "server_mhz": {
+    "mean": 3009.8999416666666,
+    "min": 2699.998,
+    "max": 4000.0075
+   },
+   "pkg_celsius": {
+    "mean": 69.85,
+    "max": 83.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 232.2,
+   "server_us_per_req": 20.915570543346348,
+   "server_cpu_share": 0.9674999999999999,
+   "wrk_cpu_share": 0.289475220833333,
+   "others_cpus": 0.18743245000000144,
+   "load": 5.81396484375,
+   "server": "go",
+   "scenario": "4cpu-pipelined",
+   "rep": 0,
+   "start": "2026-10-27 13:58:12",
+   "background_cpus": 0.3453333333333333,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:47157/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.50ms    1.09ms  20.31ms   71.10%\n    Req/Sec   494.61k    49.65k    1.07M    89.49%\n  Latency Distribution\n     50%    1.28ms\n     75%    2.12ms\n     90%    2.94ms\n     99%    4.61ms\n  117999776 requests in 1.00m, 14.62GB read\nRequests/sec: 1963705.20\nTransfer/sec:    249.07MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1280.0,
+    "75%": 2120.0,
+    "90%": 2940.0,
+    "99%": 4610.0
+   },
+   "requests": 117999776,
+   "rps": 1963705.2,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 143.6844599999995,
+   "server_mhz": {
+    "mean": 2763.3202833333335,
+    "min": 2596.87975,
+    "max": 4000.0025
+   },
+   "pkg_celsius": {
+    "mean": 69.38333333333334,
+    "max": 87.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 235.78,
+   "server_us_per_req": 1.998139386298496,
+   "server_cpu_share": 0.9824166666666667,
+   "wrk_cpu_share": 0.5986852499999978,
+   "others_cpus": 0.4657590000000084,
+   "load": 4.61865234375,
+   "server": "fasthttp",
+   "scenario": "4cpu-pipelined",
+   "rep": 0,
+   "start": "2026-10-27 13:59:32",
+   "background_cpus": 0.286,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:51395/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.06ms  620.61us  15.36ms   66.03%\n    Req/Sec   538.44k    36.89k    0.94M    88.75%\n  Latency Distribution\n     50%    1.03ms\n     75%    1.49ms\n     90%    1.84ms\n     99%    2.42ms\n  128537552 requests in 1.00m, 15.56GB read\nRequests/sec: 2139180.99\nTransfer/sec:    265.21MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1030.0,
+    "75%": 1490.0,
+    "90%": 1840.0,
+    "99%": 2420.0
+   },
+   "requests": 128537552,
+   "rps": 2139180.99,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 159.25560599999994,
+   "server_mhz": {
+    "mean": 2691.156195833333,
+    "min": 2599.993,
+    "max": 2799.99975
+   },
+   "pkg_celsius": {
+    "mean": 69.88333333333334,
+    "max": 71.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 238.66,
+   "server_us_per_req": 1.8567336648826174,
+   "server_cpu_share": 0.9944166666666666,
+   "wrk_cpu_share": 0.6635650249999998,
+   "others_cpus": 0.29007323333333423,
+   "load": 4.958984375,
+   "server": "hyper",
+   "scenario": "4cpu-pipelined",
+   "rep": 0,
+   "start": "2026-10-27 14:00:53",
+   "background_cpus": 0.2886666666666667,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:56897/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     5.84ms    3.58ms  46.94ms   68.24%\n    Req/Sec   103.89k     7.92k  182.84k    95.50%\n  Latency Distribution\n     50%    5.41ms\n     75%    7.98ms\n     90%   10.35ms\n     99%   16.42ms\n  24811037 requests in 1.00m, 3.72GB read\nRequests/sec: 412997.79\nTransfer/sec:     63.41MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 5410.0,
+    "75%": 7980.0,
+    "90%": 10350.0,
+    "99%": 16420.0
+   },
+   "requests": 24811037,
+   "rps": 412997.79,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 153.59641699999997,
+   "server_mhz": {
+    "mean": 2791.6670833333333,
+    "min": 2699.99475,
+    "max": 3300.004
+   },
+   "pkg_celsius": {
+    "mean": 69.1,
+    "max": 78.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 239.51,
+   "server_us_per_req": 9.653365153580642,
+   "server_cpu_share": 0.9979583333333333,
+   "wrk_cpu_share": 0.6399850708333332,
+   "others_cpus": 0.2725597166666669,
+   "load": 5.53125,
+   "server": "nginx",
+   "scenario": "4cpu-pipelined",
+   "rep": 0,
+   "start": "2026-10-27 14:02:13",
+   "background_cpus": 0.3333333333333333,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:56639/plaintext\n  4 threads and 64 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   362.64us   91.29us   7.98ms   97.23%\n    Req/Sec    44.45k     3.97k   79.07k    79.02%\n  Latency Distribution\n     50%  360.00us\n     75%  376.00us\n     90%  402.00us\n     99%  518.00us\n  10623070 requests in 1.00m, 1.59GB read\nRequests/sec: 176757.30\nTransfer/sec:     27.14MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 360.0,
+    "75%": 376.0,
+    "90%": 402.0,
+    "99%": 518.0
+   },
+   "requests": 10623070,
+   "rps": 176757.3,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 93.65776800000026,
+   "server_mhz": {
+    "mean": 3488.5596333333333,
+    "min": 3000.0,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 71.11666666666666,
+    "max": 77.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.84,
+   "server_us_per_req": 5.633023222100579,
+   "server_cpu_share": 0.9973333333333334,
+   "wrk_cpu_share": 0.3902407000000011,
+   "others_cpus": 0.24937053333332906,
+   "load": 5.76171875,
+   "server": "nginx",
+   "scenario": "1cpu-keepalive",
+   "rep": 1,
+   "start": "2026-10-27 14:03:34",
+   "background_cpus": 0.246,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:32789/plaintext\n  4 threads and 64 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   362.40us  183.00us  14.71ms   96.57%\n    Req/Sec    44.95k     6.31k  166.70k    78.84%\n  Latency Distribution\n     50%  347.00us\n     75%  370.00us\n     90%  418.00us\n     99%  739.00us\n  10739839 requests in 1.00m, 1.30GB read\nRequests/sec: 178701.94\nTransfer/sec:     22.16MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 347.0,
+    "75%": 370.0,
+    "90%": 418.0,
+    "99%": 739.0
+   },
+   "requests": 10739839,
+   "rps": 178701.94,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 101.22218500000031,
+   "server_mhz": {
+    "mean": 3358.3341833333334,
+    "min": 3000.0,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 70.91666666666667,
+    "max": 78.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.77,
+   "server_us_per_req": 5.565260335839299,
+   "server_cpu_share": 0.9961666666666668,
+   "wrk_cpu_share": 0.42175910416666795,
+   "others_cpus": 0.4339635833333283,
+   "load": 2.88818359375,
+   "server": "hyper",
+   "scenario": "1cpu-keepalive",
+   "rep": 1,
+   "start": "2026-10-27 14:04:54",
+   "background_cpus": 0.27066666666666667,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:50283/plaintext\n  4 threads and 64 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   406.00us  257.56us   7.78ms   69.44%\n    Req/Sec    40.40k     5.66k  133.12k    80.01%\n  Latency Distribution\n     50%  399.00us\n     75%  571.00us\n     90%  698.00us\n     99%    1.09ms\n  9651730 requests in 1.00m, 1.20GB read\nRequests/sec: 160596.68\nTransfer/sec:     20.37MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 399.0,
+    "75%": 571.0,
+    "90%": 698.0,
+    "99%": 1090.0
+   },
+   "requests": 9651730,
+   "rps": 160596.68,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 88.20739699999967,
+   "server_mhz": {
+    "mean": 3396.9914833333332,
+    "min": 2900.014,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 70.38333333333334,
+    "max": 77.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.82,
+   "server_us_per_req": 6.1978526129512534,
+   "server_cpu_share": 0.997,
+   "wrk_cpu_share": 0.367530820833332,
+   "others_cpus": 0.4723767166666721,
+   "load": 2.5771484375,
+   "server": "fasthttp",
+   "scenario": "1cpu-keepalive",
+   "rep": 1,
+   "start": "2026-10-27 14:06:15",
+   "background_cpus": 0.5433333333333333,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:48959/plaintext\n  4 threads and 64 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   776.23us  471.28us  11.88ms   66.41%\n    Req/Sec    21.10k     1.89k   35.19k    80.02%\n  Latency Distribution\n     50%  773.00us\n     75%    1.10ms\n     90%    1.33ms\n     99%    1.94ms\n  5042503 requests in 1.00m, 610.73MB read\nRequests/sec:  83902.86\nTransfer/sec:     10.16MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 773.0,
+    "75%": 1100.0,
+    "90%": 1330.0,
+    "99%": 1940.0
+   },
+   "requests": 5042503,
+   "rps": 83902.86,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 41.07773399999951,
+   "server_mhz": {
+    "mean": 3526.66645,
+    "min": 3000.0,
+    "max": 4000.0
+   },
+   "pkg_celsius": {
+    "mean": 71.33333333333333,
+    "max": 77.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.79,
+   "server_us_per_req": 11.857206629326745,
+   "server_cpu_share": 0.9964999999999999,
+   "wrk_cpu_share": 0.17115722499999794,
+   "others_cpus": 0.5300377666666748,
+   "load": 2.5283203125,
+   "server": "go",
+   "scenario": "1cpu-keepalive",
+   "rep": 1,
+   "start": "2026-10-27 14:07:35",
+   "background_cpus": 0.92,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:43193/plaintext\n  4 threads and 64 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   402.52us   94.20us   6.45ms   94.56%\n    Req/Sec    40.03k     3.43k   69.36k    84.47%\n  Latency Distribution\n     50%  393.00us\n     75%  413.00us\n     90%  451.00us\n     99%  659.00us\n  9565953 requests in 1.00m, 1.32GB read\nRequests/sec: 159168.66\nTransfer/sec:     22.47MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 393.0,
+    "75%": 413.0,
+    "90%": 451.0,
+    "99%": 659.0
+   },
+   "requests": 9565953,
+   "rps": 159168.66,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 82.25339200000008,
+   "server_mhz": {
+    "mean": 3407.95885,
+    "min": 3050.841,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 70.71666666666667,
+    "max": 78.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.76,
+   "server_us_per_req": 6.247155928949264,
+   "server_cpu_share": 0.996,
+   "wrk_cpu_share": 0.342722466666667,
+   "others_cpus": 0.38294346666666546,
+   "load": 1.732421875,
+   "server": "mojo",
+   "scenario": "1cpu-keepalive",
+   "rep": 1,
+   "start": "2026-10-27 14:08:55",
+   "background_cpus": 0.4246666666666667,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:46363/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency    12.25ms    9.38ms 605.86ms   86.50%\n    Req/Sec    47.44k     4.53k   72.71k    78.00%\n  Latency Distribution\n     50%   11.86ms\n     75%   17.12ms\n     90%   20.65ms\n     99%   28.56ms\n  11326503 requests in 1.00m, 1.70GB read\nRequests/sec: 188540.36\nTransfer/sec:     28.95MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 11860.0,
+    "75%": 17120.0,
+    "90%": 20650.0,
+    "99%": 28560.0
+   },
+   "requests": 11326503,
+   "rps": 188540.36,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 66.76253799999995,
+   "server_mhz": {
+    "mean": 3447.64265,
+    "min": 3100.0,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 70.55,
+    "max": 76.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.7,
+   "server_us_per_req": 5.270823660224166,
+   "server_cpu_share": 0.995,
+   "wrk_cpu_share": 0.27817724166666646,
+   "others_cpus": 0.3556243666666674,
+   "load": 1.95947265625,
+   "server": "nginx",
+   "scenario": "1cpu-pipelined",
+   "rep": 1,
+   "start": "2026-10-27 14:10:15",
+   "background_cpus": 0.414,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:40075/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     2.03ms    1.11ms  12.88ms   62.52%\n    Req/Sec   282.61k    23.44k  399.04k    80.12%\n  Latency Distribution\n     50%    1.99ms\n     75%    2.87ms\n     90%    3.44ms\n     99%    4.88ms\n  67472768 requests in 1.00m, 8.17GB read\nRequests/sec: 1122804.61\nTransfer/sec:    139.20MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1990.0,
+    "75%": 2870.0,
+    "90%": 3440.0,
+    "99%": 4880.0
+   },
+   "requests": 67472768,
+   "rps": 1122804.61,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 57.174923000000035,
+   "server_mhz": {
+    "mean": 3468.7549166666668,
+    "min": 3100.0,
+    "max": 4000.0
+   },
+   "pkg_celsius": {
+    "mean": 72.36666666666666,
+    "max": 78.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.76,
+   "server_us_per_req": 0.8856906537464122,
+   "server_cpu_share": 0.996,
+   "wrk_cpu_share": 0.23822884583333348,
+   "others_cpus": 0.4779179499999993,
+   "load": 1.89453125,
+   "server": "hyper",
+   "scenario": "1cpu-pipelined",
+   "rep": 1,
+   "start": "2026-10-27 14:11:36",
+   "background_cpus": 0.46266666666666667,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:60013/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     2.27ms    1.38ms  17.42ms   64.93%\n    Req/Sec   272.36k    21.85k  571.96k    78.50%\n  Latency Distribution\n     50%    2.07ms\n     75%    3.18ms\n     90%    4.19ms\n     99%    5.83ms\n  65037280 requests in 1.00m, 8.06GB read\nRequests/sec: 1082440.35\nTransfer/sec:    137.30MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 2070.0,
+    "75%": 3180.0,
+    "90%": 4190.0,
+    "99%": 5830.0
+   },
+   "requests": 65037280,
+   "rps": 1082440.35,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 57.20975999999973,
+   "server_mhz": {
+    "mean": 3507.4237166666667,
+    "min": 3100.007,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 71.41666666666667,
+    "max": 78.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.77,
+   "server_us_per_req": 0.9190113731693577,
+   "server_cpu_share": 0.9961666666666668,
+   "wrk_cpu_share": 0.2383739999999989,
+   "others_cpus": 0.45350400000000446,
+   "load": 2.02490234375,
+   "server": "fasthttp",
+   "scenario": "1cpu-pipelined",
+   "rep": 1,
+   "start": "2026-10-27 14:12:56",
+   "background_cpus": 0.452,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:49993/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency    28.92ms   18.99ms 128.99ms   62.65%\n    Req/Sec    25.66k     1.88k   32.97k    74.20%\n  Latency Distribution\n     50%   25.48ms\n     75%   42.97ms\n     90%   56.18ms\n     99%   75.93ms\n  6125710 requests in 1.00m, 741.93MB read\nRequests/sec: 101981.11\nTransfer/sec:     12.35MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 25480.0,
+    "75%": 42970.0,
+    "90%": 56180.0,
+    "99%": 75930.0
+   },
+   "requests": 6125710,
+   "rps": 101981.11,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 27.663718000000245,
+   "server_mhz": {
+    "mean": 3803.9746999999998,
+    "min": 3500.0,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 73.01666666666667,
+    "max": 76.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.78,
+   "server_us_per_req": 9.758868767865277,
+   "server_cpu_share": 0.9963333333333334,
+   "wrk_cpu_share": 0.11526549166666769,
+   "others_cpus": 0.32777136666666257,
+   "load": 1.9609375,
+   "server": "go",
+   "scenario": "1cpu-pipelined",
+   "rep": 1,
+   "start": "2026-10-27 14:14:16",
+   "background_cpus": 0.4106666666666667,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:60627/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     3.00ms    1.57ms  12.16ms   59.71%\n    Req/Sec   189.56k    11.70k  277.60k    69.04%\n  Latency Distribution\n     50%    2.97ms\n     75%    4.29ms\n     90%    5.07ms\n     99%    6.07ms\n  45271152 requests in 1.00m, 6.24GB read\nRequests/sec: 753526.68\nTransfer/sec:    106.36MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 2970.0,
+    "75%": 4290.0,
+    "90%": 5070.0,
+    "99%": 6070.0
+   },
+   "requests": 45271152,
+   "rps": 753526.68,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 35.55569400000013,
+   "server_mhz": {
+    "mean": 3755.00055,
+    "min": 3200.0,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 73.88333333333334,
+    "max": 78.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.81,
+   "server_us_per_req": 1.3211503873371722,
+   "server_cpu_share": 0.9968333333333333,
+   "wrk_cpu_share": 0.14814872500000054,
+   "others_cpus": 0.3712384333333311,
+   "load": 3.0244140625,
+   "server": "mojo",
+   "scenario": "1cpu-pipelined",
+   "rep": 1,
+   "start": "2026-10-27 14:15:37",
+   "background_cpus": 0.358,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:41679/plaintext\n  4 threads and 1024 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     7.33ms  748.38us  53.11ms   81.92%\n    Req/Sec    35.08k     2.48k   41.04k    75.77%\n  Latency Distribution\n     50%    7.26ms\n     75%    7.53ms\n     90%    7.91ms\n     99%   10.57ms\n  8371387 requests in 1.00m, 1.26GB read\nRequests/sec: 139312.33\nTransfer/sec:     21.39MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 7260.0,
+    "75%": 7530.0,
+    "90%": 7910.0,
+    "99%": 10570.0
+   },
+   "requests": 8371387,
+   "rps": 139312.33,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 68.31336099999953,
+   "server_mhz": {
+    "mean": 3639.1589,
+    "min": 3200.0,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 70.68333333333334,
+    "max": 75.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.75,
+   "server_us_per_req": 7.137407457091639,
+   "server_cpu_share": 0.9958333333333333,
+   "wrk_cpu_share": 0.2846390041666647,
+   "others_cpus": 0.4182773166666744,
+   "load": 1.673828125,
+   "server": "nginx",
+   "scenario": "1cpu-1024conns",
+   "rep": 1,
+   "start": "2026-10-27 14:16:57",
+   "background_cpus": 0.382,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:33367/plaintext\n  4 threads and 1024 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     7.24ms  767.85us  21.06ms   83.92%\n    Req/Sec    35.53k     2.54k   60.79k    76.63%\n  Latency Distribution\n     50%    7.14ms\n     75%    7.42ms\n     90%    7.82ms\n     99%   10.89ms\n  8473528 requests in 1.00m, 1.03GB read\nRequests/sec: 141079.05\nTransfer/sec:     17.49MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 7140.0,
+    "75%": 7420.0,
+    "90%": 7820.0,
+    "99%": 10890.0
+   },
+   "requests": 8473528,
+   "rps": 141079.05,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 72.20651499999985,
+   "server_mhz": {
+    "mean": 3528.33275,
+    "min": 3000.0,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 70.46666666666667,
+    "max": 75.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.72,
+   "server_us_per_req": 7.047831788600923,
+   "server_cpu_share": 0.9953333333333333,
+   "wrk_cpu_share": 0.3008604791666661,
+   "others_cpus": 0.4902247500000025,
+   "load": 1.64697265625,
+   "server": "hyper",
+   "scenario": "1cpu-1024conns",
+   "rep": 1,
+   "start": "2026-10-27 14:18:18",
+   "background_cpus": 0.45266666666666666,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:56657/plaintext\n  4 threads and 1024 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     8.39ms    1.02ms  21.44ms   79.10%\n    Req/Sec    30.64k     1.94k   64.66k    75.79%\n  Latency Distribution\n     50%    8.31ms\n     75%    8.92ms\n     90%    9.42ms\n     99%   11.89ms\n  7305299 requests in 1.00m, 0.90GB read\nRequests/sec: 121665.03\nTransfer/sec:     15.43MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 8310.0,
+    "75%": 8920.0,
+    "90%": 9420.0,
+    "99%": 11890.0
+   },
+   "requests": 7305299,
+   "rps": 121665.03,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 66.03953700000056,
+   "server_mhz": {
+    "mean": 3613.9339333333332,
+    "min": 3299.991,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 70.35,
+    "max": 75.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.72,
+   "server_us_per_req": 8.174887845110788,
+   "server_cpu_share": 0.9953333333333333,
+   "wrk_cpu_share": 0.27516473750000237,
+   "others_cpus": 0.3888410499999907,
+   "load": 2.64990234375,
+   "server": "fasthttp",
+   "scenario": "1cpu-1024conns",
+   "rep": 1,
+   "start": "2026-10-27 14:19:38",
+   "background_cpus": 0.37866666666666665,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:38483/plaintext\n  4 threads and 1024 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency    14.94ms    3.40ms  51.03ms   86.52%\n    Req/Sec    17.24k     1.94k   24.21k    88.53%\n  Latency Distribution\n     50%   14.36ms\n     75%   16.00ms\n     90%   18.55ms\n     99%   27.35ms\n  4114941 requests in 1.00m, 498.39MB read\nRequests/sec:  68470.20\nTransfer/sec:      8.29MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 14360.0,
+    "75%": 16000.0,
+    "90%": 18550.0,
+    "99%": 27350.0
+   },
+   "requests": 4114941,
+   "rps": 68470.2,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 37.70033400000057,
+   "server_mhz": {
+    "mean": 3699.9998166666664,
+    "min": 2700.006,
+    "max": 4000.01
+   },
+   "pkg_celsius": {
+    "mean": 71.31666666666666,
+    "max": 75.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.76,
+   "server_us_per_req": 14.522686959545714,
+   "server_cpu_share": 0.996,
+   "wrk_cpu_share": 0.15708472500000237,
+   "others_cpus": 0.6129944333333239,
+   "load": 2.2626953125,
+   "server": "go",
+   "scenario": "1cpu-1024conns",
+   "rep": 1,
+   "start": "2026-10-27 14:20:58",
+   "background_cpus": 0.44333333333333336,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:50423/plaintext\n  4 threads and 1024 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     7.98ms  787.20us  21.88ms   85.16%\n    Req/Sec    32.22k     2.16k   57.17k    79.80%\n  Latency Distribution\n     50%    7.90ms\n     75%    8.17ms\n     90%    8.52ms\n     99%   11.43ms\n  7682550 requests in 1.00m, 1.06GB read\nRequests/sec: 127926.02\nTransfer/sec:     18.06MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 7900.0,
+    "75%": 8170.0,
+    "90%": 8520.0,
+    "99%": 11430.0
+   },
+   "requests": 7682550,
+   "rps": 127926.02,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 63.31402799999978,
+   "server_mhz": {
+    "mean": 3612.0289166666666,
+    "min": 3300.0,
+    "max": 4000.0
+   },
+   "pkg_celsius": {
+    "mean": 71.03333333333333,
+    "max": 75.0
+   },
+   "server_cpus": "2",
+   "server_cpu_s": 59.65,
+   "server_us_per_req": 7.764349076803926,
+   "server_cpu_share": 0.9941666666666666,
+   "wrk_cpu_share": 0.2638084499999991,
+   "others_cpus": 0.4489328666666703,
+   "load": 2.01611328125,
+   "server": "mojo",
+   "scenario": "1cpu-1024conns",
+   "rep": 1,
+   "start": "2026-10-27 14:22:18",
+   "background_cpus": 0.7333333333333333,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:53773/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   822.05us  724.56us  20.75ms   94.67%\n    Req/Sec    80.95k     9.56k  176.40k    86.57%\n  Latency Distribution\n     50%  699.00us\n     75%  814.00us\n     90%    0.98ms\n     99%    4.47ms\n  19316400 requests in 1.00m, 2.90GB read\nRequests/sec: 321444.63\nTransfer/sec:     49.36MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 699.0,
+    "75%": 814.0,
+    "90%": 980.0,
+    "99%": 4470.0
+   },
+   "requests": 19316400,
+   "rps": 321444.63,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 209.4896789999998,
+   "server_mhz": {
+    "mean": 2712.7019,
+    "min": 2599.99975,
+    "max": 2800.00525
+   },
+   "pkg_celsius": {
+    "mean": 68.83333333333333,
+    "max": 71.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 227.08,
+   "server_us_per_req": 11.755813712700089,
+   "server_cpu_share": 0.9461666666666667,
+   "wrk_cpu_share": 0.8728736624999992,
+   "others_cpus": 0.5538386833333367,
+   "load": 1.71044921875,
+   "server": "nginx",
+   "scenario": "4cpu-keepalive",
+   "rep": 1,
+   "start": "2026-10-27 14:23:38",
+   "background_cpus": 0.3993333333333334,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:59409/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   760.61us  722.18us  18.73ms   94.85%\n    Req/Sec    86.57k     7.71k  111.97k    82.86%\n  Latency Distribution\n     50%  632.00us\n     75%  750.00us\n     90%    0.90ms\n     99%    4.47ms\n  20663297 requests in 1.00m, 2.50GB read\nRequests/sec: 343995.85\nTransfer/sec:     42.65MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 632.0,
+    "75%": 750.0,
+    "90%": 900.0,
+    "99%": 4470.0
+   },
+   "requests": 20663297,
+   "rps": 343995.85,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 218.59205999999995,
+   "server_mhz": {
+    "mean": 2666.3602458333335,
+    "min": 2500.003,
+    "max": 2700.00475
+   },
+   "pkg_celsius": {
+    "mean": 68.98333333333333,
+    "max": 70.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 221.79,
+   "server_us_per_req": 10.733524277369677,
+   "server_cpu_share": 0.924125,
+   "wrk_cpu_share": 0.9108002499999998,
+   "others_cpus": 0.5037990000000008,
+   "load": 5.3759765625,
+   "server": "hyper",
+   "scenario": "4cpu-keepalive",
+   "rep": 1,
+   "start": "2026-10-27 14:24:59",
+   "background_cpus": 0.422,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:39087/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   846.08us  764.34us  19.75ms   92.06%\n    Req/Sec    79.21k     7.36k  105.29k    75.95%\n  Latency Distribution\n     50%  705.00us\n     75%    1.08ms\n     90%    1.44ms\n     99%    4.38ms\n  18918672 requests in 1.00m, 2.34GB read\nRequests/sec: 314793.85\nTransfer/sec:     39.93MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 705.0,
+    "75%": 1080.0,
+    "90%": 1440.0,
+    "99%": 4380.0
+   },
+   "requests": 18918672,
+   "rps": 314793.85,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 204.55644100000063,
+   "server_mhz": {
+    "mean": 2704.5329375,
+    "min": 2599.99975,
+    "max": 2800.0015
+   },
+   "pkg_celsius": {
+    "mean": 68.78333333333333,
+    "max": 70.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 230.75,
+   "server_us_per_req": 12.19694490184089,
+   "server_cpu_share": 0.9614583333333333,
+   "wrk_cpu_share": 0.8523185041666693,
+   "others_cpus": 0.4977259833333226,
+   "load": 6.36962890625,
+   "server": "fasthttp",
+   "scenario": "4cpu-keepalive",
+   "rep": 1,
+   "start": "2026-10-27 14:26:19",
+   "background_cpus": 0.42133333333333334,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:51421/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.84ms    1.51ms  31.04ms   75.95%\n    Req/Sec    38.59k     3.97k   73.21k    91.00%\n  Latency Distribution\n     50%    1.60ms\n     75%    2.53ms\n     90%    3.63ms\n     99%    7.04ms\n  9214932 requests in 1.00m, 1.09GB read\nRequests/sec: 153357.24\nTransfer/sec:     18.57MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1600.0,
+    "75%": 2530.0,
+    "90%": 3630.0,
+    "99%": 7040.0
+   },
+   "requests": 9214932,
+   "rps": 153357.24,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 106.70986399999947,
+   "server_mhz": {
+    "mean": 2874.1269333333335,
+    "min": 2699.99625,
+    "max": 4000.00575
+   },
+   "pkg_celsius": {
+    "mean": 69.36666666666666,
+    "max": 85.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 230.67,
+   "server_us_per_req": 25.032197741665374,
+   "server_cpu_share": 0.9611249999999999,
+   "wrk_cpu_share": 0.4446244333333311,
+   "others_cpus": 0.4710022666666755,
+   "load": 6.78125,
+   "server": "go",
+   "scenario": "4cpu-keepalive",
+   "rep": 1,
+   "start": "2026-10-27 14:27:40",
+   "background_cpus": 0.42,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:57289/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     0.89ms  766.63us  29.75ms   94.45%\n    Req/Sec    75.70k     8.69k  121.80k    80.10%\n  Latency Distribution\n     50%  737.00us\n     75%    0.92ms\n     90%    1.10ms\n     99%    4.57ms\n  18067690 requests in 1.00m, 2.49GB read\nRequests/sec: 300670.33\nTransfer/sec:     42.44MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 737.0,
+    "75%": 920.0,
+    "90%": 1100.0,
+    "99%": 4570.0
+   },
+   "requests": 18067690,
+   "rps": 300670.33,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 196.64230699999962,
+   "server_mhz": {
+    "mean": 2698.7424625,
+    "min": 2599.998,
+    "max": 2800.00175
+   },
+   "pkg_celsius": {
+    "mean": 68.81666666666666,
+    "max": 71.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 230.85,
+   "server_us_per_req": 12.776951563813636,
+   "server_cpu_share": 0.9618749999999999,
+   "wrk_cpu_share": 0.8193429458333318,
+   "others_cpus": 0.5929615500000064,
+   "load": 5.482421875,
+   "server": "mojo",
+   "scenario": "4cpu-keepalive",
+   "rep": 1,
+   "start": "2026-10-27 14:29:00",
+   "background_cpus": 0.47,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:60963/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     6.02ms    3.80ms  44.76ms   68.15%\n    Req/Sec   102.41k     7.34k  181.30k    86.44%\n  Latency Distribution\n     50%    5.47ms\n     75%    8.20ms\n     90%   11.15ms\n     99%   17.38ms\n  24443870 requests in 1.00m, 3.67GB read\nRequests/sec: 406953.26\nTransfer/sec:     62.48MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 5470.0,
+    "75%": 8200.0,
+    "90%": 11150.0,
+    "99%": 17380.0
+   },
+   "requests": 24443870,
+   "rps": 406953.26,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 144.76259299999992,
+   "server_mhz": {
+    "mean": 2751.1050375,
+    "min": 2599.993,
+    "max": 2800.0035
+   },
+   "pkg_celsius": {
+    "mean": 68.96666666666667,
+    "max": 71.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 238.69,
+   "server_us_per_req": 9.764820382369894,
+   "server_cpu_share": 0.9945416666666667,
+   "wrk_cpu_share": 0.6031774708333331,
+   "others_cpus": 0.5807901166666681,
+   "load": 6.46923828125,
+   "server": "nginx",
+   "scenario": "4cpu-pipelined",
+   "rep": 1,
+   "start": "2026-10-27 14:30:20",
+   "background_cpus": 0.44466666666666665,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:58773/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.11ms  746.93us  26.26ms   76.89%\n    Req/Sec   526.39k    35.77k    0.93M    83.72%\n  Latency Distribution\n     50%    1.04ms\n     75%    1.52ms\n     90%    1.86ms\n     99%    3.74ms\n  125560384 requests in 1.00m, 15.20GB read\nRequests/sec: 2090876.31\nTransfer/sec:    259.22MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1040.0,
+    "75%": 1520.0,
+    "90%": 1860.0,
+    "99%": 3740.0
+   },
+   "requests": 125560384,
+   "rps": 2090876.31,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 155.62116500000002,
+   "server_mhz": {
+    "mean": 2667.662566666667,
+    "min": 2599.99475,
+    "max": 2700.006
+   },
+   "pkg_celsius": {
+    "mean": 69.53333333333333,
+    "max": 71.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 236.26,
+   "server_us_per_req": 1.881644452441305,
+   "server_cpu_share": 0.9844166666666666,
+   "wrk_cpu_share": 0.6484215208333334,
+   "others_cpus": 0.48348058333333294,
+   "load": 6.99462890625,
+   "server": "hyper",
+   "scenario": "4cpu-pipelined",
+   "rep": 1,
+   "start": "2026-10-27 14:31:41",
+   "background_cpus": 0.348,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:45201/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.48ms    1.04ms  22.12ms   68.16%\n    Req/Sec   496.28k    37.00k    1.02M    90.32%\n  Latency Distribution\n     50%    1.27ms\n     75%    2.11ms\n     90%    2.92ms\n     99%    4.27ms\n  118425072 requests in 1.00m, 14.67GB read\nRequests/sec: 1970904.06\nTransfer/sec:    249.99MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1270.0,
+    "75%": 2110.0,
+    "90%": 2920.0,
+    "99%": 4270.0
+   },
+   "requests": 118425072,
+   "rps": 1970904.06,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 143.60636699999986,
+   "server_mhz": {
+    "mean": 2756.9446791666664,
+    "min": 2599.9965,
+    "max": 2800.00525
+   },
+   "pkg_celsius": {
+    "mean": 68.96666666666667,
+    "max": 71.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 237.93,
+   "server_us_per_req": 2.0091184745068174,
+   "server_cpu_share": 0.991375,
+   "wrk_cpu_share": 0.5983598624999994,
+   "others_cpus": 0.4523938833333356,
+   "load": 5.8369140625,
+   "server": "fasthttp",
+   "scenario": "4cpu-pipelined",
+   "rep": 1,
+   "start": "2026-10-27 14:33:01",
+   "background_cpus": 0.316,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:38127/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency    34.67ms   30.15ms 329.11ms   74.25%\n    Req/Sec    45.28k     5.40k   78.04k    80.46%\n  Latency Distribution\n     50%   28.04ms\n     75%   50.59ms\n     90%   72.79ms\n     99%  137.10ms\n  10814642 requests in 1.00m, 1.28GB read\nRequests/sec: 180020.92\nTransfer/sec:     21.80MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 28040.0,
+    "75%": 50590.0,
+    "90%": 72790.0,
+    "99%": 137100.0
+   },
+   "requests": 10814642,
+   "rps": 180020.92,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 69.4517120000005,
+   "server_mhz": {
+    "mean": 2960.259595833333,
+    "min": 2715.588,
+    "max": 3999.99775
+   },
+   "pkg_celsius": {
+    "mean": 69.76666666666667,
+    "max": 83.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 231.02,
+   "server_us_per_req": 21.361779705698996,
+   "server_cpu_share": 0.9625833333333333,
+   "wrk_cpu_share": 0.2893821333333354,
+   "others_cpus": 0.3978047999999916,
+   "load": 5.552734375,
+   "server": "go",
+   "scenario": "4cpu-pipelined",
+   "rep": 1,
+   "start": "2026-10-27 14:34:21",
+   "background_cpus": 0.4086666666666667,
+   "waited_s": 0
+  },
+  {
+   "raw": "Running 1m test @ http://127.0.0.1:55367/plaintext\n  4 threads and 256 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.71ms    0.92ms  16.24ms   60.89%\n    Req/Sec   332.07k    24.83k  530.42k    93.87%\n  Latency Distribution\n     50%    1.68ms\n     75%    2.44ms\n     90%    2.92ms\n     99%    3.40ms\n  79273920 requests in 1.00m, 10.93GB read\nRequests/sec: 1319490.73\nTransfer/sec:    186.24MB\n",
+   "errors": 0,
+   "non2xx": 0,
+   "latency_us": {
+    "50%": 1680.0,
+    "75%": 2440.0,
+    "90%": 2920.0,
+    "99%": 3400.0
+   },
+   "requests": 79273920,
+   "rps": 1319490.73,
+   "wrk_threads": 4,
+   "wrk_cpu_s": 93.61115299999983,
+   "server_mhz": {
+    "mean": 2881.018791666667,
+    "min": 2799.994,
+    "max": 3999.99175
+   },
+   "pkg_celsius": {
+    "mean": 69.86666666666666,
+    "max": 86.0
+   },
+   "server_cpus": "2,3,6,7",
+   "server_cpu_s": 239.33,
+   "server_us_per_req": 3.0190256770448594,
+   "server_cpu_share": 0.9972083333333334,
+   "wrk_cpu_share": 0.3900464708333326,
+   "others_cpus": 0.4298141166666696,
+   "load": 4.3544921875,
+   "server": "mojo",
+   "scenario": "4cpu-pipelined",
+   "rep": 1,
+   "start": "2026-10-27 14:35:41",
+   "background_cpus": 0.2826666666666667,
+   "waited_s": 0
+  }
+ ]
+}

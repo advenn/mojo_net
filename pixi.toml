@@ -84,8 +84,8 @@ rattler-build = ">=0.77"
 [feature.package.tasks]
 package = "bash tools/build_package.sh"
 
-# The HTTP server benchmark (bench/server/README.md): wrk and nginx, beside
-# the default environment's Mojo. Go and Rust come from the host. x86_64
+# The HTTP server benchmark (bench/server/README.md): wrk, nginx, Go and
+# Rust, pinned by pixi.lock, beside the default environment's Mojo. x86_64
 # only: conda-forge has no wrk for aarch64.
 [feature.bench]
 platforms = ["linux-64"]
@@ -93,6 +93,8 @@ platforms = ["linux-64"]
 [feature.bench.dependencies]
 wrk = ">=4.2"
 nginx = ">=1.31"
+go = ">=1.27"
+rust = ">=1.99"
 
 [feature.bench.tasks]
 bench-server = "python3 bench/server/run.py"

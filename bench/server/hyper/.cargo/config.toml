@@ -1,0 +1,5 @@
+# Read by cargo when it runs in this directory (run.py's `build` does): the
+# benchmark's hyper is built for the host CPU, as Mojo builds by default and
+# as the Go servers are (GOAMD64 set to the host's level).
+[build]
+rustflags = ["-C", "target-cpu=native"]

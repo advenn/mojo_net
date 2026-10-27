@@ -1,8 +1,9 @@
 // Go's net/http for bench/server/run.py: GET /plaintext answers
-// "Hello, World!", as bench/server/plaintext.mojo does. GOMAXPROCS sets the
-// CPUs it uses.
+// "Hello, World!", as bench/server/plaintext.mojo does. One process;
+// GOMAXPROCS sets the CPUs it uses. default.pgo is its PGO profile (see
+// run.py's `pgo`).
 //
-//	go build -o bench/server/out/go_plaintext ./bench/server/go
+//	go build -C bench/server/go -o ../out/go_plaintext .
 //	GOMAXPROCS=1 bench/server/out/go_plaintext 127.0.0.1:8080
 package main
 
@@ -14,6 +15,7 @@ import (
 )
 
 func main() {
+	profile()
 	addr := "127.0.0.1:8080"
 	if len(os.Args) > 1 {
 		addr = os.Args[1]

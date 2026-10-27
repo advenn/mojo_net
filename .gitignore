@@ -19,3 +19,4 @@ output/
 # HTTP server benchmark outputs: rebuilt by bench/server/run.py build; only result JSONs are kept.
 bench/server/out/*
 !bench/server/out/*.json
+bench/server/hyper/target/
