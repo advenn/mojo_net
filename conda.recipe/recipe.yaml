@@ -25,7 +25,7 @@ build:
   noarch: generic
   script:
     - mkdir -p "$PREFIX/lib/mojo" check
-    - for pkg in linux bytes crypto net tls http server pg redis; do mojo precompile -I src "src/$pkg" -o "check/$pkg.mojoc" || exit 1; cp -R "src/$pkg" "$PREFIX/lib/mojo/$pkg"; done
+    - for pkg in linux bytes crypto json net tls http server pg redis; do mojo precompile -I src "src/$pkg" -o "check/$pkg.mojoc" || exit 1; cp -R "src/$pkg" "$PREFIX/lib/mojo/$pkg"; done
     - find "$PREFIX/lib/mojo" -name __pycache__ -prune -exec rm -rf {} +
 
 requirements:
@@ -55,7 +55,7 @@ about:
     Raw Linux syscalls (linux), byte buffers and the sans-I/O codec contract
     (bytes), TCP/Unix/UDP sockets with deadlines, DNS and Happy Eyeballs
     (net), TLS through OpenSSL (tls), HTTP/1.1 (http) and an HTTP/1.1
-    server (server), a PostgreSQL driver (pg), a Redis client (redis), and
-    the hashes they authenticate with (crypto). Linux only, x86_64 and
-    aarch64.
+    server (server), strict JSON with shortest round-trip floats (json), a
+    PostgreSQL driver (pg), a Redis client (redis), and the hashes they
+    authenticate with (crypto). Linux only, x86_64 and aarch64.
   # (no licence chosen yet; one is required before publishing)

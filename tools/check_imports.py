@@ -38,6 +38,7 @@ ALLOWED = {
     "http": {"linux", "bytes", "net", "tls", "http"},
     "server": {"linux", "bytes", "net", "http", "tls", "server"},
     "crypto": {"crypto"},
+    "json": {"json"},
     "pg": {"linux", "bytes", "net", "crypto", "pg"},
     "redis": {"linux", "bytes", "net", "redis"},
     "tls": {"linux", "bytes", "net", "tls"},

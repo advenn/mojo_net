@@ -11,6 +11,7 @@ from bytes import ByteBuffer
 from bytes.base64 import base64_decode, base64_encode
 from crypto.sha256 import sha256
 from http.parse import HeadParser, RequestHead
+from json import Writer, format_float, parse
 from linux.time import Deadline, Duration
 from net.addr import SocketAddr
 from net.tcp import TcpListener, TcpStream
@@ -46,6 +47,21 @@ def _bytes_and_crypto() raises:
     var digest = sha256("abc".as_bytes())  # (FIPS 180-2's first vector)
     assert_equal(Int(digest[0]), 0xBA)
     assert_equal(Int(digest[31]), 0xAD)
+
+
+def _json() raises:
+    """`json`: a document parsed and read, and one written."""
+    var doc = parse('{"choices": [{"message": {"content": "hi"}}], "usage": {"total_tokens": 7}}')
+    var message = doc.member(doc.child(doc.member(0, "choices"), 0), "message")
+    assert_equal(doc.text(doc.member(message, "content")), "hi")
+    assert_equal(doc.int(doc.member(doc.member(0, "usage"), "total_tokens")), 7)
+    var w = Writer()
+    w.begin_object()
+    w.key("temperature")
+    w.float(0.1)
+    w.end_object()
+    assert_equal(String(unsafe_from_utf8=Span(w.take())), '{"temperature":0.1}')
+    assert_equal(format_float(Float64(0.1) + Float64(0.2)), "0.30000000000000004")
 
 
 def _protocols() raises:
@@ -106,5 +122,6 @@ def main() raises:
     _tcp()
     _tls()
     _bytes_and_crypto()
+    _json()
     _protocols()
     print("mojo-net: every library imports and works")
