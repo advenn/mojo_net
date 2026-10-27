@@ -80,7 +80,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   rm -rf "$plant"
   mkdir -p "$plant"
   cp -r src "$plant/src"
-  python3 - "$plant/src/tls/client.mojo" <<'PY'
+  python3 - "$plant/src/tls/engine.mojo" <<'PY'
 import sys
 p = sys.argv[1]
 t = open(p).read()

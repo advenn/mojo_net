@@ -11,11 +11,15 @@ import signal
 import time
 
 
-def run(argv, timeout):
+def run(argv, timeout, env=None):
+    """`env`: the program's environment (default: this process's)."""
     pid, fd = pty.fork()
     if pid == 0:
         try:
-            os.execv(argv[0], list(argv))
+            if env is None:
+                os.execv(argv[0], list(argv))
+            else:
+                os.execve(argv[0], list(argv), env)
         finally:
             os._exit(127)
     out = b""

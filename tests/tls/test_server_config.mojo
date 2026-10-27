@@ -154,7 +154,12 @@ def test_an_encrypted_key_is_refused_without_a_prompt() raises:
     var sys = Python.import_module("sys")
     if not Bool(py=Python.evaluate("lambda p: 'tests/tls' in p")(sys.path)):
         _ = sys.path.insert(0, "tests/tls")
-    var out = String(py=Python.import_module("on_tty").run(Python.list(exe, d + "/good.chain.pem", enc), 60))
+    # The app is built without AddressSanitizer: under TG8, LD_LIBRARY_PATH
+    # points at an instrumented libssl it could not load. (A copy of the
+    # environment: `os.environ.copy()` would be the same object, CLAUDE.md.)
+    var env = Python.import_module("builtins").dict(os.environ)
+    _ = env.pop("LD_LIBRARY_PATH", None)
+    var out = String(py=Python.import_module("on_tty").run(Python.list(exe, d + "/good.chain.pem", enc), 60, env))
     _ = os.remove(exe)
     assert_false("pass phrase" in out.lower() or "password" in out.lower(), out)
     assert_true("REFUSED unusable certificate or key" in out, out)
