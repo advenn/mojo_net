@@ -48,76 +48,121 @@ Every server sends `Content-Type`, `Content-Length`, `Date` and `Server` with th
 - **mojo without bounds checks.** `-D ASSERT=none` turns off the standard library's index checks: 5% faster pipelined (1.32 to 1.25 µs a request), nothing measurable with keep-alive. They stay on, as Rust keeps its own.
 
 ## Method
-- **Pinning.** The servers and wrk never share a core. On the machine below, CPUs n and n + 4 are the two hardware threads of one core:
-  - wrk runs 4 threads on cores 0 and 1 (CPUs 0, 1, 4, 5);
-  - a one-CPU server runs on CPU 2, with its sibling, CPU 6, left idle;
-  - a four-CPU server runs on cores 2 and 3 (CPUs 2, 3, 6, 7).
-- **Sequential runs.** One server runs at a time:
-  1. it is started afresh;
-  2. it is warmed up for 5 s with the same load;
-  3. it is measured for 60 s;
-  4. it is stopped, and the machine idles 15 s before the next run. If other work kept it busier than 1 CPU over that time, the next run waits for it.
-  
-  In each scenario the servers go in the order mojo, go, fasthttp, hyper, nginx; the second rep goes in the reverse order.
-- **What is measured:**
-  - requests per second and, without pipelining, latency percentiles, from `wrk --latency`; the mean latency in every scenario from Little's law (under Results);
-  - the server's CPU per request: user plus system time of every process in its process group, from `/proc`, over the measured 60 s. On loopback this includes the kernel's TCP work for both directions of the server's sockets;
-  - wrk's CPU, as a share of its 4 threads: near 100% the client, not the server, is the limit;
-  - the server CPUs' clock, sampled each second (`scaling_cur_freq`), and the package temperature;
-  - **others:** what the rest of the machine used during the run, in CPUs. It is all busy time (`/proc/stat`) less the server's and wrk's. A run with a high value shared the machine with something else.
-- **Caveats:**
-  - one laptop, with the client on the same machine, over loopback;
-  - wrk is closed-loop: each connection sends its next request (or batch) only after the last answer, so its latencies leave out the queueing an open-loop client would see;
-  - the machine was shared with a desktop session (`others` in each result says how much it used).
+Everything below is what `run.py` does; nothing is done by hand between runs.
+
+### The test
+TechEmpower's plaintext test: `GET /plaintext` answered with `200 OK` and the 13 bytes `Hello, World!`, as `text/plain`, with `Content-Length`, `Date` and `Server`. Any other path is a 404. Each server's handler is the smallest idiomatic one for it:
+- **mojo** (`plaintext.mojo`): a `Handler` whose `handle` compares `req.path()` and calls `res.text(200, "Hello, World!")`; the server adds Date, Server (`mojo-net`) and Content-Length. 148 bytes a response.
+- **go** (`go/main.go`): `net/http` with a `ServeMux` route that sets Content-Type and Server and writes the body. 127 bytes.
+- **fasthttp** (`fasthttp/main.go`): a request handler that sets the same fields. 133 bytes.
+- **hyper** (`hyper/src/main.rs`): `http1::Builder` with `pipeline_flush(true)` and a `service_fn` building the response with `Full<Bytes>` from a static body. 130 bytes.
+- **nginx**: `location = /plaintext { return 200 "Hello, World!"; }`, access log off, keep-alive unbounded (`keepalive_requests 100000000`, `keepalive_timeout 600s`). 161 bytes.
+
+`run.py check` starts each server on 1 and on 4 CPUs, sends one request, then 16 pipelined in one write, and checks that every answer is `HTTP/1.1 200` with the body; it prints each head and its size.
+
+### The scenarios
+| Scenario | Server CPUs | Connections | Requests a write | wrk threads |
+|---|---|---|---|---|
+| `1cpu-keepalive` | 1 | 64 | 1 | 4 |
+| `1cpu-pipelined` | 1 | 256 | 16 | 4 |
+| `1cpu-1024conns` | 1 | 1024 | 1 | 4 |
+| `4cpu-keepalive` | 4 | 256 | 1 | 4 |
+| `4cpu-pipelined` | 4 | 256 | 16 | 4 |
+
+Every connection is HTTP/1.1 keep-alive for the whole run. wrk runs as
+```bash
+taskset -c <wrk CPUs> wrk -t4 -c<connections> -d60s --timeout 10s --latency http://127.0.0.1:<port>/plaintext
+```
+and for the pipelined scenarios with `-s pipeline.lua ... -- 16`: the script concatenates 16 `GET /plaintext` requests into one buffer, sent in one write, and wrk counts the 16 responses. wrk is closed-loop: a connection sends its next request (or batch) only once the last one is answered, so the number of requests in flight is fixed at connections × requests a write.
+
+### CPUs and pinning
+The server and wrk never share a core, so neither steals the other's cycles, caches or hyperthread sibling. `run.py` reads the topology from `/sys/devices/system/cpu/cpu*/topology` (package and core ids) and, by default, gives the server whole cores from the top until it has 4 CPUs and wrk every CPU of the other cores. On the i5-1145G7, CPUs n and n + 4 are one core's two hardware threads, so:
+- wrk: 4 threads on cores 0 and 1 (CPUs 0, 1, 4, 5);
+- a one-CPU server: CPU 2, with its sibling, CPU 6, left idle (it is one of the server's four, and nothing else runs there);
+- a four-CPU server: cores 2 and 3 (CPUs 2, 3, 6, 7): 2 cores' 4 hardware threads, at the lower all-core clock.
+
+Both are started under `taskset -c`. How each server uses its n CPUs is in the table above: mojo runs one process for n = 1, and for n > 1 a supervisor with n worker processes (`run_workers`), each pinned to one CPU with its own SO_REUSEPORT listener; nginx gets an explicit `worker_cpu_affinity` mask (with only `auto`, it would pin workers to CPUs 0, 1, ..., which are wrk's).
+
+### One run
+Runs are sequential: one server at a time, nothing else of ours running.
+1. **Cool-down and a quiet check.** The machine idles for 15 s (`--cooldown`; 3 s before the first run), and the busy time of every CPU (`/proc/stat`: all but idle and iowait) is measured over it. If other work used more than 1 CPU (`--quiet`), the run waits 5 s at a time until it drops, for up to 30 minutes (`--quiet-wait`); the time waited is recorded. In the runs below no run had to wait.
+2. **Start.** The server starts afresh, in a process group of its own, on a free port. `run.py` waits for its `LISTEN` lines (one per worker), then until a TCP connect succeeds.
+3. **Warm-up.** wrk runs the scenario's load for 5 s (`--warmup`): caches, page faults, Go's and Rust's lazy setup and the CPU clock settle. Its numbers are thrown away.
+4. **Measurement.** wrk runs the same load for 60 s (`--duration`). Around it, `run.py` reads the server group's CPU time and the machine's busy time before and after, and a sampler thread reads the server CPUs' clock (`scaling_cur_freq`) and the package temperature (`x86_pkg_temp`) every second.
+5. **Stop.** SIGTERM to the server's process group; SIGKILL to the group after 10 s if needed, and to anything left in it.
+
+Each scenario runs every server in the order mojo, go, fasthttp, hyper, nginx. With `--reps 2` the whole set runs again in the reverse order, so a drift over the hour (temperature, background work) does not always favour the same server. The results are the mean of the two reps, with both shown.
+
+### What is computed
+- **Requests per second, and latency percentiles** (p50, p99; keep-alive scenarios only): wrk's own output. Socket errors and non-2xx answers are recorded too (none in the runs below).
+- **Mean latency, by Little's law:** requests in flight / throughput = connections × requests a write / req/s. wrk's coordinated-omission correction makes its pipelined percentiles meaningless (see Latency, below), so only this mean is given for those rows.
+- **Server CPU per request:** the user + system time (`utime` + `stime` in `/proc/<pid>/stat`) of every process whose process group is the server's, over the measured 60 s, divided by the requests wrk counted. On loopback this includes the kernel's TCP work for the server's sockets in both directions, so it is the server's whole cost, not only its own code.
+- **wrk CPU:** wrk's user + system time (`getrusage(RUSAGE_CHILDREN)` around it), as a share of its 4 threads × 60 s. Near 100%, the client is the limit, not the server: the four-CPU keep-alive rows are like that.
+- **Others:** what the rest of the machine used during the run, in CPUs: all busy time less the server's and wrk's. A high value means the run shared the machine with other work.
+- **Clock and temperature:** the mean, minimum and maximum of the per-second samples.
+
+All of it, with wrk's raw output, the CPUs used, the load average, and the versions (CPU model, kernel, governor, Mojo, Go and `GOAMD64`, fasthttp, rustc, hyper and tokio from `Cargo.lock`, nginx, wrk), goes to `out/<time>.json`, rewritten after every run. `run.py summary out/<time>.json` prints the table.
+
+### The profile
+Time says how fast; `profile.py` says where the time goes. It runs mojo (`plaintext_profile.mojo`, the same server without signal setup, which valgrind cannot follow through a re-execution) and hyper under valgrind's callgrind, both built for x86-64-v3 (valgrind has no AVX-512) with line tables, on one CPU: 3 s of wrk to warm up, its counters zeroed, 10 s of 16 connections × 16 pipelined, then a dump. Instructions counted divided by requests answered gives instructions a request, by object, file, function and line. They count user space only: the kernel's share is the same for every server (Why mojo was slower, below). Instructions are not time (hyper's may retire faster), which is why both are reported.
+
+### Caveats
+- One laptop, with the client on the same machine, over loopback: no network, NIC or interrupt costs, and the kernel's loopback TCP is a large share of every request.
+- wrk is closed-loop, so its latencies leave out the queueing an open-loop client (many independent users) would see.
+- The machine was shared with a desktop session (`others` in each result says how much it used), and runs on a laptop's `powersave` governor with turbo: the clock moves with temperature and load (recorded per run).
+- Each server runs in its fastest usual form, not tuned beyond that (Settings tried and left out, above).
 
 ## Results
-Measured on 2026-10-27, 13:30 to 14:37 (`out/20261027-133003.json`):
+Measured on 2026-10-28, 10:57 to 12:04 (`out/20261028-105727.json`), after the http and server reviews (HR3, SR2):
 - **The machine:** an i5-1145G7 laptop (4 cores, 8 threads), Linux 6.12, the `powersave` governor (intel_pstate) with turbo on.
-- **Versions:** Mojo 1.2.0, Go 1.27.3 with fasthttp 1.77.0, rustc 1.99.1 with hyper 1.12.0 on tokio 1.54.1, nginx 1.31.8 and wrk 4.2, all from pixi.
-- **Conditions:** 2 reps of 60 s, the second in the reverse order. Other work on the machine (a desktop session) used 0.2 to 0.6 CPUs during the runs, and no run had to wait for a quiet machine.
-- **Clock and temperature:** the server's CPUs ran at 3.4–3.8 GHz on one CPU and 2.7–3.0 GHz on four (the all-core turbo is lower), at a package temperature of 69–74 °C.
+- **Versions:** Mojo 1.2.0, Go 1.27.3 with fasthttp 1.77.0, rustc 1.99.1 with hyper 1.12.0 on tokio 1.54.1, nginx 1.31.8 and wrk 4.2, all from pixi: the same as on 2026-10-27.
+- **Conditions:** 2 reps of 60 s, the second in the reverse order. Other work on the machine (a desktop session) used 0.2 to 0.9 CPUs during the runs, and no run had to wait for a quiet machine. The first rep of the one-CPU keep-alive scenario was the noisiest (0.6 to 0.9 CPUs of other work, a lower clock): every server ran 6% to 17% slower in it than in the second rep, so that row's ranges are wide.
+- **Clock and temperature:** the server's CPUs ran at 3.2–3.8 GHz on one CPU and 2.6–3.0 GHz on four (the all-core turbo is lower), at a package temperature of 71–80 °C.
 
 Requests per second are the mean of the two runs, followed by both runs. The mean latency comes from Little's law (below); in the pipelined rows it is per batch of 16. Server CPU is per request.
 
 | Scenario | Server | req/s (both runs) | Mean latency | p50 | p99 | Server CPU | wrk CPU |
 |---|---|---|---|---|---|---|---|
-| **1 CPU, 64 keep-alive connections** | hyper | **181k** (179k, 184k) | 353 µs | 344 µs | 638 µs | 5.48 µs | 42% |
-| | nginx | 175k (174k, 177k) | 365 µs | 363 µs | 522 µs | 5.68 µs | 38% |
-| | fasthttp | 164k (161k, 167k) | 391 µs | 392 µs | 985 µs | 6.08 µs | 37% |
-| | mojo | 156k (154k, 159k) | 409 µs | 396 µs | 694 µs | 6.36 µs | 34% |
-| | go (net/http) | 86k (84k, 88k) | 746 µs | 757 µs | 1.84 ms | 11.60 µs | 17% |
-| **1 CPU, 256 connections, 16 pipelined** | hyper | **1169k** (1123k, 1214k) | 3.51 ms | | | 0.85 µs | 24% |
-| | fasthttp | 1067k (1052k, 1082k) | 3.84 ms | | | 0.93 µs | 24% |
-| | mojo | 762k (754k, 770k) | 5.38 ms | | | 1.31 µs | 15% |
-| | nginx | 191k (189k, 194k) | 21.42 ms | | | 5.20 µs | 28% |
-| | go (net/http) | 102k (102k, 102k) | 40.24 ms | | | 9.78 µs | 11% |
-| **1 CPU, 1024 keep-alive connections** | hyper | **144k** (141k, 148k) | 7.09 ms | 7.04 ms | 9.81 ms | 6.89 µs | 30% |
-| | nginx | 141k (139k, 143k) | 7.25 ms | 7.20 ms | 9.78 ms | 7.04 µs | 28% |
-| | mojo | 132k (128k, 135k) | 7.79 ms | 7.71 ms | 10.71 ms | 7.56 µs | 26% |
-| | fasthttp | 124k (122k, 126k) | 8.26 ms | 8.18 ms | 11.15 ms | 8.03 µs | 28% |
-| | go (net/http) | 70k (68k, 72k) | 14.61 ms | 14.14 ms | 23.82 ms | 14.18 µs | 16% |
-| **4 CPUs, 256 keep-alive connections** | hyper | **350k** (344k, 356k) | 732 µs | 624 µs | 4.21 ms | 10.68 µs | 92% |
-| | nginx | 327k (321k, 333k) | 782 µs | 698 µs | 4.02 ms | 11.72 µs | 89% |
-| | fasthttp | 319k (315k, 323k) | 802 µs | 714 µs | 3.91 ms | 12.15 µs | 87% |
-| | mojo | 301k (301k, 301k) | 851 µs | 748 µs | 4.48 ms | 12.79 µs | 83% |
-| | go (net/http) | 155k (153k, 156k) | 1.66 ms | 1.59 ms | 6.89 ms | 24.89 µs | 44% |
-| **4 CPUs, 256 connections, 16 pipelined** | hyper | **2115k** (2091k, 2139k) | 1.94 ms | | | 1.87 µs | 66% |
-| | fasthttp | 1967k (1964k, 1971k) | 2.08 ms | | | 2.00 µs | 60% |
-| | mojo | 1326k (1319k, 1332k) | 3.09 ms | | | 3.01 µs | 39% |
-| | nginx | 410k (407k, 413k) | 9.99 ms | | | 9.71 µs | 62% |
-| | go (net/http) | 182k (180k, 185k) | 22.46 ms | | | 21.14 µs | 29% |
+| **1 CPU, 64 keep-alive connections** | hyper | **172k** (162k, 183k) | 373 µs | 360 µs | 612 µs | 5.77 µs | 41% |
+| | mojo | 168k (153k, 183k) | 384 µs | 368 µs | 749 µs | 5.94 µs | 40% |
+| | fasthttp | 162k (154k, 169k) | 397 µs | 398 µs | 992 µs | 6.16 µs | 37% |
+| | nginx | 156k (142k, 171k) | 413 µs | 394 µs | 764 µs | 6.40 µs | 37% |
+| | go (net/http) | 82k (78k, 86k) | 782 µs | 793 µs | 2.08 ms | 12.07 µs | 17% |
+| **1 CPU, 256 connections, 16 pipelined** | hyper | **1193k** (1186k, 1199k) | 3.43 ms | | | 0.83 µs | 24% |
+| | mojo | 1185k (1106k, 1265k) | 3.47 ms | | | 0.84 µs | 26% |
+| | fasthttp | 1123k (1119k, 1128k) | 3.65 ms | | | 0.88 µs | 24% |
+| | nginx | 200k (197k, 203k) | 20.47 ms | | | 4.96 µs | 29% |
+| | go (net/http) | 103k (103k, 104k) | 39.69 ms | | | 9.64 µs | 12% |
+| **1 CPU, 1024 keep-alive connections** | hyper | **146k** (145k, 147k) | 7.01 ms | 6.97 ms | 9.95 ms | 6.80 µs | 29% |
+| | mojo | 144k (141k, 146k) | 7.12 ms | 7.05 ms | 11.09 ms | 6.91 µs | 32% |
+| | nginx | 141k (140k, 143k) | 7.25 ms | 7.24 ms | 9.43 ms | 7.03 µs | 28% |
+| | fasthttp | 123k (122k, 124k) | 8.31 ms | 8.23 ms | 10.89 ms | 8.07 µs | 28% |
+| | go (net/http) | 67k (63k, 71k) | 15.45 ms | 15.03 ms | 23.71 ms | 14.96 µs | 16% |
+| **4 CPUs, 256 keep-alive connections** | mojo | **350k** (349k, 351k) | 731 µs | 612 µs | 3.57 ms | 10.83 µs | 92% |
+| | hyper | 340k (338k, 343k) | 752 µs | 628 µs | 4.25 ms | 10.92 µs | 91% |
+| | nginx | 322k (320k, 323k) | 796 µs | 703 µs | 4.33 ms | 11.86 µs | 88% |
+| | fasthttp | 317k (317k, 317k) | 808 µs | 722 µs | 3.60 ms | 12.26 µs | 87% |
+| | go (net/http) | 154k (153k, 154k) | 1.66 ms | 1.60 ms | 6.54 ms | 25.11 µs | 45% |
+| **4 CPUs, 256 connections, 16 pipelined** | mojo | **2153k** (2151k, 2155k) | 1.90 ms | | | 1.83 µs | 67% |
+| | hyper | 2073k (2058k, 2088k) | 1.98 ms | | | 1.90 µs | 66% |
+| | fasthttp | 1950k (1938k, 1961k) | 2.10 ms | | | 2.02 µs | 60% |
+| | nginx | 403k (401k, 405k) | 10.16 ms | | | 9.87 µs | 63% |
+| | go (net/http) | 180k (180k, 181k) | 22.71 ms | | | 21.34 µs | 29% |
 
 What it shows:
-- **Without pipelining, the top four are close:** hyper, nginx, fasthttp and mojo take 5.5 to 6.4 µs of CPU a request on one CPU, most of it the kernel's loopback TCP (one recv and one send a request). mojo is 14% behind hyper there (0.9 µs a request). With 1024 connections, mojo is ahead of fasthttp and 8% behind hyper.
-- **Go's net/http takes about twice the CPU of the others without pipelining**, and gains little from it: 9.8 µs a request, 7 to 11 times what hyper, fasthttp and mojo take. It writes each response out on its own. Pipelined, it still makes 1.01 `write` calls a request, while its reads drop from 1.99 to 0.13 a request (counted from `/proc/<pid>/io`). fasthttp, in the same language, is in the top group.
-- **Pipelined, hyper and fasthttp lead:** 0.85 and 0.93 µs a request, against mojo's 1.31. The gap is all in mojo's own code, most of it in how the HTTP codec handles header fields (below). nginx makes a system call per response, so it gains little.
-- **The four-CPU keep-alive runs mostly measure wrk.** It used 83–92% of its 4 threads. The order there follows the CPU per request, but the totals are the client's limit.
+- **mojo caught up with hyper.** Pipelined on one CPU it takes 0.84 µs of CPU a request against hyper's 0.83, where it took 1.31 against 0.85 a day earlier (Earlier runs, below): the codec and server work of HR3 and SR2 (`why_mojo_is_slower.note`). On four CPUs it is ahead pipelined (2153k against 2073k, with 4% less CPU a request), and on one CPU without pipelining it is within 2% of hyper.
+- **Without pipelining, the top four are within a few percent:** hyper, mojo, fasthttp and nginx take 5.8 to 6.4 µs of CPU a request on one CPU, most of it the kernel's loopback TCP (one recv and one send a request). In the quieter second rep, mojo and hyper were even: 183,059 and 183,042 req/s, 5.41 and 5.43 µs a request. With 1024 connections, mojo is 1% behind hyper and ahead of nginx and fasthttp.
+- **Go's net/http takes about twice the CPU of the others without pipelining**, and gains little from it: 9.6 µs a request pipelined, 11 times what hyper and mojo take. It writes each response out on its own (1.01 `write` calls a request pipelined, counted from `/proc/<pid>/io` on 2026-10-27). fasthttp, in the same language, is in the top group.
+- **nginx makes a system call per response**, so it gains little from pipelining.
+- **The four-CPU keep-alive runs mostly measure wrk.** It used 87–92% of its 4 threads; the order there follows the CPU per request, but the totals are the client's limit.
 - **The four CPUs are 2 cores' 4 hardware threads**, at a lower clock, so the CPU per request is about twice that on one CPU.
 
-**Latency.** wrk is closed-loop: every connection always has exactly one request (or one batch of 16) in flight. By Little's law, the mean latency is then exactly connections × requests per write / requests per second. With keep-alive it is close to wrk's medians: within 4% on one CPU, and up to 17% above them on four CPUs, where the tail is longer (a long tail puts the mean above the median). Pipelined, wrk's percentiles are left out, because they are wrong there. Its coordinated-omission correction (`stats_correct`) adds samples spaced by the time between responses rather than batches. It can put them below the histogram's minimum, where the percentile scan never looks: one run printed a p99 of 0.
+**Latency.** wrk is closed-loop: every connection always has exactly one request (or one batch of 16) in flight. By Little's law, the mean latency is then exactly connections × requests per write / requests per second. With keep-alive it is close to wrk's medians: within 5% on one CPU, and up to 20% above them on four CPUs, where the tail is longer (a long tail puts the mean above the median). Pipelined, wrk's percentiles are left out, because they are wrong there. Its coordinated-omission correction (`stats_correct`) adds samples spaced by the time between responses rather than batches. It can put them below the histogram's minimum, where the percentile scan never looks: one run printed a p99 of 0.
 
-## Why mojo is slower
-mojo's own code does twice the work of hyper's for each request; the kernel's share is the same. Measured on 2026-10-27:
+## Why mojo was slower (2026-10-27)
+This is what the profile showed before the http and server reviews (HR3, SR2), which closed the gap (Results, above). It is kept for what it found and how; `why_mojo_is_slower.note` has what changed.
+
+mojo's own code did twice the work of hyper's for each request; the kernel's share was the same. Measured on 2026-10-27:
 - **The CPU split:** user and system time from `/proc`, one CPU, the best of 2 runs of 10 s.
 - **The instructions:** valgrind's callgrind (`pixi run -e bench bench-profile`, `out/profile-20261027-150833.json`). It counts every user-space instruction by function and source line, for the server on one CPU: 16 connections, 16 pipelined, 342k requests for mojo and 415k for hyper.
 
@@ -127,7 +172,7 @@ mojo's own code does twice the work of hyper's for each request; the kernel's sh
 | pipelined: user + system | 0.99 + 0.33 µs | 0.52 + 0.33 µs | 0.56 + 0.35 µs | 1.31 + 3.75 µs |
 | pipelined: user-space instructions | 9,644 | 4,565 | (not profiled) | (not profiled) |
 
-**Update, 2026-10-28** (the http review HR3, then the server review SR2; `out/profile-20261028-020523.json`, both servers in one run): mojo now takes **4,227** user-space instructions a request pipelined, against hyper's 4,565 (unchanged). By file: `src/http/connection.mojo` 1,097, `parse.mojo` 875, `server.mojo` 823, `headers.mojo` 295, bounds checks 150. What changed is in `why_mojo_is_slower.note`. The times above have not been measured again: instructions are not time (hyper's may retire faster), and the wrk runs need a quiet machine.
+**Update, 2026-10-28** (the http review HR3, then the server review SR2; `out/profile-20261028-020523.json`, both servers in one run): mojo now takes **4,227** user-space instructions a request pipelined, against hyper's 4,565 (unchanged). By file: `src/http/connection.mojo` 1,097, `parse.mojo` 875, `server.mojo` 823, `headers.mojo` 295, bounds checks 150. What changed is in `why_mojo_is_slower.note`. The wrk runs of the same day (Results, above) show it as time: 0.84 µs of CPU a request pipelined, against hyper's 0.83.
 
 **What it is not:**
 - **Not the kernel.** mojo's system time per request is hyper's to the hundredth of a µs: the same system calls (one recv and one send a request with keep-alive).
@@ -156,15 +201,22 @@ The likely reasons, from the functions and lines that cost the most:
 3. **Bounds checks.** Mojo's standard library checks every `Span` and `List` index at run time: 470 instructions a request, 4.9%. Rust checks too, but its iterators skip most checks. Turning them off is worth 5% pipelined (Settings tried, above).
 4. **Small copies and loops through the standard library.** `memory.mojo` (copies of a few bytes, 647), `range` loops (383) and `String` building (444) are 15% of the total.
 
-**Leads, not yet tried** ([why_mojo_is_slower.note](why_mojo_is_slower.note) has them in detail, with every hot spot's file and line, the baseline to compare against, and what must not change):
-- Write the server's fields and constant fields straight into the output. Date and Server are already pushed without checks; Content-Type is not.
-- Summarize the framing fields while parsing, in the same pass.
+**Leads** ([why_mojo_is_slower.note](why_mojo_is_slower.note) has them in detail, with every hot spot's file and line, the baseline to compare against, and what must not change):
+- Done in SR2: the server's Date and Server lines go to the codec encoded once a second, with the body's length as a number, and the default Content-Type is set without checks.
+- Still open: summarize the framing fields while parsing, in the same pass.
 - Check field bytes with SIMD, as `_find_end` finds the end of the head.
 - Remember a connection's Host field once it has been checked.
 
-The profile is pipelined. With keep-alive, the same code runs once per request, plus one recv and one send: 1.63 µs of user time, against hyper's 0.97.
+The profile is pipelined. With keep-alive, the same code ran once per request, plus one recv and one send: 1.63 µs of user time, against hyper's 0.97 (2026-10-27).
 
 ## Earlier runs
+**2026-10-27, before HR3 and SR2** (`out/20261027-133003.json`; the same machine, versions and method, other work 0.2 to 0.6 CPUs). Requests per second, the mean of 2 reps of 60 s, with the CPU a request where it matters:
+- 1 CPU, 64 keep-alive connections: hyper 181k, nginx 175k, fasthttp 164k, mojo 156k (6.36 µs, against hyper's 5.48), go 86k.
+- 1 CPU, 16 pipelined: hyper 1169k (0.85 µs), fasthttp 1067k, mojo 762k (1.31 µs), nginx 191k, go 102k.
+- 1 CPU, 1024 connections: hyper 144k, nginx 141k, mojo 132k, fasthttp 124k, go 70k.
+- 4 CPUs, keep-alive: hyper 350k, nginx 327k, fasthttp 319k, mojo 301k, go 155k (wrk at 83–92%).
+- 4 CPUs, 16 pipelined: hyper 2115k, fasthttp 1967k, mojo 1326k (3.01 µs), nginx 410k, go 182k.
+
 `out/20261025-182428.json` and `out/20261026-182035.json` were 10 s runs (3 reps in a rotating order) of mojo, nginx, Go's net/http and hyper. They were built with Go 1.26.2 and rustc 1.96.1 from the host, without PGO, `target-cpu=native` or `panic = "abort"`, and run on a busier machine. Without fasthttp, the order was the same as above: mojo, nginx and hyper level with keep-alive, hyper ahead pipelined, and net/http at about half. On 2026-10-25, one CPU, 64 keep-alive connections: mojo 152k req/s, nginx 142k, hyper 163k, Go 75k. Pipelined: hyper 918k, mojo 614k.
 
 **Where mojo's time goes** (2026-10-25), against hyper and nginx on one CPU (the best of 2 runs of 8 s; system calls counted with strace on a separate run):
