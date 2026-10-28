@@ -57,6 +57,9 @@ So a Mojo upgrade, or a change in a shared layer, lands in every package in one 
   - A program that wants a signal blocks it and reads it from a signalfd (`linux.signal`).
   - The block must hold in every thread, and the Mojo runtime starts its threads before `main` with the exec-time mask. So the library blocks the signal and executes the program again when some thread does not block it (`server.process`; measured in `docs/spikes.md`).
   - Child processes are clone3 + execve (`linux.process.spawn`), with only raw syscalls on memory prepared beforehand in between, since a forked copy of a threaded process must not allocate.
+- **SIGPIPE keeps its default action** (it ends the process), and the library raises none: sockets are written with `MSG_NOSIGNAL`, and pipes only while this process holds their read end (`linux.sys`, "SIGPIPE policy").
+  - **The decision for a write that cannot carry the flag** to an fd whose reader may be gone (SR2, 2026-10-28: the server's log lines to stderr, a pipe to a log shipper that may have exited): `linux.signal.write_no_sigpipe`. It blocks SIGPIPE in the calling thread for the write, takes off the SIGPIPE the write raised (thread-directed) with a zero-timeout `rt_sigtimedwait` unless one was pending already, and restores the mask: libpq's approach. Three syscalls more than a plain write, for writes that are rare.
+  - The same would serve sendfile or splice into a socket (a static-file path), which has no wrapper yet.
 - **No async/await yet.** Mojo marks it unstable.
   - The libraries expose blocking APIs, plus nonblocking building blocks for callers that run their own readiness loop.
   - An async runtime waits for Mojo's async design ("the compiler generates coroutines, the library schedules them"), which will shape its API. That is why `rt` is frozen.

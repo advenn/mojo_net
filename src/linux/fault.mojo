@@ -14,7 +14,7 @@ call per syscall number and consults a process-global plan of rules:
   data, and an injected error on close leaves the descriptor open (unlike a
   real close, where Linux releases the fd even on EINTR).
 - `inject_short(nr, max_bytes, ...)`: clamp the length argument (arg 3) of
-  read, write, sendto or recvfrom to `max_bytes` and issue the real
+  read, write, sendto, recvfrom or pread64 to `max_bytes` and issue the real
   syscall, so a short transfer really moves only that many bytes.
 
 Schedule (per rule, counted from when the rule is added): of the calls to
@@ -53,7 +53,7 @@ from std.sys import get_defined_bool
 
 from .errno import Errno
 from .error import ErrorKind, IoError
-from .nr import SYS_read, SYS_recvfrom, SYS_sendto, SYS_write
+from .nr import SYS_pread64, SYS_read, SYS_recvfrom, SYS_sendto, SYS_write
 from .syscall import MAX_ERRNO
 
 comptime ENABLED = get_defined_bool["MOJO_NET_FAULTS"]()
@@ -179,8 +179,8 @@ def inject(
 def inject_short(
     nr: Int, max_bytes: Int, skip: Int = 0, times: Int = 1, every: Int = 1
 ) raises IoError:
-    """Clamp the length of calls to `nr` (read, write, sendto or recvfrom
-    only) to `max_bytes`, then issue the real syscall.
+    """Clamp the length of calls to `nr` (read, write, sendto, recvfrom or
+    pread64 only) to `max_bytes`, then issue the real syscall.
 
     `max_bytes = 0` turns the call into a zero-length transfer: write and
     send return 0 (which no real socket does), read and recv return 0 and
@@ -193,6 +193,7 @@ def inject_short(
         or nr == SYS_write
         or nr == SYS_sendto
         or nr == SYS_recvfrom
+        or nr == SYS_pread64
     ):
         raise IoError.of_kind("fault.inject_short", ErrorKind.InvalidInput)
     _add("fault.inject_short", nr, _SHORT, max_bytes, skip, times, every)

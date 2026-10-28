@@ -17,14 +17,14 @@ thread has handled signal 33. As glibc's own `sigprocmask` does, `block`,
 that blocking "every signal" cannot hang a later `setuid`.
 """
 
-from .abi import SignalfdSiginfo
-from .consts import SFD_CLOEXEC, SFD_NONBLOCK, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK
+from .abi import SignalfdSiginfo, Timespec
+from .consts import SFD_CLOEXEC, SFD_NONBLOCK, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SIGPIPE
 from .errno import Errno
 from .error import IoError, check
 from .fd import AsFd, OwnedFd
-from .nr import SYS_read, SYS_rt_sigprocmask, SYS_signalfd4
+from .nr import SYS_read, SYS_rt_sigpending, SYS_rt_sigprocmask, SYS_rt_sigtimedwait, SYS_signalfd4, SYS_write
 from .sys import keep_alive
-from .syscall import err_of, is_err, syscall3, syscall4
+from .syscall import err_of, is_err, syscall2, syscall3, syscall4
 
 comptime _SIGSET_SIZE = 8
 """The kernel's sigset size on x86_64 and aarch64 (64 signals)."""
@@ -113,6 +113,43 @@ def set_mask(set: SignalSet) raises IoError -> SignalSet:
 def blocked() raises IoError -> SignalSet:
     """The calling thread's mask."""
     return block(SignalSet.empty())
+
+
+def _raw_mask(how: Int, bits: UInt64) -> UInt64:
+    """rt_sigprocmask without raising: the mask before (all ones if the call
+    failed, which then reads as "SIGPIPE was blocked")."""
+    var new = bits
+    var old: UInt64 = 0
+    var r = syscall4(SYS_rt_sigprocmask, how, Int(Pointer(to=new)), Int(Pointer(to=old)), _SIGSET_SIZE)
+    keep_alive(new)
+    keep_alive(old)
+    return UInt64.MAX if is_err(r) else old
+
+
+def write_no_sigpipe[F: AsFd](fd: F, buf: Span[UInt8, _]) -> Int:
+    """write(2) that raises no SIGPIPE, for a pipe whose reader may be gone
+    (stderr, a log shipper's pipe): the result as `sys.write` gives it,
+    `-EPIPE` then. The calling thread blocks SIGPIPE for the write; the
+    SIGPIPE the write raised (it is the thread's own) is taken off with
+    rt_sigtimedwait before the mask comes back, unless one was pending
+    already; a thread that blocks SIGPIPE itself just writes. The library
+    never changes the mask beyond this call (`sys`, "SIGPIPE policy";
+    docs/design.md records the decision)."""
+    var pipe = UInt64(1) << UInt64(SIGPIPE - 1)
+    var old = _raw_mask(SIG_BLOCK, pipe)
+    if old & pipe != 0:
+        return syscall3(SYS_write, Int(fd.raw_fd()), Int(buf.unsafe_ptr()), len(buf))
+    var pending: UInt64 = 0
+    _ = syscall2(SYS_rt_sigpending, Int(Pointer(to=pending)), _SIGSET_SIZE)
+    keep_alive(pending)
+    var r = syscall3(SYS_write, Int(fd.raw_fd()), Int(buf.unsafe_ptr()), len(buf))
+    if is_err(r) and Errno(err_of(r)) == Errno.EPIPE and pending & pipe == 0:
+        var zero = Timespec(0, 0)
+        _ = syscall4(SYS_rt_sigtimedwait, Int(Pointer(to=pipe)), 0, Int(Pointer(to=zero)), _SIGSET_SIZE)
+        keep_alive(zero)
+        keep_alive(pipe)
+    _ = _raw_mask(SIG_SETMASK, old)
+    return r
 
 
 struct SignalFd(AsFd, Movable, Writable):

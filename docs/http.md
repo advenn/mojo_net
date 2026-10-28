@@ -213,7 +213,8 @@ while True:
     - **Request checks:** HTTP/1.x only (505); the Host count per RFC 9112 3.2 (400).
     - **Response framing:** the application's Content-Length, or else chunked (HTTP/1.1) or close-delimited (HTTP/1.0). No body for HEAD and 1xx/204/304. `Connection: close` or `keep-alive` is added as persistence needs.
     - **Early responses:** a response that ends before its request body closes the connection. A full-duplex echo keeps it.
-    - **Continue and 1xx:** `send_continue` and 1xx responses; a no-op for HTTP/1.0 clients.
+    - **Continue and 1xx:** `send_continue` and 1xx responses; a no-op for HTTP/1.0 clients. `expects_continue()` says whether the request asked for one (HTTP/1.1 and `Expect: 100-continue`) and none went yet.
+    - **The end:** `end_response()`, or `end_response(trailers)` for a chunked body's trailer fields.
     - **Switching:** 101 to an Upgrade request and 2xx to CONNECT hand the connection over (`take_remaining`).
     - **Errors:** a malformed request carries its status (400, 414, 431, 501, 505), and `send_error` answers it.
   - `ClientConnection`:

@@ -21,7 +21,7 @@ WANTED = [
     # processes (the server's workers)
     "execve", "clone3", "clone", "waitid", "pidfd_send_signal",
     # signals
-    "rt_sigprocmask", "rt_sigaction", "signalfd4",
+    "rt_sigprocmask", "rt_sigaction", "signalfd4", "rt_sigpending", "rt_sigtimedwait",
     # time
     "clock_gettime", "clock_nanosleep", "timerfd_create", "timerfd_settime",
     "timer_create", "timer_settime", "timer_delete",

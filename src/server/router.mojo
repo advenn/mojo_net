@@ -1,7 +1,9 @@
 """Routing (docs/server.md, "Routing"): `Router[A]` sends requests to
 functions by method and path pattern, and everything else to the
 application `A` itself, a `Handler`: requests no route matches, and every
-streaming and shutdown hook.
+other hook (admission, streaming, errors, completion, shutdown). A
+wrapper of a `Handler` must pass each hook on like this: one it leaves
+out falls back to the trait's default without a word.
 
     def get_user(mut app: App, req: Request, params: Params, mut res: Response) raises:
         res.text(200, String("user ", params["id"]))
@@ -21,9 +23,16 @@ streaming and shutdown hook.
 absolute-form target), split at "/" and percent-decoded segment by
 segment, so an encoded "/" never splits one. At each segment, text beats
 a parameter, which beats the rest: the most specific pattern wins,
-whatever the order routes were added in. A segment that decodes to
-something with "/" or NUL in it matches no pattern, and a malformed
-percent-encoding gets 400.
+whatever the order routes were added in. Parameters are the decoded
+bytes, which must be UTF-8.
+
+**Paths no pattern can take** are answered by the router, so that no
+route's checks are skipped by a crafted path (SR2 RTR-1): 400 for a
+malformed percent-encoding, a parameter that is not UTF-8, or a segment
+that decodes to something with "/" or NUL in it; 404 for more than 128
+segments. With `fallback_unroutable` set, the last two go to the
+application instead (a proxy that forwards paths as they came). A path
+no pattern matches goes to the application.
 
 **Methods.** When the path matches but the method has no route, the
 router answers 405 with `Allow`. HEAD uses the GET route (the server drops
@@ -31,12 +40,25 @@ the body), and OPTIONS without a route of its own is answered with 204 and
 `Allow`.
 """
 
-from http.headers import Headers
+from http.headers import Headers, is_token
 
-from .server import Handler, Request, Response
+from .server import Exchange, Handler, Request, Response
 
 comptime _MAX_SEGMENTS = 128
-"""Deeper paths match nothing (they go to the application)."""
+"""Deeper paths match nothing (404)."""
+
+comptime NO_ROUTE = -1
+"""`Router.find`: no pattern matches (the application answers)."""
+comptime NO_METHOD = -2
+"""`Router.find`: a pattern matches, not for this method (405)."""
+comptime MALFORMED = -3
+"""`Router.find`: a malformed percent-encoding, or a parameter that is
+not UTF-8 (400)."""
+comptime ENCODED_SLASH = -4
+"""`Router.find`: a segment decodes to something with "/" or NUL in it
+(400)."""
+comptime TOO_DEEP = -5
+"""`Router.find`: more than 128 segments (404)."""
 
 # segment kinds
 comptime _TEXT = 0
@@ -140,10 +162,15 @@ struct Router[A: Handler](Handler):
     var _path: List[UInt8]
     """The decoded path of the request being matched."""
     var _segments: List[_Segment]
+    var fallback_unroutable: Bool
+    """Send requests whose paths have a segment that decodes to "/" or
+    NUL, or more than 128 segments, to the application rather than
+    answering 400 or 404 (the default)."""
     var _bad: Bool
     """The path's percent-encoding is malformed."""
-    var _unroutable: Bool
-    """A segment decodes to "/" or NUL, or the path is too deep."""
+    var _unroutable: Int
+    """0, or why no pattern can match the path: NO_ROUTE (not a path: the
+    asterisk form), ENCODED_SLASH or TOO_DEEP."""
     var _kinds: List[Int]
     var _values: List[Int]
     var _taken: List[Int]
@@ -158,8 +185,9 @@ struct Router[A: Handler](Handler):
         self._params = Params()
         self._path = List[UInt8]()
         self._segments = List[_Segment]()
+        self.fallback_unroutable = False
         self._bad = False
-        self._unroutable = False
+        self._unroutable = 0
         self._kinds = List[Int]()
         self._values = List[Int]()
         self._taken = List[Int]()
@@ -183,12 +211,17 @@ struct Router[A: Handler](Handler):
 
     def route(mut self, method: StringSlice, pattern: StringSlice, f: Self.Route) raises:
         """Send `method` requests whose path matches `pattern` to `f`.
-        Raises for a malformed pattern, a method and pattern added before,
-        or a parameter named differently from one at the same place in
-        another pattern."""
+        Raises for a method that is not a token, a malformed pattern (a
+        text segment with "%", "?" or "#" in it, which no decoded path
+        holds; a name used twice in it), a method and pattern added
+        before, or a parameter named differently from one at the same
+        place in another pattern."""
+        if method.byte_length() == 0 or not is_token(method.as_bytes()):
+            raise Error("route method is not a token: '", method, "'")
         if not pattern.startswith("/"):
             raise Error("route pattern must start with '/': ", pattern)
         var node = 0
+        var names = List[String]()
         var parts = String(pattern[byte=1:]).split("/")
         var segments = List[String]()
         if not (len(parts) == 1 and parts[0].byte_length() == 0):  # "/" alone: no segments
@@ -200,6 +233,7 @@ struct Router[A: Handler](Handler):
                 var name = String(seg[byte=1:])
                 if name.byte_length() == 0:
                     raise Error("route parameter without a name: ", pattern)
+                _new_name(names, name, pattern)
                 if self._nodes[node].param < 0:
                     self._nodes.append(_Node(String()))
                     self._nodes[node].param = len(self._nodes) - 1
@@ -214,6 +248,7 @@ struct Router[A: Handler](Handler):
                 var name = String(seg[byte=1:])
                 if name.byte_length() == 0:
                     raise Error("route wildcard without a name: ", pattern)
+                _new_name(names, name, pattern)
                 if i != len(segments) - 1:
                     raise Error("route wildcard not last: ", pattern)
                 if self._nodes[node].rest < 0:
@@ -229,6 +264,9 @@ struct Router[A: Handler](Handler):
             else:
                 if seg.byte_length() == 0 and i != len(segments) - 1:
                     raise Error("empty segment in route pattern: ", pattern)
+                for b in seg.as_bytes():
+                    if b == 37 or b == 63 or b == 35:  # "%", "?", "#"
+                        raise Error("route text no path can match: ", pattern)
                 var found = -1
                 for c in self._nodes[node].texts:
                     if self._nodes[c].text == seg:
@@ -254,7 +292,7 @@ struct Router[A: Handler](Handler):
         self._path.clear()
         self._segments.clear()
         self._bad = False
-        self._unroutable = False
+        self._unroutable = 0
         var t = target.as_bytes()
         var n = len(t)
         var i = 0
@@ -263,7 +301,7 @@ struct Router[A: Handler](Handler):
             var s = String(target)
             var at = s.find("://")
             if at < 0:
-                self._unroutable = True  # asterisk-form, or not a path
+                self._unroutable = NO_ROUTE  # asterisk-form, or not a path
                 return
             i = at + 3
             while i < n and t[i] != 47 and t[i] != 63:
@@ -292,7 +330,7 @@ struct Router[A: Handler](Handler):
                     self._segments.append(_Segment(start, k - start))
                     start = k + 1
             if len(self._segments) > _MAX_SEGMENTS:
-                self._unroutable = True
+                self._unroutable = TOO_DEEP
             return
         while True:
             var start = len(self._path)
@@ -303,15 +341,15 @@ struct Router[A: Handler](Handler):
                         self._bad = True
                         return
                     b = UInt8(_hex(t[i + 1]) * 16 + _hex(t[i + 2]))
-                    if b == 47 or b == 0:
-                        self._unroutable = True
+                    if (b == 47 or b == 0) and self._unroutable == 0:
+                        self._unroutable = ENCODED_SLASH
                     i += 3
                 else:
                     i += 1
                 self._path.append(b)
             self._segments.append(_Segment(start, len(self._path) - start))
             if len(self._segments) > _MAX_SEGMENTS:
-                self._unroutable = True
+                self._unroutable = TOO_DEEP
                 return
             if i >= end:
                 return
@@ -398,8 +436,10 @@ struct Router[A: Handler](Handler):
             for m in self._nodes[rest].methods:
                 _add_unique(out, m)
 
-    def _fill_params(mut self):
-        """Name the parameters of the match just found."""
+    def _fill_params(mut self) -> Bool:
+        """Name the parameters of the match just found: False if one is not
+        UTF-8 (decoded lossily, distinct paths would give one value: SR2
+        RTR-2)."""
         self._params._clear()
         var node = 0
         for k in range(len(self._kinds)):
@@ -408,10 +448,16 @@ struct Router[A: Handler](Handler):
             if kind == _PARAM:
                 var s = self._segments[seg]
                 self._params._names.append(self._nodes[node].param_name)
-                self._params._values.append(
-                    String(from_utf8_lossy=Span(self._path)[s.start : s.start + s.len])
-                )
+                try:
+                    self._params._values.append(
+                        String(StringSlice(from_utf8=Span(self._path)[s.start : s.start + s.len]))
+                    )
+                except:
+                    self._params._clear()
+                    return False
             elif kind == _REST:
+                # (the segments lie one after another in `_path`, each
+                # "/" between them dropped: one "/" back between each)
                 var text = List[UInt8]()
                 for j in range(seg, len(self._segments)):
                     if j > seg:
@@ -419,8 +465,13 @@ struct Router[A: Handler](Handler):
                     var s = self._segments[j]
                     text.extend(Span(self._path)[s.start : s.start + s.len])
                 self._params._names.append(self._nodes[node].rest_name)
-                self._params._values.append(String(from_utf8_lossy=Span(text)))
+                try:
+                    self._params._values.append(String(StringSlice(from_utf8=Span(text))))
+                except:
+                    self._params._clear()
+                    return False
             node = self._taken[k]
+        return True
 
     @inline(.always)
     def _route_at(self, node: Int, method: StringSlice) -> Int:
@@ -450,13 +501,14 @@ struct Router[A: Handler](Handler):
 
     def find(mut self, method: StringSlice, target: StringSlice) -> Int:
         """The route index `method` and `target` go to (its parameters then
-        in `last_params()`), or -1 (no pattern matches), -2 (one does, not
-        for this method), -3 (malformed path)."""
+        in `last_params()`; empty for anything else), or NO_ROUTE,
+        NO_METHOD, MALFORMED, ENCODED_SLASH or TOO_DEEP."""
+        self._params._clear()
         self._split(target)
         if self._bad:
-            return -3
-        if self._unroutable:
-            return -1
+            return MALFORMED
+        if self._unroutable != 0:
+            return self._unroutable
         self._kinds.clear()
         self._values.clear()
         self._taken.clear()
@@ -465,11 +517,12 @@ struct Router[A: Handler](Handler):
             self._kinds.clear()
             self._values.clear()
             self._taken.clear()
-            return -2 if self._walk(0, 0, "") >= 0 else -1
+            return NO_METHOD if self._walk(0, 0, "") >= 0 else NO_ROUTE
         var r = self._route_at(end, method)
         if r < 0:
             r = self._route_at(end, "GET")  # (HEAD)
-        self._fill_params()
+        if not self._fill_params():
+            return MALFORMED
         return r
 
     def last_params(self) -> ref [self._params] Params:
@@ -487,10 +540,15 @@ struct Router[A: Handler](Handler):
             var f = self._fns[r]
             f(self.app, req, self._params, res)
             return
-        if r == -3:
+        if (r == ENCODED_SLASH or r == TOO_DEEP) and self.fallback_unroutable:
+            r = NO_ROUTE
+        if r == MALFORMED or r == ENCODED_SLASH:
             res.text(400, "Bad Request\n")
             return
-        if r == -2:
+        if r == TOO_DEEP:
+            res.text(404, "Not Found\n")
+            return
+        if r == NO_METHOD:
             var allow = self._allow()
             if req.method == "OPTIONS":
                 res.status = 204
@@ -501,8 +559,14 @@ struct Router[A: Handler](Handler):
             return
         self.app.handle(req, res)
 
+    def admit(mut self, req: Request, mut res: Response) raises -> Bool:
+        return self.app.admit(req, res)
+
     def stream_request(mut self, req: Request) raises -> Bool:
         return self.app.stream_request(req)
+
+    def body_limit(mut self, req: Request) -> Int:
+        return self.app.body_limit(req)
 
     def on_body(mut self, req: Request, data: Span[UInt8, _]) raises:
         self.app.on_body(req, data)
@@ -521,6 +585,21 @@ struct Router[A: Handler](Handler):
 
     def shutting_down(mut self):
         self.app.shutting_down()
+
+    def failed(mut self, req: Request, error: Error, mut res: Response) raises:
+        self.app.failed(req, error, res)
+
+    def completed(mut self, req: Request, done: Exchange):
+        self.app.completed(req, done)
+
+
+def _new_name(mut names: List[String], name: String, pattern: StringSlice) raises:
+    """Add `name` to the names of `pattern`'s parameters: raises if it is
+    there (`params[name]` would return the first, SR2 RTR-3)."""
+    for n in names:
+        if n == name:
+            raise Error("route parameter named twice: ", pattern)
+    names.append(name)
 
 
 def _add_unique(mut out: List[String], m: String):

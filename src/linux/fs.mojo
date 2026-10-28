@@ -1,7 +1,8 @@
 """Files with raw syscalls: whole small files (`read_file`: configuration
 such as /etc/resolv.conf and /etc/hosts, and procfs entries), and opening
 files beneath a directory without leaving it (`open_dir`, `open_beneath`,
-`stat_fd`, `pread`), which is what a static file server needs; and
+`open_beneath_path`, `stat_fd`, `same_file`, `pread`), which is what a
+static file server needs; and
 `stat_path`, for a file named by path (a TLS key's permissions).
 
 No libc on the I/O path holds for files too: the stdlib's `open` goes
@@ -128,7 +129,9 @@ def open_beneath[F: AsFd](dir: F, path: StringSlice) raises IoError -> OwnedFd:
     O_NOCTTY: without it, a session leader with no controlling terminal
     (a container's PID 1, anything run under setsid) that opens a terminal
     device takes it as its controlling terminal, and a hangup on that line
-    later sends it SIGHUP.
+    later sends it SIGHUP. Opening a device runs its driver (a watchdog
+    arms, a tape rewinds): to learn what a path is first, use
+    `open_beneath_path`.
     `NotFound` for a missing file, `PermissionDenied`, and EXDEV
     (`InvalidInput`) for a path that would leave `dir`.
 
@@ -137,13 +140,21 @@ def open_beneath[F: AsFd](dir: F, path: StringSlice) raises IoError -> OwnedFd:
     or mount anywhere on the host (openat2(2) says to retry). It also means
     the file is under a write lease, which lasts until the lease breaks:
     `WouldBlock` once the tries run out."""
-    comptime op = "openat2"
+    return _beneath(dir, path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOCTTY, "openat2")
+
+
+def open_beneath_path[F: AsFd](dir: F, path: StringSlice) raises IoError -> OwnedFd:
+    """`open_beneath`'s lookup, with the same rules and errors, opened
+    O_PATH: a handle that names the file without opening it (no driver
+    runs, no FIFO end opens, and a directory needs only search
+    permission), for `stat_fd` and as a directory for `open_beneath`.
+    Reading it fails (EBADF)."""
+    return _beneath(dir, path, O_PATH | O_CLOEXEC, "openat2")
+
+
+def _beneath[F: AsFd](dir: F, path: StringSlice, flags: Int, op: StaticString) raises IoError -> OwnedFd:
     var cpath = _cpath(path, op)
-    var how = OpenHow(
-        UInt64(O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOCTTY),
-        0,
-        UInt64(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS),
-    )
+    var how = OpenHow(UInt64(flags), 0, UInt64(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS))
     var r: Int
     var tries = 0
     while True:
@@ -205,6 +216,11 @@ def is_dir(st: Statx) -> Bool:
 
 def is_regular(st: Statx) -> Bool:
     return Int(st.mode) & S_IFMT == S_IFREG
+
+
+def same_file(a: Statx, b: Statx) -> Bool:
+    """Whether `a` and `b` describe one file (its device and inode)."""
+    return a.ino == b.ino and a.dev_major == b.dev_major and a.dev_minor == b.dev_minor
 
 
 def pread[F: AsFd](fd: F, buf: MutSpan[UInt8, _], offset: Int) raises IoError -> Int:

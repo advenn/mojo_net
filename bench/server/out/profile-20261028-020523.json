@@ -1,0 +1,682 @@
+{
+ "versions": {
+  "cpu": "model name\t: 11th Gen Intel(R) Core(TM) i5-1145G7 @ 2.60GHz",
+  "kernel": "6.12.111+deb13-amd64",
+  "governor": "powersave",
+  "server_cpus": "2,3,6,7",
+  "wrk_cpus": "0,1,4,5",
+  "mojo": "Mojo 1.2.0 (2016d0cd)",
+  "nginx": "nginx version: nginx/1.31.8",
+  "go": "go version go1.27.3 linux/amd64",
+  "goamd64": "v4",
+  "fasthttp": {
+   "github.com/valyala/fasthttp": "1.77.0"
+  },
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "hyper": {
+   "hyper": "1.12.0",
+   "tokio": "1.54.1"
+  },
+  "wrk": "wrk d40fce9-dirty [epoll] Copyright (C) 2012 Will Glozer"
+ },
+ "connections": 16,
+ "pipelined": 16,
+ "seconds": 10,
+ "servers": {
+  "mojo": {
+   "requests": 671328,
+   "instructions_per_request": 4227.037202380952,
+   "by_object": {
+    "plaintext_profile": 4226.844615448782,
+    "???": 0.14221215262881928,
+    "ld-linux-x86-64.so.2": 0.02572512989179656,
+    "libc.so.6": 0.015716609466609466,
+    "libKGENCompilerRTShared.so": 0.005191203107869775,
+    "libAsyncRTRuntimeGlobals.so": 0.0037418370751704086
+   },
+   "by_file": {
+    "src/http/connection.mojo": 1097.0797881214548,
+    "src/http/parse.mojo": 874.9308415558415,
+    "src/server/server.mojo": 823.2294452190285,
+    "src/http/headers.mojo": 295.1102769436103,
+    "std/collections/string/string.mojo": 172.47798393631726,
+    "std/builtin/swap.mojo": 155.43048405548404,
+    "std/collections/check_bounds.mojo": 150.24318365985033,
+    "std/memory/memory.mojo": 144.94824884408217,
+    "std/collections/list.mojo": 98.38176271509604,
+    "src/http/body.mojo": 79.02847043472043,
+    "src/bytes/buffer.mojo": 78.1145297082797,
+    "std/builtin/range.mojo": 56.65610551027218,
+    "std/collections/span.mojo": 41.82780846322513,
+    "src/http/types.mojo": 24.008580008580008,
+    "std/utils/variant.mojo": 23.954908777825445,
+    "std/memory/pointer.mojo": 18.015311442394776,
+    "std/collections/string/string_span.mojo": 18.00680889222556,
+    "src/linux/time.mojo": 14.243979098145765,
+    "std/builtin/len.mojo": 13.197246353496354,
+    "src/linux/error.mojo": 12.004385337718672
+   },
+   "by_function": [
+    [
+     "server::server::_Conn::dispatch[server::server::Handler & ::AnyType & ::Deinitable & ::Movable](server::server::_Conn,$0,server::server::ServerConfig,server::date::DateCache,server::server::_Shared,linux::time::Instant),H=[typevalue<#kgen.instref<plaintext_profile::App>>, struct<() memoryOnly>]",
+     1629.0712557795891,
+     [
+      [
+       "src/server/server.mojo:1206",
+       105.03603603603604
+      ],
+      [
+       "src/http/parse.mojo:234",
+       71.02199818866485
+      ],
+      [
+       "src/http/connection.mojo:825",
+       60.02145002145002
+      ],
+      [
+       "std/builtin/swap.mojo:31",
+       56.02002002002002
+      ]
+     ]
+    ],
+    [
+     "http::connection::ServerConnection::_respond[::Bool,LITOrigin[$0._mlir_value],::Origin[$0, $1]](http::connection::ServerConnection,http::parse::ResponseHead,::Span[$0, $1, ::SIMD[DType.uint8, 1], $2, AddressSpace.GENERIC],::SIMD[DType.int, 1]),lines.mut`2x2=false",
+     580.2121168787835,
+     [
+      [
+       "src/http/connection.mojo:0",
+       48.017160017160016
+      ],
+      [
+       "src/http/connection.mojo:970",
+       30.01072501072501
+      ],
+      [
+       "src/http/connection.mojo:945",
+       23.00822250822251
+      ]
+     ]
+    ],
+    [
+     "http::parse::HeadParser::_parse_fields[LITImmOrigin,::Origin[False, $0]](http::parse::HeadParser,::Span[False, $0, ::SIMD[DType.uint8, 1], $1, AddressSpace.GENERIC],http::headers::Headers)",
+     355.128962295629,
+     [
+      [
+       "src/http/parse.mojo:0",
+       92.03289003289004
+      ],
+      [
+       "src/http/parse.mojo:669",
+       33.01179751179751
+      ]
+     ]
+    ],
+    [
+     "server::server::_Conn::send(server::server::_Conn,server::server::ServerConfig,server::date::DateCache)",
+     319.1140426140426,
+     [
+      [
+       "std/builtin/swap.mojo:31",
+       42.01501501501502
+      ],
+      [
+       "src/server/server.mojo:0",
+       42.01501501501502
+      ]
+     ]
+    ],
+    [
+     "http::connection::_valid_host[::Bool,LITOrigin[$0._mlir_value],::Origin[$0, $1]](::Span[$0, $1, ::SIMD[DType.uint8, 1], $2, AddressSpace.GENERIC])_REMOVED_ARG",
+     291.1040326040326,
+     [
+      [
+       "src/http/connection.mojo:502",
+       60.02145002145002
+      ],
+      [
+       "src/http/connection.mojo:500",
+       40.01430001430001
+      ],
+      [
+       "src/http/connection.mojo:471",
+       34.01215501215501
+      ],
+      [
+       "src/http/connection.mojo:501",
+       30.01072501072501
+      ]
+     ]
+    ],
+    [
+     "http::parse::HeadParser::_find_end[LITImmOrigin,::Origin[False, $0]](http::parse::HeadParser,::Span[False, $0, ::SIMD[DType.uint8, 1], $1, AddressSpace.GENERIC])",
+     233.58072358072357,
+     [
+      [
+       "src/http/parse.mojo:0",
+       85.65417202917203
+      ],
+      [
+       "src/http/parse.mojo:490",
+       26.133651508651507
+      ],
+      [
+       "src/http/parse.mojo:521",
+       24.008580008580008
+      ]
+     ]
+    ],
+    [
+     "http::connection::_summarize(http::headers::Headers)",
+     211.0754325754326,
+     [
+      [
+       "src/http/connection.mojo:388",
+       70.02502502502503
+      ],
+      [
+       "src/http/connection.mojo:0",
+       55.01966251966252
+      ]
+     ]
+    ],
+    [
+     "server::server::Response::bytes[::Bool,LITOrigin[$0._mlir_value],::Origin[$0, $1],LITImmOrigin,::Origin[False, $3]](server::server::Response,::SIMD[DType.int, 1],::Span[$0, $1, ::SIMD[DType.uint8, 1], $2, AddressSpace.GENERIC],::StringSpan[$3, $4])_REMOVED_ARG",
+     122.04418704418704,
+     [
+      [
+       "src/server/server.mojo:0",
+       37.01322751322751
+      ],
+      [
+       "src/http/headers.mojo:487",
+       29.01036751036751
+      ]
+     ]
+    ],
+    [
+     "http::headers::Headers::_store[::Bool,LITOrigin[$0._mlir_value],::Origin[$0, $1],::Bool,LITOrigin[$3._mlir_value],::Origin[$3, $4]](http::headers::Headers,::Span[$0, $1, ::SIMD[DType.uint8, 1], $2, AddressSpace.GENERIC],::Span[$3, $4, ::SIMD[DType.uint8, 1], $5, AddressSpace.GENERIC],utf8:::Bool),name.mut`2x1=false,value.mut`2x4=false",
+     90.03258019924687,
+     [
+      [
+       "src/http/headers.mojo:454",
+       28.01001001001001
+      ]
+     ]
+    ],
+    [
+     "server::server::_Conn::waiting(server::server::_Conn,server::server::ServerConfig,server::server::_Shared,linux::time::Instant)",
+     78.02788502788503,
+     [
+      [
+       "src/server/server.mojo:1274",
+       33.01179751179751
+      ]
+     ]
+    ],
+    [
+     "http::body::BodyDecoder::restart(http::body::BodyDecoder,http::body::Framing)",
+     73.02609752609753,
+     [
+      [
+       "src/http/body.mojo:479",
+       55.01966251966252
+      ]
+     ]
+    ],
+    [
+     "server::server::Server::_serve(server::server::Server[$0],::SIMD[DType.int, 1],linux::time::Instant,::Bool),H=[typevalue<#kgen.instref<plaintext_profile::App>>, struct<() memoryOnly>]",
+     59.51179453262787,
+     []
+    ],
+    [
+     "std::collections::string::string::String::__eq__(::String,::String)",
+     48.017160017160016,
+     []
+    ],
+    [
+     "http::connection::ServerConnection::poll_transmit(http::connection::ServerConnection,bytes::buffer::ByteBuffer)",
+     38.45143804518805,
+     []
+    ],
+    [
+     "std::collections::list::List::extend[::Bool,LITOrigin[$1._mlir_value],::Origin[$1, $2]](::List[$0],::Span[$1, $2, $0, $3, AddressSpace.GENERIC]){conforms_to($0, ::AnyType & ::Copyable & ::Movable)}_REMOVED_ARG,T=[typevalue<#kgen.instref<std::simd::SIMD,dtype=ui8,length=1>>, scalar<ui8>]",
+     35.012703179369844,
+     []
+    ],
+    [
+     "http::connection::ServerConnection::end_response(http::connection::ServerConnection)",
+     21.00750750750751,
+     []
+    ],
+    [
+     "http::types::reason(::SIMD[DType.int, 1])",
+     13.004647504647505,
+     []
+    ],
+    [
+     "http::connection::ServerConnection::feed[::Bool,LITOrigin[$0._mlir_value],::Origin[$0, $1]](http::connection::ServerConnection,::Span[$0, $1, ::SIMD[DType.uint8, 1], $2, AddressSpace.GENERIC]),data.mut`2x1=true",
+     12.005052671719339,
+     []
+    ],
+    [
+     "server::server::_Conn::_recv(server::server::_Conn,::List[::SIMD[DType.uint8, 1]],::SIMD[DType.int, 1])",
+     9.625892261308929,
+     []
+    ],
+    [
+     "http::connection::ServerConnection::_can_drain(http::connection::ServerConnection)",
+     4.001430001430001,
+     []
+    ]
+   ],
+   "by_line": [
+    [
+     "src/http/parse.mojo:0",
+     203.1959757376424
+    ],
+    [
+     "src/http/connection.mojo:0",
+     151.5541151270318
+    ],
+    [
+     "src/server/server.mojo:1206",
+     105.03603603603604
+    ],
+    [
+     "src/server/server.mojo:0",
+     104.77019877019877
+    ],
+    [
+     "std/builtin/swap.mojo:31",
+     98.03503503503504
+    ],
+    [
+     "src/http/parse.mojo:234",
+     71.02199818866485
+    ],
+    [
+     "src/http/connection.mojo:388",
+     70.02502502502503
+    ],
+    [
+     "std/collections/check_bounds.mojo:138",
+     69.64951260784594
+    ],
+    [
+     "src/http/connection.mojo:825",
+     60.02145002145002
+    ],
+    [
+     "src/http/connection.mojo:502",
+     60.02145002145002
+    ],
+    [
+     "src/http/parse.mojo:555",
+     55.01966251966252
+    ],
+    [
+     "src/http/body.mojo:479",
+     55.01966251966252
+    ],
+    [
+     "src/http/parse.mojo:550",
+     51.07940976690977
+    ],
+    [
+     "src/server/server.mojo:474",
+     50.01787501787502
+    ],
+    [
+     "std/collections/string/string.mojo:1553",
+     40.01698275656609
+    ],
+    [
+     "src/server/server.mojo:402",
+     40.01430001430001
+    ],
+    [
+     "src/http/connection.mojo:500",
+     40.01430001430001
+    ],
+    [
+     "src/server/server.mojo:401",
+     38.013585013585015
+    ],
+    [
+     "std/collections/string/string.mojo:1556",
+     37.01395889937557
+    ],
+    [
+     "src/server/server.mojo:1260",
+     36.01287001287001
+    ]
+   ],
+   "callgrind_file": "bench/server/out/callgrind.mojo.20261028-020523.1"
+  },
+  "hyper": {
+   "requests": 455776,
+   "instructions_per_request": 4564.688601418241,
+   "by_object": {
+    "hyper_plaintext": 3948.613604051113,
+    "libc.so.6": 616.0749973671277
+   },
+   "by_file": {
+    "???": 616.0749973671277,
+    "index.crates.io-1949cf8c6b5b557f/http-1.5.0/src/header/map.rs": 408.2018623183318,
+    "ptr/mod.rs": 337.7116346626413,
+    "index.crates.io-1949cf8c6b5b557f/hyper-1.12.0/src/proto/h1/role.rs": 265.192498069227,
+    "index.crates.io-1949cf8c6b5b557f/hyper-1.12.0/src/proto/h1/conn.rs": 235.9313039738819,
+    "index.crates.io-1949cf8c6b5b557f/hyper-1.12.0/src/proto/h1/dispatch.rs": 235.55556238152076,
+    "index.crates.io-1949cf8c6b5b557f/http-1.5.0/src/uri/path.rs": 182.08942550726672,
+    "index.crates.io-1949cf8c6b5b557f/http-1.5.0/src/response.rs": 146.07143421329775,
+    "result.rs": 145.59350645931335,
+    "index.crates.io-1949cf8c6b5b557f/bytes-1.12.1/src/bytes.rs": 144.0706158288282,
+    "index.crates.io-1949cf8c6b5b557f/httparse-1.10.1/src/lib.rs": 140.06955170961174,
+    "index.crates.io-1949cf8c6b5b557f/httparse-1.10.1/src/iter.rs": 127.68772379414449,
+    "index.crates.io-1949cf8c6b5b557f/http-1.5.0/src/header/value.rs": 121.05920452151935,
+    "index.crates.io-1949cf8c6b5b557f/hyper-1.12.0/src/proto/h1/io.rs": 118.65556545320509,
+    "index.crates.io-1949cf8c6b5b557f/http-1.5.0/src/header/name.rs": 110.0539738819069,
+    "vec/mod.rs": 109.70815049497999,
+    "raw_vec/mod.rs": 89.99246998525591,
+    "slice/iter/macros.rs": 82.35307256196026,
+    "str/validations.rs": 81.0418714456224,
+    "sys/alloc/unix.rs": 79.60371761567086
+   },
+   "by_function": [
+    [
+     "tokio::runtime::task::raw::poll::<hyper_plaintext::serve::{closure#0}::{closure#0}, alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>",
+     928.1645413536475,
+     [
+      [
+       "index.crates.io-1949cf8c6b5b557f/hyper-1.12.0/src/proto/h1/io.rs:183",
+       66.0324369865899
+      ],
+      [
+       "sys/alloc/unix.rs:0",
+       64.03155936249385
+      ],
+      [
+       "result.rs:2178",
+       28.01376114582602
+      ],
+      [
+       "index.crates.io-1949cf8c6b5b557f/hyper-1.12.0/src/proto/h1/dispatch.rs:331",
+       27.013269676332232
+      ]
+     ]
+    ],
+    [
+     "<hyper::proto::h1::conn::Conn<hyper_util::rt::tokio::TokioIo<tokio::net::tcp::stream::TcpStream>, bytes::bytes::Bytes, hyper::proto::h1::role::Server>>::write_head",
+     660.3229217861406,
+     [
+      [
+       "ptr/mod.rs:573",
+       40.01957101734185
+      ],
+      [
+       "vec/mod.rs:2986",
+       35.01712464017412
+      ],
+      [
+       "vec/mod.rs:0",
+       25.01223188583866
+      ],
+      [
+       "index.crates.io-1949cf8c6b5b557f/http-1.5.0/src/header/map.rs:2558",
+       24.01174261040511
+      ]
+     ]
+    ],
+    [
+     "<http::response::Builder>::header::<http::header::name::HeaderName, &str>",
+     486.2377878607035,
+     [
+      [
+       "index.crates.io-1949cf8c6b5b557f/http-1.5.0/src/header/value.rs:564",
+       94.04599189075336
+      ],
+      [
+       "slice/iter/macros.rs:180",
+       32.015656813873484
+      ],
+      [
+       "ptr/mod.rs:1963",
+       32.015656813873484
+      ],
+      [
+       "index.crates.io-1949cf8c6b5b557f/http-1.5.0/src/header/map.rs:3715",
+       24.01174261040511
+      ]
+     ]
+    ],
+    [
+     "<hyper::proto::h1::dispatch::Dispatcher<hyper::proto::h1::dispatch::Server<hyper::service::util::ServiceFn<hyper_plaintext::plaintext, hyper::body::incoming::Incoming>, hyper::body::incoming::Incoming>, http_body_util::full::Full<bytes::bytes::Bytes>, hyper_util::rt::tokio::TokioIo<tokio::net::tcp::stream::TcpStream>, hyper::proto::h1::role::Server>>::poll_write",
+     356.17498946851083,
+     [
+      [
+       "result.rs:837",
+       35.01712464017412
+      ],
+      [
+       "index.crates.io-1949cf8c6b5b557f/hyper-1.12.0/src/proto/h1/dispatch.rs:364",
+       24.01174261040511
+      ]
+     ]
+    ],
+    [
+     "free",
+     300.67028101523556,
+     [
+      [
+       "???:0",
+       300.67028101523556
+      ]
+     ]
+    ],
+    [
+     "httparse::parse_headers_iter_uninit",
+     214.230235905357,
+     [
+      [
+       "index.crates.io-1949cf8c6b5b557f/httparse-1.10.1/src/iter.rs:188",
+       36.017692901776314
+      ]
+     ]
+    ],
+    [
+     "<http::uri::path::PathAndQuery>::from_shared",
+     175.08600716141262,
+     [
+      [
+       "index.crates.io-1949cf8c6b5b557f/http-1.5.0/src/uri/path.rs:495",
+       70.03440286456505
+      ]
+     ]
+    ],
+    [
+     "malloc",
+     167.59846064733554,
+     [
+      [
+       "???:0",
+       167.59846064733554
+      ]
+     ]
+    ],
+    [
+     "0x0000000000162880",
+     107.05637198974935,
+     [
+      [
+       "???:0",
+       107.05637198974935
+      ]
+     ]
+    ],
+    [
+     "core::str::converts::from_utf8",
+     106.0545092326055,
+     [
+      [
+       "str/validations.rs:241",
+       31.016442287439443
+      ]
+     ]
+    ],
+    [
+     "<http::header::map::HeaderMap>::try_append2::<http::header::name::HeaderName>",
+     106.05209576634137,
+     []
+    ],
+    [
+     "<hyper::proto::h1::dispatch::Server<hyper::service::util::ServiceFn<hyper_plaintext::plaintext, hyper::body::incoming::Incoming>, hyper::body::incoming::Incoming> as hyper::proto::h1::dispatch::Dispatch>::recv_msg",
+     104.05115890261882,
+     [
+      [
+       "pin.rs:1489",
+       23.011303798357087
+      ]
+     ]
+    ],
+    [
+     "http::header::map::hash_elem_using::<http::header::name::HeaderName>",
+     96.04707575651197,
+     [
+      [
+       "index.crates.io-1949cf8c6b5b557f/http-1.5.0/src/header/name.rs:43",
+       24.011768939127993
+      ]
+     ]
+    ],
+    [
+     "<http::header::map::HeaderMap>::try_reserve_one",
+     82.0401205855508,
+     []
+    ],
+    [
+     "<http::header::name::HeaderName>::from_bytes",
+     78.03833462051534,
+     []
+    ],
+    [
+     "core::ptr::drop_glue::<http::header::map::HeaderMap>",
+     69.03489872217932,
+     [
+      [
+       "ptr/mod.rs:847",
+       49.02477313417117
+      ]
+     ]
+    ],
+    [
+     "core::ptr::drop_glue::<http::extensions::Extensions>",
+     68.03334532752932,
+     [
+      [
+       "ptr/mod.rs:847",
+       68.03334532752932
+      ]
+     ]
+    ],
+    [
+     "<bytes::bytes_mut::BytesMut>::split_to",
+     46.085138313557536,
+     []
+    ],
+    [
+     "<hyper::proto::h1::dispatch::Dispatcher<hyper::proto::h1::dispatch::Server<hyper::service::util::ServiceFn<hyper_plaintext::plaintext, hyper::body::incoming::Incoming>, hyper::body::incoming::Incoming>, http_body_util::full::Full<bytes::bytes::Bytes>, hyper_util::rt::tokio::TokioIo<tokio::net::tcp::stream::TcpStream>, hyper::proto::h1::role::Server>>::poll_flush",
+     42.02156761216036,
+     []
+    ],
+    [
+     "<hyper::proto::h1::io::WriteBuf<hyper::proto::h1::encode::EncodedBuf<bytes::bytes::Bytes>>>::buffer::<bytes::bytes::Bytes>",
+     40.01957101734185,
+     []
+    ]
+   ],
+   "by_line": [
+    [
+     "???:0",
+     616.0749973671277
+    ],
+    [
+     "ptr/mod.rs:847",
+     222.64970731236397
+    ],
+    [
+     "index.crates.io-1949cf8c6b5b557f/http-1.5.0/src/header/value.rs:564",
+     94.04599189075336
+    ],
+    [
+     "index.crates.io-1949cf8c6b5b557f/http-1.5.0/src/uri/path.rs:495",
+     70.03440286456505
+    ],
+    [
+     "index.crates.io-1949cf8c6b5b557f/hyper-1.12.0/src/proto/h1/io.rs:183",
+     66.0324369865899
+    ],
+    [
+     "sys/alloc/unix.rs:0",
+     65.0320486379274
+    ],
+    [
+     "index.crates.io-1949cf8c6b5b557f/http-1.5.0/src/header/map.rs:0",
+     56.02771317489293
+    ],
+    [
+     "ptr/mod.rs:573",
+     52.02546426314681
+    ],
+    [
+     "index.crates.io-1949cf8c6b5b557f/http-1.5.0/src/header/map.rs:3715",
+     49.02416976760514
+    ],
+    [
+     "ptr/mod.rs:1963",
+     48.39924875377378
+    ],
+    [
+     "slice/iter/macros.rs:180",
+     48.02349399705118
+    ],
+    [
+     "index.crates.io-1949cf8c6b5b557f/bytes-1.12.1/src/bytes.rs:670",
+     46.02254396896721
+    ],
+    [
+     "index.crates.io-1949cf8c6b5b557f/httparse-1.10.1/src/iter.rs:188",
+     44.021624657726605
+    ],
+    [
+     "index.crates.io-1949cf8c6b5b557f/hyper-1.12.0/src/proto/h1/role.rs:0",
+     37.018133907884575
+    ],
+    [
+     "vec/mod.rs:2986",
+     37.01810319104121
+    ],
+    [
+     "result.rs:837",
+     35.01742303236678
+    ],
+    [
+     "pin.rs:1489",
+     34.0166858281261
+    ],
+    [
+     "result.rs:2178",
+     33.01625798637927
+    ],
+    [
+     "str/validations.rs:241",
+     31.016442287439443
+    ],
+    [
+     "num/uint_macros.rs:2689",
+     30.515163150319456
+    ]
+   ],
+   "callgrind_file": "bench/server/out/callgrind.hyper.20261028-020523.1"
+  }
+ }
+}

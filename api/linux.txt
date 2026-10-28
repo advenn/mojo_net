@@ -127,6 +127,10 @@ struct Statx(Copyable, Deinitable, Movable)
     var attributes: UInt64
     var blksize: UInt32
     var blocks: UInt64
+    var ctime_nsec: UInt32
+    var ctime_sec: Int64
+    var dev_major: UInt32
+    var dev_minor: UInt32
     var gid: UInt32
     var ino: UInt64
     var mask: UInt32
@@ -134,6 +138,8 @@ struct Statx(Copyable, Deinitable, Movable)
     var mtime_nsec: UInt32
     var mtime_sec: Int64
     var nlink: UInt32
+    var rdev_major: UInt32
+    var rdev_minor: UInt32
     var size: UInt64
     var uid: UInt32
     def __init__(out self)
@@ -684,9 +690,11 @@ comptime DEFAULT_MAX_FILE = 16777216
 def is_dir(st: Statx) -> Bool
 def is_regular(st: Statx) -> Bool
 def open_beneath[F: AsFd](dir: F, path: StringSpan) raises -> OwnedFd
+def open_beneath_path[F: AsFd](dir: F, path: StringSpan) raises -> OwnedFd
 def open_dir(path: StringSpan) raises -> OwnedFd
 def pread[F: AsFd](fd: F, buf: Span[UInt8], offset: Int) raises -> Int
 def read_file(path: StringSpan, op: StringSpan[ImmStaticOrigin], max_bytes: Int = Int(16777216)) raises -> List[UInt8]
+def same_file(a: Statx, b: Statx) -> Bool
 def stat_fd[F: AsFd](fd: F) raises -> Statx
 def stat_path(path: StringSpan) raises -> Statx
 
@@ -745,7 +753,9 @@ comptime SYS_recvfrom = Int(45) if CompilationTarget.is_x86() else Int(207)
 comptime SYS_recvmmsg = Int(299) if CompilationTarget.is_x86() else Int(243)
 comptime SYS_recvmsg = Int(47) if CompilationTarget.is_x86() else Int(212)
 comptime SYS_rt_sigaction = Int(13) if CompilationTarget.is_x86() else Int(134)
+comptime SYS_rt_sigpending = Int(127) if CompilationTarget.is_x86() else Int(136)
 comptime SYS_rt_sigprocmask = Int(14) if CompilationTarget.is_x86() else Int(135)
+comptime SYS_rt_sigtimedwait = Int(128) if CompilationTarget.is_x86() else Int(137)
 comptime SYS_sched_getaffinity = Int(204) if CompilationTarget.is_x86() else Int(123)
 comptime SYS_sched_setaffinity = Int(203) if CompilationTarget.is_x86() else Int(122)
 comptime SYS_sched_yield = Int(24) if CompilationTarget.is_x86() else Int(124)
@@ -879,6 +889,7 @@ def block(set: SignalSet) raises -> SignalSet
 def blocked() raises -> SignalSet
 def set_mask(set: SignalSet) raises -> SignalSet
 def unblock(set: SignalSet) raises -> SignalSet
+def write_no_sigpipe[F: AsFd](fd: F, buf: Span[UInt8]) -> Int
 struct SignalFd(AsFd, Deinitable, Movable, Writable)
     def __init__(out self, var fd: OwnedFd)
     static def new(set: SignalSet) raises -> Self

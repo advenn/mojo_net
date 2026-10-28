@@ -14,9 +14,10 @@ wrappers, never `syscallN` with a hand-made address.
 `sendmsg`/`recvmsg` must keep those buffers alive across the call (use
 `keep_alive` after the call).
 
-SIGPIPE policy. The library installs no signal handlers and never touches
-the signal mask, so SIGPIPE keeps its default action: it kills the whole
-process (docs/spikes.md). The kernel raises it, along with EPIPE, from every
+SIGPIPE policy. The library installs no signal handlers and leaves the
+signal mask alone (but for the length of a `linux.signal.write_no_sigpipe`
+call), so SIGPIPE keeps its default action: it kills the whole process
+(docs/spikes.md). The kernel raises it, along with EPIPE, from every
 write path that cannot carry `MSG_NOSIGNAL`:
 - `write`/`writev` on a socket, or on a pipe/FIFO whose read end is closed;
 - `sendfile`/`splice`/`vmsplice` into a socket or pipe (they take no
@@ -26,14 +27,14 @@ Therefore:
   `net` does this);
 - pipes/FIFOs (`pipe2`): `write` only while this process itself holds the
   read end open (wakeup pipes), or when the application has chosen to block
-  or ignore SIGPIPE;
+  or ignore SIGPIPE; else (stderr, a log pipe) `signal.write_no_sigpipe`;
 - `writev`, `sendfile`, `splice` and `vmsplice` deliberately have no
   wrappers, although `linux.nr` defines some of their numbers. Adding one
-  (e.g. a sendfile static-file path for the HTTP server) first needs a
-  recorded decision in docs/design.md: block SIGPIPE in the calling thread
-  (`rt_sigprocmask`), consume a pending one with `rt_sigtimedwait` before
-  unblocking (the libpq approach; a write's SIGPIPE is thread-directed), or
-  keep the call off sockets and pipes.
+  (e.g. a sendfile static-file path for the HTTP server) goes the way
+  docs/design.md records for `write_no_sigpipe`: block SIGPIPE in the
+  calling thread (`rt_sigprocmask`), consume the one raised with
+  `rt_sigtimedwait` before unblocking (the libpq approach; a write's
+  SIGPIPE is thread-directed), or keep the call off sockets and pipes.
 `tests/linux/test_linux_core_regressions.mojo` pins this policy.
 """
 

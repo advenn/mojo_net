@@ -21,15 +21,24 @@ The loop, per connection:
   read cannot make the server buffer without limit (backpressure); after
   `write_timeout` without progress the connection is dropped.
 - Then input: read what fits the codec (`feed_capacity`), feed it, and
-  drain the events. A request's head starts it (413 at once if its
-  Content-Length is over `max_body`; `100 Continue` for an
-  `Expect: 100-continue` otherwise), its body is collected up to
-  `max_body`, and at its END the handler runs and its response is sent.
-  Pipelined requests are answered in order.
+  drain the events. A request's head starts it: `Handler.admit` may
+  answer it at once (before its body), then 413 if its Content-Length is
+  over its limit (`max_body`, or `Handler.body_limit`), 503 if it would
+  take the buffered bodies past `max_body_memory`, else `100 Continue`
+  for an `Expect: 100-continue`. Its body is collected up to its limit,
+  and at its END the handler runs and its response is sent. Pipelined
+  requests are answered in order. CONNECT gets 501 (no tunnels).
+- A connection's last request is the `max_requests`-th, or the first
+  after `max_connection_age`: its response says `Connection: close`.
+- Each request ends with one `Handler.completed` (an access log), the
+  server's own answers included; a hook that raises gets a 500, which
+  `Handler.failed` may change, and the error is logged on stderr
+  (`log_errors`, at most a line a second), as is a pause in accepting.
 - Timeouts are checked by a sweep a few times a second: `header_timeout`
   for a request head that has started (408), `idle_timeout` between
   requests (closed quietly), `read_timeout` while a body arrives (408),
-  `write_timeout` while output waits. The last two restart only when a
+  `write_timeout` while output waits, `request_timeout` (if set) from a
+  head to its buffered body's end. Read and write restart only when a
   window's worth of progress has passed (`min_rate` times the timeout,
   15 KB for 30 s at 512 B/s), so a client cannot hold a connection by
   dripping a byte at a time. A write timeout aborts the connection (RST),
@@ -77,8 +86,10 @@ The loop, per connection:
   serves new connections (live ones keep theirs), and a failed reload
   keeps the old one, saying why on stderr, as it does when the
   certificate's renewal is due.
-- Graceful shutdown (`shutdown()`): the connections already queued are
-  accepted and the listener closed; idle connections close, requests in
+- Graceful shutdown (`shutdown()`): after `drain_delay` (if set), during
+  which the server goes on accepting and each response says
+  `Connection: close`, the connections already queued are accepted and
+  the listener closed; idle connections close, requests in
   progress get their responses (the last on their connections, saying
   `Connection: close`), and whatever is left closes after
   `shutdown_timeout`. `stopped()` says when no connection is left.
@@ -114,6 +125,8 @@ from .process import Stop, _log
 
 comptime _LISTENER: UInt64 = UInt64.MAX
 comptime _STOP: UInt64 = UInt64.MAX - 1
+comptime _TEXT_PLAIN = "text/plain; charset=utf-8"
+"""`Response.text`'s default type."""
 comptime _PAUSE = Duration.from_millis(100)
 comptime _READ_CHUNK = 64 * 1024
 comptime _HEARTBEAT = ":\n"
@@ -208,6 +221,33 @@ struct ServerConfig(Copyable, Movable):
     var tls_reload_check: Duration
     """TLS: how often the certificate and key files are checked for a
     change (TS12; `Duration.ZERO`: never)."""
+    var max_body_memory: Int
+    """The most buffered request bodies may hold at once, over all the
+    process's connections: a request whose body would go past it gets 503
+    with Retry-After, and the connection closes (0: no bound). Without it,
+    10,000 slow uploads of 1 MiB hold 10 GiB."""
+    var max_requests: Int
+    """Requests a connection may carry: the last one's response says
+    `Connection: close` (0: no limit). Long-lived connections from a load
+    balancer then spread again over the workers after a restart."""
+    var max_connection_age: Duration
+    """How long a connection may take new requests: the first response
+    after it says `Connection: close` (`Duration.ZERO`: no limit)."""
+    var request_timeout: Duration
+    """From a request's head to the end of its buffered body, whatever the
+    progress (408 after; `Duration.ZERO`: none). A body streamed to the
+    handler (`stream_request`) is not bound by it."""
+    var drain_delay: Duration
+    """At `shutdown()`: how long to go on accepting and serving, each
+    response saying `Connection: close`, before the shutdown proper (a load
+    balancer still sends new connections for a few seconds after it was
+    told to stop: they would be refused). `shutting_down` is called at its
+    start (`Duration.ZERO`: none)."""
+    var log_errors: Bool
+    """Write a line on stderr for a handler that raised (its method, path
+    and error, escaped), and when accepting pauses (`max_connections`
+    reached, out of fds); at most one a second, saying how many were left
+    out."""
 
     def __init__(
         out self,
@@ -231,6 +271,12 @@ struct ServerConfig(Copyable, Movable):
         tls_handshake_rate: Int = 1000,
         tls_reload_check: Duration = Duration.from_secs(10),
         tls_client_wait: Duration = Duration.from_secs(1),
+        max_body_memory: Int = 256 * 1024 * 1024,
+        max_requests: Int = 0,
+        max_connection_age: Duration = Duration.ZERO,
+        request_timeout: Duration = Duration.ZERO,
+        drain_delay: Duration = Duration.ZERO,
+        log_errors: Bool = True,
     ):
         self.max_connections = max_connections
         self.max_body = max_body
@@ -251,6 +297,12 @@ struct ServerConfig(Copyable, Movable):
         self.tls_handshake_rate = tls_handshake_rate
         self.tls_reload_check = tls_reload_check
         self.tls_client_wait = tls_client_wait
+        self.max_body_memory = max_body_memory
+        self.max_requests = max_requests
+        self.max_connection_age = max_connection_age
+        self.request_timeout = request_timeout
+        self.drain_delay = drain_delay
+        self.log_errors = log_errors
 
     def _sweep_every(self) -> Duration:
         """How often timeouts (and heartbeats, and the TLS files) are
@@ -290,6 +342,14 @@ struct Request(Movable):
     """The connection's id, for `Server.wake` (and `Handler.take_wakes`):
     it names this connection while it lives, and is not reused before 2^40
     connections."""
+    var number: Int
+    """This request's number on its connection, from 1 (with `id`, it names
+    the request: for logs, and for state a handler keeps per request)."""
+    var unix_time: Int
+    """The second, since the epoch, of the response's Date field: the
+    server's clock as of the loop turn that calls `handle` (0 outside a
+    server). So a handler need not read the clock, which costs a syscall
+    here, and can keep its dates no later than Date (RFC 9110 8.8.2.1)."""
     var _authority: String
     """The authority of an absolute-form target, or empty."""
 
@@ -302,6 +362,8 @@ struct Request(Movable):
         self.trailers = Headers()
         self.peer = peer
         self.id = id
+        self.number = 0
+        self.unix_time = 0
         self._authority = String()
 
     def host(self) -> String:
@@ -317,21 +379,29 @@ struct Request(Movable):
         """The target up to its query ("?"), raw: not percent-decoded, so
         compare decoded segments (as `Router` does) when access depends on
         the path."""
-        var q = self.target.find("?")
-        if q < 0:
-            return StringSlice(self.target)
-        return StringSlice(self.target)[byte=0:q]
+        var b = StringSlice(self.target).as_bytes()
+        # ("?" is ASCII: the bytes before it are whole characters)
+        return StringSlice(unsafe_from_utf8=b[0 : _query_mark(b)])
 
     def query(self) -> StringSlice[origin_of(self.target)]:
         """The target after its "?", or empty."""
-        var q = self.target.find("?")
-        if q < 0:
-            return StringSlice(self.target)[byte=0:0]
-        return StringSlice(self.target)[byte = q + 1 :]
+        var b = StringSlice(self.target).as_bytes()
+        return StringSlice(unsafe_from_utf8=b[min(_query_mark(b) + 1, len(b)) :])
 
     def text(self) -> String:
         """The body as a string (lossy for bytes that are not UTF-8)."""
         return String(from_utf8_lossy=Span(self.body))
+
+
+@inline(.always)
+def _query_mark(t: Span[UInt8, _]) -> Int:
+    """Where the first "?" of `t` is, or its length."""
+    var p = t.unsafe_ptr()
+    var n = len(t)
+    for i in range(n):
+        if p[unsafe_offset=i] == 63:
+            return i
+    return n
 
 
 struct Response(Movable):
@@ -373,9 +443,9 @@ struct Response(Movable):
         `ServerConfig.heartbeat`, between lines (never inside one), so
         that proxies and clients keep it open. A Content-Length set by the
         handler stops the heartbeats, which would break its framing."""
-        self.headers.set("Content-Type", "text/event-stream")
-        self.headers.set("Cache-Control", "no-cache")
-        self.headers.set("X-Accel-Buffering", "no")
+        self.headers._set_valid("Content-Type".as_bytes(), "text/event-stream".as_bytes())
+        self.headers._set_valid("Cache-Control".as_bytes(), "no-cache".as_bytes())
+        self.headers._set_valid("X-Accel-Buffering".as_bytes(), "no".as_bytes())
         self._events = True
         self.stream()
 
@@ -403,12 +473,26 @@ struct Response(Movable):
         """Answer `status` with a text body."""
         self.bytes(status, body.as_bytes(), content_type)
 
+    def redirect(mut self, status: Int, location: StringSlice) raises IoError:
+        """Answer `status` (301, 302, 303, 307 or 308) with `Location:
+        location` and its phrase as a short text body. `InvalidInput` for
+        another status, or a `location` that is no field value (CR, LF:
+        `Headers.set` refuses it)."""
+        if status != 301 and status != 302 and status != 303 and status != 307 and status != 308:
+            raise IoError.of_kind("Response.redirect", ErrorKind.InvalidInput)
+        self.text(status, String(_phrase(status), "\n"))
+        self.headers.set("Location", location)
+
     def bytes(
         mut self, status: Int, body: Span[UInt8, _], content_type: StringSlice
     ) raises IoError:
         """Answer `status` with `body`, typed `content_type`."""
         self.status = status
-        self.headers.set("Content-Type", content_type)
+        if content_type == _TEXT_PLAIN:
+            # (the default, valid by construction: no byte checks, SR2 PERF-1)
+            self.headers._set_valid("Content-Type".as_bytes(), _TEXT_PLAIN.as_bytes())
+        else:
+            self.headers.set("Content-Type", content_type)
         self.body.clear()
         self.body.extend(body)
 
@@ -421,6 +505,28 @@ struct Response(Movable):
         self._events = False
 
 
+@fieldwise_init
+struct Exchange(Copyable, Movable):
+    """How a request went, for `Handler.completed`."""
+
+    var status: Int
+    """The status that went out (0: none, the connection was closed)."""
+    var sent: Int
+    """Response body bytes handed to the connection."""
+    var received: Int
+    """Request body bytes read (up to an early answer)."""
+    var started: Instant
+    """When the request's head was read."""
+    var ended: Instant
+    """When its response was handed over, or cut (the loop's clock)."""
+    var finished: Bool
+    """The whole response was handed over: False when it was cut (the
+    client left, `produce` raised, a shutdown timed out) or none was sent."""
+    var by_server: Bool
+    """The server answered, not the handler: a malformed request, a body
+    over its limit or the memory budget, a timeout, an error (500)."""
+
+
 trait Handler(Deinitable, Movable):
     """The application: one `handle` call per complete request, and, with
     the defaulted hooks, streamed request bodies and streamed responses.
@@ -429,15 +535,33 @@ trait Handler(Deinitable, Movable):
 
     def handle(mut self, req: Request, mut res: Response) raises:
         """Fill `res` for `req` (it starts as an empty 200), or call
-        `res.stream()`. An error it raises is answered with 500."""
+        `res.stream()`. An error it raises is answered with 500 (see
+        `failed`)."""
         ...
 
+    def admit(mut self, req: Request, mut res: Response) raises -> Bool:
+        """Called at a request's head, first, before any of its body is
+        read and before `100 Continue`: True (the default) to go on. False
+        answers with `res` at once (401, 403, 413, 415, 417, 503: a buffered
+        response; a stream is not), and the body is ignored, as after an
+        early 413: read and dropped if it is short, else the connection
+        closes after the answer. So a client is refused before it uploads.
+        An error answers 500."""
+        return True
+
     def stream_request(mut self, req: Request) raises -> Bool:
-        """Called at a request's head: True to take its body as it arrives
-        (`on_body`), unbuffered and without `max_body`; `handle` follows at
-        its end with `req.body` empty. False (the default) buffers it. An
-        error answers 500 (as from `on_body`)."""
+        """Called at a request's head, after `admit`: True to take its body
+        as it arrives (`on_body`), unbuffered and without `max_body`;
+        `handle` follows at its end with `req.body` empty. False (the
+        default) buffers it. An error answers 500 (as from `on_body`)."""
         return False
+
+    def body_limit(mut self, req: Request) -> Int:
+        """The largest body this request may buffer (413 beyond), asked at
+        its head after `stream_request` said False: -1 (the default) for
+        `ServerConfig.max_body`. A route that takes uploads larger, or
+        smaller, than the rest says so here."""
+        return -1
 
     def on_body(mut self, req: Request, data: Span[UInt8, _]) raises:
         """A piece of a streamed request body. An error answers 500 at once
@@ -476,15 +600,115 @@ trait Handler(Deinitable, Movable):
         pass
 
     def shutting_down(mut self):
-        """Called once when the server begins a graceful shutdown. Streams
-        last until `shutdown_timeout` unless they end: a handler with
-        long-lived ones (server-sent events) ends them here, by waking them
-        (`take_wakes` is asked after this call) so that `produce` returns
-        False."""
+        """Called once when the server begins a graceful shutdown (at the
+        start of its `drain_delay`, if any: a readiness check can fail from
+        here). Streams last until `shutdown_timeout` unless they end: a
+        handler with long-lived ones (server-sent events) ends them here, by
+        waking them (`take_wakes` is asked after this call) so that
+        `produce` returns False."""
+        pass
+
+    def failed(mut self, req: Request, error: Error, mut res: Response) raises:
+        """`handle`, `admit`, `stream_request` or `on_body` raised `error`
+        for `req`. `res` holds the 500 that will go out (reset: nothing the
+        hook that raised set is kept); change it to answer otherwise (a
+        malformed body: 400). A stream is not allowed, and an error here
+        keeps the 500. `ServerConfig.log_errors` logs `error` either way.
+        Not called for `produce` (its response is under way: the
+        connection just ends)."""
+        pass
+
+    def completed(mut self, req: Request, done: Exchange):
+        """A request is over: its response was handed to the connection, or
+        it was cut (`done.finished` False). Called once for each request
+        whose head was read, the server's own answers to it included
+        (400, 408, 413, 421, 500, 503): an access log. Requests too
+        malformed to be read (no head) are not seen."""
         pass
 
 
 # ---- one connection ---------------------------------------------------------------------
+
+
+struct _Limiter(Movable):
+    """Log lines of one kind, at most one per `period`, each saying how
+    many were left out since the last."""
+
+    var period: Duration
+    var next: Instant
+    var skipped: Int
+
+    def __init__(out self, period: Duration):
+        self.period = period
+        self.next = Instant(nanos=Int.MIN)
+        self.skipped = 0
+
+    def say(mut self, now: Instant, var text: String):
+        if now < self.next:
+            self.skipped += 1
+            return
+        if self.skipped > 0:
+            text += String(" (and ", self.skipped, " more since)")
+        self.skipped = 0
+        self.next = now + self.period
+        _log(text)
+
+
+struct _Shared(Movable):
+    """What the connections of one server share while it serves them."""
+
+    var bodies: Int
+    """Bytes the buffered request bodies under way hold or are to hold
+    (their Content-Length): `max_body_memory`."""
+    var draining: Bool
+    """A shutdown's `drain_delay` is under way: each request is its
+    connection's last."""
+    var log: Bool
+    var errors: _Limiter
+    """Handler errors (`log_errors`)."""
+    var cliffs: _Limiter
+    """Accepting paused (`log_errors`)."""
+
+    def __init__(out self, log: Bool):
+        self.bodies = 0
+        self.draining = False
+        self.log = log
+        self.errors = _Limiter(Duration.from_secs(1))
+        self.cliffs = _Limiter(Duration.from_secs(10))
+
+
+def _printable(mut out: String, text: StringSlice, limit: Int):
+    """Append `text` with each byte outside printable ASCII (and "\\") as
+    `\\xNN`, cut at `limit` bytes ("..." then): what a client sent is no
+    terminal escape in a log."""
+    var digits = "0123456789abcdef".as_bytes()
+    var b = text.as_bytes()
+    var n = min(len(b), limit)
+    var buf = List[UInt8](capacity=n + 8)
+    for i in range(n):
+        var c = b[i]
+        if c >= 32 and c < 127 and c != 92:
+            buf.append(c)
+        else:
+            buf.append(92)
+            buf.append(120)
+            buf.append(digits[Int(c >> 4)])
+            buf.append(digits[Int(c & 15)])
+    out += StringSlice(unsafe_from_utf8=Span(buf))
+    if len(b) > limit:
+        out += "..."
+
+
+def _error_line(req: Request, error: Error) -> String:
+    """The log line for a handler error: method, path and error, escaped
+    and cut short."""
+    var line = String("server: ")
+    _printable(line, req.method, 16)
+    line += " "
+    _printable(line, req.path(), 200)
+    line += ": "
+    _printable(line, String(error), 300)
+    return line^
 
 
 struct _Conn(Movable):
@@ -496,8 +720,8 @@ struct _Conn(Movable):
     var req: Request
     var res: Response
     var state: Int
-    var first: Bool
-    """No request has been answered on this connection yet."""
+    var served: Int
+    """Requests whose heads came on this connection (`Request.number`)."""
     var head_started: Bool
     var deadline: Instant
     """When the current state times out."""
@@ -510,6 +734,8 @@ struct _Conn(Movable):
     """The current request's body goes to `Handler.on_body`."""
     var paused: Bool
     """The streamed response waits for a wake."""
+    var probing: Bool
+    """Keepalive probes are on (`detect_dead_peers`): a stream paused once."""
     var beating: Bool
     """The streamed response is an event stream that gets heartbeats."""
     var line_open: Bool
@@ -570,6 +796,24 @@ struct _Conn(Movable):
     """It is in the server's queue of handshakes to admit."""
     var hello_deadline: Instant
     """When the first record must have arrived whole."""
+    var born: Instant
+    """When the connection was accepted (`max_connection_age`)."""
+    var limit: Int
+    """The current request's body limit (`max_body`, or `body_limit`)."""
+    var reserved: Int
+    """Bytes of `max_body_memory` the current request's body holds."""
+    var request_deadline: Instant
+    """When the current buffered body must have ended (`request_timeout`)."""
+    var started: Instant
+    """When the current request's head was read."""
+    var received: Int
+    """Its body bytes read so far."""
+    var sent: Int
+    """Its response body bytes handed to the codec so far."""
+    var status_sent: Int
+    """The status of its response, once sent."""
+    var exchange_open: Bool
+    """Its `Handler.completed` is still owed."""
 
     def __init__(
         out self,
@@ -588,7 +832,7 @@ struct _Conn(Movable):
         self.req = Request(peer, id)
         self.res = Response()
         self.state = _WAITING
-        self.first = True
+        self.served = 0
         self.head_started = False
         self.deadline = now + config.header_timeout
         self.blocked = False
@@ -596,6 +840,7 @@ struct _Conn(Movable):
         self.rejected = False
         self.streamed = False
         self.paused = False
+        self.probing = False
         self.beating = False
         self.line_open = False
         self.last_out = now
@@ -625,6 +870,15 @@ struct _Conn(Movable):
         self.hello_ready = False
         self.tls_waiting = False
         self.hello_deadline = now + min(config.tls_hello_timeout, config.tls_handshake_timeout)
+        self.born = now
+        self.limit = config.max_body
+        self.reserved = 0
+        self.request_deadline = Instant(nanos=Int.MAX)
+        self.started = now
+        self.received = 0
+        self.sent = 0
+        self.status_sent = 0
+        self.exchange_open = False
 
     def _read_hello(mut self, mut chunk: List[UInt8]) raises -> Optional[Int]:
         """Read the client's first record into `hello`, and no further
@@ -772,6 +1026,7 @@ struct _Conn(Movable):
         config: ServerConfig,
         date: DateCache,
         mut chunk: List[UInt8],
+        mut shared: _Shared,
         now: Instant,
         hangup: Bool,
     ) raises -> Bool:
@@ -820,9 +1075,9 @@ struct _Conn(Movable):
                 self.again = True  # the others' turn
                 return True
             if self.state == _PRODUCING:
-                if not self.paused and self.produce(handler, config, now):
+                if not self.paused and self.produce(handler, config, shared, now):
                     continue  # more body went out: flush it
-            elif self.dispatch(handler, config, date, now) or self.queued() > 0:
+            elif self.dispatch(handler, config, date, shared, now) or self.queued() > 0:
                 continue  # output came (a response, a 100 Continue): flush it first
             # Only a paused stream reads while _PRODUCING (one that has
             # something to send loops above), and a client that leaves it,
@@ -854,6 +1109,8 @@ struct _Conn(Movable):
                     self.body_window += n
                     if _enough(self.body_window, config.read_timeout, config.min_rate):
                         self.deadline = now + config.read_timeout  # progress
+                        if self.request_deadline < self.deadline:
+                            self.deadline = self.request_deadline  # (request_timeout)
                         self.body_window = 0
 
     def absorb(mut self, mut chunk: List[UInt8], config: ServerConfig, now: Instant) raises:
@@ -898,6 +1155,12 @@ struct _Conn(Movable):
         while True:
             if len(self.out) == 0 and self._fill() == 0:
                 self.blocked = False
+                if self.writing and self.state == _WAITING:
+                    # (The response that waited is out now: the next request
+                    # gets its whole idle or header timeout from here, not
+                    # from when the response was queued, SR2 BP-2.)
+                    self.head_started = self.http.head_begun()
+                    self.deadline = now + (config.header_timeout if self.head_started else config.idle_timeout)
                 self.writing = False
                 if self.state == _WAITING:
                     self._give_back()
@@ -929,7 +1192,7 @@ struct _Conn(Movable):
             self.tls_in = List[UInt8]()
 
     def dispatch[H: Handler](
-        mut self, mut handler: H, config: ServerConfig, date: DateCache, now: Instant
+        mut self, mut handler: H, config: ServerConfig, date: DateCache, mut shared: _Shared, now: Instant
     ) raises -> Bool:
         """Drain the codec's events, collecting and answering requests, until
         `_HIGH_WATER` of output is queued (True: flush it before answering
@@ -945,48 +1208,56 @@ struct _Conn(Movable):
                 self.cut_body(handler)
                 if not self.rejected:  # (else it was answered already)
                     var status = self.http.error_status()
+                    status = status if status >= 400 else 400
+                    var sent = True
                     try:
-                        self.http.send_error(status if status >= 400 else 400, date.current())
+                        self.http.send_error(status, date.current(), config.server_name)
                     except:
-                        pass  # (its response went out already: the codec closes after it)
+                        sent = False  # (its response went out already: the codec closes after it)
+                    self.sent = 0
+                    self.finish(handler, status if sent else 0, sent, True, now)
                 return True  # the codec now closes, after what it sends
             if not got:
                 return False
             if self.ev.kind == EventKind.HEAD:
-                if self.start(handler, config, date, now):
+                if self.start(handler, config, date, shared, now):
                     return True  # answered at once (413, or a hook failed)
             elif self.ev.kind == EventKind.DATA:
+                self.received += len(self.ev.data)
                 if self.rejected:
                     continue
                 if self.streamed:
-                    var ok = True
+                    # (The error is handled where it is caught: an `Error`
+                    # made ahead, to hold one, takes a stack trace on every
+                    # request.)
                     try:
                         handler.on_body(self.req, Span(self.ev.data))
-                    except:
-                        ok = False
-                    if not ok:
+                    except e:
                         self.cut_body(handler)
-                        self.fail(config, date)
+                        self.fail(handler, config, date, shared, now, e)
                         return True
                     continue
-                if len(self.req.body) + len(self.ev.data) > config.max_body:
-                    self.reject(config, date)
+                var total = len(self.req.body) + len(self.ev.data)
+                if total > self.limit:
+                    self.reject(handler, config, date, now, 413)
+                    return True
+                if not self.take(shared, config, total):
+                    self.reject(handler, config, date, now, 503)
                     return True
                 self.req.body.extend(Span(self.ev.data))
             else:  # END
                 var answered = not self.rejected
-                self.first = False
                 self.body_open = False  # complete: `handle` comes
                 if answered:
                     swap(self.req.trailers, self.ev._trailers[0])
                     self.answered_now += 1
-                    if self.answer(handler, config, date):
+                    if self.answer(handler, config, date, shared, now):
                         self.state = _PRODUCING  # until produce says the end
                         self.paused = False
                         self.last_out = now
                         self.line_open = False
                         return True
-                self.waiting(config, now)
+                self.waiting(config, shared, now)
                 if answered and (
                     self.queued() >= _HIGH_WATER
                     or self.answered_now >= _SLICE_REQUESTS
@@ -1000,11 +1271,12 @@ struct _Conn(Movable):
             self.body_open = False
             handler.body_cut(self.req)
 
-    def waiting(mut self, config: ServerConfig, now: Instant):
+    def waiting(mut self, config: ServerConfig, mut shared: _Shared, now: Instant):
         """Between requests again: the idle timeout, or the header one if
         the next head has begun."""
         self.state = _WAITING
         self.rejected = False
+        self.give_back(shared)
         # (Line ends before a request line are no head: RFC 9112 2.2.)
         self.head_started = self.http.head_begun()
         var t = config.header_timeout if self.head_started else config.idle_timeout
@@ -1023,7 +1295,7 @@ struct _Conn(Movable):
             self.ev._head[0].headers = Headers()
 
     def produce[H: Handler](
-        mut self, mut handler: H, config: ServerConfig, now: Instant
+        mut self, mut handler: H, config: ServerConfig, mut shared: _Shared, now: Instant
     ) raises -> Bool:
         """Pull streamed body from the handler while the output is under
         `_HIGH_WATER`: True if some went out (flush it), False if the stream
@@ -1037,98 +1309,219 @@ struct _Conn(Movable):
             if n > 0:
                 self.http.send_body(Span(self.res.body))
                 sent = True
+                self.sent += n
                 self.last_out = now
                 var last = self.res.body[n - 1]
                 self.line_open = last != 10 and last != 13
             if not more:
                 self.http.end_response()
-                self.waiting(config, now)
+                self.waiting(config, shared, now)
                 handler.stream_ended(self.req, True)
+                self.finish(handler, self.status_sent, True, False, now)
                 return True
             if len(self.res.body) == 0:
                 self.paused = True
+                if not self.probing:
+                    # (A client that vanishes without FIN or RST would hold a
+                    # paused stream forever: nothing is sent, so nothing
+                    # times out. Keepalive probes notice it in about a
+                    # minute; the error then closes the connection, SR2
+                    # SRV-1.)
+                    self.probing = True
+                    try:
+                        self.stream.detect_dead_peers()
+                    except:
+                        pass
                 return sent
         return sent
 
     def start[H: Handler](
-        mut self, mut handler: H, config: ServerConfig, date: DateCache, now: Instant
+        mut self, mut handler: H, config: ServerConfig, date: DateCache, mut shared: _Shared, now: Instant
     ) raises -> Bool:
         """A request head arrived: move it into `req`. True if it was
-        answered at once (a body over `max_body`, or a failing hook)."""
+        answered at once (a body over its limit or the memory budget, a
+        refusal by `admit`, or a failing hook)."""
         ref h = self.ev.head()
+        self.served += 1
+        self.req.number = self.served
         swap(self.req.method, h.method)
         swap(self.req.target, h.target)
         self.req.version = h.version
         swap(self.req.headers, h.headers)
         self.req.body.clear()
         self.req.trailers.clear()
+        self.exchange_open = True
+        self.started = now
+        self.received = 0
+        self.sent = 0
+        self.status_sent = 0
         if not _origin_form(self.req):
             self.rejected = True
-            self.http.send_error(400, date.current())
+            self.http.send_error(400, date.current(), config.server_name)
+            self.finish(handler, 400, True, True, now)
             return True
         if self.sni.byte_length() > 0 and not _same_host(self.req.host(), self.sni):
             # (TS6) Not the name the client asked for: 421 Misdirected
             # Request, and the connection closes after it.
             self.rejected = True
-            self.http.send_error(421, date.current())
+            self.http.send_error(421, date.current(), config.server_name)
+            self.finish(handler, 421, True, True, now)
+            return True
+        if self.req.method == "CONNECT":
+            # (No tunnels here: answered before the handler, whose 2xx
+            # would become a 500, SR2 I-17.)
+            self.rejected = True
+            self.http.send_error(501, date.current(), config.server_name)
+            self.finish(handler, 501, True, True, now)
             return True
         self.rejected = False
         self.state = _BODY
+        self.limit = config.max_body
+        self.request_deadline = Instant(nanos=Int.MAX)
         self.deadline = now + config.read_timeout
         self.body_window = 0
         self.body_open = False
-        var ok = True
+        if (
+            shared.draining
+            or (config.max_requests > 0 and self.served >= config.max_requests)
+            or (Duration.ZERO < config.max_connection_age and now - self.born >= config.max_connection_age)
+        ):
+            self.http.close_gracefully()  # this request is the connection's last
+        # Admission, before any of the body is read or 100 Continue sent.
+        self.res._reset()
+        self.req.unix_time = date.unix_seconds()
+        var admitted: Bool
+        try:
+            admitted = handler.admit(self.req, self.res)
+        except e:
+            self.fail(handler, config, date, shared, now, e)
+            return True
+        if not admitted:
+            self.rejected = True
+            self.res._stream = False  # (no stream here)
+            self.res._events = False
+            _ = self.send(config, date)
+            self.finish(handler, self.status_sent, True, False, now)
+            return True
         try:
             self.streamed = handler.stream_request(self.req)
-        except:
-            ok = False
-        if not ok:
-            self.fail(config, date)
+        except e:
+            self.fail(handler, config, date, shared, now, e)
             return True
         self.body_open = self.streamed
-        var length = self.ev.framing.length
-        if not self.streamed and length > config.max_body:
-            self.reject(config, date)
-            return True
-        if self.req.version.at_least_1_1() and self.req.headers.has_token("expect", "100-continue"):
+        if not self.streamed:
+            var limit = handler.body_limit(self.req)
+            if limit >= 0:
+                self.limit = limit
+            var length = self.ev.framing.length
+            if length > self.limit:
+                self.reject(handler, config, date, now, 413)
+                return True
+            if not self.take(shared, config, length):
+                self.reject(handler, config, date, now, 503)
+                return True
+            if Duration.ZERO < config.request_timeout:
+                self.request_deadline = now + config.request_timeout
+                if self.request_deadline < self.deadline:
+                    self.deadline = self.request_deadline
+        if self.http.expects_continue():
             self.http.send_continue()
         return False
 
-    def fail(mut self, config: ServerConfig, date: DateCache) raises:
-        """A hook raised before the request ended: answer 500; the rest of
-        the request is ignored."""
+    def take(mut self, mut shared: _Shared, config: ServerConfig, total: Int) -> Bool:
+        """Hold `total` bytes of `max_body_memory` for the current body (it
+        holds `reserved` already): False if not that many are left."""
+        if total <= self.reserved:
+            return True
+        var more = total - self.reserved
+        if config.max_body_memory > 0 and shared.bodies + more > config.max_body_memory:
+            return False
+        shared.bodies += more
+        self.reserved = total
+        return True
+
+    def give_back(mut self, mut shared: _Shared):
+        """The current body no longer counts against `max_body_memory`."""
+        shared.bodies -= self.reserved
+        self.reserved = 0
+
+    def finish[H: Handler](mut self, mut handler: H, status: Int, finished: Bool, by_server: Bool, now: Instant):
+        """The current request is over: `Handler.completed`, once."""
+        if not self.exchange_open:
+            return
+        self.exchange_open = False
+        handler.completed(
+            self.req, Exchange(status, self.sent, self.received, self.started, now, finished, by_server)
+        )
+
+    def map_failure[H: Handler](
+        mut self, mut handler: H, error: Error, mut shared: _Shared, now: Instant
+    ) raises -> Bool:
+        """`res` holds a fresh 500 for a hook that raised `error`: log it
+        (`log_errors`), and let `Handler.failed` change the answer. True if
+        it did."""
+        if shared.log:
+            shared.errors.say(now, _error_line(self.req, error))
+        var ok = True
+        try:
+            handler.failed(self.req, error, self.res)
+        except:
+            ok = False
+        if ok and not self.res._stream:
+            return self.res.status != 500
+        self.res._reset()
+        self.res.text(500, "Internal Server Error\n")
+        return False
+
+    def fail[H: Handler](
+        mut self, mut handler: H, config: ServerConfig, date: DateCache, mut shared: _Shared, now: Instant, error: Error
+    ) raises:
+        """A hook raised (`error`) before the request ended: answer 500, or
+        what `Handler.failed` makes of it; the rest of the request is
+        ignored."""
         self.rejected = True
         self.res._reset()
         self.res.text(500, "Internal Server Error\n")
+        var mapped = self.map_failure(handler, error, shared, now)
         _ = self.send(config, date)
+        self.finish(handler, self.status_sent, True, not mapped, now)
 
-    def reject(mut self, config: ServerConfig, date: DateCache) raises:
-        """Answer 413 before the body ends; its rest is then ignored (the
+    def reject[H: Handler](
+        mut self, mut handler: H, config: ServerConfig, date: DateCache, now: Instant, status: Int
+    ) raises:
+        """Answer before the body ends: 413 (over its limit) or 503 (over
+        `max_body_memory`, with Retry-After); its rest is then ignored (the
         codec reads a short one and closes after a long one)."""
         self.rejected = True
         self.res._reset()
-        self.res.text(413, "Request body too large\n")
+        if status == 503:
+            self.res.retry_later(503, Duration.from_secs(1))
+        else:
+            self.res.text(413, "Request body too large\n")
         _ = self.send(config, date)
+        self.finish(handler, self.status_sent, True, True, now)
 
     def answer[H: Handler](
-        mut self, mut handler: H, config: ServerConfig, date: DateCache
+        mut self, mut handler: H, config: ServerConfig, date: DateCache, mut shared: _Shared, now: Instant
     ) raises -> Bool:
         """Run the handler and send its response: True if it is a stream
         whose body is still to come."""
         self.res._reset()
-        var failed = False
+        self.req.unix_time = date.unix_seconds()
+        var by_server = False
         try:
             handler.handle(self.req, self.res)
-        except:
-            failed = True
-        if failed:
+        except e:
             if self.res._stream:
                 handler.stream_ended(self.req, False)  # (it may hold something)
             self.res._reset()
             self.res.text(500, "Internal Server Error\n")
+            by_server = not self.map_failure(handler, e, shared, now)
         var streaming = self.send(config, date)
         if self.res._stream and not streaming:
             handler.stream_ended(self.req, not self.refused)  # nothing to stream
+        if not streaming:
+            self.finish(handler, self.status_sent, True, by_server or self.refused, now)
         return streaming
 
     def send(mut self, config: ServerConfig, date: DateCache) raises -> Bool:
@@ -1137,30 +1530,37 @@ struct _Conn(Movable):
         instead. A streamed response gets its head only (the codec chunks
         it, unless the handler gave a Content-Length): True then, unless
         it has no body to stream (HEAD, 204, 304)."""
-        var head = ResponseHead(self.res.status, self.res.reason)
+        var head = ResponseHead(self.res.status)
+        swap(head.reason, self.res.reason)
         swap(head.headers, self.res.headers)
         var has = _scan(head.headers)
-        # The server's own fields are valid by construction: pushed as is.
-        if not has.date:
-            head.headers._push("Date".as_bytes(), date.current().as_bytes(), utf8=True)
-        if config.server_name.byte_length() > 0 and not has.server:
-            head.headers._push("Server".as_bytes(), config.server_name.as_bytes(), utf8=True)
+        # The server's own fields are valid by construction: its Date and
+        # Server lines go to the codec encoded (`DateCache.lines`), unless
+        # the handler set either, which is rare: then they are pushed.
+        var whole_lines = not has.date and not has.server and date.lines().byte_length() > 0
+        if not whole_lines:
+            if not has.date:
+                head.headers._push("Date".as_bytes(), date.current().as_bytes(), utf8=True)
+            if config.server_name.byte_length() > 0 and not has.server:
+                head.headers._push("Server".as_bytes(), config.server_name.as_bytes(), utf8=True)
         var s = head.status
         var bodiless = (s >= 100 and s < 200) or s == 204 or s == 304
-        var streaming = self.res._stream and not bodiless and self.req.method != "HEAD"
+        var head_req = self.req.method == "HEAD"
+        var streaming = self.res._stream and not bodiless and not head_req
         # What the server cannot send as asked gets a 500: no upgrades or
         # tunnels (the connection stays HTTP), and a buffered body must fit
         # the codec and match the handler's Content-Length.
         var invalid = s == 101 or (self.req.method == "CONNECT" and s >= 200 and s < 300)
-        if not invalid and not self.res._stream and not bodiless and self.req.method != "HEAD":
+        if not invalid and not self.res._stream and not bodiless and not head_req:
             if len(self.res.body) > _MAX_BUFFERED_BODY:
                 invalid = True
             elif has.framing:
                 var declared = _declared_length(head.headers)
                 invalid = Bool(declared) and declared.value() != len(self.res.body)
+        var length = -1
         if not bodiless and not has.framing:
             if not self.res._stream:
-                _push_decimal(head.headers, "Content-Length", len(self.res.body))
+                length = len(self.res.body)  # (the codec writes its line)
             elif not streaming and self.req.version.at_least_1_1():
                 # HEAD: the fields its GET gets (RFC 9110 9.3.2), where the
                 # codec would chunk the body
@@ -1168,10 +1568,17 @@ struct _Conn(Movable):
         var refused = invalid
         if not refused:
             try:
-                self.http.send_response(head)
+                if whole_lines:
+                    self.http._respond(head, date.lines().as_bytes(), length)
+                else:
+                    self.http._respond(head, "".as_bytes(), length)
             except:
                 refused = True
         self.refused = refused
+        self.status_sent = 500 if refused else s
+        self.sent = 0
+        if not refused and not bodiless and not self.res._stream and not head_req:
+            self.sent = len(self.res.body)
         if refused:
             var fallback = ResponseHead(500)
             fallback.headers.add("Date", date.current())
@@ -1179,12 +1586,14 @@ struct _Conn(Movable):
             self.http.send_response(fallback)
         elif streaming:
             swap(head.headers, self.res.headers)
+            swap(head.reason, self.res.reason)
             self.beating = self.res._events and not has.framing
             return True  # the body comes from produce
         elif not bodiless and not self.res._stream:
             self.http.send_body(Span(self.res.body))
         self.http.end_response()
-        swap(head.headers, self.res.headers)  # keep the allocation for the next one
+        swap(head.headers, self.res.headers)  # keep the allocations for the next one
+        swap(head.reason, self.res.reason)
         return False
 
 
@@ -1214,23 +1623,6 @@ def _scan(headers: Headers) -> _Has:
     return h
 
 
-def _push_decimal(mut headers: Headers, name: StringSlice, n: Int):
-    """Push the field `name: <n in decimal>` (n >= 0) without a String."""
-    var buf = Array[UInt8, 20](fill=0)
-    var digits = 0
-    var v = n
-    while True:
-        digits += 1
-        v //= 10
-        if v == 0:
-            break
-    v = n
-    for i in range(digits - 1, -1, -1):
-        buf[i] = UInt8(48 + v % 10)
-        v //= 10
-    headers._push(name.as_bytes(), Span(buf)[0:digits], utf8=True)
-
-
 def _declared_length(headers: Headers) -> Optional[Int]:
     """The Content-Length a handler set, if it is plain digits (anything
     else the codec refuses)."""
@@ -1251,7 +1643,11 @@ def _enough(window: Int, timeout: Duration, min_rate: Int) -> Bool:
     least 1 byte)."""
     if min_rate <= 0:
         return window > 0
-    var need = max(min_rate * Int(timeout.as_nanos() // 1_000_000) // 1000, 1)
+    var ms = Int(timeout.as_nanos() // 1_000_000)
+    # (Saturated: a long timeout times a large rate wrapped below zero, and
+    # then any progress renewed the timeout, SR2 SRV-3.)
+    var product = Int.MAX if ms > 0 and min_rate > Int.MAX // ms else min_rate * ms
+    var need = max(product // 1000, 1)
     return window >= need
 
 
@@ -1343,7 +1739,9 @@ struct Server[H: Handler](Movable):
 
     var handler: Self.H
     """The application; reachable between `step`s (tests read its state)."""
-    var config: ServerConfig
+    var _config: ServerConfig
+    """Checked once, at construction, and never changed after: the loop
+    trusts what it checked (the Server field is sent as is: SR2 SRV-2)."""
     var _listener: Optional[TcpListener]
     var _ep: Epoll
     var _conns: List[Optional[_Conn]]
@@ -1399,17 +1797,33 @@ struct Server[H: Handler](Movable):
     whose handshake ended are skipped when met): the oldest is the first
     to give its place up (`tls_client_wait`)."""
     var _admitted_head: Int
+    var _shared: _Shared
+    """What the connections share: the body budget, the drain, the logs."""
+    var _drain_end: Instant
+    """With `_shared.draining`: when the shutdown proper begins."""
 
     def __init__(out self, var handler: Self.H, config: ServerConfig = ServerConfig()) raises IoError:
         """`InvalidInput` for a configuration that cannot work: a
         `server_name` that is no valid field value, `max_connections` out of
-        1..16 million or so, or inconsistent `limits`."""
+        1..16 million or so, a negative `max_body`, `max_body_memory`,
+        `max_requests` or `min_rate`, a `max_body_memory` under `max_body`,
+        a zero
+        `header_timeout`, `idle_timeout`, `read_timeout` or `write_timeout`
+        (each would close connections at the next sweep: `Duration.MAX` is
+        "practically never"), or inconsistent `limits`."""
         comptime op = "Server"
         for b in config.server_name.as_bytes():
             if not is_field_byte(b) or b == 9:  # (also no tab)
                 raise IoError.of_kind(op, ErrorKind.InvalidInput)
         if config.max_connections < 1 or config.max_connections > _MAX_CONNECTIONS or config.min_rate < 0:
             raise IoError.of_kind(op, ErrorKind.InvalidInput)
+        if config.max_body < 0 or config.max_body_memory < 0 or config.max_requests < 0:
+            raise IoError.of_kind(op, ErrorKind.InvalidInput)
+        if config.max_body_memory > 0 and config.max_body_memory < config.max_body:
+            raise IoError.of_kind(op, ErrorKind.InvalidInput)  # (a body at `max_body` could never fit)
+        for d in [config.header_timeout, config.idle_timeout, config.read_timeout, config.write_timeout]:
+            if not (Duration.ZERO < d):
+                raise IoError.of_kind(op, ErrorKind.InvalidInput)
         if config.tls_max_handshakes < 1 or config.tls_handshake_rate < 0 or not (Duration.ZERO < config.tls_client_wait):
             raise IoError.of_kind(op, ErrorKind.InvalidInput)
         self._max_buffered = max(
@@ -1417,7 +1831,7 @@ struct Server[H: Handler](Movable):
         )
         _ = ServerConnection(limits=config.limits, max_buffered=self._max_buffered)  # (checks them)
         self.handler = handler^
-        self.config = config.copy()
+        self._config = config.copy()
         self._listener = None
         self._ep = Epoll.new()
         self._conns = List[Optional[_Conn]]()
@@ -1426,6 +1840,7 @@ struct Server[H: Handler](Movable):
         self._events = List[EpollEvent](capacity=1024)
         self._chunk = List[UInt8](length=_READ_CHUNK, fill=0)
         self._date = DateCache()
+        self._date.set_server(config.server_name)
         self._paused_until = None
         self._backlog = False
         self._next_sweep = Instant.now()
@@ -1452,13 +1867,24 @@ struct Server[H: Handler](Movable):
         self._admitted_ids = List[UInt64]()
         self._admitted_at = List[Instant]()
         self._admitted_head = 0
+        self._shared = _Shared(config.log_errors)
+        self._drain_end = self._now
+
+    def config(self) -> ServerConfig:
+        """The configuration, as checked at construction (a copy: it cannot
+        change once the server runs)."""
+        return self._config.copy()
 
     def bind(mut self, addr: SocketAddr) raises IoError:
         """Listen on `addr` (port 0 picks one: see `local_addr`), with
         SO_REUSEPORT if the configuration asks. Raises the fd limit and
-        pre-grows the fd table first (docs/spikes.md)."""
+        pre-grows the fd table first (docs/spikes.md). `InvalidInput` if
+        the server listens already: it has one listener (a second `bind`
+        closed the first one)."""
+        if self._listener:
+            raise IoError.of_kind("Server.bind", ErrorKind.InvalidInput)
         _ = raise_nofile_limit()
-        var l = TcpListener.bind_reuseport(addr) if self.config.reuseport else TcpListener.bind(addr)
+        var l = TcpListener.bind_reuseport(addr) if self._config.reuseport else TcpListener.bind(addr)
         _ = pregrow_fd_table(l)
         self._ep.add(l, UInt32(EPOLLIN | EPOLLET), _LISTENER)
         self._listener = l^
@@ -1480,7 +1906,7 @@ struct Server[H: Handler](Movable):
         self._reload_failed = False
         self._tls_config.clear()
         self._tls_config.append(c^)
-        self._next_reload = Instant.now() + self.config.tls_reload_check
+        self._next_reload = Instant.now() + self._config.tls_reload_check
         self._alarm(Instant.now())
 
     def tls_context(self) -> Optional[TlsContext]:
@@ -1583,13 +2009,29 @@ struct Server[H: Handler](Movable):
 
     def shutdown(mut self):
         """Begin a graceful shutdown (see the module docs); `step` or `run`
-        carries it out. Calling it again changes nothing."""
-        if self._stopping:
+        carries it out. With a `drain_delay`, the server first goes on
+        accepting and serving for that long, each response saying
+        `Connection: close` (`shutting_down` is called at its start).
+        Calling it again changes nothing."""
+        if self._stopping or self._shared.draining:
             return
+        if Duration.ZERO < self._config.drain_delay:
+            self._shared.draining = True
+            self._now = Instant.now()
+            self._drain_end = self._now + self._config.drain_delay
+            self.handler.shutting_down()
+            self._take_wakes()
+            return
+        self._shut(True)
+
+    def _shut(mut self, hook: Bool):
+        """The shutdown proper (`hook`: call `shutting_down`, which a drain
+        called already)."""
+        self._shared.draining = False
         self._stopping = True
         var now = Instant.now()
         self._now = now
-        self._stop_deadline = now + self.config.shutdown_timeout
+        self._stop_deadline = now + self._config.shutdown_timeout
         if self._listener:
             # Connections the kernel has queued may have sent requests:
             # take them before closing the listener resets them.
@@ -1601,8 +2043,9 @@ struct Server[H: Handler](Movable):
             self._listener = None
         self._paused_until = None
         self._backlog = False
-        self.handler.shutting_down()
-        self._take_wakes()
+        if hook:
+            self.handler.shutting_down()
+            self._take_wakes()
         for slot in range(len(self._conns)):
             if not self._conns[slot]:
                 continue
@@ -1615,7 +2058,7 @@ struct Server[H: Handler](Movable):
             # read is in progress), then stop taking requests.
             var ok = True
             try:
-                self._conns[slot].value().absorb(self._chunk, self.config, now)
+                self._conns[slot].value().absorb(self._chunk, self._config, now)
             except:
                 ok = False
             if not ok:
@@ -1656,14 +2099,16 @@ struct Server[H: Handler](Movable):
             wait = min(wait, self._paused_until.value() - self._now)
         if self._stopping and self._live > 0:
             wait = min(wait, self._stop_deadline - self._now)
+        if self._shared.draining:
+            wait = min(wait, max(Duration.ZERO, self._drain_end - self._now))
         if len(self._again) > 0:
             wait = Duration.ZERO
-        elif len(self._tls_queue) > 0 and self._handshakes < self.config.tls_max_handshakes:
+        elif len(self._tls_queue) > 0 and self._handshakes < self._config.tls_max_handshakes:
             wait = min(wait, max(Duration.ZERO, self._rate_start + Duration.from_secs(1) - self._now))
         elif len(self._tls_queue) > 0:
             var oldest = self._oldest_admitted()
             if oldest:
-                wait = min(wait, max(Duration.ZERO, oldest.value() + self.config.tls_client_wait - self._now))
+                wait = min(wait, max(Duration.ZERO, oldest.value() + self._config.tls_client_wait - self._now))
         var n = self._ep.wait(self._events, Optional[Duration](wait))
         var now = Instant.now()
         self._now = now
@@ -1706,12 +2151,16 @@ struct Server[H: Handler](Movable):
             if what != Stop.NONE:
                 self.shutdown()
             if what == Stop.NOW:
+                if self._shared.draining:
+                    self._shut(False)  # (no drain at once)
                 self._close_all()
+        if self._shared.draining and now >= self._drain_end:
+            self._shut(False)
         if self._stopping and now >= self._stop_deadline:
             self._close_all()  # what is left after shutdown_timeout
         if now >= self._next_sweep:
             self._sweep(now)
-            self._next_sweep = now + self.config._sweep_every()
+            self._next_sweep = now + self._config._sweep_every()
             if len(self._tls_queue) > 0:
                 self._admit(now)  # (the sweep may have freed handshakes)
 
@@ -1719,7 +2168,7 @@ struct Server[H: Handler](Movable):
         var alive: Bool
         try:
             alive = self._conns[slot].value().service(
-                self.handler, self.config, self._date, self._chunk, now, hangup
+                self.handler, self._config, self._date, self._chunk, self._shared, now, hangup
             )
         except:
             alive = False  # reset, broken pipe, a TLS failure: drop it
@@ -1743,6 +2192,7 @@ struct Server[H: Handler](Movable):
         if c.handshaking:
             c.handshaking = False
             self._handshakes -= 1
+        c.give_back(self._shared)
         if c.state == _PRODUCING or c.body_open:
             if c.state == _PRODUCING:
                 self.handler.stream_ended(c.req, False)  # its stream is cut
@@ -1750,6 +2200,9 @@ struct Server[H: Handler](Movable):
                 c.body_open = False
                 self.handler.body_cut(c.req)  # its body will not complete
             self._take_wakes()
+        # (a request under way: cut, its response unsent or not whole)
+        ref d = self._conns[slot].value()
+        d.finish(self.handler, d.status_sent, False, d.state != _PRODUCING, self._now)
         try:
             self._ep.delete(self._conns[slot].value().stream)
         except:
@@ -1763,7 +2216,11 @@ struct Server[H: Handler](Movable):
         all of it if not `limit` (a shutdown takes everything queued)."""
         self._backlog = False
         while True:
-            if limit and self._live >= self.config.max_connections:
+            if limit and self._live >= self._config.max_connections:
+                if self._shared.log:
+                    self._shared.cliffs.say(
+                        now, String("server: accepting paused: max_connections (", self._config.max_connections, ") reached")
+                    )
                 self._backlog = True  # take the rest when one closes
                 return
             var acc: Optional[TcpAccepted]
@@ -1774,6 +2231,8 @@ struct Server[H: Handler](Movable):
                     continue  # that connection's network error: the next
                 # out of fds or memory: try again a little later (the
                 # edge-triggered listener would not say so again)
+                if self._shared.log:
+                    self._shared.cliffs.say(now, String("server: accepting paused for 100 ms: ", e))
                 self._paused_until = now + _PAUSE
                 return
             if not acc:
@@ -1793,7 +2252,7 @@ struct Server[H: Handler](Movable):
             self._ids[slot] = id
             try:
                 self._ep.add(stream, UInt32(EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET), UInt64(slot))
-                self._conns[slot] = _Conn(stream^, peer, id, self.config, self._max_buffered, now, len(self._tls) > 0)
+                self._conns[slot] = _Conn(stream^, peer, id, self._config, self._max_buffered, now, len(self._tls) > 0)
                 self._live += 1
             except:
                 self._free.append(slot)  # (the stream closes here)
@@ -1808,12 +2267,12 @@ struct Server[H: Handler](Movable):
             if self._ids[slot] != self._tls_queue_ids[i] or not self._conns[slot] or not self._conns[slot].value().tls_waiting:
                 i += 1  # (closed meanwhile)
                 continue
-            if self._handshakes >= self.config.tls_max_handshakes and not self._evict_stalled(now):
+            if self._handshakes >= self._config.tls_max_handshakes and not self._evict_stalled(now):
                 break
             if now - self._rate_start >= Duration.from_secs(1):
                 self._rate_start = now
                 self._rate_count = 0
-            if self.config.tls_handshake_rate > 0 and self._rate_count >= self.config.tls_handshake_rate:
+            if self._config.tls_handshake_rate > 0 and self._rate_count >= self._config.tls_handshake_rate:
                 break  # (the next second: `step` wakes for it)
             i += 1
             ref c = self._conns[slot].value()
@@ -1869,7 +2328,7 @@ struct Server[H: Handler](Movable):
         `tls_client_wait` since its admission (the server's flight went out
         then: what is left is the client's turn): True if one was."""
         var oldest = self._oldest_admitted()
-        if not oldest or now - oldest.value() < self.config.tls_client_wait:
+        if not oldest or now - oldest.value() < self._config.tls_client_wait:
             return False
         var slot = self._admitted[self._admitted_head]
         self._admitted_head += 1
@@ -1898,8 +2357,8 @@ struct Server[H: Handler](Movable):
         """Apply the timeouts (see the module docs), and check the TLS
         files."""
         if len(self._tls) > 0:
-            if Duration.ZERO < self.config.tls_reload_check and now >= self._next_reload:
-                self._next_reload = now + self.config.tls_reload_check
+            if Duration.ZERO < self._config.tls_reload_check and now >= self._next_reload:
+                self._next_reload = now + self._config.tls_reload_check
                 self._reload(now)
             self._alarm(now)
         for slot in range(len(self._conns)):
@@ -1929,8 +2388,8 @@ struct Server[H: Handler](Movable):
                     c.paused
                     and c.beating
                     and not c.line_open
-                    and Duration.ZERO < self.config.heartbeat
-                    and now - c.last_out >= self.config.heartbeat
+                    and Duration.ZERO < self._config.heartbeat
+                    and now - c.last_out >= self._config.heartbeat
                 ):
                     self._beat(slot, now)
                 continue
@@ -1945,10 +2404,12 @@ struct Server[H: Handler](Movable):
             self._take_wakes()  # (wakes close nothing)
             var answered = False
             try:
-                self._conns[slot].value().http.send_error(408, self._date.current())
+                self._conns[slot].value().http.send_error(408, self._date.current(), self._config.server_name)
                 answered = True
             except:
                 pass  # a response is under way: just close
+            self._conns[slot].value().sent = 0
+            self._conns[slot].value().finish(self.handler, 408 if answered else 0, answered, True, now)
             if answered:
                 self._serve(slot, now)  # flush the 408; it then closes
             else:

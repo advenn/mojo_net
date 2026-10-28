@@ -189,12 +189,20 @@ struct DateCache(Movable):
     this library is a real syscall (no vDSO without libc)."""
 
     var _text: String
+    var _secs: Int
     var _next: Instant
     """When (monotonic) the next second begins."""
+    var _server: String
+    """`Server: <name>` CRLF, or empty."""
+    var _lines: String
+    """`Date: <date>` CRLF, then `_server`: what a response gets."""
 
     def __init__(out self):
         self._text = String()
+        self._secs = 0
         self._next = Instant(nanos=Int.MIN)
+        self._server = String()
+        self._lines = String()
 
     def refresh(mut self, now: Instant):
         """Reformat if `now` is in a later second than the cached date."""
@@ -203,11 +211,30 @@ struct DateCache(Movable):
         var ns = unix_time_ns()
         var secs = ns // NANOS_PER_SEC
         self._text = http_date(secs)
+        self._secs = secs
+        self._lines = String("Date: ", self._text, "\r\n", self._server)
         self._next = now + Duration.from_nanos(NANOS_PER_SEC - (ns - secs * NANOS_PER_SEC))
 
     def current(self) -> StringSlice[origin_of(self._text)]:
         """The date as of the last `refresh`."""
         return StringSlice(self._text)
+
+    def set_server(mut self, name: StringSlice):
+        """Put a `Server: name` line after the Date line in `lines()` (none
+        if `name` is empty). `name` must be a valid field value."""
+        self._server = String("Server: ", name, "\r\n") if name.byte_length() > 0 else String()
+        if self._text.byte_length() > 0:
+            self._lines = String("Date: ", self._text, "\r\n", self._server)
+
+    def lines(self) -> StringSlice[origin_of(self._lines)]:
+        """The Date field line, and the Server one (`set_server`), encoded
+        with their CRLFs, as of the last `refresh` (empty before it)."""
+        return StringSlice(self._lines)
+
+    def unix_seconds(self) -> Int:
+        """The date as of the last `refresh`, in seconds since the epoch
+        (0 before the first)."""
+        return self._secs
 
     def get(mut self) -> StringSlice[origin_of(self._text)]:
         """The current date (reads the monotonic clock to know)."""

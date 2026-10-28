@@ -239,7 +239,7 @@ def _idle_buffers(s: Server[App]) -> Int:
     for i in range(len(s._conns)):
         if s._conns[i]:
             ref c = s._conns[i].value()
-            if c.state == _WAITING and not c.first and len(c.out) == 0 and c.http.pending_transmit() == 0:
+            if c.state == _WAITING and c.served > 0 and len(c.out) == 0 and c.http.pending_transmit() == 0:
                 for n in [
                     c.req.body.capacity(), c.res.body.capacity(), c.out.capacity(),
                     c.http._tx.capacity(), c.http._rx.capacity(), c.req.headers._data.capacity(),

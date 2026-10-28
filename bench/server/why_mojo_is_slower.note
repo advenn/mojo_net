@@ -11,8 +11,30 @@ instructions per request fell by 32-42% (bench/http/codec.mojo; the
 details are in bench/http/README.md). Most of the "line 0" cost in
 section 3 was IoError: passed in registers, it made every typed raise
 cost ~85 instructions on success. It is passed in memory now. The figures
-below are from before that work; the server's profile is to be taken
-again with it.
+below are from before that work.
+
+Update, 2026-10-28 (the server review, SR2; docs/server.md): the profile
+taken again, mojo and hyper in one run (out/profile-20261028-020523.json):
+mojo 4,227 user-space instructions a request pipelined, hyper 4,565. From
+the 9,644 below, HR3's work (IoError in memory, cheaper case-insensitive
+compares, raw stores for heads, the Host bitmap) left 6,417. Then SR2,
+each step measured:
+- field bytes copied as 16/32-byte vectors (Headers._copy): 6,417 -> 5,727;
+- the review's new hooks and checks (admit, body_limit, the body budget,
+  completed, ...): 5,727 -> 6,071, 60 of it a trap: `var error = Error()`,
+  made ahead to hold a caught error, takes a stack trace
+  (KGEN_CompilerRT_GetStackTrace) on every request. Handle the error
+  inside `except e:` instead;
+- then, together: 6,071 -> 4,227. The default Content-Type set without
+  checks (Headers._checked had been 612 a request); the Date and Server
+  lines encoded once a second (DateCache.lines) and the body's length
+  handed to the codec as a number (ServerConnection._respond), so neither
+  is pushed as a field, encoded and parsed back; Request.path() as a byte
+  scan (StringSpan.find had been 125); Expect read from the codec's
+  summary; no empty trailer section built per response; the reason
+  swapped into the head, not copied; the stack trace gone.
+Time has not been measured again (instructions are not time; the wrk runs
+need a quiet machine), so the section 1 figures still stand as measured.
 
 
 1. The short version

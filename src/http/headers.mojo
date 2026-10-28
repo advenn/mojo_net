@@ -157,9 +157,33 @@ def _tail(mut out: ByteBuffer) -> Pointer[UInt8, MutAnyOrigin]:
 
 
 @inline(.always)
+def _copy(dst: Pointer[UInt8, MutAnyOrigin], src: Pointer[UInt8, _], n: Int):
+    """Copy `n` bytes between regions apart, sized as field names and
+    values are. The stdlib's `memcpy` copies 17 to 31 bytes, and the tail
+    past a multiple of 32, one byte at a time; here 17 to 256 go as 16- or
+    32-byte vectors, the last one overlapping (HR3)."""
+    if n <= 16:
+        unsafe_memcpy(dest=dst, src=src, count=n)  # (overlapping loads there)
+    elif n <= 32:
+        var a = src.unsafe_load[width=16]()
+        var b = src.unsafe_offset(n - 16).unsafe_load[width=16]()
+        dst.unsafe_store(a)
+        dst.unsafe_offset(n - 16).unsafe_store(b)
+    elif n <= 256:
+        var i = 0
+        while i + 32 <= n:
+            dst.unsafe_offset(i).unsafe_store(src.unsafe_offset(i).unsafe_load[width=32]())
+            i += 32
+        if i < n:
+            dst.unsafe_offset(n - 32).unsafe_store(src.unsafe_offset(n - 32).unsafe_load[width=32]())
+    else:
+        unsafe_memcpy(dest=dst, src=src, count=n)
+
+
+@inline(.always)
 def _put(dst: Pointer[UInt8, MutAnyOrigin], at: Int, s: Span[UInt8, _]) -> Int:
     """Store `s` at `dst + at`; return the index after it."""
-    unsafe_memcpy(dest=dst.unsafe_offset(at), src=s.unsafe_ptr(), count=len(s))
+    _copy(dst.unsafe_offset(at), s.unsafe_ptr(), len(s))
     return at + len(s)
 
 
@@ -365,6 +389,20 @@ struct Headers(Copyable, Defaultable, Movable, Sized, Writable):
         self._fields[first] = nv
         self._maybe_compact()
 
+    def _set_valid(mut self, name: Span[UInt8, _], value: Span[UInt8, _]):
+        """`set` for a name and value already known to be valid and
+        trimmed (constants): no checks."""
+        var first = self._find(name, 0)
+        if first < 0:
+            self._push(name, value, utf8=True)
+            return
+        _ = self._drop_after(name, first + 1)
+        var f = self._fields[first]
+        self._garbage += f.stored()
+        var nv = self._store(name, value, utf8=True)
+        self._fields[first] = nv
+        self._maybe_compact()
+
     @staticmethod
     def _checked(
         name: Span[UInt8, _], value: Span[UInt8, _], op: StaticString
@@ -399,11 +437,7 @@ struct Headers(Copyable, Defaultable, Movable, Sized, Writable):
         var n = len(s)
         if n > 0:
             self._reserve(n)
-            unsafe_memcpy(
-                dest=self._data.unsafe_ptr().unsafe_offset(at),
-                src=s.unsafe_ptr(),
-                count=n,
-            )
+            _copy(self._data.unsafe_ptr().unsafe_offset(at).unsafe_origin_cast[MutAnyOrigin](), s.unsafe_ptr(), n)
             self._used = at + n
         return at
 
@@ -650,20 +684,12 @@ struct Headers(Copyable, Defaultable, Movable, Sized, Writable):
         var src = self._data.unsafe_ptr()
         var at = start
         for f in self._fields:
-            unsafe_memcpy(
-                dest=dst.unsafe_offset(at),
-                src=src.unsafe_offset(f.name),
-                count=f.name_len,
-            )
+            _copy(dst.unsafe_offset(at), src.unsafe_offset(f.name), f.name_len)
             at += f.name_len
             dst[unsafe_offset=at] = _COLON
             dst[unsafe_offset=at + 1] = _SP
             at += 2
-            unsafe_memcpy(
-                dest=dst.unsafe_offset(at),
-                src=src.unsafe_offset(f.value),
-                count=f.value_len,
-            )
+            _copy(dst.unsafe_offset(at), src.unsafe_offset(f.value), f.value_len)
             at += f.value_len
             dst[unsafe_offset=at] = _CR
             dst[unsafe_offset=at + 1] = _LF

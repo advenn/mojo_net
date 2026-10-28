@@ -127,6 +127,8 @@ mojo's own code does twice the work of hyper's for each request; the kernel's sh
 | pipelined: user + system | 0.99 + 0.33 µs | 0.52 + 0.33 µs | 0.56 + 0.35 µs | 1.31 + 3.75 µs |
 | pipelined: user-space instructions | 9,644 | 4,565 | (not profiled) | (not profiled) |
 
+**Update, 2026-10-28** (the http review HR3, then the server review SR2; `out/profile-20261028-020523.json`, both servers in one run): mojo now takes **4,227** user-space instructions a request pipelined, against hyper's 4,565 (unchanged). By file: `src/http/connection.mojo` 1,097, `parse.mojo` 875, `server.mojo` 823, `headers.mojo` 295, bounds checks 150. What changed is in `why_mojo_is_slower.note`. The times above have not been measured again: instructions are not time (hyper's may retire faster), and the wrk runs need a quiet machine.
+
 **What it is not:**
 - **Not the kernel.** mojo's system time per request is hyper's to the hundredth of a µs: the same system calls (one recv and one send a request with keep-alive).
 - **Not the event loop.** `server.mojo`, the loop and the handler plumbing, is 7% of mojo's instructions (700 a request).

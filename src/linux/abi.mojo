@@ -508,11 +508,21 @@ struct Statx(Copyable, Movable):
     var _attributes_mask: UInt64
     var _atime: Array[UInt64, 2]
     var _btime: Array[UInt64, 2]
-    var _ctime: Array[UInt64, 2]
+    var ctime_sec: Int64
+    """The last status change: any write, chmod, link count change or
+    rename (user space cannot set it)."""
+    var ctime_nsec: UInt32
+    var _ctime_reserved: Int32
     var mtime_sec: Int64
     var mtime_nsec: UInt32
     var _mtime_reserved: Int32
-    var _rest: Array[UInt64, 16]
+    var rdev_major: UInt32
+    var rdev_minor: UInt32
+    """The device a device file is (else 0)."""
+    var dev_major: UInt32
+    var dev_minor: UInt32
+    """The device the file is on: with `ino`, which file it is."""
+    var _rest: Array[UInt64, 14]
 
     def __init__(out self):
         self.mask = 0
@@ -529,8 +539,14 @@ struct Statx(Copyable, Movable):
         self._attributes_mask = 0
         self._atime = Array[UInt64, 2](fill=0)
         self._btime = Array[UInt64, 2](fill=0)
-        self._ctime = Array[UInt64, 2](fill=0)
+        self.ctime_sec = 0
+        self.ctime_nsec = 0
+        self._ctime_reserved = 0
         self.mtime_sec = 0
         self.mtime_nsec = 0
         self._mtime_reserved = 0
-        self._rest = Array[UInt64, 16](fill=0)
+        self.rdev_major = 0
+        self.rdev_minor = 0
+        self.dev_major = 0
+        self.dev_minor = 0
+        self._rest = Array[UInt64, 14](fill=0)

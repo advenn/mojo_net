@@ -48,9 +48,11 @@ os.mkfifo(os.path.join(root, "pub", "fifo"))
 """
 
 comptime _CLIENT = """
-import http.client, os, socket, sys
+import http.client, os, socket, sys, time
 port = int(sys.argv[1]); mode = sys.argv[2]
 out = []
+if mode in ("conditional", "ranges"):
+    time.sleep(2.1)  # files changed within a second or two get weak validators
 c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
 def get(path, method="GET", **headers):
     c.request(method, path, headers=headers); r = c.getresponse(); body = r.read()

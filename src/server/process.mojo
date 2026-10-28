@@ -64,7 +64,7 @@ from linux.process import (
     set_allowed_cpus,
     spawn,
 )
-from linux.signal import SignalFd, SignalSet, block
+from linux.signal import SignalFd, SignalSet, block, write_no_sigpipe
 from linux.syscall import err_of, is_err, syscall0, syscall3, syscall4
 from linux.time import Duration, Instant
 
@@ -81,9 +81,10 @@ def _stop_signals() -> SignalSet:
 
 def _log(msg: String):
     """A line on stderr, with raw write(2) (CLAUDE.md: never print in
-    library code)."""
+    library code), raising no SIGPIPE: a stderr whose reader has gone must
+    not end the process (`linux.signal.write_no_sigpipe`, SR2 BP-1)."""
     var line = String("mojo_net: ", msg, "\n")
-    _ = sys.write(RawFd(2), line.as_bytes())
+    _ = write_no_sigpipe(RawFd(2), line.as_bytes())
 
 
 def _ensure_stdio():

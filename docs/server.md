@@ -29,10 +29,11 @@ def main() raises:
     server.stop_on(stop^)  # SIGTERM or Ctrl-C: a graceful shutdown
     server.run()  # returns when it has finished
 ```
-- **`handle`** gets the whole request: `req.method`, `req.target` (`path()`, `query()`), `req.host()`, `req.headers`, `req.body` (`text()`), `req.peer`. It fills the response: `res.text(...)`, `res.bytes(...)`, or `status`, `headers` and `body` directly. The server adds `Date`, `Content-Length` and the configured `Server`; HEAD drops the body; an error raised gets a 500.
+- **`handle`** gets the whole request: `req.method`, `req.target` (`path()`, `query()`), `req.host()`, `req.headers`, `req.body` (`text()`), `req.peer`. It fills the response: `res.text(...)`, `res.bytes(...)`, `res.redirect(303, "/next")`, or `status`, `headers` and `body` directly. The server adds `Date`, `Content-Length` and the configured `Server`; HEAD drops the body; an error raised gets a 500 (which `failed` may change), and is logged on stderr.
 - **`path()` is raw,** not percent-decoded. Make access decisions on decoded segments, as `Router` matches them: `/%61dmin` is `/admin`.
 - **One loop serves every connection** of the process, so `handle` must not block: no blocking I/O, no sleeping. Handler state needs no locks.
-- **`ServerConfig`** holds the limits and timeouts: `max_connections`, `max_body`, the header, idle, read, write, linger and shutdown timeouts, `min_rate`, `limits` for request heads, `reuseport`, `server_name`, and the event streams' `heartbeat`. `Server(...)` refuses one that cannot work (`InvalidInput`): a `server_name` that is no field value, `max_connections` past the id space.
+- **`ServerConfig`** holds the limits and timeouts: `max_connections`, `max_body` and `max_body_memory`, the header, idle, read, write, request, linger and shutdown timeouts, `min_rate`, `limits` for request heads, `max_requests` and `max_connection_age` per connection, `drain_delay`, `reuseport`, `server_name`, `log_errors`, the event streams' `heartbeat`, and the `tls_*` settings (see TLS). `Server(...)` refuses one that cannot work (`InvalidInput`): a `server_name` that is no field value, `max_connections` past the id space, a negative `max_body`, `max_body_memory`, `max_requests` or `min_rate`, a `max_body_memory` under `max_body`, a zero header, idle, read or write timeout, inconsistent `limits` or `tls_*` settings. Every limit is per process: with N workers, the server takes N times as much.
+- **More hooks,** all defaulted (see "Admission, errors and access logs"): `admit` answers at a request's head, before its body; `body_limit` sets a body limit per request; `failed` maps an error to another answer; `completed` sees every request once, for an access log. A `Handler` that wraps another must pass every hook on, as `Router` does: one it leaves out falls back to the default without a word.
 
 **Routes** go to functions instead (see Routing), with parameters:
 ```mojo
@@ -85,24 +86,46 @@ def main() raises:
   - HEAD: a GET handler answers it, and its body is dropped.
   - `Expect: 100-continue` is answered when the body will be accepted.
   - Request bodies are limited to `max_body`. Beyond it the server answers 413, as soon as Content-Length says so. That answer is the request's only one: a rest that then stalls or breaks closes the connection without another response.
-  - Malformed requests get their status (400, 414, 431, 501 or 505), with a Date, and the connection closes.
+  - Malformed requests get their status (400, 414, 431, 501 or 505), with a Date, and the connection closes. An HTTP/2 client with prior knowledge (`PRI * HTTP/2.0`) gets one 505 and an orderly end of input.
+  - `Request.number` counts a connection's requests from 1 (with `Request.id`, it names a request: for logs). `Request.unix_time` is the second of the response's Date, so a handler need not read the clock (a syscall here) and can keep its own dates no later than Date.
   - A handler that raises gets a 500. So does an answer the server cannot send as asked:
     - a buffered body that does not match the handler's Content-Length, or is over 63 MiB (stream larger ones);
     - a 101, or a 2xx to CONNECT, since the server does no upgrades or tunnels.
 - **Timeouts** (`ServerConfig`), against clients that are slow or stall:
   - `header_timeout`: a request head must arrive within it once it starts, else 408.
-  - `idle_timeout`: how long a kept-alive connection may sit idle.
+  - `idle_timeout`: how long a kept-alive connection may sit idle, from when its last response has gone out to the socket (not from when it was queued: a long download then left the client no time for its next request).
   - `read_timeout`: while a body arrives (408).
   - `write_timeout`: while a response waits on a client that does not read. At its end the connection is aborted (RST), so that the kernel does not go on sending what was queued, up to a send buffer, at the client's pace.
   - **Minimum rate:** the read and write timeouts restart only when a window's worth of progress has passed: `min_rate` (512 B/s) times the timeout, so 15 KB per 30 s window by default. A client dripping a byte at a time is cut at the timeout. `min_rate=0` restarts them on any progress.
+  - Each of the four must be more than zero (`Server` refuses `Duration.ZERO`, which would close at the next sweep); `Duration.MAX` is practically never. For `heartbeat` and `tls_reload_check`, ZERO means never.
+- **Configuration** is checked once, by `Server`, and kept: `Server.config()` returns a copy, so nothing can change it past its checks (a `server_name` set later could have split every response). `max_body` must not be negative. A server has one listener: a second `bind` raises `InvalidInput`.
 - **Fairness:** a connection gets a slice of each turn: 64 KiB read and written, or 128 requests answered. Then it waits for the next turn, which does not wait for readiness. A client that pipelines without pause cannot keep the loop from the others, nor from accepting, the timeouts and stop requests.
 - **Backpressure:** a connection reads nothing while its output is pending.
-- **Responses** get `Date` and `Content-Length`, and `Server` if configured.
+- **Responses** get `Date` and `Content-Length`, and `Server` if configured, the server's own answers (400, 408, 413, 421, 431, 500, 505) too.
 - **Resources:**
   - At start the fd limit is raised and the fd table pre-grown (docs/spikes.md).
   - Above `max_connections` accepting pauses. On EMFILE, and on any other accept error but the network errors accept(2) passes on (those just skip that connection), it pauses for 100 ms.
   - An idle connection gives back every buffer grown past 16 KiB: the bodies, the header arenas, the codec's receive and output buffers. Whatever a client once sent or asked for, an idle connection holds about 100 KiB at most.
   - Connection ids are 40 bits of a per-server count above 24 bits of slot, so an id is not reused before 2^40 connections.
+
+## Admission, errors and access logs (SR2)
+**`admit(req, mut res) -> Bool`** is called at each request's head, first: before `stream_request`, before any of the body is read, and before `100 Continue`. False answers with `res` at once (401, 403, 413, 415, 417, 503; a buffered answer: a stream is refused), and the body is then ignored as after an early 413, read and dropped if short, else the connection closes after the answer. So a client is refused before it uploads, as Go and nginx allow.
+
+**`body_limit(req) -> Int`** gives the request's body limit (413 beyond), asked after `stream_request` said False; -1 (the default) is `max_body`. An upload route can take more than the rest.
+
+**`max_body_memory`** (256 MiB) bounds what buffered request bodies hold at once, over all of the process's connections: each holds its Content-Length from its head, or what has arrived of a chunked body. A request that would go past it gets 503 with `Retry-After: 1`, and is ignored as after a 413. Without it, 10,000 connections uploading 1 MiB slowly held 10 GiB; `min_rate` does not stop that, since 512 B/s a connection is cheap. Bodies streamed to `on_body` do not count.
+
+**Errors.** A hook that raises (`handle`, `admit`, `stream_request`, `on_body`) gets a 500 with a fixed body, and nothing it had set. Then:
+- `failed(req, error, mut res)` may change the answer (a malformed body: 400). A stream is not allowed there, and an error from it keeps the 500.
+- With `log_errors` (the default), a line goes to stderr: the method, the path and the error, with every byte outside printable ASCII escaped (`\x1b`), so a client cannot write terminal escapes into a log. At most one a second, the next saying how many were left out. Accepting that pauses (at `max_connections`, or out of fds) is logged too, at most once in 10 s. The lines are written with `write_no_sigpipe`: a stderr whose reader has gone costs the line, not the process.
+- An error from `produce` ends the connection (its response is under way), and is not logged.
+- A Mojo abort (a bounds check, `abort()`) ends the process and every connection on it; run it under `run_workers` (even with one worker) to have it restarted.
+
+**`completed(req, done: Exchange)`** is called once for each request whose head was read: when its response has been handed to the connection, or when it was cut. `Exchange` holds the status that went out (0 for none), the body bytes sent and received, when the head came and when it ended, whether the response went out whole (`finished`), and whether the server answered rather than the handler (`by_server`: 400, 408, 413, 421, 500, 501, 503). That is an access log; a malformed request whose head could not be read has no `Request`, and is not seen. "Handed to the connection" is not "delivered": the client may still be reading it.
+
+**Keep-alive limits.** After `max_requests` requests on a connection, or once it is older than `max_connection_age`, the next response says `Connection: close` (both off by default, as in Go and Node). Long-lived connections from a load balancer then spread again over the workers after a restart. **`request_timeout`** (off by default) bounds the time from a request's head to the end of its buffered body, whatever its progress (408), as Node's `requestTimeout` does.
+
+**CONNECT** gets 501 from the server, before the handler: the server cannot tunnel, and a handler's 2xx would have become a 500.
 
 ## Closing and shutdown (S3)
 **Lingering close.** When the server ends a connection, it closes it at once unless the client may still be sending: a request answered before its body arrived (413, 408), requests pipelined after the last response, a malformed request (`ServerConnection.input_pending()`).
@@ -110,12 +133,13 @@ def main() raises:
 - Closing at once would answer the client's next bytes with a reset, and a reset can erase the response before the client has read it.
 
 **Graceful shutdown.** `Server.shutdown()` begins it, and `step()` (or `run()`, which then returns) carries it out:
+0. With a `drain_delay` (off by default), the server first goes on accepting and serving for that long, each response saying `Connection: close`, and `shutting_down()` is called at its start, so a readiness check can fail from then on. Kubernetes removes a pod's endpoint at the same time as it sends SIGTERM, and load balancers go on sending new connections for a few seconds: without a delay they are refused (the usual workaround is a `preStop` sleep). A stop at once (a second signal) cuts the delay short. Keep `WorkerConfig.stop_timeout` above `drain_delay` plus `shutdown_timeout`.
 1. The connections the kernel has queued are accepted, without the `max_connections` cap, because their clients may have sent requests already. Then the listener closes, and new connections are refused.
 2. Each connection first reads what has arrived, so a request already sent counts as in progress. Then `close_gracefully()` stops it taking requests:
    - an idle connection closes now;
    - a request in progress gets its response, the last on its connection, saying `Connection: close` if its head has not gone out yet;
    - requests pipelined after it are not answered, and the client retries them on another connection.
-3. `Handler.shutting_down()` is called once. Streams last until `shutdown_timeout` unless they end, so a handler with long-lived ones (server-sent events) ends them there by waking them.
+3. `Handler.shutting_down()` is called once (here, unless a drain called it). Streams last until `shutdown_timeout` unless they end, so a handler with long-lived ones (server-sent events) ends them there by waking them.
 4. After `shutdown_timeout` (10 s), whatever is left closes. `stopped()` is True once no connection is left.
 
 `Server.stop_on(stop)` connects the trigger: a `Stop` from `Stop.on_signals()` or `run_workers` (below).
@@ -185,13 +209,17 @@ def main() raises:
 - The most specific pattern with a route for the method wins: at each segment, text beats a parameter, which beats the rest, with backtracking. So `/users/me` beats `/users/:id`, whatever order the routes were added in, but only for methods `/users/me` has.
 - HEAD uses the GET route.
 - When the path matches but the method has none: 405 with `Allow`, the union of the methods of every pattern that matches. OPTIONS gets 204 and the same `Allow`.
+- Parameters are the decoded bytes, which must be UTF-8: decoded lossily, `a%FF` and `a%FE` would be one value.
 
-**Not routed** (the application gets these):
-- a segment that decodes to something with "/" or NUL in it;
-- an asterisk-form target;
-- a path deeper than 128 segments.
+**Paths no pattern can take fail closed**, so that a crafted path cannot skip a route's checks (`/admin/*rest` answering 403 is not bypassed by `/admin%2Fusers`, which a fallback that forwards would decode):
+- 400: a malformed percent-encoding, a parameter that is not UTF-8, or a segment that decodes to something with "/" or NUL in it;
+- 404: a path deeper than 128 segments.
 
-A malformed percent-encoding gets 400. Matching is strict: no trailing-slash redirects, no case folding, and no dot-segment removal (`/a/../b` is three segments; whoever maps paths to files must refuse those).
+With `router.fallback_unroutable = True`, the last two go to the application instead (a proxy that forwards paths as they came). An asterisk-form target (`OPTIONS *`) goes to the application. `find` tells these cases apart (`NO_ROUTE`, `NO_METHOD`, `MALFORMED`, `ENCODED_SLASH`, `TOO_DEEP`), and clears the parameters on a miss.
+
+**Patterns refused** at `route()`: a method that is not a token, a name used twice in one pattern (`params["id"]` would return the first), and text with "%", "?" or "#" in it, which no decoded path holds.
+
+Matching is strict: no trailing-slash redirects, no case folding, and no dot-segment removal (`/a/../b` is three segments; whoever maps paths to files must refuse those).
 
 **Measured:** 100 to 300 ns per match over 12 routes and paths of 1 to 4 segments (the minimum over batches, on a loaded machine).
 
@@ -207,22 +235,26 @@ Large files are streamed, so the application passes `produce` and `stream_ended`
 
 **No path leaves the directory:**
 - First, the path itself is checked: no empty, "." or ".." segment, and no NUL (404). One trailing "/" names a directory.
-- Dotfiles (`.env`, `.git/`) are 404 too, except `.well-known` (ACME challenges live there), unless `StaticFiles.open(..., dotfiles=True)`.
-- Then the kernel keeps the open beneath the directory: openat2 with `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`. A symlink out of it gets 404 too.
-- Only regular files are served. Files are opened nonblocking, so that a FIFO put in the directory cannot stall the loop; it then gets 404 like any other non-regular file (a socket, a device).
+- Dotfiles (`.env`, `.git/`) are 404 too, except `.well-known` (ACME challenges live there), unless `StaticFiles.open(..., dotfiles=True)`. Hiding them is a convenience, not a boundary: a link with another name, or a vfat short name (`GIT~1` for `.git`), still reaches them. Keep secrets out of the directory.
+- Then the kernel keeps the lookup beneath the directory: openat2 with `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`. A symlink out of it gets 404 too. `StaticFiles.open` checks that openat2 works (Linux 5.6 or later, and a seccomp profile that allows it), and raises if not; there is no fallback to an unconfined open.
+- **Only regular files are served,** and nothing else is opened: a path is looked up first with O_PATH, which runs no device driver (a watchdog would arm, a tape rewind), opens no FIFO end, and needs only search permission on a directory (one at 0711 serves its index). A FIFO, socket or device gets 404. A regular file is then opened for reading.
 - A path through a file (`a.txt/x`), a symlink loop or a name too long gets 404; a file the server may not read gets 403.
+- **The directory is the one `open` found,** held open: renaming another tree over it, or flipping a symlink to it (a `current -> releases/N` deploy), is not seen until it is opened again. Symlinks inside it are followed on every request.
 
 **Responses:**
-- **Fields:** Content-Type (from the extension), Content-Length, Last-Modified (never later than now: a future modification time is replaced, RFC 9110 8.8.2.1), an ETag (size and modification time, like nginx's) and `Accept-Ranges: bytes`.
+- **Fields:** Content-Type (from the extension), Content-Length, Last-Modified (never later than the response's Date: a future modification time is replaced, RFC 9110 8.8.2.1), an ETag, `Accept-Ranges: bytes`, `X-Content-Type-Options: nosniff` (no browser runs an uploaded text file as a script), and `Cache-Control` when `cache_control` is set (`no-cache` for pages, `public, max-age=31536000, immutable` for assets with hashed names; without it, caches guess a freshness from the file's age).
+- **The ETag** names the size, the modification time, and, unless `inode_etags=False`, the inode and the status-change time. User space cannot set the last, so a rewrite that keeps both the size and the modification time (`cp -p`, `rsync -t`, a reproducible build's fixed times) still changes the tag: with nginx's tag a client would revalidate to a stale 304. Turn it off for replicas behind one balancer that serve copies of one tree. A file changed within the last second or two gets a weak tag (another change in the same clock tick could keep every time), which If-Match and If-Range never match; If-Range by date does not match then either.
 - **Directories:** a directory serves its `index.html`, after a 301 to the path with a trailing "/" when it lacks one. There are no listings.
 - **Conditional requests,** in RFC 9110 13.2.2's order:
   - If-Match (strong comparison), and only without it If-Unmodified-Since, answer 412 when they fail. A resumed download of a file that changed gets 412, not new bytes after old ones.
   - Then If-None-Match (weak comparison) answers 304; only without it, If-Modified-Since does.
+  - A list may come in several field lines (RFC 9110 5.3); a date in several is invalid, and ignored.
 - **Ranges** (RFC 9110 14), for GET only (HEAD ignores Range):
   - one byte range gets 206 with Content-Range, an unsatisfiable one 416;
   - several ranges, a malformed one, or an If-Range that does not match get the whole file;
   - an empty file ignores Range.
-- **Bodies:** up to 64 KiB are read whole. Larger ones stream in 64 KiB pieces as the client takes them (`produce`), and `stream_ended` closes the file however the response ends.
+- **Bodies:** up to 64 KiB are read whole. Larger ones stream in 16 KiB pieces as the client takes them (`produce`), and `stream_ended` closes the file however the response ends. A HEAD reads nothing. A slow client's download holds about 144 KiB: 64 KiB queued for its socket, 64 KiB in the codec, and the piece (it was 192 KiB with 64 KiB pieces). At `max_connections` (10,000) slow downloads that is 1.4 GB; sendfile would need none of it (a lead).
+- **A body is the version its head describes.** A file that changes between its lookup and its read (size, times or inode) is looked up again, up to three times, then 500. One that changes while it streams (checked every 256 KiB, and after the last piece) or shrinks ends the connection short of its Content-Length: the client sees an incomplete body, never one made of two versions under the first one's validators (a rewrite in place, as `cp` and editors do; a rename over the file is served consistently, since the open file keeps the old inode).
 - **Reads block:** they are plain preads, so a file not in the page cache stalls the loop while the disk reads it.
 
 **HTTP dates** in conditional fields are read in all three forms, which recipients must accept (`parse_http_date`, RFC 9110 5.6.7).
@@ -237,7 +269,7 @@ The `Handler` hooks beyond `handle` all have defaults, so a handler that buffers
 
 **Responses.** `handle` calls `res.stream()`, and the head goes out at once.
 - **Framing:** chunked, unless the handler set Content-Length; then `produce` must give exactly that many bytes, or the connection closes.
-- **The body comes from `produce(req, mut out)`.** The server asks for more while less than 64 KiB of the connection's output is queued, so a stream goes at its client's pace. A connection holds about 64 KiB, plus one piece; keep pieces small (64 KiB, say).
+- **The body comes from `produce(req, mut out)`.** The server asks for more only once the connection's output has gone to its socket, and while less than 64 KiB is queued, so a stream goes at its client's pace. A connection's buffers then hold up to 64 KiB queued for the socket and 64 KiB in the codec, plus the piece's: keep pieces small (16 KiB, as `StaticFiles` does). At `max_connections` (10,000) slow clients, that is about 1.4 GB: lower `max_connections` where memory is tighter.
 - **The end:** returning False ends the stream: the last chunk goes out, and the connection serves its next request.
 - **Pausing:** appending nothing and returning True pauses the stream. Nothing more is asked until its connection is woken:
   - `Request.id` names the connection. It names that connection while it lives and never another one.
@@ -253,7 +285,7 @@ The `Handler` hooks beyond `handle` all have defaults, so a handler that buffers
   - otherwise when it was cut: the client left, `produce` raised, the head was refused, or a shutdown timed out.
 
   It is where a stream's resources (an open file, a subscription) are released.
-- A paused stream lasts as long as its handler wants: the header, idle and read timeouts do not apply to it, and the write timeout applies while its output waits.
+- A paused stream lasts as long as its handler wants: the header, idle and read timeouts do not apply to it, and the write timeout applies while its output waits. When it first pauses, its socket gets keepalive probes (`TcpStream.detect_dead_peers`: after 30 s of silence, then every 10 s, 3 of them), so a client that vanished without FIN or RST (power loss, a NAT that dropped the connection) is cut within about a minute rather than held forever.
 - A client that closes or half-closes its side while its stream is paused ends the stream, as nginx does.
 - A client that half-closes while output waits for it may still be reading, so the stream goes on. If the client is gone, the server's next probe of its zero window draws a reset (TCP's persist timer, about 200 ms), and the stream is cut then; a peer that never answers is cut at `write_timeout`. This also holds when the client's pipelined requests fill the codec, so that no read can see the end of input: epoll's hangup flag tells instead.
 - An error from `stream_request` or `on_body` answers 500, ignores the rest of the request, and closes the connection after the response (unless the rest is short enough to drain).
@@ -450,3 +482,19 @@ server.run()
   - **Planted bugs:** 9 of 9 caught: no close_notify, no 421, no handshake deadline, no cap on handshakes at once or a second, no reload, the configured ALPN kept, `SSLKEYLOGFILE` passed on, handshakes cut at a shutdown. (`test_workers.mojo` builds its app from `MOJO_NET_TEST_SRC` when set, so that a planted copy reaches it.)
   - **Review (TR2, 2026-10-27; `docs/tls.md`, "Review"):** silent sockets held every handshake's place while accepting paused (fixed: no TLS state before the ClientHello, which waits for admission unread); an upload behind the Finished refused as a too large handshake; a failed reload never tried again after a `chmod`; an absolute-form authority checked while another Host field stayed. Tests: `tests/server/test_server_tls_regressions.mojo` (6), with the admission tests of `test_tls.mojo` rewritten. `tls-asan` now runs `test_tls.mojo` too.
   - **Not run here:** sslyze against the listener (not on conda-forge); the protocol profile is tested on `tls.TlsServer` itself (`docs/tls.md`, "Checks"), and the listener uses that context unchanged.
+- **SR2: the second review (2026-10-28).** Three internal reviewers, read-only: the loop as an attacker sees it, best practices against Go, nginx, hyper and Kestrel, and static files with the router. Every finding is fixed, each with a regression test checked to fail on the old code:
+  - `tests/server/test_server_review2_regressions.mojo` (15: the router failing closed, UTF-8 parameters, patterns refused, parameters cleared on a miss; keepalive on a paused stream, the configuration read-only, a saturating `min_rate` window, a log line to a broken stderr, the idle timer after a long response, a second `bind`, settings refused, the server's own errors with `Server`, request numbers, `unix_time`, the HTTP/2 preface);
+  - `tests/server/test_static_review2_regressions.mojo` (10) and `test_static_review2_faults.mojo` (3, through the fault seam: openat2 refused, a short read);
+  - `tests/linux/test_signal.mojo` (`write_no_sigpipe`).
+
+  The most severe:
+  - **A file rewritten in place while it downloaded was sent whole, as a mix of both versions,** under the first one's strong ETag (`cp`, a shell `>`, `rsync --inplace`). Now the connection ends short, and a file that changes between its lookup and its read is looked up again.
+  - **ETags collided** for a same-size change that kept the modification time (`cp -p`, reproducible builds), so clients revalidated to stale 304s; times before 1970 lost their seconds.
+  - **A long poll to a client that vanished without FIN or RST was never reclaimed**: nothing was sent, so nothing timed out. A paused stream now turns on keepalive probes.
+  - **The router passed paths it cannot route to the application** (an encoded "/", NUL, over 128 segments), past every route's checks.
+  - **A log line to a stderr pipe whose reader had gone killed the process** (SIGPIPE): a TLS reload note did it, and a certificate in its last third crash-looped every worker.
+  - Also: `server_name` could be changed past its check (`Server.config()` is a copy now); a long `min_rate` window wrapped; the idle timer started when a long response was queued; a second `bind` closed the first listener; a negative `max_body` refused every request; FIFOs and devices were opened before their type was known; a 0711 directory answered 403; openat2 refused made every request fail after `open` succeeded; list fields in several lines; a Last-Modified a second past Date; non-UTF-8 parameters decoded lossily; patterns that could not work.
+  - **Best practices** (`tests/server/test_server_practices.mojo`, 11): `admit` and `body_limit`, `max_body_memory`, `failed` and the error log, `completed` with `Exchange`, `max_requests` and `max_connection_age`, `request_timeout`, `drain_delay`, CONNECT answered 501, `Response.redirect`, nosniff and `cache_control` on files (see the sections above).
+  - **Cost per request** (`pixi run -e bench bench-profile`, pipelined, one CPU): from 6,417 user-space instructions to 4,227, against hyper's 4,565 in the same run (`bench/server/README.md`; time not measured again). The Content-Type default is set without checks, `path()` scans bytes, `Expect` is read from the codec's summary, and the server hands the codec its Date and Server lines encoded once a second and the body's length as a number (`ServerConnection._respond`, checked byte for byte against `send_response` by `tests/http/test_respond.mojo`). Building an `Error` ahead to hold one had cost a stack trace per request (60 instructions); errors are now handled where they are caught.
+  - **Planted bugs:** 62 of 62 caught: 31 for the findings, 25 for the best practices, 6 for the savings. Three survived the first tests and got better ones: STA-3's measured queued output, which the loop already bounds (it now measures the buffers); the unchecked Content-Type and the last chunk's end were not looked at by `test_server.mojo` (a Content-Type test, and `test_server_connection.mojo`'s exact bytes, catch them).
+  - **Not done** (the owner's decisions, or later): sendfile for large files; precompressed files; a cross-thread waker; socket activation, readiness and sd_notify; SIGHUP; 503 at the connection cap; WebSocket; renames (`server_name` → `server_header`); PROXY protocol; a default `idle_timeout` of 75 s (load balancers keep 60); workers forced to `reuseport`.

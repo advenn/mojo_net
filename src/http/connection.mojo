@@ -551,6 +551,26 @@ def _only_chunked(headers: Headers) raises IoError -> Bool:
     return n == 1 and chunked
 
 
+comptime _CL_LINE_MAX = 16 + 19 + 2
+"""The longest `Content-Length: <n>` CRLF line."""
+
+
+@inline(.always)
+def _put_length(dst: Pointer[UInt8, MutAnyOrigin], at: Int, n: Int) -> Int:
+    """Write `Content-Length: <n>` CRLF (n >= 0) at `at`; return the end."""
+    var i = _put(dst, at, "Content-Length: ".as_bytes())
+    var digits = 1
+    var v = UInt(n)
+    while v >= 10:
+        v //= 10
+        digits += 1
+    v = UInt(n)
+    for k in range(digits - 1, -1, -1):
+        dst[unsafe_offset = i + k] = UInt8(48 + Int(v % 10))
+        v //= 10
+    return _put_crlf(dst, i + digits)
+
+
 @inline(.always)
 def _crlf(mut out: ByteBuffer) raises IoError:
     out.write_byte(_CR)
@@ -865,6 +885,11 @@ struct ServerConnection(Codec, Copyable):
     def _misuse(self, op: StaticString) -> IoError:
         return IoError.of_kind(op, ErrorKind.InvalidInput)
 
+    def expects_continue(self) -> Bool:
+        """The request being answered asked for `100 Continue` (`Expect:
+        100-continue`, HTTP/1.1), and none was sent yet."""
+        return self._expect and not self._continued
+
     def send_continue(mut self) raises IoError:
         """`100 Continue`, for a request with `Expect: 100-continue` whose
         body the application wants (RFC 9110 10.1.1). A no-op for an
@@ -899,6 +924,17 @@ struct ServerConnection(Codec, Copyable):
         status of 101 or 200..599, 101 only for an Upgrade request, no
         Content-Length or Transfer-Encoding on 204 or a 2xx to CONNECT, and
         Transfer-Encoding only as `chunked` to an HTTP/1.1 client."""
+        self._respond(head, "".as_bytes(), -1)
+
+    def _respond(mut self, head: ResponseHead, lines: Span[UInt8, _], length: Int) raises IoError:
+        """`send_response` for a server that knows more (SR2 PERF-7, -8):
+        `lines` are field lines already valid and encoded, each ending in
+        CRLF (its Date and Server, made once a second), which go after the
+        head's own fields; and `length`, unless -1, is the body's length
+        for a head without Content-Length or Transfer-Encoding, whose
+        Content-Length line is written here instead of being parsed back
+        from the head. `InvalidInput` as `send_response`, and for a
+        `length` beside such a field."""
         comptime op = "ServerConnection.send_response"
         if self._out != _OUT_PENDING:
             raise self._misuse(op)
@@ -909,10 +945,15 @@ struct ServerConnection(Codec, Copyable):
         var sum = _summarize(head.headers)
         var has_te = sum.has_te
         var cl: Optional[Int]
-        try:
-            cl = _content_length(head.headers, sum)
-        except:
-            raise self._misuse(op)
+        if length >= 0:
+            if sum.has_cl or has_te:
+                raise self._misuse(op)
+            cl = length
+        else:
+            try:
+                cl = _content_length(head.headers, sum)
+            except:
+                raise self._misuse(op)
         var connect_ok = self._method == "CONNECT" and status >= 200 and status < 300
         var switch = status == 101 or connect_ok
         if status == 101 and not self._upgrade:
@@ -960,9 +1001,13 @@ struct ServerConnection(Codec, Copyable):
         if add_close and sum.conn_keep_alive:
             # The application's keep-alive no longer holds: drop its
             # Connection fields rather than send contradictory ones.
-            self._tx.ensure_writable(16 + head.reason.byte_length() + head.headers.encoded_len() + 64)
+            self._tx.ensure_writable(16 + head.reason.byte_length() + head.headers.encoded_len() + len(lines) + 64)
             _status_line(self._tx, status, head.reason)
             head.headers._encode_except(self._tx, "connection")
+            self._tx.write_bytes(lines)
+            if length >= 0:
+                self._tx.ensure_writable(_CL_LINE_MAX)
+                self._tx.commit(_put_length(_tail(self._tx), 0, length))
             _write_str(self._tx, "Connection: close\r\n")
             _crlf(self._tx)
         else:
@@ -970,6 +1015,9 @@ struct ServerConnection(Codec, Copyable):
             var own = head.reason.byte_length() > 0
             var registered = reason(status)
             var n = 15 + (head.reason.byte_length() if own else registered.byte_length()) + head.headers.encoded_len() + 2
+            n += len(lines)
+            if length >= 0:
+                n += _CL_LINE_MAX
             if add_te:
                 n += _TE_CHUNKED.byte_length()
             if add_close:
@@ -984,6 +1032,9 @@ struct ServerConnection(Codec, Copyable):
             else:
                 at = _put_status_line(dst, 0, status, registered.as_bytes())
             at = head.headers._encode_into(dst, at)
+            at = _put(dst, at, lines)
+            if length >= 0:
+                at = _put_length(dst, at, length)
             if add_te:
                 at = _put(dst, at, _TE_CHUNKED.as_bytes())
             if add_close:
@@ -1032,8 +1083,20 @@ struct ServerConnection(Codec, Copyable):
         elif n > 0 and self._method != "HEAD":
             raise self._misuse(op)
 
-    def end_response(mut self, trailers: Headers = Headers()) raises IoError:
-        """End the response (with trailer fields, for a chunked one).
+    def end_response(mut self) raises IoError:
+        """End the response, without trailer fields. `InvalidInput` outside
+        a response, or if its Content-Length is not reached."""
+        comptime op = "ServerConnection.end_response"
+        if self._out != _OUT_BODY:
+            raise self._misuse(op)
+        if self._resp_kind == BodyKind.LENGTH and self._resp_left > 0:
+            raise self._misuse(op)
+        if self._resp_kind == BodyKind.CHUNKED:
+            self._tx.write_bytes("0\r\n\r\n".as_bytes())
+        self._ended()
+
+    def end_response(mut self, trailers: Headers) raises IoError:
+        """End the response with trailer fields, for a chunked one.
         `InvalidInput` outside a response, if its Content-Length is not
         reached, or for trailers on a body that is not chunked."""
         comptime op = "ServerConnection.end_response"
@@ -1046,6 +1109,10 @@ struct ServerConnection(Codec, Copyable):
             raise self._misuse(op)  # (trailers for HEAD are dropped, like its body)
         if self._resp_kind == BodyKind.CHUNKED:
             encode_last_chunk(trailers, self._tx)
+        self._ended()
+
+    def _ended(mut self):
+        """After the end of a response: what comes next."""
         self._out = _OUT_NONE
         if self._resp_close or self._failed:
             self._closing = True
@@ -1061,13 +1128,14 @@ struct ServerConnection(Codec, Copyable):
             # then go on with the next request.
             self._answered = True
 
-    def send_error(mut self, status: Int, date: StringSlice = "") raises IoError:
+    def send_error(mut self, status: Int, date: StringSlice = "", server: StringSlice = "") raises IoError:
         """A minimal response with `status` (usually `error_status()`, and
         always 400..599), `Content-Length: 0` and `Connection: close`, and a
         Date field if `date` is given (an IMF-fixdate: a server with a clock
-        sends one, RFC 9110 6.6.1); the connection then closes.
-        `InvalidInput` for another status, a `date` that is no field value,
-        or while a response is being sent."""
+        sends one, RFC 9110 6.6.1), and a Server field if `server` is given;
+        the connection then closes. `InvalidInput` for another status, a
+        `date` or `server` that is no field value, or while a response is
+        being sent."""
         if self._out == _OUT_BODY or self._answered or status < 400 or status > 599:
             # (answered: its response went out, and a second one would
             # answer the client's next request)
@@ -1075,10 +1143,17 @@ struct ServerConnection(Codec, Copyable):
         for b in date.as_bytes():
             if not is_field_byte(b):
                 raise self._misuse("ServerConnection.send_error")
+        for b in server.as_bytes():
+            if not is_field_byte(b):
+                raise self._misuse("ServerConnection.send_error")
         _status_line(self._tx, status, "")
         if date.byte_length() > 0:
             _write_str(self._tx, "Date: ")
             _write_str(self._tx, date)
+            _write_str(self._tx, "\r\n")
+        if server.byte_length() > 0:
+            _write_str(self._tx, "Server: ")
+            _write_str(self._tx, server)
             _write_str(self._tx, "\r\n")
         _write_str(self._tx, "Content-Length: 0\r\nConnection: close\r\n\r\n")
         self._out = _OUT_NONE

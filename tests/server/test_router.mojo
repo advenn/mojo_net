@@ -128,8 +128,8 @@ def test_decoding_queries_and_targets() raises:
     assert_equal(_call(r, "GET", "/%75sers/1"), "200 user id=1")  # text matches the decoded path
     assert_equal(_call(r, "GET", "/users/%zz"), "400 Bad Request")
     assert_equal(_call(r, "GET", "/users/%4"), "400 Bad Request")
-    assert_equal(_call(r, "GET", "/users/a%2Fb"), "404 nothing here")  # an encoded "/" routes nowhere
-    assert_equal(_call(r, "GET", "/users/a%00"), "404 nothing here")
+    assert_equal(_call(r, "GET", "/users/a%2Fb"), "400 Bad Request")  # an encoded "/" routes nowhere
+    assert_equal(_call(r, "GET", "/users/a%00"), "400 Bad Request")
     assert_equal(_call(r, "GET", "/users/"), "404 nothing here")  # strict about trailing slashes
     assert_equal(_call(r, "GET", "/users//1"), "404 nothing here")
     assert_equal(_call(r, "GET", "http://example.com:8080/users/7?q"), "200 user id=7")
