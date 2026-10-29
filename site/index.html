@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mojo_net: an AI-written experiment</title>
+<meta name="description" content="mojo_net: a networking stack for Linux in Mojo, written by an AI as an experiment. What it is, how it was made, and how its HTTP server compares with hyper, fasthttp, nginx and Go, with the method in full.">
+<style>
+:root {
+  --bg: #fbfaf7; --fg: #1d1d1b; --dim: #6a6862; --line: #e2dfd7; --card: #f2f0ea;
+  --accent: #c2410c; --accent-soft: #fde7d9; --bar: #9ca3af; --bar-old: #d6d3cc; --warn-bg: #fff4e5; --warn-line: #f0b36b;
+  --code-bg: #efece5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161614; --fg: #e9e7e1; --dim: #a19e95; --line: #34322d; --card: #1f1e1b;
+    --accent: #fb8c4a; --accent-soft: #3a2416; --bar: #6b7280; --bar-old: #403e39; --warn-bg: #2a2116; --warn-line: #8a5a22;
+    --code-bg: #24231f;
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 17px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+main { max-width: 860px; margin: 0 auto; padding: 0 16px 64px; }
+header { padding: 56px 0 8px; }
+h1 { font-size: 2.3rem; line-height: 1.15; margin: 0 0 8px; letter-spacing: -0.02em; }
+h1 code { font: inherit; background: none; padding: 0; }
+.lede { font-size: 1.2rem; color: var(--dim); margin: 0 0 20px; }
+h2 { font-size: 1.5rem; margin: 56px 0 12px; padding-top: 8px; border-top: 1px solid var(--line); letter-spacing: -0.01em; }
+h3 { font-size: 1.15rem; margin: 32px 0 8px; }
+h4 { font-size: 1rem; margin: 24px 0 6px; }
+p, li { max-width: 72ch; }
+a { color: var(--accent); }
+code, pre { font: 0.9em/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+pre { background: var(--code-bg); padding: 12px 14px; border-radius: 8px; overflow-x: auto; }
+pre code { background: none; padding: 0; }
+nav { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 0.95rem; margin: 8px 0 0; }
+.notice { background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 10px; padding: 14px 18px; margin: 20px 0; }
+.notice p { margin: 6px 0; }
+.notice strong { font-size: 1.05rem; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 20px 0; }
+.card { background: var(--card); border-radius: 10px; padding: 14px 16px; }
+.card .big { font-size: 1.6rem; font-weight: 700; letter-spacing: -0.01em; }
+.card .small { color: var(--dim); font-size: 0.9rem; }
+.chart { margin: 18px 0 26px; }
+.chart figcaption { font-weight: 600; margin-bottom: 8px; }
+.row { display: grid; grid-template-columns: 100px 1fr 64px; align-items: center; gap: 10px; margin: 4px 0; font-size: 0.95rem; }
+.row.wide { grid-template-columns: 230px 1fr 64px; }
+.track { background: var(--card); border-radius: 4px; height: 18px; overflow: hidden; }
+.bar { display: block; height: 100%; background: var(--bar); border-radius: 4px; }
+.bar.mojo { background: var(--accent); }
+.bar.old { background: var(--bar-old); }
+.val { text-align: right; font-variant-numeric: tabular-nums; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 0.92rem; font-variant-numeric: tabular-nums; margin: 6px 0 12px; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--dim); font-weight: 600; }
+tr.me td { background: var(--accent-soft); }
+.dim { color: var(--dim); }
+.steps li { margin: 6px 0; }
+footer { margin-top: 64px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--dim); font-size: 0.9rem; }
+@media (max-width: 560px) {
+  body { font-size: 16px; }
+  h1 { font-size: 1.8rem; }
+  .row { grid-template-columns: 78px 1fr 54px; font-size: 0.85rem; }
+  .row.wide { grid-template-columns: 120px 1fr 50px; }
+}
+</style>
+</head>
+<body>
+<main>
+<header>
+<h1><code>mojo_net</code></h1>
+<p class="lede">A networking stack for Linux in Mojo, from raw syscalls to an HTTP server. Written by an AI, as an experiment.</p>
+<nav>
+  <a href="#what">What it is</a>
+  <a href="#made">How it was made</a>
+  <a href="#results">Results</a>
+  <a href="#method">How the results were taken</a>
+  <a href="#profile">Where the time went</a>
+  <a href="#concurrency">Concurrency</a>
+  <a href="#learned">Mojo notes</a>
+  <a href="#reproduce">Reproduce</a>
+  <a href="https://github.com/advenn/mojo_net">GitHub</a>
+</nav>
+</header>
+
+<div class="notice">
+<p><strong>An AI-generated, play-like experiment. Not a product.</strong></p>
+<p>The code, tests, documentation and this page were written by an AI (Claude, through Claude Code), at the direction of one person who chose what to build, in what order, and what not to do. The question was simply how far an AI agent could take a networking stack in a young language. Not all of the code has been read by a human. The TLS code has been reviewed only by AI reviewers, never by a human expert.</p>
+<p>Don't use it in production. No package is published. The repository is public, under Apache-2.0, for reading and curiosity.</p>
+</div>
+
+<div class="cards">
+  <div class="card"><div class="big">1.19M</div><div class="small">requests/s pipelined on one CPU, level with hyper (1.19M)</div></div>
+  <div class="card"><div class="big">2.15M</div><div class="small">requests/s pipelined on four CPUs, against hyper's 2.07M</div></div>
+  <div class="card"><div class="big">4,227</div><div class="small">instructions per request, down from 9,644 a day earlier</div></div>
+  <div class="card"><div class="big">0</div><div class="small">threads, async tasks or libc calls on the I/O path</div></div>
+</div>
+<p class="dim">One laptop, over loopback, on 28 October 2026. The method is <a href="#method">below</a>, in full.</p>
+
+<h2 id="what">What it is</h2>
+<p>Mojo is a young language from Modular, Python-like in syntax and compiled to native code. Its standard library has little networking, and its async/await is not stable yet. <code>mojo_net</code> builds the missing layers for Linux on x86_64 and aarch64:</p>
+<ul>
+  <li><b><code>linux</code></b>: every syscall as inline assembly, with no libc on the I/O path; ABI structs checked against the C headers; epoll, signals through signalfd, and processes through clone3 and pidfds.</li>
+  <li><b><code>net</code></b>: TCP, UDP and Unix sockets with deadlines, a DNS resolver of its own, and connect-by-name with Happy Eyeballs.</li>
+  <li><b><code>tls</code></b>: TLS 1.2 and 1.3 through OpenSSL 3.5, client and server. TLS itself was never written here: OpenSSL does the protocol, and this layer only drives it over memory buffers.</li>
+  <li><b><code>http</code></b>: an HTTP/1.1 parser and connection codecs that do no I/O themselves, server-sent events, and a blocking client for <code>http://</code> and <code>https://</code>.</li>
+  <li><b><code>server</code></b>: an HTTP/1.1 server with timeouts, backpressure, streaming, HTTPS, a router, static files, graceful shutdown and supervised worker processes.</li>
+  <li>Also: a PostgreSQL driver, a Redis client, strict JSON, the hashes and MACs that database logins need, and clients for model APIs, all on the same layers.</li>
+</ul>
+
+<h2 id="made">How it was made</h2>
+<p>Between 22 and 29 October 2026, in about 75 commits: about 45,500 lines of Mojo in the libraries and 55,000 in the tests (166 test files).</p>
+<ul class="steps">
+  <li><b>Direction:</b> one person set the goals and the order of work, and made the calls: TLS only through OpenSSL; no async runtime until Mojo's async is stable; nothing presented as production-ready.</li>
+  <li><b>Writing:</b> an AI coding agent planned each step, wrote the code, tests and documentation, ran the checks and committed.</li>
+  <li><b>Reviews:</b> separate AI reviewer agents read each library in turn, as an attacker, against the RFCs and against how Go, nginx, hyper and Kestrel behave. TLS, TCP/UDP and HTTP each had three rounds, the server two, and PostgreSQL one round with three reviewers. Every finding was first reproduced by a test that fails on the old code, then fixed.</li>
+  <li><b>Checking the tests:</b> each fix was then undone again, one at a time, on a copy of the code, to see whether its test notices. In the latest server review, all 62 of these planted bugs were caught, three of them only after their tests were made sharper.</li>
+  <li><b>Independent references:</b> outputs are compared with other implementations: Python's <code>ipaddress</code>, <code>json</code>, <code>hashlib</code> and <code>http.server</code>, OpenSSL's own tools, a real PostgreSQL and Valkey, and the x509-limbo corpus for certificate checks.</li>
+  <li><b>CI:</b> every push runs all of it on x86_64 and on a real aarch64 machine, with the TLS tests also under AddressSanitizer.</li>
+</ul>
+<p>The repository's README carries the same warning as this page. Its docs record the decisions, the reviews and what each one found.</p>
+
+<h2 id="results">Results: the HTTP server against hyper, fasthttp, nginx and Go</h2>
+<p>This is TechEmpower's plaintext test: <code>GET /plaintext</code> answered with <code>Hello, World!</code>. Each server runs in its fastest usual form, measured with wrk on one laptop (an Intel i5-1145G7, 4 cores and 8 threads) on 28 October 2026. Requests per second are the mean of two 60-second runs.</p>
+<figure class="chart"><figcaption>1 CPU, 64 keep-alive connections</figcaption>
+<div class="row"><span class="name">hyper</span><span class="track"><span class="bar" style="width:100.0%"></span></span><span class="val">172k</span></div>
+<div class="row"><span class="name">mojo</span><span class="track"><span class="bar mojo" style="width:97.7%"></span></span><span class="val">168k</span></div>
+<div class="row"><span class="name">fasthttp</span><span class="track"><span class="bar" style="width:94.2%"></span></span><span class="val">162k</span></div>
+<div class="row"><span class="name">nginx</span><span class="track"><span class="bar" style="width:90.7%"></span></span><span class="val">156k</span></div>
+<div class="row"><span class="name">go net/http</span><span class="track"><span class="bar" style="width:47.7%"></span></span><span class="val">82k</span></div>
+</figure>
+<figure class="chart"><figcaption>1 CPU, 256 connections, 16 pipelined</figcaption>
+<div class="row"><span class="name">hyper</span><span class="track"><span class="bar" style="width:100.0%"></span></span><span class="val">1.19M</span></div>
+<div class="row"><span class="name">mojo</span><span class="track"><span class="bar mojo" style="width:99.3%"></span></span><span class="val">1.19M</span></div>
+<div class="row"><span class="name">fasthttp</span><span class="track"><span class="bar" style="width:94.1%"></span></span><span class="val">1.12M</span></div>
+<div class="row"><span class="name">nginx</span><span class="track"><span class="bar" style="width:16.8%"></span></span><span class="val">200k</span></div>
+<div class="row"><span class="name">go net/http</span><span class="track"><span class="bar" style="width:8.6%"></span></span><span class="val">103k</span></div>
+</figure>
+<figure class="chart"><figcaption>1 CPU, 1024 keep-alive connections</figcaption>
+<div class="row"><span class="name">hyper</span><span class="track"><span class="bar" style="width:100.0%"></span></span><span class="val">146k</span></div>
+<div class="row"><span class="name">mojo</span><span class="track"><span class="bar mojo" style="width:98.6%"></span></span><span class="val">144k</span></div>
+<div class="row"><span class="name">nginx</span><span class="track"><span class="bar" style="width:96.6%"></span></span><span class="val">141k</span></div>
+<div class="row"><span class="name">fasthttp</span><span class="track"><span class="bar" style="width:84.2%"></span></span><span class="val">123k</span></div>
+<div class="row"><span class="name">go net/http</span><span class="track"><span class="bar" style="width:45.9%"></span></span><span class="val">67k</span></div>
+</figure>
+<figure class="chart"><figcaption>4 CPUs, 256 keep-alive connections</figcaption>
+<div class="row"><span class="name">mojo</span><span class="track"><span class="bar mojo" style="width:100.0%"></span></span><span class="val">350k</span></div>
+<div class="row"><span class="name">hyper</span><span class="track"><span class="bar" style="width:97.1%"></span></span><span class="val">340k</span></div>
+<div class="row"><span class="name">nginx</span><span class="track"><span class="bar" style="width:92.0%"></span></span><span class="val">322k</span></div>
+<div class="row"><span class="name">fasthttp</span><span class="track"><span class="bar" style="width:90.6%"></span></span><span class="val">317k</span></div>
+<div class="row"><span class="name">go net/http</span><span class="track"><span class="bar" style="width:44.0%"></span></span><span class="val">154k</span></div>
+</figure>
+<figure class="chart"><figcaption>4 CPUs, 256 connections, 16 pipelined</figcaption>
+<div class="row"><span class="name">mojo</span><span class="track"><span class="bar mojo" style="width:100.0%"></span></span><span class="val">2.15M</span></div>
+<div class="row"><span class="name">hyper</span><span class="track"><span class="bar" style="width:96.3%"></span></span><span class="val">2.07M</span></div>
+<div class="row"><span class="name">fasthttp</span><span class="track"><span class="bar" style="width:90.6%"></span></span><span class="val">1.95M</span></div>
+<div class="row"><span class="name">nginx</span><span class="track"><span class="bar" style="width:18.7%"></span></span><span class="val">403k</span></div>
+<div class="row"><span class="name">go net/http</span><span class="track"><span class="bar" style="width:8.4%"></span></span><span class="val">180k</span></div>
+</figure>
+<p>What it shows:</p>
+<ul>
+  <li><b>Pipelined</b> (16 requests per write), mojo takes 0.84 µs of CPU per request against hyper's 0.83 and fasthttp's 0.88. On four CPUs it is ahead: 2.15M requests/s against 2.07M.</li>
+  <li><b>Without pipelining</b>, hyper, mojo, fasthttp and nginx are within a few percent of each other, and the runs' ranges overlap. Most of each request's time there is the kernel's loopback TCP, which is the same for every server. In the quieter of the two one-CPU runs, mojo and hyper were even: 183,059 and 183,042 requests/s.</li>
+  <li><b>On four CPUs without pipelining</b>, wrk itself used 87–92% of its CPU, so those numbers mostly measure the client.</li>
+  <li><b>Go's net/http</b> takes about twice the CPU per request of the others, and gains little from pipelining: it writes each response separately. fasthttp, in the same language, is in the top group.</li>
+</ul>
+
+<h3>A day earlier</h3>
+<p>On 27 October, before the HTTP and server reviews, mojo was 35% behind hyper pipelined. The reviews' profile-driven changes moved it to the numbers above. hyper's own numbers stayed the same within noise:</p>
+<div class="scroll"><table><thead><tr><th>Scenario</th><th>mojo, 27 Oct</th><th>mojo, 28 Oct</th><th>change</th><th>hyper, 27 / 28 Oct</th></tr></thead><tbody>
+<tr><td>1 CPU, 64 keep-alive connections</td><td>156k</td><td><b>168k</b></td><td>+8%</td><td>181k / 172k</td></tr>
+<tr><td>1 CPU, 256 connections, 16 pipelined</td><td>762k</td><td><b>1.19M</b></td><td>+56%</td><td>1.17M / 1.19M</td></tr>
+<tr><td>1 CPU, 1024 keep-alive connections</td><td>132k</td><td><b>144k</b></td><td>+9%</td><td>144k / 146k</td></tr>
+<tr><td>4 CPUs, 256 keep-alive connections</td><td>301k</td><td><b>350k</b></td><td>+16%</td><td>350k / 340k</td></tr>
+<tr><td>4 CPUs, 256 connections, 16 pipelined</td><td>1.33M</td><td><b>2.15M</b></td><td>+62%</td><td>2.12M / 2.07M</td></tr>
+</tbody></table></div>
+
+<h3>Every number</h3>
+<p>CPU per request is the server's user plus system time divided by the requests answered. Mean latency comes from Little's law: connections × requests per write ÷ requests per second. For the pipelined rows it is per batch of 16. The p50 and p99 are wrk's, and are given only without pipelining (see <a href="#caveats">caveats</a>). The raw data, with wrk's own output for every run, is <a href="https://github.com/advenn/mojo_net/blob/main/bench/server/out/20261028-105727.json">in the repository</a>.</p>
+<h4>1 CPU, 64 keep-alive connections</h4><div class="scroll"><table><thead><tr><th>Server</th><th>req/s (both runs)</th><th>CPU per request</th><th>wrk CPU</th><th>Mean latency</th><th>p50</th><th>p99</th></tr></thead><tbody>
+<tr><td>hyper</td><td><b>172k</b> <span class="dim">(162k, 183k)</span></td><td>5.77 µs</td><td>41%</td><td>373 µs</td><td>360 µs</td><td>612 µs</td></tr>
+<tr class="me"><td>mojo</td><td><b>168k</b> <span class="dim">(153k, 183k)</span></td><td>5.94 µs</td><td>40%</td><td>384 µs</td><td>368 µs</td><td>749 µs</td></tr>
+<tr><td>fasthttp</td><td><b>162k</b> <span class="dim">(154k, 169k)</span></td><td>6.16 µs</td><td>37%</td><td>397 µs</td><td>398 µs</td><td>992 µs</td></tr>
+<tr><td>nginx</td><td><b>156k</b> <span class="dim">(142k, 171k)</span></td><td>6.40 µs</td><td>37%</td><td>413 µs</td><td>394 µs</td><td>764 µs</td></tr>
+<tr><td>go net/http</td><td><b>82k</b> <span class="dim">(78k, 86k)</span></td><td>12.07 µs</td><td>17%</td><td>782 µs</td><td>793 µs</td><td>2.08 ms</td></tr>
+</tbody></table></div>
+<h4>1 CPU, 256 connections, 16 pipelined</h4><div class="scroll"><table><thead><tr><th>Server</th><th>req/s (both runs)</th><th>CPU per request</th><th>wrk CPU</th><th>Mean latency</th></tr></thead><tbody>
+<tr><td>hyper</td><td><b>1.19M</b> <span class="dim">(1.19M, 1.20M)</span></td><td>0.83 µs</td><td>24%</td><td>3.43 ms</td></tr>
+<tr class="me"><td>mojo</td><td><b>1.19M</b> <span class="dim">(1.11M, 1.26M)</span></td><td>0.84 µs</td><td>26%</td><td>3.47 ms</td></tr>
+<tr><td>fasthttp</td><td><b>1.12M</b> <span class="dim">(1.12M, 1.13M)</span></td><td>0.88 µs</td><td>24%</td><td>3.65 ms</td></tr>
+<tr><td>nginx</td><td><b>200k</b> <span class="dim">(197k, 203k)</span></td><td>4.96 µs</td><td>29%</td><td>20.47 ms</td></tr>
+<tr><td>go net/http</td><td><b>103k</b> <span class="dim">(103k, 104k)</span></td><td>9.64 µs</td><td>12%</td><td>39.69 ms</td></tr>
+</tbody></table></div>
+<h4>1 CPU, 1024 keep-alive connections</h4><div class="scroll"><table><thead><tr><th>Server</th><th>req/s (both runs)</th><th>CPU per request</th><th>wrk CPU</th><th>Mean latency</th><th>p50</th><th>p99</th></tr></thead><tbody>
+<tr><td>hyper</td><td><b>146k</b> <span class="dim">(145k, 147k)</span></td><td>6.80 µs</td><td>29%</td><td>7.01 ms</td><td>6.97 ms</td><td>9.95 ms</td></tr>
+<tr class="me"><td>mojo</td><td><b>144k</b> <span class="dim">(141k, 146k)</span></td><td>6.91 µs</td><td>32%</td><td>7.12 ms</td><td>7.05 ms</td><td>11.09 ms</td></tr>
+<tr><td>nginx</td><td><b>141k</b> <span class="dim">(140k, 143k)</span></td><td>7.03 µs</td><td>28%</td><td>7.25 ms</td><td>7.24 ms</td><td>9.43 ms</td></tr>
+<tr><td>fasthttp</td><td><b>123k</b> <span class="dim">(122k, 124k)</span></td><td>8.07 µs</td><td>28%</td><td>8.31 ms</td><td>8.23 ms</td><td>10.89 ms</td></tr>
+<tr><td>go net/http</td><td><b>67k</b> <span class="dim">(63k, 71k)</span></td><td>14.96 µs</td><td>16%</td><td>15.45 ms</td><td>15.03 ms</td><td>23.71 ms</td></tr>
+</tbody></table></div>
+<h4>4 CPUs, 256 keep-alive connections</h4><div class="scroll"><table><thead><tr><th>Server</th><th>req/s (both runs)</th><th>CPU per request</th><th>wrk CPU</th><th>Mean latency</th><th>p50</th><th>p99</th></tr></thead><tbody>
+<tr class="me"><td>mojo</td><td><b>350k</b> <span class="dim">(349k, 351k)</span></td><td>10.83 µs</td><td>92%</td><td>731 µs</td><td>612 µs</td><td>3.57 ms</td></tr>
+<tr><td>hyper</td><td><b>340k</b> <span class="dim">(338k, 343k)</span></td><td>10.92 µs</td><td>91%</td><td>752 µs</td><td>628 µs</td><td>4.25 ms</td></tr>
+<tr><td>nginx</td><td><b>322k</b> <span class="dim">(320k, 323k)</span></td><td>11.86 µs</td><td>88%</td><td>796 µs</td><td>703 µs</td><td>4.33 ms</td></tr>
+<tr><td>fasthttp</td><td><b>317k</b> <span class="dim">(317k, 317k)</span></td><td>12.26 µs</td><td>87%</td><td>808 µs</td><td>722 µs</td><td>3.60 ms</td></tr>
+<tr><td>go net/http</td><td><b>154k</b> <span class="dim">(153k, 154k)</span></td><td>25.11 µs</td><td>45%</td><td>1.66 ms</td><td>1.60 ms</td><td>6.54 ms</td></tr>
+</tbody></table></div>
+<h4>4 CPUs, 256 connections, 16 pipelined</h4><div class="scroll"><table><thead><tr><th>Server</th><th>req/s (both runs)</th><th>CPU per request</th><th>wrk CPU</th><th>Mean latency</th></tr></thead><tbody>
+<tr class="me"><td>mojo</td><td><b>2.15M</b> <span class="dim">(2.15M, 2.15M)</span></td><td>1.83 µs</td><td>67%</td><td>1.90 ms</td></tr>
+<tr><td>hyper</td><td><b>2.07M</b> <span class="dim">(2.06M, 2.09M)</span></td><td>1.90 µs</td><td>66%</td><td>1.98 ms</td></tr>
+<tr><td>fasthttp</td><td><b>1.95M</b> <span class="dim">(1.94M, 1.96M)</span></td><td>2.02 µs</td><td>60%</td><td>2.10 ms</td></tr>
+<tr><td>nginx</td><td><b>403k</b> <span class="dim">(401k, 405k)</span></td><td>9.87 µs</td><td>63%</td><td>10.16 ms</td></tr>
+<tr><td>go net/http</td><td><b>180k</b> <span class="dim">(180k, 181k)</span></td><td>21.34 µs</td><td>29%</td><td>22.71 ms</td></tr>
+</tbody></table></div>
+
+<h2 id="method">How the results were taken</h2>
+<p>Everything is driven by one script, <a href="https://github.com/advenn/mojo_net/blob/main/bench/server/run.py"><code>bench/server/run.py</code></a>. Nothing is done by hand between runs.</p>
+
+<h3>The servers</h3>
+<ul>
+  <li><b>mojo:</b> <code>server.Server</code> with a handler that calls <code>res.text(200, "Hello, World!")</code>, built with <code>mojo build</code> (-O3 and the host CPU by default). On one CPU it is one process. On four, a supervisor runs four worker processes, each pinned to one CPU with its own <code>SO_REUSEPORT</code> listener.</li>
+  <li><b>hyper 1.12</b> on tokio: one <code>current_thread</code> runtime per CPU, each with its own <code>SO_REUSEPORT</code> listener, and <code>pipeline_flush</code> on. Built with fat LTO, one codegen unit, <code>panic = "abort"</code> and <code>target-cpu=native</code>.</li>
+  <li><b>fasthttp 1.77</b>: one process per CPU (its prefork mode, as TechEmpower runs it), with Go 1.27, PGO and <code>GOAMD64</code> at the host's level.</li>
+  <li><b>Go's net/http</b>: a <code>ServeMux</code> route, one process with <code>GOMAXPROCS</code> set to the CPU count, the same build flags.</li>
+  <li><b>nginx 1.31</b>: <code>return 200 "Hello, World!"</code>, one worker per CPU pinned with an explicit mask, <code>reuseport</code>, access log off, keep-alive unbounded.</li>
+</ul>
+<p>Every server sends <code>Content-Type</code>, <code>Content-Length</code>, <code>Date</code> and <code>Server</code> with the 13-byte body: 127 to 161 bytes per response. Before the measurements, <code>run.py check</code> sent each server one request and then 16 pipelined, on one and on four CPUs, and checked every answer. Some settings were tried and left out, each alternated against the chosen one: Go's GC settings, PGO on and off, mimalloc for hyper, pinning hyper's threads, and mojo without bounds checks. The benchmark's README says what each did.</p>
+
+<h3>The load</h3>
+<div class="scroll"><table>
+<thead><tr><th>Scenario</th><th>Server CPUs</th><th>Connections</th><th>Requests per write</th><th>wrk threads</th></tr></thead>
+<tbody>
+<tr><td>1 CPU, keep-alive</td><td>1</td><td>64</td><td>1</td><td>4</td></tr>
+<tr><td>1 CPU, pipelined</td><td>1</td><td>256</td><td>16</td><td>4</td></tr>
+<tr><td>1 CPU, 1024 connections</td><td>1</td><td>1024</td><td>1</td><td>4</td></tr>
+<tr><td>4 CPUs, keep-alive</td><td>4</td><td>256</td><td>1</td><td>4</td></tr>
+<tr><td>4 CPUs, pipelined</td><td>4</td><td>256</td><td>16</td><td>4</td></tr>
+</tbody></table></div>
+<pre><code>taskset -c &lt;wrk CPUs&gt; wrk -t4 -c&lt;connections&gt; -d60s --timeout 10s --latency http://127.0.0.1:&lt;port&gt;/plaintext
+# pipelined: add  -s bench/server/pipeline.lua ... -- 16  (16 requests in each write)</code></pre>
+<p>Every connection stays open for the whole run. wrk is closed-loop: a connection sends its next request, or batch, only when the last one has been answered.</p>
+
+<h3>No shared cores</h3>
+<p>The server and wrk never share a physical core, so neither takes the other's cycles, caches or hyperthread sibling. <code>run.py</code> reads the CPU topology from <code>/sys</code> and pins both with <code>taskset</code>:</p>
+<ul>
+  <li><b>wrk:</b> cores 0 and 1 (four hardware threads).</li>
+  <li><b>A one-CPU server:</b> one hardware thread of core 2, with its sibling left idle.</li>
+  <li><b>A four-CPU server:</b> cores 2 and 3, all four hardware threads, at the lower all-core clock. That is why a request costs about twice the CPU there.</li>
+</ul>
+
+<h3>One run, step by step</h3>
+<ol class="steps">
+  <li><b>Cool-down:</b> the machine idles for 15 seconds, and the busy time of every CPU is measured meanwhile. If other work used more than one CPU's worth, the run waits until it drops. None of the runs here had to wait.</li>
+  <li><b>Start:</b> the server starts afresh, in a process group of its own, on a free port, and the script waits until it accepts connections.</li>
+  <li><b>Warm-up:</b> the same load for 5 seconds (caches, lazy setup, the CPU clock), and its numbers are thrown away.</li>
+  <li><b>Measurement:</b> the load for 60 seconds. Around it, the script reads the server's CPU time and the whole machine's busy time. Every second it also samples the server CPUs' clock and the package temperature.</li>
+  <li><b>Stop:</b> SIGTERM to the server's process group, SIGKILL after 10 seconds if needed.</li>
+</ol>
+<p>One server runs at a time, in the order mojo, Go, fasthttp, hyper, nginx. The whole set then runs again in reverse order, so that a slow drift over the hour, in temperature or background work, does not always favour the same server. The tables show the mean of the two runs, and both values.</p>
+
+<h3>What each number is</h3>
+<ul>
+  <li><b>Requests per second, p50 and p99:</b> wrk's own output. There were no socket errors and no non-200 answers in any run.</li>
+  <li><b>Server CPU per request:</b> the user plus system time (<code>utime</code> + <code>stime</code> from <code>/proc/&lt;pid&gt;/stat</code>) of every process in the server's process group, over the 60 seconds, divided by the requests answered. Over loopback this includes the kernel's TCP work for the server's sockets in both directions: it is the server's whole cost, not only its own code.</li>
+  <li><b>wrk CPU:</b> wrk's own user plus system time, as a share of its four threads. Near 100% the client, not the server, is the limit.</li>
+  <li><b>Others:</b> the CPU the rest of the machine used during the run, which is all busy time minus the server's and wrk's. It was 0.2 to 0.9 CPUs here: a desktop session.</li>
+  <li><b>Clock and temperature:</b> 3.2–3.8 GHz on one CPU and 2.6–3.0 GHz on four, at 71–80 °C.</li>
+</ul>
+<p>Every run's numbers, wrk's raw output, the CPUs used and the versions of everything go into one JSON file. The full method is in <a href="https://github.com/advenn/mojo_net/blob/main/bench/server/README.md">bench/server/README.md</a>.</p>
+
+<h3 id="caveats">Caveats</h3>
+<ul>
+  <li>One laptop, with the client on the same machine, over loopback. There are no network, NIC or interrupt costs, and the kernel's loopback TCP is a large share of every request.</li>
+  <li>wrk is closed-loop, so its latencies leave out the queueing that many independent users would see. Its corrected percentiles are wrong for pipelined runs, which is why only Little's-law means are given there.</li>
+  <li>A desktop session shared the machine, and the CPU ran on the <code>powersave</code> governor with turbo, so the clock moved with temperature and load. Both are recorded per run. The first one-CPU keep-alive run was the noisiest for every server.</li>
+  <li>A plaintext "Hello, World!" measures the HTTP machinery, not an application.</li>
+</ul>
+
+<h2 id="profile">Where the time went</h2>
+<p>The day before the runs above, mojo took twice hyper's user time per request. Its kernel time was the same as hyper's to the hundredth of a microsecond, since both make the same system calls. To find where the rest went, both servers ran under valgrind's callgrind, which counts every user-space instruction by function and source line. The setup: one CPU, 16 connections with 16 requests pipelined in each, 3 seconds of warm-up, then 10 seconds counted. Dividing by the requests answered gives instructions per request.</p>
+<figure class="chart"><figcaption>User-space instructions per request (callgrind, pipelined, one CPU)</figcaption>
+<div class="row wide"><span class="name">mojo, 27 Oct (before the reviews)</span><span class="track"><span class="bar old" style="width:100.0%"></span></span><span class="val">9,644</span></div>
+<div class="row wide"><span class="name">mojo, after the HTTP review</span><span class="track"><span class="bar old" style="width:66.5%"></span></span><span class="val">6,417</span></div>
+<div class="row wide"><span class="name">mojo, after the server review</span><span class="track"><span class="bar mojo" style="width:43.8%"></span></span><span class="val">4,227</span></div>
+<div class="row wide"><span class="name">hyper</span><span class="track"><span class="bar" style="width:47.3%"></span></span><span class="val">4,565</span></div>
+</figure>
+<ul>
+  <li><b>The cause</b> was mostly HTTP header handling. Every request's head was walked several times (to parse it, check it, decide the framing, encode the response), and checked one byte at a time. Each layer also re-checked what the layer above had already checked.</li>
+  <li><b>An error type passed in registers</b> made every call that might fail cost about 85 extra instructions, even when it succeeded. Passed in memory, a success costs one flag test.</li>
+  <li><b>The server's own fields:</b> it now hands the HTTP codec its <code>Date</code> and <code>Server</code> lines already encoded, once a second, and the body's length as a number. Before, it pushed them as header fields that were then checked, encoded and parsed back.</li>
+  <li><b>Smaller changes:</b> the default <code>Content-Type</code> is set without re-checking a constant; field bytes are copied in 16- and 32-byte blocks; a request's path is scanned byte by byte instead of through a general string search.</li>
+  <li><b>One trap:</b> creating an empty <code>Error</code> ahead of time, to hold one that might be caught later, takes a stack trace in Mojo, about 60 instructions on every request. The errors are now handled where they are caught.</li>
+</ul>
+<p>Instructions are not time, so the wrk runs above are the measure of speed. The profile only says where to look. Every hot spot, with file and line, is written up in <a href="https://github.com/advenn/mojo_net/blob/main/bench/server/why_mojo_is_slower.note">why_mojo_is_slower.note</a>.</p>
+
+<h2 id="concurrency">How it handles concurrency without threads</h2>
+<p>Each process runs one loop over nonblocking sockets registered with Linux's epoll. Each turn, one <code>epoll_wait</code> returns whichever sockets are ready, out of any number. For each one, the loop writes what it can, reads what has arrived, feeds the HTTP parser, and, when a request is complete, calls the handler and queues the response. When a socket would block, it moves on to the next. A connection's progress lives in a small struct (waiting, reading a body, streaming, closing), not on a thread's stack. Timeouts are deadlines checked a few times a second.</p>
+<ul>
+  <li><b>Fairness:</b> a busy connection gets a slice of each turn (64 KiB or 128 requests), then waits for the next turn.</li>
+  <li><b>Backpressure:</b> a connection whose output is still waiting reads nothing more, so a client that doesn't read can't make the server buffer without limit.</li>
+  <li><b>Streams</b> (server-sent events, long polls, token streams) pause when they have nothing to send, until something wakes them. They need no thread each.</li>
+  <li><b>Several cores:</b> one process per CPU, each with its own loop and its own listener on the same port (<code>SO_REUSEPORT</code>), so the kernel spreads new connections across them. Processes share nothing, so nothing needs a lock. A supervisor restarts workers that die and stops them gracefully on SIGTERM. It is the model nginx uses. In the benchmark, hyper ran the same way (one single-threaded runtime per CPU), as did fasthttp.</li>
+</ul>
+<p>The cost of this model: a handler must not block, because a blocking call stalls every connection in its process. In an early test, one Mojo thread held 11,000 TCP connections this way (10,000 idle, 1,000 busy) without an error.</p>
+
+<h2 id="learned">Things Mojo taught along the way</h2>
+<ul>
+  <li><b>A value is destroyed right after its last use.</b> In <code>fcntl(owner.raw_fd(), …)</code> the owner, and with it the file descriptor, is gone before the syscall runs. Every syscall wrapper therefore takes the owner itself.</li>
+  <li><b>An <code>Optional</code> of a large struct is slow</b> when its destructor isn't inlined: about 900 instructions for a 256-byte struct. Returning one per request cost about 2 µs, so hot loops now fill a value the caller owns.</li>
+  <li><b>An error type passed in registers that holds a pointer</b> is rebuilt byte by byte on every call that might fail, about 85 instructions even on success.</li>
+  <li><b>Runtime indexes into a wide <code>SIMD</code> value are slow.</b> SHA-256 ran at 29 MB/s that way, and at about 260 MB/s with the loop unrolled at compile time.</li>
+  <li><b>A field reassigned in a loop</b>, after another field of the same local struct was last used, corrupted the heap on Mojo 1.2.0: a compiler bug, with a workaround.</li>
+</ul>
+<p>The full list, with a reproduction for each, is in the repository's <a href="https://github.com/advenn/mojo_net/blob/main/CLAUDE.md">CLAUDE.md</a>.</p>
+
+<h2 id="reproduce">Reproduce it</h2>
+<p>You need Linux on x86_64, <a href="https://pixi.sh">pixi</a>, and at least 8 hardware threads (or CPUs chosen by hand). pixi installs pinned toolchains: Mojo, Go, Rust, nginx and wrk.</p>
+<pre><code>git clone https://github.com/advenn/mojo_net &amp;&amp; cd mojo_net
+pixi run -e bench bench-server build          # the five servers
+pixi run -e bench bench-server check          # each answers correctly, on 1 and 4 CPUs
+pixi run -e bench bench-server run --reps 2   # 5 scenarios x 5 servers x 2, about 70 minutes
+pixi run -e bench bench-server summary bench/server/out/&lt;time&gt;.json
+pixi run -e bench bench-profile               # mojo and hyper under callgrind
+pixi run test                                 # the library's own tests</code></pre>
+
+<footer>
+<p><b>AI-generated, play-like experiment.</b> Code, tests, docs and this page were written by an AI (Claude) at one person's direction. Not all of it has been reviewed by a human, and it is not for production. Apache-2.0. <a href="https://github.com/advenn/mojo_net">github.com/advenn/mojo_net</a></p>
+<p>Results measured on 28 October 2026; page generated on 29 October 2026.</p>
+</footer>
+</main>
+</body>
+</html>
