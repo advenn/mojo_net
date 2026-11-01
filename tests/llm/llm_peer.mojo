@@ -4,6 +4,9 @@ The process is killed when the `LlmPeer` is destroyed; end each test with
 
 from std.python import Python, PythonObject
 
+from http.client import Client
+from linux.time import Duration
+
 
 struct LlmPeer(Movable):
     var proc: PythonObject
@@ -29,11 +32,13 @@ struct LlmPeer(Movable):
         return String("http://127.0.0.1:", self.port, "/", scenario, "/v1")
 
     def log(self) raises -> PythonObject:
-        """Every request so far: a list of {path, headers, body}."""
-        var urllib = Python.import_module("urllib.request")
-        var json = Python.import_module("json")
-        var r = urllib.urlopen(String("http://127.0.0.1:", self.port, "/_log"), timeout=10)
-        return json.loads(r.read())
+        """Every request so far: a list of {path, headers, body}. Fetched
+        with `http.client`, not Python's urllib, which imports Python's
+        `ssl` into this process (OpenSSL's config with it: CLAUDE.md, the
+        test-only TLS peers; tools/check_tls_asan.sh saw its leaks)."""
+        var c = Client(timeout=Duration.from_secs(10))
+        var res = c.get(String("http://127.0.0.1:", self.port, "/_log"))
+        return Python.import_module("json").loads(String(from_utf8_lossy=Span(res.body)))
 
     def __deinit__(deinit self):
         _kill(self.proc)

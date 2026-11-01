@@ -462,7 +462,8 @@ struct ReplyStream(Movable):
                     self._size += x.text.byte_length()
                 elif len(self._failure) == 0:
                     self._complete = True
-            if self._size > self._max_reply:
+            var kept = self._anthropic.kept if self._provider == Provider.ANTHROPIC else 0
+            if self._size + kept > self._max_reply:
                 raise LlmError(LlmError.PROTOCOL, "llm: the reply is over max_reply bytes")
             if self._calls > self._max_tool_calls:
                 raise LlmError(LlmError.PROTOCOL, "llm: the reply starts more than max_tool_calls calls")

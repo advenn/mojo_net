@@ -22,6 +22,12 @@ The path picks the behaviour: `/<scenario>/v1/...`, where <scenario> is
   badindex        a stream: "A", a chunk with a tool call index 7, "B", [DONE]
   drop            a stream cut by the connection's end (no last chunk)
   retrybroken-<id>-<n>  429 n times, then a stream with an error event
+  thinking        Anthropic with thinking and a tool call: a thinking block
+                  (signature sig_1), a redacted one (data enc_1), text and
+                  get_weather, with cache counts in the usage. A request that
+                  answers the call must send the assistant turn back starting
+                  with those two blocks unchanged, as the real API demands
+                  (else 400); it then gets "It is sunny."
 Streams carry x-request-id: req_stream (request-id for Anthropic).
 GET /_log returns every request so far (path, headers, body) as JSON, and
 POST /_reset forgets them.
@@ -258,7 +264,77 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Anthropic ----
 
+    def _thinking(self, body):
+        """The `thinking` scenario (see the module docs)."""
+        messages = body.get("messages", [])
+        answered = any(isinstance(m.get("content"), list) and any(b.get("type") == "tool_result" for b in m["content"])
+                       for m in messages if m.get("role") == "user")
+        for i, m in enumerate(messages):
+            c = m.get("content")
+            if m.get("role") != "assistant" or not isinstance(c, list) or not any(b.get("type") == "tool_use" for b in c):
+                continue
+            want = [{"type": "thinking", "thinking": "Let me think.", "signature": "sig_1"},
+                    {"type": "redacted_thinking", "data": "enc_1"}]
+            if c[:2] != want:
+                self._send_json(400, {"type": "error", "error": {"type": "invalid_request_error", "message":
+                                "messages.%d.content.0.type: Expected `thinking` or `redacted_thinking`, but found `%s`. "
+                                "When `thinking` is enabled, a final `assistant` message must start with a thinking block."
+                                % (i, c[0].get("type"))}})
+                return
+        usage = {"input_tokens": 5, "cache_read_input_tokens": 20, "cache_creation_input_tokens": 3, "output_tokens": 13}
+        if answered:
+            content = [{"type": "text", "text": "It is sunny."}]
+            stop = "end_turn"
+        else:
+            content = [{"type": "thinking", "thinking": "Let me think.", "signature": "sig_1"},
+                       {"type": "redacted_thinking", "data": "enc_1"},
+                       {"type": "text", "text": "Let me check."},
+                       {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"location": "Tashkent"}}]
+            stop = "tool_use"
+        if not body.get("stream"):
+            self._send_json(200, {"id": "msg_t", "type": "message", "role": "assistant", "model": body["model"],
+                                  "content": content, "stop_reason": stop, "stop_sequence": None, "usage": usage})
+            return
+        self._start_stream(anthropic=True)
+
+        def event(name, obj):
+            self._chunk("event: " + name + "\ndata: " + json.dumps(obj) + "\n\n")
+
+        start = dict(usage, output_tokens=1)
+        event("message_start", {"type": "message_start", "message": {"id": "msg_t", "type": "message", "role": "assistant",
+                                "content": [], "model": body["model"], "stop_reason": None, "stop_sequence": None, "usage": start}})
+        for i, b in enumerate(content):
+            if b["type"] == "thinking":
+                event("content_block_start", {"type": "content_block_start", "index": i,
+                                              "content_block": {"type": "thinking", "thinking": ""}})
+                for p in _pieces(b["thinking"], 5):
+                    event("content_block_delta", {"type": "content_block_delta", "index": i,
+                                                  "delta": {"type": "thinking_delta", "thinking": p}})
+                for p in ["sig", "_1"]:
+                    event("content_block_delta", {"type": "content_block_delta", "index": i,
+                                                  "delta": {"type": "signature_delta", "signature": p}})
+            elif b["type"] == "text":
+                event("content_block_start", {"type": "content_block_start", "index": i,
+                                              "content_block": {"type": "text", "text": ""}})
+                event("content_block_delta", {"type": "content_block_delta", "index": i,
+                                              "delta": {"type": "text_delta", "text": b["text"]}})
+            elif b["type"] == "tool_use":
+                event("content_block_start", {"type": "content_block_start", "index": i,
+                                              "content_block": dict(b, input={})})
+                event("content_block_delta", {"type": "content_block_delta", "index": i,
+                                              "delta": {"type": "input_json_delta", "partial_json": json.dumps(b["input"])}})
+            else:
+                event("content_block_start", {"type": "content_block_start", "index": i, "content_block": b})
+            event("content_block_stop", {"type": "content_block_stop", "index": i})
+        event("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
+                                "usage": {"output_tokens": 13}})
+        event("message_stop", {"type": "message_stop"})
+        self._end_stream()
+
     def _anthropic(self, scenario, body):
+        if scenario == "thinking":
+            self._thinking(body)
+            return
         text = _echo(body.get("messages", []))
         tools = scenario == "tools"
         if not body.get("stream"):

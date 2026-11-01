@@ -2,7 +2,7 @@
 
 > **Warning: this is an AI-generated project, and not all of it has been reviewed. Use it at your own risk.**
 >
-> The code, tests and documentation were written by an AI (Claude) at the direction of the maintainer. The tests compare it with independent implementations, and planted bugs show that the tests catch them. The TLS code has had two internal reviews, also by AI, but no human expert's (`docs/tls.md`). Read [SECURITY.md](SECURITY.md) before relying on it.
+> The code, tests and documentation were written by an AI (Claude) at the direction of the maintainer. The tests compare it with independent implementations, and planted bugs show that the tests catch them. The TLS code has had three rounds of internal reviews, also by AI, but no human expert's (`docs/tls.md`). Read [SECURITY.md](SECURITY.md) before relying on it.
 >
 > A page about the experiment, with the benchmark results and how they were taken: https://advenn.github.io/mojo_net/
 
@@ -109,7 +109,7 @@ Everything runs through [pixi](https://pixi.sh):
 ```bash
 pixi run test             # every tests/**/test_*.mojo, plus the ABI layout check
 pixi run test net/        # only files whose path contains "net/"
-pixi run ci               # import rules + stable API + tests + no-libc check + example builds
+pixi run ci               # every check CI runs: import rules, tls and json checks, stable API, tests, tls under ASan, no-libc, examples
 pixi run package          # the conda package, built and tested in a fresh environment
 ```
 

@@ -6,12 +6,23 @@ them and sometimes picks tiny limits; the decoder must give the same
 outcome, delivering the same body bytes before it, both with all the input
 at once and when the input arrives in random pieces."""
 
+from std.os import getenv
 from std.python import Python
 from std.testing import TestSuite, assert_equal, assert_true
 
 from http.body import BodyDecoder, BodyKind, BodyLimits, Framing, Piece
 from http.headers import Headers
 from linux import IoError
+
+
+def _env(name: StaticString, default: Int) raises -> Int:
+    """A fuzz setting from the environment, for the weekly fuzz run
+    (.github/workflows/fuzz.yml): MOJO_NET_FUZZ_SEED shifts the seeds, so a
+    run explores cases CI never saw (a failure prints the value to replay
+    it with), and MOJO_NET_FUZZ_SCALE multiplies the number of cases."""
+    var v = getenv(name)
+    return atol(v) if v.byte_length() > 0 else default
+
 
 comptime CASES = 20000
 
@@ -101,9 +112,11 @@ def test_decoder_matches_the_reference_on_mutated_bodies() raises:
     var sys = Python.import_module("sys")
     _ = sys.path.insert(0, "tests/http")
     var oracle = Python.import_module("chunked_oracle")
-    var rng = _Rng(77)
+    var first = _env("MOJO_NET_FUZZ_SEED", 0)
+    var cases = CASES * _env("MOJO_NET_FUZZ_SCALE", 1)
+    var rng = _Rng(UInt64(77 + first))
     var oks = 0
-    for seed in range(CASES):
+    for seed in range(first, first + cases):
         var line = String(oracle.case(seed))
         var pos = 0
         var kind = _field(line, pos)
@@ -119,7 +132,7 @@ def test_decoder_matches_the_reference_on_mutated_bodies() raises:
         var got = _run(request, limits, Span(data), rng, True)
         var split = _run(request, limits, Span(data), rng, False)
         if got != want or split != want:
-            print("case", seed, kind, max_line, max_trailers, max_fields)
+            print("case", seed, kind, max_line, max_trailers, max_fields, "(replay: MOJO_NET_FUZZ_SEED=", first, ")")
             print("  input   ", _hex(Span(data)))
             print("  expected", want)
             print("  whole   ", got)
@@ -128,7 +141,7 @@ def test_decoder_matches_the_reference_on_mutated_bodies() raises:
         assert_equal(split, want, String("case ", seed, " split"))
         if want.startswith("ok"):
             oks += 1
-    assert_true(oks > CASES // 4)
+    assert_true(oks > cases // 4)
 
 
 def main() raises:

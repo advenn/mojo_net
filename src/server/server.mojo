@@ -100,6 +100,7 @@ The loop, per connection:
 
 from bytes.buffer import ByteBuffer
 from http.connection import EventKind, ServerConnection, ServerEvent
+from http.form import DEFAULT_LIMIT as DEFAULT_PAIRS, Pairs, SetCookie, parse_cookie, parse_form, parse_query
 from http.headers import Headers, eq_ignore_case, is_field_byte
 from http.parse import Limits, RequestHead, ResponseHead
 from http.types import Version, reason as _phrase
@@ -392,6 +393,31 @@ struct Request(Movable):
         """The body as a string (lossy for bytes that are not UTF-8)."""
         return String(from_utf8_lossy=Span(self.body))
 
+    def query_params(self, limit: Int = DEFAULT_PAIRS) raises IoError -> Pairs:
+        """The query's `name=value` pairs, decoded (`http.form.parse_query`):
+        `InvalidData` for a malformed escape, a value that is not UTF-8, or
+        more than `limit` pairs; a handler can answer that with
+        `raise res.fail(400, ...)`."""
+        return parse_query(self.query(), limit)
+
+    def form(self, limit: Int = DEFAULT_PAIRS) raises IoError -> Pairs:
+        """The pairs of an application/x-www-form-urlencoded body
+        (`http.form.parse_form`), whatever its Content-Type says."""
+        return parse_form(Span(self.body), limit)
+
+    def cookies(self) -> Pairs:
+        """The pairs of the Cookie fields (`http.form.parse_cookie`;
+        malformed pairs skipped)."""
+        var fields = self.headers.get_all("cookie")
+        if len(fields) == 1:
+            return parse_cookie(fields[0])
+        var joined = String()  # (HTTP/2 splits it; RFC 9113 8.2.3 joins with "; ")
+        for i in range(len(fields)):
+            if i > 0:
+                joined += "; "
+            joined += fields[i]
+        return parse_cookie(joined)
+
 
 @inline(.always)
 def _query_mark(t: Span[UInt8, _]) -> Int:
@@ -417,6 +443,8 @@ struct Response(Movable):
     var _stream: Bool
     var _events: Bool
     """An event stream: heartbeats while it is paused."""
+    var _failed: Bool
+    """Made by `fail`: the answer to send when the handler raises."""
 
     def __init__(out self):
         self.status = 200
@@ -425,6 +453,38 @@ struct Response(Movable):
         self.body = List[UInt8]()
         self._stream = False
         self._events = False
+        self._failed = False
+
+    def set_cookie(mut self, cookie: SetCookie) raises IoError:
+        """Add a `Set-Cookie` field (`http.form.SetCookie`: `InvalidInput`
+        for a part that could end the value or the field)."""
+        self.headers.add("Set-Cookie", cookie.text())
+
+    def fail(mut self, status: Int, message: StringSlice) -> Error:
+        """Answer `status` (4xx or 5xx) with `message` as plain text, and
+        return an error to raise with it:
+
+            var doc = parse(req.body) except e: raise res.fail(400, String("bad JSON: ", e))
+
+        When the handler raises, this answer goes instead of a 500; it is
+        not logged and `Handler.failed` is not asked, since it is the
+        handler's own answer (a client's mistake found deep in the code: a
+        body that does not parse, a parameter that is not a number). A
+        streamed response begun before is dropped (`stream_ended` comes as
+        for any raise). Any other status, or a message that is no valid
+        text, leaves the usual 500."""
+        self.status = 500
+        self.reason = String()
+        self.headers.clear()
+        self.body.clear()
+        self._failed = False
+        if status >= 400 and status <= 599:
+            try:
+                self.text(status, String(message, "\n"))
+                self._failed = True
+            except:
+                pass
+        return Error(message)
 
     def stream(mut self):
         """Make this a streamed response: the head goes out now (chunked,
@@ -503,6 +563,7 @@ struct Response(Movable):
         self.body.clear()
         self._stream = False
         self._events = False
+        self._failed = False
 
 
 @fieldwise_init
@@ -613,7 +674,9 @@ trait Handler(Deinitable, Movable):
         for `req`. `res` holds the 500 that will go out (reset: nothing the
         hook that raised set is kept); change it to answer otherwise (a
         malformed body: 400). A stream is not allowed, and an error here
-        keeps the 500. `ServerConfig.log_errors` logs `error` either way.
+        keeps the 500. `ServerConfig.log_errors` logs `error` unless this
+        answers with another status (the app's own answer, not a server
+        error). A handler can also answer for itself: `Response.fail`.
         Not called for `produce` (its response is under way: the
         connection just ends)."""
         pass
@@ -744,6 +807,13 @@ struct _Conn(Movable):
     """When the stream last sent something (its head, body, a heartbeat)."""
     var hangup: Bool
     """Epoll reported that the peer closed or half-closed (sticky)."""
+    var readable: Bool
+    """The socket may hold input: set by a readable edge, cleared by a
+    read that found nothing or less than it asked for. A short read
+    drained the socket, so whatever arrives later raises a new edge; with
+    `hangup` set it reads on to EOF (docs/net.md: a FIN that came with the
+    data raises no edge of its own). This saves a recv that finds nothing
+    after each request or event."""
     var eof: Bool
     """The end of the client's input was read."""
     var refused: Bool
@@ -845,6 +915,7 @@ struct _Conn(Movable):
         self.line_open = False
         self.last_out = now
         self.hangup = False
+        self.readable = True
         self.eof = False
         self.refused = False
         self.moved = 0
@@ -890,7 +961,7 @@ struct _Conn(Movable):
             var need = 5
             if have >= 5:
                 need = 5 + (Int(self.hello[3]) << 8 | Int(self.hello[4]))
-            var got = self.stream.try_read(Span(chunk)[0 : need - have])
+            var got = self._read(Span(chunk)[0 : need - have])
             if not got:
                 return None
             if got.value() == 0:
@@ -921,6 +992,16 @@ struct _Conn(Movable):
         self.tls[0].feed(Span(hello))
         self.handshaking = True
 
+    def _read(mut self, buf: MutSpan[UInt8, _]) raises IoError -> Optional[Int]:
+        """One read from the socket, skipped (None) while it is known to be
+        drained (`readable`)."""
+        if not self.readable and not self.hangup:
+            return None
+        var got = self.stream.try_read(buf)
+        if not got or (got.value() > 0 and got.value() < len(buf)):
+            self.readable = False
+        return got
+
     def _recv(mut self, mut chunk: List[UInt8], room: Int) raises -> Optional[Int]:
         """Input for the codec, at most `room` bytes into `chunk`: what the
         socket has, or with TLS the plaintext (None: nothing now; 0: the
@@ -930,7 +1011,7 @@ struct _Conn(Movable):
         if self.tls_wanted:
             return self._read_hello(chunk)
         if len(self.tls) == 0:
-            var got = self.stream.try_read(Span(chunk)[0:room])
+            var got = self._read(Span(chunk)[0:room])
             if got:
                 self.moved += got.value()
             return got
@@ -972,7 +1053,7 @@ struct _Conn(Movable):
             if cap == 0:
                 self.again = True
                 return None
-            var got = self.stream.try_read(Span(chunk)[0:cap])
+            var got = self._read(Span(chunk)[0:cap])
             if not got:
                 return None
             if got.value() == 0:
@@ -1457,20 +1538,21 @@ struct _Conn(Movable):
     def map_failure[H: Handler](
         mut self, mut handler: H, error: Error, mut shared: _Shared, now: Instant
     ) raises -> Bool:
-        """`res` holds a fresh 500 for a hook that raised `error`: log it
-        (`log_errors`), and let `Handler.failed` change the answer. True if
-        it did."""
-        if shared.log:
-            shared.errors.say(now, _error_line(self.req, error))
+        """`res` holds a fresh 500 for a hook that raised `error`: let
+        `Handler.failed` change the answer, and log the error
+        (`log_errors`) unless it did. True if it did."""
         var ok = True
         try:
             handler.failed(self.req, error, self.res)
         except:
             ok = False
-        if ok and not self.res._stream:
-            return self.res.status != 500
-        self.res._reset()
-        self.res.text(500, "Internal Server Error\n")
+        if ok and not self.res._stream and self.res.status != 500:
+            return True  # (mapped to the app's own answer: not a server error)
+        if shared.log:
+            shared.errors.say(now, _error_line(self.req, error))
+        if not ok or self.res._stream:
+            self.res._reset()
+            self.res.text(500, "Internal Server Error\n")
         return False
 
     def fail[H: Handler](
@@ -1514,9 +1596,13 @@ struct _Conn(Movable):
         except e:
             if self.res._stream:
                 handler.stream_ended(self.req, False)  # (it may hold something)
-            self.res._reset()
-            self.res.text(500, "Internal Server Error\n")
-            by_server = not self.map_failure(handler, e, shared, now)
+            if self.res._failed:
+                self.res._stream = False  # (Response.fail: its own answer, not logged)
+                self.res._events = False
+            else:
+                self.res._reset()
+                self.res.text(500, "Internal Server Error\n")
+                by_server = not self.map_failure(handler, e, shared, now)
         var streaming = self.send(config, date)
         if self.res._stream and not streaming:
             handler.stream_ended(self.req, not self.refused)  # nothing to stream
@@ -2126,8 +2212,10 @@ struct Server[H: Handler](Movable):
             var slot = Int(key)
             if slot >= len(self._conns) or not self._conns[slot]:
                 continue  # closed earlier in this batch
-            var hup = self._events[i].events() & UInt32(EPOLLRDHUP | EPOLLHUP | EPOLLERR)
-            self._serve(slot, now, hup != 0)
+            var events = self._events[i].events()
+            if events & UInt32(EPOLLIN):
+                self._conns[slot].value().readable = True
+            self._serve(slot, now, events & UInt32(EPOLLRDHUP | EPOLLHUP | EPOLLERR) != 0)
         # Streams woken since the last turn, and connections whose slice
         # ran out. What serving them adds waits for the next turn, so
         # neither a handler that keeps waking a stream nor a busy client

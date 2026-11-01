@@ -336,14 +336,25 @@ def test_anthropic_bad_events() raises:
         ]).kind,
         LlmError.PROTOCOL,
     )
-    # Unknown events and deltas (thinking) are skipped.
+    # Unknown events are skipped; thinking comes as THINKING deltas (it
+    # was skipped too before the 2026-11 analysis).
     var d = EventDecoder()
     var ds = _anthropic_feed([
         '{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}',
         '{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}',
         '{"type":"a_new_event"}',
     ], d)
-    assert_equal(len(ds), 0)
+    assert_equal(len(ds), 1)
+    assert_true(ds[0].kind == DeltaKind.THINKING)
+    assert_equal(ds[0].text, "hmm")
+    # A thinking delta for a block that is not thinking is refused.
+    assert_equal(
+        _anthropic_error([
+            '{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+            '{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"s"}}',
+        ]).kind,
+        LlmError.PROTOCOL,
+    )
 
 
 def test_read_messages() raises:

@@ -1,0 +1,53 @@
+# The fuzzers, 20 times longer than in CI and from a new seed each week,
+# then the parser fuzzers under AddressSanitizer (tools/fuzz_long.sh); and
+# request streams read by our codec and by Go's net/http, which must agree
+# where both read (tools/smuggling/compare.py). A failure prints the
+# MOJO_NET_FUZZ_SEED that replays it.
+name: fuzz
+
+on:
+  schedule:
+    - cron: "23 3 * * 3"
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "MOJO_NET_FUZZ_SEED (empty: the date)"
+        required: false
+      scale:
+        description: "MOJO_NET_FUZZ_SCALE"
+        required: false
+        default: "20"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+      - uses: prefix-dev/setup-pixi@v0.11.2
+        with:
+          pixi-version: v0.82.1
+      - name: tools/fuzz_long.sh
+        env:
+          MOJO_NET_FUZZ_SEED: ${{ github.event.inputs.seed }}
+          MOJO_NET_FUZZ_SCALE: ${{ github.event.inputs.scale || '20' }}
+        run: pixi run fuzz-long
+
+  smuggling:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: prefix-dev/setup-pixi@v0.11.2
+        with:
+          pixi-version: v0.82.1
+          environments: bench
+      - name: Our codec against Go's net/http
+        env:
+          MOJO_NET_FUZZ_SEED: ${{ github.event.inputs.seed }}
+        run: |
+          [ -n "$MOJO_NET_FUZZ_SEED" ] || export MOJO_NET_FUZZ_SEED=$(date -u +%Y%m%d)
+          pixi run -e bench smuggling-check --streams 100000

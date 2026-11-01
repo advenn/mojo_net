@@ -3,7 +3,7 @@ embeddings, as OpenAI and the servers compatible with it speak them
 (vLLM, SGLang, Ollama, Modular's `max serve`), and Anthropic's Messages.
 
 - `types`: the provider-neutral chat (`ChatRequest`, `Message`, `Tool`,
-  `ToolCall`, `Reply`, `Delta`, `Usage`, `Embeddings`).
+  `ToolCall`, `Thinking`, `Reply`, `Delta`, `Usage`, `Embeddings`).
 - `openai`, `anthropic`: each API's bodies, replies and stream events,
   sans-I/O.
 - `retry`: the SDKs' retry policy.
@@ -13,4 +13,4 @@ embeddings, as OpenAI and the servers compatible with it speak them
 
 from .error import LlmError
 from .retry import RetryPolicy
-from .types import ChatRequest, Delta, DeltaKind, Embeddings, Message, Reply, Tool, ToolCall, Usage
+from .types import ChatRequest, Delta, DeltaKind, Embeddings, Message, Reply, Thinking, Tool, ToolCall, Usage

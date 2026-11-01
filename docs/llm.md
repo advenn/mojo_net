@@ -12,7 +12,7 @@ Package rules are in `docs/design.md`.
 **In scope:**
 - one provider-neutral chat model:
   - `ChatRequest`: messages with the roles system, user, assistant and tool; an assistant's tool calls; tools described by JSON Schema; the common options, and extra fields as given;
-  - `Reply`: text, tool calls, finish reason and usage;
+  - `Reply`: text, tool calls, the model's reasoning (`thinking`), finish reason and usage (with cache and reasoning counts);
   - `Delta`: the pieces of a streamed reply;
 - each dialect's request bodies, replies and stream events, sans-I/O (`llm.openai`, `llm.anthropic`);
 - `Client`: blocking calls over `http.client`, with one deadline per call, an idle timeout per stream, and retries;
@@ -32,7 +32,10 @@ Package rules are in `docs/design.md`.
 - **Tool arguments stay text.** A model writes a call's arguments as JSON text, and it can write something that is not valid JSON. `ToolCall.arguments` keeps exactly what came: OpenAI sends a string, and Anthropic's `input` object is rendered back to text. The caller parses it with `json.parse` and checks it before acting on it.
 - **Streams end explicitly.** A streamed reply is complete only at OpenAI's `[DONE]` or Anthropic's `message_stop`. A stream whose body ends cleanly before that is cut short (PROTOCOL); a connection dropped mid-body is TRANSPORT (`UnexpectedEof`). Either way it can never look like a short answer.
   - **Error events:** an error event in the middle of a stream raises API. That is `{"error": {...}}`, TGI's `{"error": "<text>", "error_type": ...}`, or Anthropic's `error` event.
-  - **Skipped:** event types this client does not know, and `ping`, as Anthropic asks of clients. So are content blocks other than text and `tool_use`: thinking, a server tool's or an MCP tool's use, and their deltas.
+  - **Skipped:** event types this client does not know, and `ping`, as Anthropic asks of clients. So are content blocks other than text, `tool_use` and thinking: a server tool's or an MCP tool's use, and their deltas.
+- **Thinking goes back.** Claude's `thinking` and `redacted_thinking` blocks are kept in `Reply.thinking`, with their signatures (in a stream, assembled from `signature_delta`s; the reasoning comes as THINKING deltas). An assistant `Message` sends its own back first in its content, unchanged; `Message.from_reply(reply)` builds that turn. The API refuses a turn with tool calls that lacks them, and current Claude models think by default, so a tool loop needs this. OpenAI-compatible servers that return their reasoning (`reasoning_content` from vLLM, SGLang and DeepSeek; `reasoning` from Ollama) give it as THINKING too, kept as one block without a signature, which the OpenAI-style request never sends back (those servers ask not to).
+- **One meaning for usage.** `Usage.input_tokens` is the whole prompt for both APIs. OpenAI's `prompt_tokens` is that already, with `cached_tokens` a part of it; Anthropic's `input_tokens` leaves out what was read from or written to the cache, so the client adds `cache_read_input_tokens` and `cache_creation_input_tokens` to it. The parts are `cache_read_tokens`, `cache_write_tokens` (Anthropic) and `reasoning_tokens` (OpenAI's reasoning models); -1 where the API did not say.
+- **Cache breakpoints.** `Message.cache` and `Tool.cache` put Anthropic's `cache_control: {"type": "ephemeral"}` at the end of that message or tool definition (system messages with one are then sent as text blocks). Automatic caching, a top-level `cache_control`, goes in `ChatRequest.extra`. OpenAI-style APIs cache by themselves and ignore both.
 - **A stream's first error is final.** An event that fails gives out none of its deltas, and every later `next` raises the same error, so a caller that keeps reading cannot reach a DONE. `complete()` says whether the reply ended as the API ends one. `reply()` after a failure may hold part of the event that failed.
 - **Streams are bounded.** A reply's text and tool arguments together may grow to `max_reply` bytes (16 MiB), and a reply may start `max_tool_calls` calls (128); past either, the stream fails. `stream_total` bounds a stream's whole time. Pings and unknown events keep a stream alive between deltas, so set `stream_total` when the caller needs a wall-clock bound.
 - **Retries as the SDKs do them.**
@@ -102,9 +105,10 @@ Its lower-confidence findings were fixed too:
 - unclipped error messages;
 - a framing header reported as TRANSPORT.
 
-Still open from it: extended thinking with tools (the thinking blocks are dropped, and Anthropic refuses the next turn without them), and keys over `http://` to a host other than the local machine, which are documented, not refused.
+Still open from it: keys over `http://` to a host other than the local machine, which are documented, not refused.
 
 ## Milestones
 - **L1: chat, streams, tools, embeddings, retries.** Done.
   - **Tests:** 43: `tests/llm/test_llm_codec.mojo` (sans-I/O), `test_llm_client.mojo` (against the fake API, including keys with CR or LF, refused before anything is sent) and `test_llm_regressions.mojo` (the review's findings, and the planted bugs the other files missed).
+- **The 2026-11 analysis** (six read-only analysts, each checked by a skeptic): Claude's thinking blocks sent back with tool calls, THINKING deltas, usage with cache and reasoning counts, cache breakpoints, `reasoning_content` (`tests/llm/test_llm_analysis_regressions.mojo`; the fake API's `thinking` scenario refuses a turn without its thinking blocks, as the real one does).
 - **L2:** OpenAI's Responses API and legacy completions; image and document content parts; a pool of streams for many concurrent calls.

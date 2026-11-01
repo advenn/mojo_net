@@ -1,6 +1,11 @@
-# `pixi run ci` on x86_64 and on a real aarch64 machine, then the conda
-# package, built and tested on each (docs/design.md, "Packaging"). The
-# package is kept as a workflow artifact only: nothing is published.
+# What `pixi run ci` runs, on x86_64 and on a real aarch64 machine, split
+# into parallel jobs per architecture: the checks (with the TLS spike and
+# the conda package, built and tested: docs/design.md, "Packaging"), the
+# tests in three parts (tools/run_tests.sh, MOJO_NET_TEST_SHARD), and
+# tls-asan. Almost all of the time is compiling, one file at a time, so
+# the parts run side by side. tools/check_ci.py (pixi run ci-check) fails
+# when a task of `ci` is missing here. The package is kept as a workflow
+# artifact only: nothing is published.
 name: ci
 
 on:
@@ -11,24 +16,27 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # (a push to main runs to the end, so every commit there has a result)
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
   ci:
-    name: ci (${{ matrix.arch }})
+    name: ${{ matrix.part }} (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
+        arch: [x86_64, aarch64]
+        part: [checks, test 1/3, test 2/3, test 3/3, tls-asan]
         include:
           - arch: x86_64
             runner: ubuntu-24.04
           - arch: aarch64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    timeout-minutes: 90
     env:
       # Skips are failures here: the runners have PostgreSQL and Valkey (from
       # pixi) and IPv6 loopback.
@@ -40,21 +48,43 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.11.2
         with:
           pixi-version: v0.82.1
-          environments: default package
+          environments: ${{ matrix.part == 'checks' && 'default package' || 'default' }}
       - name: Host
         run: |
           uname -a
           echo "cpus: $(nproc)"
           grep -E 'MemTotal|MemAvailable' /proc/meminfo
-      - name: pixi run ci
-        run: pixi run ci
+
+      - name: Checks
+        if: matrix.part == 'checks'
+        run: |
+          pixi run ci-check
+          pixi run import-check
+          pixi run tls-check
+          pixi run json-check
+          pixi run api-check
+          pixi run nolibc-check
+          pixi run examples-check
       - name: TLS spike (T0, docs/spikes.md)
+        if: matrix.part == 'checks'
         run: pixi run spike-tls
       - name: Package
+        if: matrix.part == 'checks'
         run: pixi run package
       - uses: actions/upload-artifact@v7
+        if: matrix.part == 'checks'
         with:
           name: mojo-net-${{ matrix.arch }}
           path: output/noarch/*.conda
           if-no-files-found: error
           retention-days: 30
+
+      - name: Tests, part ${{ matrix.part }}
+        if: startsWith(matrix.part, 'test ')
+        env:
+          PART: ${{ matrix.part }}
+        run: MOJO_NET_TEST_SHARD="${PART#test }" pixi run test
+
+      - name: tls-asan
+        if: matrix.part == 'tls-asan'
+        run: pixi run tls-asan

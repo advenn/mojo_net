@@ -7,11 +7,22 @@ or refused as the oracle does, and an accepted one must render to the
 oracle's compact text byte for byte. Numbers must read as Python reads
 them: `float` to the same bits, `int` to the same value."""
 
+from std.os import getenv
 from std.memory import bitcast
 from std.python import Python, PythonObject
 from std.testing import TestSuite, assert_equal, assert_true
 
 from json import Document, JsonError, parse
+
+
+def _env(name: StaticString, default: Int) raises -> Int:
+    """A fuzz setting from the environment, for the weekly fuzz run
+    (.github/workflows/fuzz.yml): MOJO_NET_FUZZ_SEED shifts the seeds, so a
+    run explores cases CI never saw (a failure prints the value to replay
+    it with), and MOJO_NET_FUZZ_SCALE multiplies the number of cases."""
+    var v = getenv(name)
+    return atol(v) if v.byte_length() > 0 else default
+
 
 comptime CASES = 4000
 
@@ -42,8 +53,10 @@ def _same(a: Span[UInt8, _], b: Span[UInt8, _]) -> Bool:
     return True
 
 
-def _differential(seed: Int) raises:
-    var text = String(_oracle().fuzz(seed, CASES))
+def _differential(base: Int) raises:
+    var seed = base + _env("MOJO_NET_FUZZ_SEED", 0)
+    var cases = CASES * _env("MOJO_NET_FUZZ_SCALE", 1)
+    var text = String(_oracle().fuzz(seed, cases))
     var doc = Document()
     var out = List[UInt8]()
     var bad = 0
@@ -78,8 +91,8 @@ def _differential(seed: Int) raises:
                 print("rendering differs:", String(line)[byte = : min(len(b), 400)])
                 print("  got:", String(unsafe_from_utf8=Span(out)) if len(out) <= 400 else String("(", len(out), " bytes)"))
             bad += 1
-    assert_equal(bad, 0)
-    assert_true(accepted > CASES // 4)
+    assert_equal(bad, 0, String("seed ", seed, " (replay: MOJO_NET_FUZZ_SEED=", seed - base, ")"))
+    assert_true(accepted > cases // 4)
 
 
 def test_differential_seed_1() raises:

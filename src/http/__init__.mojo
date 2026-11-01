@@ -1,6 +1,7 @@
 """HTTP/1.1 (RFC 9110, RFC 9112): message types, the header map, the
 sans-I/O message parser, body framing and connection state machines,
-server-sent events (`sse`) and Retry-After (`retry`), and a blocking client.
+server-sent events (`sse`), Retry-After (`retry`), query strings, forms and
+cookies (`form`), and a blocking client.
 
 The protocol modules are sans-I/O (docs/design.md, contract 1): they parse
 and build bytes and never touch a socket or a clock, so the same code runs
@@ -11,6 +12,7 @@ never pulls in the transport: `from http.client import Client`. The server
 is its own package, `server` (docs/server.md).
 """
 
+from .form import Pairs, SetCookie, parse_cookie, parse_form, parse_query, percent_decode
 from .body import (
     BodyDecoder,
     BodyKind,

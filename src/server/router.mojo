@@ -40,6 +40,8 @@ the body), and OPTIONS without a route of its own is answered with 204 and
 `Allow`.
 """
 
+from std.collections import Dict
+
 from http.headers import Headers, is_token
 
 from .server import Exchange, Handler, Request, Response
@@ -130,6 +132,29 @@ struct _Node(Copyable, Movable):
         self.routes = List[Int]()
 
 
+struct _Match(Copyable, Movable):
+    """The route a connection's request matched at its head (`admit`),
+    kept for `handle` and `body_limit`."""
+
+    var number: Int
+    """`Request.number`: which of the connection's requests it is."""
+    var route: Int
+    """The route index, or NO_ROUTE (the application's)."""
+    var names: List[String]
+    var values: List[String]
+
+    def __init__(out self, number: Int, route: Int):
+        self.number = number
+        self.route = route
+        self.names = List[String]()
+        self.values = List[String]()
+
+
+def _pass[A: Handler](mut app: A, req: Request, params: Params, mut res: Response) raises -> Bool:
+    """The `admit` of a route added without one: admit."""
+    return True
+
+
 @fieldwise_init
 struct _Segment(TrivialRegisterPassable):
     var start: Int
@@ -151,13 +176,22 @@ struct Router[A: Handler](Handler):
     """Routes to functions of the application (see the module docs)."""
 
     comptime Route = def(mut Self.A, Request, Params, mut Response) raises thin
+    comptime Guard = def(mut Self.A, Request, Params, mut Response) raises thin -> Bool
+    """A route's `admit`: False to answer with `res` instead (as
+    `Handler.admit`), with the decoded parameters at hand."""
 
     var app: Self.A
     """The application: unmatched requests and the streaming hooks go to
     it."""
     var _nodes: List[_Node]
     var _fns: List[Self.Route]
+    var _guards: List[Self.Guard]
+    var _limits: List[Int]
+    """Per route: its `admit` (`_pass` if none) and its body limit (-1:
+    the application's `body_limit`)."""
     var _patterns: List[String]
+    var _matches: Dict[UInt64, _Match]
+    """By connection id: the route its request in progress matched."""
     var _params: Params
     var _path: List[UInt8]
     """The decoded path of the request being matched."""
@@ -181,7 +215,10 @@ struct Router[A: Handler](Handler):
         self._nodes = List[_Node]()
         self._nodes.append(_Node(String()))
         self._fns = List[Self.Route]()
+        self._guards = List[Self.Guard]()
+        self._limits = List[Int]()
         self._patterns = List[String]()
+        self._matches = Dict[UInt64, _Match]()
         self._params = Params()
         self._path = List[UInt8]()
         self._segments = List[_Segment]()
@@ -194,23 +231,48 @@ struct Router[A: Handler](Handler):
 
     # ---- adding routes ---------------------------------------------------------
 
-    def get(mut self, pattern: StringSlice, f: Self.Route) raises:
-        self.route("GET", pattern, f)
+    def get(
+        mut self, pattern: StringSlice, f: Self.Route, admit: Optional[Self.Guard] = None, body_limit: Int = -1
+    ) raises:
+        self.route("GET", pattern, f, admit, body_limit)
 
-    def post(mut self, pattern: StringSlice, f: Self.Route) raises:
-        self.route("POST", pattern, f)
+    def post(
+        mut self, pattern: StringSlice, f: Self.Route, admit: Optional[Self.Guard] = None, body_limit: Int = -1
+    ) raises:
+        self.route("POST", pattern, f, admit, body_limit)
 
-    def put(mut self, pattern: StringSlice, f: Self.Route) raises:
-        self.route("PUT", pattern, f)
+    def put(
+        mut self, pattern: StringSlice, f: Self.Route, admit: Optional[Self.Guard] = None, body_limit: Int = -1
+    ) raises:
+        self.route("PUT", pattern, f, admit, body_limit)
 
-    def patch(mut self, pattern: StringSlice, f: Self.Route) raises:
-        self.route("PATCH", pattern, f)
+    def patch(
+        mut self, pattern: StringSlice, f: Self.Route, admit: Optional[Self.Guard] = None, body_limit: Int = -1
+    ) raises:
+        self.route("PATCH", pattern, f, admit, body_limit)
 
-    def delete(mut self, pattern: StringSlice, f: Self.Route) raises:
-        self.route("DELETE", pattern, f)
+    def delete(
+        mut self, pattern: StringSlice, f: Self.Route, admit: Optional[Self.Guard] = None, body_limit: Int = -1
+    ) raises:
+        self.route("DELETE", pattern, f, admit, body_limit)
 
-    def route(mut self, method: StringSlice, pattern: StringSlice, f: Self.Route) raises:
+    def route(
+        mut self,
+        method: StringSlice,
+        pattern: StringSlice,
+        f: Self.Route,
+        admit: Optional[Self.Guard] = None,
+        body_limit: Int = -1,
+    ) raises:
         """Send `method` requests whose path matches `pattern` to `f`.
+
+        `admit` runs at the request's head, before its body, after the
+        application's own `admit`, with the decoded parameters: False to
+        answer with `res` instead (a 401, a 403). It is the place for a
+        check that depends on the route, since the application's `admit`
+        sees only the raw target ("/%70rivate" routes to "/private").
+        `body_limit` (>= 0) replaces `Handler.body_limit` for this route.
+
         Raises for a method that is not a token, a malformed pattern (a
         text segment with "%", "?" or "#" in it, which no decoded path
         holds; a name used twice in it), a method and pattern added
@@ -220,6 +282,8 @@ struct Router[A: Handler](Handler):
             raise Error("route method is not a token: '", method, "'")
         if not pattern.startswith("/"):
             raise Error("route pattern must start with '/': ", pattern)
+        if body_limit < -1:
+            raise Error("route body_limit must be -1 (the application's) or more: ", pattern)
         var node = 0
         var names = List[String]()
         var parts = String(pattern[byte=1:]).split("/")
@@ -283,6 +347,8 @@ struct Router[A: Handler](Handler):
         self._nodes[node].methods.append(String(method))
         self._nodes[node].routes.append(len(self._fns))
         self._fns.append(f)
+        self._guards.append(admit.value() if admit else _pass[Self.A])
+        self._limits.append(body_limit)
         self._patterns.append(String(pattern))
 
     # ---- matching --------------------------------------------------------------
@@ -534,8 +600,23 @@ struct Router[A: Handler](Handler):
 
     # ---- Handler -----------------------------------------------------------------
 
+    def _matched(mut self, req: Request) -> Int:
+        """The route `req` matched at its head, its parameters back in
+        `_params`; or, if `admit` did not see it (a test calling `handle`),
+        matched now."""
+        if req.id in self._matches:
+            try:
+                var m = self._matches.pop(req.id)
+                if m.number == req.number:
+                    swap(self._params._names, m.names)
+                    swap(self._params._values, m.values)
+                    return m.route
+            except:
+                pass
+        return self.find(req.method, req.target)
+
     def handle(mut self, req: Request, mut res: Response) raises:
-        var r = self.find(req.method, req.target)
+        var r = self._matched(req)
         if r >= 0:
             var f = self._fns[r]
             f(self.app, req, self._params, res)
@@ -560,12 +641,36 @@ struct Router[A: Handler](Handler):
         self.app.handle(req, res)
 
     def admit(mut self, req: Request, mut res: Response) raises -> Bool:
-        return self.app.admit(req, res)
+        """The application's `admit` first (it sees every request, so a
+        refused client learns nothing of the routes); then the path is
+        matched, once: what the router answers itself (400, 404 past 128
+        segments, 405, OPTIONS) is answered here, before any body, and a
+        matched route's own `admit` runs with its parameters."""
+        if not self.app.admit(req, res):
+            return False
+        var r = self.find(req.method, req.target)
+        if (r == ENCODED_SLASH or r == TOO_DEEP) and self.fallback_unroutable:
+            r = NO_ROUTE
+        if r < 0 and r != NO_ROUTE:
+            self.handle(req, res)  # (its answer for r: find runs again, rarely)
+            return False
+        var m = _Match(req.number, r)
+        if r >= 0 and not self._guards[r](self.app, req, self._params, res):
+            return False
+        swap(m.names, self._params._names)
+        swap(m.values, self._params._values)
+        self._matches[req.id] = m^
+        return True
 
     def stream_request(mut self, req: Request) raises -> Bool:
         return self.app.stream_request(req)
 
     def body_limit(mut self, req: Request) -> Int:
+        var m = self._matches.get(req.id)
+        if m and m.value().number == req.number and m.value().route >= 0:
+            var limit = self._limits[m.value().route]
+            if limit >= 0:
+                return limit
         return self.app.body_limit(req)
 
     def on_body(mut self, req: Request, data: Span[UInt8, _]) raises:
@@ -590,6 +695,11 @@ struct Router[A: Handler](Handler):
         self.app.failed(req, error, res)
 
     def completed(mut self, req: Request, done: Exchange):
+        if req.id in self._matches:
+            try:
+                _ = self._matches.pop(req.id)  # (refused, or cut before `handle`)
+            except:
+                pass
         self.app.completed(req, done)
 
 

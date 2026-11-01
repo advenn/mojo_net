@@ -8,11 +8,20 @@ the events of a streamed reply. Sans-I/O.
   consecutive results in one turn. Tools carry their `input_schema`.
   `max_tokens` is required, `seed` is refused (the API has none), and so
   is a turn with empty content (the API refuses it).
+- **Thinking:** `thinking` and `redacted_thinking` blocks are kept in
+  `Reply.thinking`, in order, with their signatures; an assistant
+  `Message` sends its own back first in its content (`Message.from_reply`
+  builds one), as the API requires of a turn with tool calls. Streams
+  give the reasoning as THINKING deltas.
+- **Caching:** a `Message` or `Tool` with `cache` set ends with a cache
+  breakpoint (`cache_control: ephemeral`); system messages with one are
+  sent as text blocks instead of one string. Automatic caching (a
+  top-level `cache_control`) can go in `ChatRequest.extra`.
 - **Replies:** `read_messages` joins the text blocks and keeps each
-  `tool_use` block as a call (its `input` as JSON text). Other blocks
-  (thinking, a server tool's or MCP tool's use) are skipped, in replies
-  and streams alike, so extended thinking with tools, which needs the
-  thinking blocks sent back, is not supported yet.
+  `tool_use` block as a call (its `input` as JSON text). Other blocks (a
+  server tool's or MCP tool's use, types to come) are skipped, in replies
+  and streams alike. `Usage.input_tokens` adds the cached input to the
+  API's `input_tokens`, which leaves it out.
 - **Streams:** `EventDecoder` follows the event types: `message_start`,
   `content_block_start` / `_delta` / `_stop`, `message_delta`,
   `message_stop` (DONE), `ping`; `error` raises API. Types it does not
@@ -26,7 +35,7 @@ from json import JsonError, Writer
 
 from .common import Reader, clip, usage_error, write_extra, write_object_text
 from .error import LlmError
-from .types import ChatRequest, Delta, DeltaKind, Reply, ToolCall, Usage
+from .types import ChatRequest, Delta, DeltaKind, Reply, Thinking, ToolCall, Usage
 
 comptime VERSION = "2023-06-01"
 """The `anthropic-version` header this module speaks."""
@@ -49,11 +58,15 @@ def _write_messages(req: ChatRequest, stream: Bool) raises JsonError -> List[UIn
     if req.seed:
         raise JsonError(JsonError.USAGE, "llm: Anthropic's API takes no seed")
     var system = String()
+    var cached_system = False
     for m in req.messages:
         if m.role == "system":
             if system.byte_length() > 0:
                 system += "\n\n"
             system += m.content
+            cached_system = cached_system or m.cache
+        elif len(m.thinking) > 0 and m.role != "assistant":
+            raise JsonError(JsonError.USAGE, "llm: only an assistant message carries thinking blocks")
     var w = Writer()
     w.begin_object()
     w.key("model")
@@ -62,7 +75,14 @@ def _write_messages(req: ChatRequest, stream: Bool) raises JsonError -> List[UIn
     w.int(req.max_tokens)
     if system.byte_length() > 0:
         w.key("system")
-        w.string(system)
+        if cached_system:  # (blocks, so that each can carry its breakpoint)
+            w.begin_array()
+            for m in req.messages:
+                if m.role == "system" and m.content.byte_length() > 0:
+                    _text_block(w, m.content, m.cache)
+            w.end_array()
+        else:
+            w.string(system)
     w.key("messages")
     w.begin_array()
     var in_results = False  # (a user turn of tool results is open)
@@ -88,6 +108,8 @@ def _write_messages(req: ChatRequest, stream: Bool) raises JsonError -> List[UIn
             w.string(m.tool_call_id)
             w.key("content")
             w.string(m.content)
+            if m.cache:
+                _cache_control(w)
             w.end_object()
             continue
         if in_results:
@@ -105,18 +127,31 @@ def _write_messages(req: ChatRequest, stream: Bool) raises JsonError -> List[UIn
         w.key("role")
         w.string(m.role)
         w.key("content")
-        if len(m.tool_calls) == 0:
+        if len(m.tool_calls) == 0 and len(m.thinking) == 0 and not m.cache:
             w.string(m.content)
         else:
+            # Blocks: the thinking first (the API checks that a turn with
+            # tool calls starts with its own), then the text, then the
+            # calls; a breakpoint on the last.
             w.begin_array()
-            if m.content.byte_length() > 0:
+            for t in m.thinking:
                 w.begin_object()
                 w.key("type")
-                w.string("text")
-                w.key("text")
-                w.string(m.content)
+                if t.redacted.byte_length() > 0:
+                    w.string("redacted_thinking")
+                    w.key("data")
+                    w.string(t.redacted)
+                else:
+                    w.string("thinking")
+                    w.key("thinking")
+                    w.string(t.text)
+                    w.key("signature")
+                    w.string(t.signature)
                 w.end_object()
-            for c in m.tool_calls:
+            if m.content.byte_length() > 0:
+                _text_block(w, m.content, m.cache and len(m.tool_calls) == 0)
+            for i in range(len(m.tool_calls)):
+                ref c = m.tool_calls[i]
                 w.begin_object()
                 w.key("type")
                 w.string("tool_use")
@@ -126,6 +161,8 @@ def _write_messages(req: ChatRequest, stream: Bool) raises JsonError -> List[UIn
                 w.string(c.name)
                 w.key("input")
                 write_object_text(w, c.arguments if c.arguments.byte_length() > 0 else String("{}"))
+                if m.cache and i == len(m.tool_calls) - 1:
+                    _cache_control(w)
                 w.end_object()
             w.end_array()
         w.end_object()
@@ -147,6 +184,8 @@ def _write_messages(req: ChatRequest, stream: Bool) raises JsonError -> List[UIn
                 w.string(t.description)
             w.key("input_schema")
             write_object_text(w, t.parameters)
+            if t.cache:
+                _cache_control(w)
             w.end_object()
         w.end_array()
     if req.temperature:
@@ -182,6 +221,43 @@ def _write_messages(req: ChatRequest, stream: Bool) raises JsonError -> List[UIn
     return w.take()
 
 
+def _cache_control(mut w: Writer) raises JsonError:
+    w.key("cache_control")
+    w.begin_object()
+    w.key("type")
+    w.string("ephemeral")
+    w.end_object()
+
+
+def _text_block(mut w: Writer, text: StringSlice, cache: Bool) raises JsonError:
+    w.begin_object()
+    w.key("type")
+    w.string("text")
+    w.key("text")
+    w.string(text)
+    if cache:
+        _cache_control(w)
+    w.end_object()
+
+
+def _usage(mut r: Reader, u: Int, mut usage: Usage):
+    """The counts in usage object `u` (those it has), into `usage`. The
+    API's `input_tokens` leaves out the input read from or written to the
+    cache: `usage.input_tokens` is all three."""
+    var input = r.int(u, "input_tokens")
+    var read = r.int(u, "cache_read_input_tokens")
+    var write = r.int(u, "cache_creation_input_tokens")
+    if input >= 0:
+        usage.input_tokens = input + max(read, 0) + max(write, 0)
+    if read >= 0:
+        usage.cache_read_tokens = read
+    if write >= 0:
+        usage.cache_write_tokens = write
+    var output = r.int(u, "output_tokens")
+    if output >= 0:
+        usage.output_tokens = output
+
+
 def _raise_if_error(mut r: Reader) raises LlmError:
     if r.str(0, "type") != "error":
         return
@@ -201,7 +277,7 @@ def read_messages(body: Span[UInt8, _]) raises LlmError -> Reply:
     reply.finish_reason = r.str(0, "stop_reason")
     var u = r.object(0, "usage")
     if u >= 0:
-        reply.usage = Usage(r.int(u, "input_tokens"), r.int(u, "output_tokens"))
+        _usage(r, u, reply.usage)
     var content = r.array(0, "content")
     r.check()
     if content < 0:
@@ -214,6 +290,10 @@ def read_messages(body: Span[UInt8, _]) raises LlmError -> Reply:
         elif t == "tool_use":
             var input = r.object(b, "input")
             reply.tool_calls.append(ToolCall(r.str(b, "id"), r.str(b, "name"), r.json(input) if input >= 0 else String("{}")))
+        elif t == "thinking":
+            reply.thinking.append(Thinking(r.str(b, "thinking"), r.str(b, "signature"), String()))
+        elif t == "redacted_thinking":
+            reply.thinking.append(Thinking(String(), String(), r.str(b, "data")))
         b = r.next(b)
     r.check()
     return reply^
@@ -228,11 +308,18 @@ struct EventDecoder(Movable):
     var _tool_of_block: List[Int]
     """Per content block: its tool call's index; -1 for a text block, -2
     for any other (thinking, a server or MCP tool's use, a type to come)."""
+    var _thought_of_block: List[Int]
+    """Per content block: its index in `reply.thinking`, or -1."""
+    var kept: Int
+    """Bytes kept without a delta of their own (signatures, redacted
+    thinking): `ReplyStream` counts them against `max_reply` too."""
 
     def __init__(out self):
         self.reply = Reply()
         self.done = False
         self._tool_of_block = List[Int]()
+        self._thought_of_block = List[Int]()
+        self.kept = 0
 
     def feed(mut self, data: StringSlice, mut out: List[Delta]) raises LlmError:
         """Append the deltas in one event's `data` to `out` (the event's
@@ -248,13 +335,16 @@ struct EventDecoder(Movable):
             self.reply.model = r.str(m, "model")
             var u = r.object(m, "usage")
             if u >= 0:
-                self.reply.usage.input_tokens = r.int(u, "input_tokens")
+                var output = self.reply.usage.output_tokens  # (the start's is a placeholder)
+                _usage(r, u, self.reply.usage)
+                self.reply.usage.output_tokens = output
         elif t == "content_block_start":
             var index = r.int(0, "index")
             var block = r.object(0, "content_block")
             if index < 0 or index != len(self._tool_of_block):
                 raise LlmError(LlmError.PROTOCOL, "llm: content blocks out of order")
             var kind = r.str(block, "type")
+            self._thought_of_block.append(-1)
             if kind == "tool_use":
                 var call = len(self.reply.tool_calls)
                 self._tool_of_block.append(call)
@@ -268,6 +358,16 @@ struct EventDecoder(Movable):
             elif kind == "text":
                 self._tool_of_block.append(-1)
                 self._text(r.str(block, "text"), out)
+            elif kind == "thinking" or kind == "redacted_thinking":
+                self._tool_of_block.append(-2)
+                self._thought_of_block[index] = len(self.reply.thinking)
+                if kind == "thinking":
+                    self.reply.thinking.append(Thinking(String(), r.str(block, "signature"), String()))
+                    self.kept += self.reply.thinking[len(self.reply.thinking) - 1].signature.byte_length()
+                    self._thought(index, r.str(block, "thinking"), out)
+                else:
+                    self.reply.thinking.append(Thinking(String(), String(), r.str(block, "data")))
+                    self.kept += self.reply.thinking[len(self.reply.thinking) - 1].redacted.byte_length()
             else:
                 self._tool_of_block.append(-2)
         elif t == "content_block_delta":
@@ -278,6 +378,16 @@ struct EventDecoder(Movable):
             var kind = r.str(delta, "type")
             if kind == "text_delta":
                 self._text(r.str(delta, "text"), out)
+            elif kind == "thinking_delta" or kind == "signature_delta":
+                var at = self._thought_of_block[index]
+                if at < 0 or self.reply.thinking[at].redacted.byte_length() > 0:
+                    raise LlmError(LlmError.PROTOCOL, "llm: a thinking delta for a block that is not thinking")
+                if kind == "thinking_delta":
+                    self._thought(index, r.str(delta, "thinking"), out)
+                else:
+                    var piece = r.str(delta, "signature")
+                    self.kept += piece.byte_length()
+                    self.reply.thinking[at].signature += piece
             elif kind == "input_json_delta":
                 var call = self._tool_of_block[index]
                 if call == -1:
@@ -306,7 +416,7 @@ struct EventDecoder(Movable):
                 self.reply.finish_reason = reason
             var u = r.object(0, "usage")
             if u >= 0:
-                self.reply.usage.output_tokens = r.int(u, "output_tokens")
+                _usage(r, u, self.reply.usage)  # (the output so far; the input again, in newer versions)
         elif t == "message_stop":
             self.done = True
             var d = Delta()
@@ -316,6 +426,15 @@ struct EventDecoder(Movable):
             out.append(d^)
         # ("ping", and types this module does not know, are skipped.)
         r.check()
+
+    def _thought(mut self, index: Int, text: String, mut out: List[Delta]):
+        if text.byte_length() == 0:
+            return
+        self.reply.thinking[self._thought_of_block[index]].text += text
+        var d = Delta()
+        d.kind = DeltaKind.THINKING
+        d.text = text
+        out.append(d^)
 
     def _text(mut self, text: String, mut out: List[Delta]):
         if text.byte_length() == 0:

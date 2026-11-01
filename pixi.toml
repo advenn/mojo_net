@@ -52,7 +52,16 @@ aarch64-check = "bash tools/check_aarch64.sh"
 # the stable API, every test file (which includes the ABI layout check), the
 # tls tests under ASan, the no-libc check and the example builds. Set
 # MOJO_NET_REQUIRE_IPV6=1 on runners with IPv6.
-ci = { depends-on = ["import-check", "tls-check", "json-check", "api-check", "test", "tls-asan", "nolibc-check", "examples-check"] }
+# TG12: the HTTPS server scanned by sslyze and testssl.sh (weekly in
+# .github/workflows/tls-weekly.yml; not ci: it downloads both).
+tls-interop = "bash tools/check_tls_interop.sh"
+# The fuzzers longer and from a new seed, then under ASan (weekly in
+# .github/workflows/fuzz.yml; not ci).
+fuzz-long = "bash tools/fuzz_long.sh"
+# GitHub CI runs the same tasks as parallel jobs; ci-check fails when one of
+# them is missing from .github/workflows/ci.yml.
+ci-check = "python3 tools/check_ci.py"
+ci = { depends-on = ["ci-check", "import-check", "tls-check", "json-check", "api-check", "test", "tls-asan", "nolibc-check", "examples-check"] }
 # Re-run the M1 threading/runtime/callback spikes (see docs/spikes.md).
 spikes = "bash spikes/run_spikes.sh"
 # The TLS-through-OpenSSL spike (T0): checks every recorded fact.
@@ -101,9 +110,24 @@ rust = ">=1.99"
 valgrind = ">=3.27"
 
 [feature.bench.tasks]
+# Request streams read by our codec and by Go's net/http: where both read a
+# request, they must agree (tools/smuggling/compare.py; weekly in fuzz.yml).
+smuggling-check = "python3 tools/smuggling/compare.py"
 bench-server = "python3 bench/server/run.py"
 bench-profile = "python3 bench/server/profile.py"
+
+# The cost check (tools/check_perf.py, .github/workflows/perf.yml): the
+# codecs' instructions per request under callgrind, against a base commit.
+[feature.perf]
+platforms = ["linux-64"]
+
+[feature.perf.dependencies]
+valgrind = ">=3.27"
+
+[feature.perf.tasks]
+perf-check = "python3 tools/check_perf.py"
 
 [environments]
 package = { features = ["package"], no-default-feature = true }
 bench = { features = ["bench"] }
+perf = { features = ["perf"] }

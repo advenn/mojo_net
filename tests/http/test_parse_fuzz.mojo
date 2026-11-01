@@ -7,11 +7,22 @@ parser must give the same outcome, error rule and status included, both
 when it sees all the input at once and when it gets growing prefixes cut
 at random points."""
 
+from std.os import getenv
 from std.python import Python
 from std.testing import TestSuite, assert_equal, assert_true
 
 from http.parse import HeadParser, Limits, RequestHead, ResponseHead
 from linux import IoError
+
+
+def _env(name: StaticString, default: Int) raises -> Int:
+    """A fuzz setting from the environment, for the weekly fuzz run
+    (.github/workflows/fuzz.yml): MOJO_NET_FUZZ_SEED shifts the seeds, so a
+    run explores cases CI never saw (a failure prints the value to replay
+    it with), and MOJO_NET_FUZZ_SCALE multiplies the number of cases."""
+    var v = getenv(name)
+    return atol(v) if v.byte_length() > 0 else default
+
 
 comptime CASES = 20000
 
@@ -128,9 +139,11 @@ def test_parser_matches_the_reference_on_mutated_heads() raises:
     var sys = Python.import_module("sys")
     _ = sys.path.insert(0, "tests/http")
     var oracle = Python.import_module("head_oracle")
-    var rng = _Rng(2026)
+    var first = _env("MOJO_NET_FUZZ_SEED", 0)
+    var cases = CASES * _env("MOJO_NET_FUZZ_SCALE", 1)
+    var rng = _Rng(UInt64(2026 + first))
     var oks = 0
-    for seed in range(CASES):
+    for seed in range(first, first + cases):
         var line = String(oracle.case(seed))
         var pos = 0
         var kind = _field(line, pos)
@@ -144,7 +157,7 @@ def test_parser_matches_the_reference_on_mutated_heads() raises:
         var got = _whole(request, limits, Span(data))
         var split = _split(request, limits, Span(data), rng)
         if got != want or split != want:
-            print("case", seed, kind, max_head, max_start, max_fields)
+            print("case", seed, kind, max_head, max_start, max_fields, "(replay: MOJO_NET_FUZZ_SEED=", first, ")")
             print("  input   ", _hex(Span(data)))
             print("  expected", want)
             print("  whole   ", got)
@@ -153,7 +166,7 @@ def test_parser_matches_the_reference_on_mutated_heads() raises:
         assert_equal(split, want, String("case ", seed, " split"))
         if want.startswith("ok"):
             oks += 1
-    assert_true(oks > CASES // 4)
+    assert_true(oks > cases // 4)
 
 
 def main() raises:

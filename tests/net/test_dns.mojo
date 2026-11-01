@@ -3,6 +3,7 @@ chains in any order, NODATA/NXDOMAIN/TC, the RFC 5452 acceptance rules that
 ignore forged or unrelated packets, compression-pointer and length attacks),
 plus a mutation fuzz run that must never crash."""
 
+from std.os import getenv
 from std.testing import TestSuite, assert_equal, assert_false, assert_true
 
 from linux import ErrorKind, IoError
@@ -26,6 +27,15 @@ from net.dns import (
     tcp_frame,
 )
 from reader_script import Rng
+
+
+def _env(name: StaticString, default: Int) raises -> Int:
+    """A fuzz setting from the environment, for the weekly fuzz run
+    (.github/workflows/fuzz.yml): MOJO_NET_FUZZ_SEED shifts the seeds, so a
+    run explores cases CI never saw (a failure prints the value to replay
+    it with), and MOJO_NET_FUZZ_SCALE multiplies the number of cases."""
+    var v = getenv(name)
+    return atol(v) if v.byte_length() > 0 else default
 
 
 # ---- a tiny message builder --------------------------------------------------
@@ -409,10 +419,10 @@ def test_mutation_fuzz_never_crashes() raises:
     m.rr_head(TYPE_A, 9, 4)
     for v in [1, 2, 3, 4]:
         m.u8(v)
-    var rng = Rng(0xD45)
+    var rng = Rng(0xD45 + UInt64(_env("MOJO_NET_FUZZ_SEED", 0)))
     var seen_ok = 0
     var seen_invalid = 0
-    for _ in range(200_000):
+    for _ in range(200_000 * _env("MOJO_NET_FUZZ_SCALE", 1)):
         var b = m.b.copy()
         var edits = 1 + rng.below(4)
         for _ in range(edits):

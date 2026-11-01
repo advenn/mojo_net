@@ -314,7 +314,7 @@ elif mode == "idle-after-flush":
             head, _ = data.split(b"\\r\\n\\r\\n", 1)
             n = int([l for l in head.split(b"\\r\\n") if l.lower().startswith(b"content-length:")][0].split(b":")[1])
             want = len(head) + 4 + n
-        # 2.4 s for the 32 MiB, far past the 1 s idle timeout; the server's
+        # 2.4 s for the 32 MiB, far past the 1.5 s idle timeout; the server's
         # last write comes about 0.3 s before the end (what its send buffer
         # holds, up to 4 MiB)
         lag = len(data) / (32 << 20) * 2.4 - (time.time() - start)
@@ -389,7 +389,9 @@ def test_the_idle_timer_starts_when_the_response_is_out() raises:
     assert_equal(
         _run(
             "idle-after-flush",
-            ServerConfig(idle_timeout=Duration.from_secs(1), write_timeout=Duration.from_secs(5), min_rate=0),
+            # (1.5 s: a timer started at queueing ends it well inside the
+            # 2.4 s transfer, and a loaded machine still has 1 s to spare)
+            ServerConfig(idle_timeout=Duration.from_millis(1500), write_timeout=Duration.from_secs(5), min_rate=0),
         ),
         "HTTP/1.1 200 OK",
     )

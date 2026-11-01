@@ -18,6 +18,20 @@ struct ToolCall(Copyable, Movable, Writable):
         writer.write(self.name, "(", self.arguments, ") #", self.id)
 
 
+@fieldwise_init
+struct Thinking(Copyable, Movable):
+    """A block of the model's reasoning, as Anthropic's API returns it.
+    With tools, the API wants an assistant turn's thinking blocks sent back
+    unchanged, signature and all (`Message.from_reply` does it), or it
+    refuses the next request."""
+
+    var text: String
+    """The reasoning ("" for a redacted block)."""
+    var signature: String
+    var redacted: String
+    """A `redacted_thinking` block's data ("" for a plain one)."""
+
+
 struct Message(Copyable, Movable):
     """One turn of the conversation."""
 
@@ -28,12 +42,30 @@ struct Message(Copyable, Movable):
     """An assistant turn's calls, when the conversation is sent back."""
     var tool_call_id: String
     """A "tool" turn: the call it answers."""
+    var thinking: List[Thinking]
+    """An assistant turn's thinking blocks (Anthropic), sent back before
+    its text and calls; other APIs ignore them."""
+    var cache: Bool
+    """Anthropic: put a cache breakpoint at the end of this message
+    (`cache_control: ephemeral`), so the prompt up to here can be read from
+    the cache next time. Other APIs ignore it (OpenAI caches by itself)."""
 
     def __init__(out self, role: StringSlice, content: StringSlice):
         self.role = String(role)
         self.content = String(content)
         self.tool_calls = List[ToolCall]()
         self.tool_call_id = String()
+        self.thinking = List[Thinking]()
+        self.cache = False
+
+    @staticmethod
+    def from_reply(reply: Reply) -> Message:
+        """The assistant turn `reply` was, to send back with the rest of
+        the conversation: its text, tool calls and thinking blocks."""
+        var m = Message("assistant", reply.text)
+        m.tool_calls = reply.tool_calls.copy()
+        m.thinking = reply.thinking.copy()
+        return m^
 
     @staticmethod
     def system(content: StringSlice) -> Message:
@@ -57,7 +89,6 @@ struct Message(Copyable, Movable):
         return m^
 
 
-@fieldwise_init
 struct Tool(Copyable, Movable):
     """A function the model may call."""
 
@@ -65,6 +96,15 @@ struct Tool(Copyable, Movable):
     var description: String
     var parameters: String
     """A JSON Schema of the arguments, as JSON text (an object)."""
+    var cache: Bool
+    """Anthropic: a cache breakpoint after this tool's definition (tools
+    come first in the prompt, so on the last tool it caches them all)."""
+
+    def __init__(out self, name: StringSlice, description: StringSlice, parameters: StringSlice, cache: Bool = False):
+        self.name = String(name)
+        self.description = String(description)
+        self.parameters = String(parameters)
+        self.cache = cache
 
 
 struct ChatRequest(Copyable, Movable):
@@ -109,22 +149,58 @@ struct ChatRequest(Copyable, Movable):
         self.extra = String()
 
 
-@fieldwise_init
 struct Usage(Copyable, Equatable, TrivialRegisterPassable, Writable):
-    """Tokens counted by the provider (-1 when it did not say)."""
+    """Tokens counted by the provider (-1 when it did not say).
+
+    `input_tokens` is the whole prompt, the same for every API: Anthropic's
+    own `input_tokens` leaves out what was read from or written to the
+    cache, so its three counts are added up here."""
 
     var input_tokens: Int
     var output_tokens: Int
+    var cache_read_tokens: Int
+    """Of the input, what came from the prompt cache (billed at a fraction
+    of the rest)."""
+    var cache_write_tokens: Int
+    """Of the input, what was written to the cache (Anthropic)."""
+    var reasoning_tokens: Int
+    """Of the output, the model's reasoning (OpenAI's reasoning models)."""
+
+    def __init__(
+        out self,
+        input_tokens: Int,
+        output_tokens: Int,
+        cache_read_tokens: Int = -1,
+        cache_write_tokens: Int = -1,
+        reasoning_tokens: Int = -1,
+    ):
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.cache_read_tokens = cache_read_tokens
+        self.cache_write_tokens = cache_write_tokens
+        self.reasoning_tokens = reasoning_tokens
 
     @staticmethod
     def unknown() -> Usage:
         return Usage(-1, -1)
 
     def __eq__(self, other: Self) -> Bool:
-        return self.input_tokens == other.input_tokens and self.output_tokens == other.output_tokens
+        return (
+            self.input_tokens == other.input_tokens
+            and self.output_tokens == other.output_tokens
+            and self.cache_read_tokens == other.cache_read_tokens
+            and self.cache_write_tokens == other.cache_write_tokens
+            and self.reasoning_tokens == other.reasoning_tokens
+        )
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write("in=", self.input_tokens, " out=", self.output_tokens)
+        if self.cache_read_tokens >= 0:
+            writer.write(" cache_read=", self.cache_read_tokens)
+        if self.cache_write_tokens >= 0:
+            writer.write(" cache_write=", self.cache_write_tokens)
+        if self.reasoning_tokens >= 0:
+            writer.write(" reasoning=", self.reasoning_tokens)
 
 
 struct Reply(Copyable, Movable, Writable):
@@ -140,6 +216,11 @@ struct Reply(Copyable, Movable, Writable):
     var refusal: String
     """OpenAI-style APIs: the model's refusal, when it refused instead of
     answering ("" otherwise)."""
+    var thinking: List[Thinking]
+    """The model's reasoning: Anthropic's thinking blocks (to send back:
+    `Message.from_reply`), or the `reasoning_content` of OpenAI-compatible
+    servers that return it (vLLM, DeepSeek), as one block without a
+    signature."""
     var usage: Usage
 
     def __init__(out self):
@@ -149,6 +230,7 @@ struct Reply(Copyable, Movable, Writable):
         self.tool_calls = List[ToolCall]()
         self.finish_reason = String()
         self.refusal = String()
+        self.thinking = List[Thinking]()
         self.usage = Usage.unknown()
 
     def write_to(self, mut writer: Some[Writer]):
@@ -170,6 +252,9 @@ struct DeltaKind(Equatable, TrivialRegisterPassable, Writable):
     """The answer is complete: `text` is the finish reason, and `usage`."""
     comptime REFUSAL = DeltaKind(5)
     """`text` is the next piece of a refusal (OpenAI-style APIs)."""
+    comptime THINKING = DeltaKind(6)
+    """`text` is the next piece of the model's reasoning (Anthropic's
+    thinking, or `reasoning_content`), not of the answer."""
 
     def __init__(out self, v: Int):
         self._v = v
@@ -178,7 +263,7 @@ struct DeltaKind(Equatable, TrivialRegisterPassable, Writable):
         return self._v == other._v
 
     def write_to(self, mut writer: Some[Writer]):
-        var names: List[StaticString] = ["?", "text", "tool_call", "tool_args", "done", "refusal"]
+        var names: List[StaticString] = ["?", "text", "tool_call", "tool_args", "done", "refusal", "thinking"]
         writer.write(names[self._v] if self._v > 0 and self._v < len(names) else "?")
 
 

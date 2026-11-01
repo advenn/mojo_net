@@ -30,10 +30,26 @@
 # Without a filter the run also checks struct layouts and constants against
 # this host's C headers (tools/gen_abi.py --check plus the generated
 # build/test_abi_layout.mojo, i.e. `pixi run abi-check`). `pixi run ci` adds
-# `import-check`, `nolibc-check` and `examples-check`.
+# the other checks (pixi.toml, `ci`).
+#
+# Shards: MOJO_NET_TEST_SHARD=i/n runs only part i of n (1-based): the k-th
+# file in sorted order (counted from 0) belongs to part k % n + 1, so the
+# parts together run every file, new ones included, and each part gets
+# some of every package. Part 1 also runs the layout check. CI runs the
+# parts as parallel jobs (.github/workflows/ci.yml).
 set -u
 cd "$(dirname "$0")/.."
 filter="${1:-}"
+shard_i=1
+shard_n=1
+if [[ -n "${MOJO_NET_TEST_SHARD:-}" ]]; then
+  if [[ ! "$MOJO_NET_TEST_SHARD" =~ ^([0-9]+)/([0-9]+)$ ]] || (( BASH_REMATCH[1] < 1 || BASH_REMATCH[1] > BASH_REMATCH[2] )); then
+    echo "MOJO_NET_TEST_SHARD must be i/n with 1 <= i <= n, not '$MOJO_NET_TEST_SHARD'"
+    exit 2
+  fi
+  shard_i=${BASH_REMATCH[1]}
+  shard_n=${BASH_REMATCH[2]}
+fi
 limit="${MOJO_NET_TEST_TIMEOUT:-600}"
 fail=0
 total=0
@@ -74,7 +90,10 @@ run_one() {
 }
 
 sim=(-D MOJO_NET_SIM=1)
+k=-1
 while IFS= read -r f; do
+  k=$((k + 1))
+  (( k % shard_n + 1 == shard_i )) || continue
   [[ -n "$filter" && "$f" != *"$filter"* ]] && continue
   base="$(basename "$f")"
   if [[ "$base" == test_*_faults.mojo ]]; then
@@ -90,10 +109,11 @@ while IFS= read -r f; do
   fi
 done < <(find tests -name 'test_*.mojo' | sort)
 
-if [[ -z "$filter" ]]; then
+if [[ -z "$filter" && $shard_i -eq 1 ]]; then
   run_one "build/test_abi_layout.mojo (gen_abi.py --check)" "" \
     bash -c 'python3 tools/gen_abi.py --check && mojo run -I src build/test_abi_layout.mojo'
 fi
 
 echo "---- $((total - fail))/$total test file runs passed, $skipped tests skipped on this host"
-[[ $fail -eq 0 && $total -gt 0 ]]
+# (no file at all is a mistyped filter, unless a shard simply got none)
+[[ $fail -eq 0 && ( $total -gt 0 || $shard_n -gt 1 ) ]]

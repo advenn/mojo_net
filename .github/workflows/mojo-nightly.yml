@@ -1,0 +1,50 @@
+# Mojo's next release, before it ships (2026-11 analysis, finding
+# compiler-upgrade-canary): weekly, `pixi run ci` against the nightly
+# compiler instead of the pinned one, plus the compile errors the code
+# relies on (spikes/expected_failures) and the canary of the one compiler
+# bug whose silent fix or return matters most (spikes/canaries). Not a
+# gate: a red run says what to fix before the pin (pixi.toml, `mojo`, and
+# conda.recipe's mojo-compiler range) moves. The lock file is solved here
+# and not kept.
+name: mojo-nightly
+
+on:
+  schedule:
+    - cron: "17 5 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nightly:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      MOJO_NET_REQUIRE_PG: "1"
+      MOJO_NET_REQUIRE_REDIS: "1"
+      MOJO_NET_REQUIRE_IPV6: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: prefix-dev/setup-pixi@v0.11.2
+        with:
+          pixi-version: v0.82.1
+          run-install: false
+      - name: Point the environment at Mojo's nightly
+        run: |
+          sed -i 's|^channels = \["https://conda.modular.com/max", |channels = ["https://conda.modular.com/max-nightly", "https://conda.modular.com/max", |' pixi.toml
+          sed -i 's|^mojo = "==1.2.0"$|mojo = "*"|' pixi.toml
+          grep -n '^channels\|^mojo =' pixi.toml
+          pixi install
+          pixi run mojo --version
+      - name: Canary, field reassignment in a loop (crashes on 1.2.0)
+        run: |
+          if pixi run mojo run spikes/canaries/field_reassign_loop.mojo; then
+            echo "::notice::the field-reassignment bug looks fixed in this nightly (CLAUDE.md)"
+          else
+            echo "still there (exit $?): its workarounds stay"
+          fi
+      - name: Expected compile errors (spikes/expected_failures)
+        run: pixi run bash spikes/check_expected_failures.sh
+      - name: pixi run ci
+        run: pixi run ci

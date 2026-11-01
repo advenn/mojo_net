@@ -858,13 +858,23 @@ def same_bytes(a: Span[UInt8, _], b: Span[UInt8, _]) -> Bool:
 def verify_error(L: Library, code: Int, expected: String) -> TlsError:
     """A failed verification, with its category (TC18)."""
     var detail = String(from_c_string(L.X509_verify_cert_error_string(code)), " (expected ", expected, ")")
+    # The op says why, so that an IoError alone (all that http.Client
+    # raises) is enough to act on.
     var category = Category.UNTRUSTED
-    if code == X509_V_ERR_CERT_HAS_EXPIRED or code == X509_V_ERR_CERT_NOT_YET_VALID:
+    var op: StaticString = "tls: the server's certificate is not trusted"
+    if code == X509_V_ERR_CERT_HAS_EXPIRED:
         category = Category.EXPIRED
+        op = "tls: the server's certificate has expired"
+    elif code == X509_V_ERR_CERT_NOT_YET_VALID:
+        category = Category.EXPIRED
+        op = "tls: the server's certificate is not valid yet"
     elif code == X509_V_ERR_HOSTNAME_MISMATCH:
         category = Category.HOST_MISMATCH
+        op = "tls: the server's certificate is for another host name"
     elif code == X509_V_ERR_IP_ADDRESS_MISMATCH:
         category = Category.IP_MISMATCH
+        op = "tls: the server's certificate is for another IP address"
     elif code == X509_V_ERR_EE_KEY_TOO_SMALL or code == X509_V_ERR_CA_KEY_TOO_SMALL or code == X509_V_ERR_CA_MD_TOO_WEAK:
         category = Category.WEAK
-    return tls_error("tls: the server failed verification", ErrorKind.PermissionDenied, category, detail, code)
+        op = "tls: the server's certificate chain uses a key or hash that is too weak"
+    return tls_error(op, ErrorKind.PermissionDenied, category, detail, code)

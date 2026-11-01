@@ -253,7 +253,8 @@ struct UnixStream(AsFd, Movable, Read, Writable):
         """For readiness loops (`linux.Epoll`): one read that never waits and
         ignores the read deadline. The bytes read, 0 at EOF (or for an empty
         `buf`), or None when nothing is available; with edge-triggered epoll,
-        read until None before waiting again."""
+        read until None, or until a read returns less than `len(buf)`, before
+        waiting again (docs/net.md, "Rules for readiness-loop servers")."""
         return try_recv(self._sock, buf, "read")
 
     def try_write(self, buf: Span[UInt8, _]) raises IoError -> Optional[Int]:

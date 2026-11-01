@@ -26,7 +26,7 @@ from json import JsonError, Kind, Writer
 
 from .common import Reader, clip, usage_error, write_extra, write_object_text
 from .error import LlmError
-from .types import ChatRequest, Delta, DeltaKind, Embeddings, Reply, ToolCall, Usage
+from .types import ChatRequest, Delta, DeltaKind, Embeddings, Reply, Thinking, ToolCall, Usage
 
 comptime _ROLES: List[StaticString] = ["system", "user", "assistant", "tool"]
 
@@ -175,10 +175,29 @@ def _write_chat(req: ChatRequest, stream: Bool) raises JsonError -> List[UInt8]:
 
 
 def _usage(mut r: Reader, n: Int) -> Usage:
+    """`prompt_tokens` counts the cached part too (`cached_tokens` is of
+    it), as `Usage.input_tokens` does."""
     var u = r.object(n, "usage")
     if u < 0:
         return Usage.unknown()
-    return Usage(r.int(u, "prompt_tokens"), r.int(u, "completion_tokens"))
+    var prompt = r.object(u, "prompt_tokens_details")
+    var completion = r.object(u, "completion_tokens_details")
+    return Usage(
+        r.int(u, "prompt_tokens"),
+        r.int(u, "completion_tokens"),
+        cache_read_tokens=r.int(prompt, "cached_tokens"),
+        reasoning_tokens=r.int(completion, "reasoning_tokens"),
+    )
+
+
+def _reasoning(mut r: Reader, n: Int) -> String:
+    """The reasoning some OpenAI-compatible servers return beside the
+    content: `reasoning_content` (vLLM, DeepSeek, SGLang) or `reasoning`
+    (Ollama, OpenRouter)."""
+    var text = r.str(n, "reasoning_content")
+    if text.byte_length() == 0:
+        text = r.str(n, "reasoning")
+    return text^
 
 
 def read_chat(body: Span[UInt8, _]) raises LlmError -> Reply:
@@ -198,6 +217,9 @@ def read_chat(body: Span[UInt8, _]) raises LlmError -> Reply:
     var message = r.object(choice, "message")
     reply.text = r.str(message, "content")
     reply.refusal = r.str(message, "refusal")
+    var reasoning = _reasoning(r, message)
+    if reasoning.byte_length() > 0:
+        reply.thinking.append(Thinking(reasoning^, String(), String()))
     var calls = r.array(message, "tool_calls")
     var c = r.first(calls)
     for _ in range(r.count(calls)):
@@ -306,6 +328,15 @@ struct ChunkDecoder(Movable):
             self.reply.text += text
             var d = Delta()
             d.text = text^
+            out.append(d^)
+        var reasoning = _reasoning(r, delta)
+        if reasoning.byte_length() > 0:
+            if len(self.reply.thinking) == 0:
+                self.reply.thinking.append(Thinking(String(), String(), String()))
+            self.reply.thinking[0].text += reasoning
+            var d = Delta()
+            d.kind = DeltaKind.THINKING
+            d.text = reasoning^
             out.append(d^)
         var refusal = r.str(delta, "refusal")
         if refusal.byte_length() > 0:

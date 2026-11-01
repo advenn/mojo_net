@@ -6,6 +6,7 @@ malformed patterns refused; a server running a router, over the wire;
 and a differential check against a naive matcher (every matching route,
 ranked by its segment kinds) over random route sets and paths."""
 
+from std.os import getenv
 from std.python import Python
 from std.random import random_ui64, seed
 from std.testing import TestSuite, assert_equal, assert_false, assert_true
@@ -297,11 +298,19 @@ def _naive(
     return best
 
 
+def _env(name: StaticString, default: Int) raises -> Int:
+    """A fuzz setting from the environment (the weekly fuzz run,
+    tools/fuzz_long.sh): MOJO_NET_FUZZ_SEED shifts the seed,
+    MOJO_NET_FUZZ_SCALE multiplies the cases."""
+    var v = getenv(name)
+    return atol(v) if v.byte_length() > 0 else default
+
+
 def test_against_a_naive_matcher() raises:
-    seed(20261023)
+    seed(20261023 + _env("MOJO_NET_FUZZ_SEED", 0))
     var texts = ["a", "b", "c"]
     var verbs = ["GET", "POST"]
-    for _ in range(300):
+    for _ in range(300 * _env("MOJO_NET_FUZZ_SCALE", 1)):
         var router = Router(App())
         var patterns = List[List[String]]()
         var methods = List[String]()

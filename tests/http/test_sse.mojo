@@ -4,6 +4,7 @@ and on random streams fed in random pieces; chunking invariance
 (`drive_chunked`); bounds; and the encoder, whose output must parse back
 to what was written."""
 
+from std.os import getenv
 from std.python import Python, PythonObject
 from std.testing import TestSuite, assert_equal, assert_false, assert_true
 
@@ -11,6 +12,15 @@ from bytes.buffer import ByteBuffer
 from bytes.codec import drive_chunked
 from http.sse import SseEvent, SseParser, write_comment, write_event
 from linux import ErrorKind, IoError
+
+
+def _env(name: StaticString, default: Int) raises -> Int:
+    """A fuzz setting from the environment, for the weekly fuzz run
+    (.github/workflows/fuzz.yml): MOJO_NET_FUZZ_SEED shifts the seeds, so a
+    run explores cases CI never saw (a failure prints the value to replay
+    it with), and MOJO_NET_FUZZ_SCALE multiplies the number of cases."""
+    var v = getenv(name)
+    return atol(v) if v.byte_length() > 0 else default
 
 
 def _oracle() raises -> PythonObject:
@@ -133,12 +143,13 @@ def test_random_streams_in_random_pieces() raises:
     last ID, retry and end as the reference."""
     var o = _oracle()
     var random = Python.import_module("random")
-    var rng = random.Random(20261026)
+    var first = _env("MOJO_NET_FUZZ_SEED", 0)
+    var rng = random.Random(20261026 + first)
     var pieces: List[String] = [
         "data: ", "data:", "data", "event: ", "event:", "id: ", "id:", "retry: ", "retry:", ":", "x", "y z", " ",
         "1", "42", "é", "世", "{\"a\":1}", "[DONE]", "\x00", "\n", "\r", "\r\n", "\n\n", "\r\n\r\n",
     ]
-    for _ in range(400):
+    for _ in range(400 * _env("MOJO_NET_FUZZ_SCALE", 1)):
         var s = String()
         var parts = Int(py=rng.randint(1, 40))
         for _ in range(parts):

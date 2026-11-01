@@ -139,10 +139,10 @@ These names and their documented behavior are stable for v1.
   - `examples/net/epoll_echo.mojo` follows every rule below.
 - **Syscall budget: 2 syscalls per message.**
   - Register once, edge-triggered, with no `EPOLL_CTL_MOD` per operation.
-  - Read and write until EAGAIN.
+  - Write until EAGAIN (or done). Read until EAGAIN, or until a read returns fewer bytes than it asked for: the socket is then drained, and whatever arrives later raises a new edge. Stopping there saves the recv that would find nothing, one per request on a keep-alive connection (`server` does it with `_Conn.readable`; `docs/spikes.md` measured 3.00 against 2.00 syscalls a message, +0.18–0.34 µs).
   - Drain accept until EAGAIN.
   - Batch ~1024 events per wait.
-- **Sticky read-closed.** Once RDHUP/HUP/ERR has been seen, read to EOF or EAGAIN. Otherwise a FIN that arrives with data is lost.
+- **Sticky read-closed.** Once RDHUP/HUP/ERR has been seen, read to EOF or EAGAIN, short reads or not. Otherwise a FIN that arrives with data is lost: its edge is the data's, and none comes after.
 - **Pre-grow the fd table at startup** with `linux.probe.pregrow_fd_table(listener)`. Every Mojo process is multi-threaded, so otherwise each fd-table doubling stalls 20–40 ms under load.
 - **EMFILE.** Pause accepting rather than spin on a readable listener. Log with raw `write(2)`.
 
