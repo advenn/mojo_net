@@ -8,6 +8,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
@@ -35,7 +36,11 @@ func main() {
 	}
 	fmt.Printf("LISTEN %s pid=%d\n", ln.Addr(), os.Getpid())
 	if cert := os.Getenv("TLS_CERT"); cert != "" { // (HTTPS: run.py's https scenarios)
-		err = http.ServeTLS(ln, mux, cert, os.Getenv("TLS_KEY"))
+		// (no session tickets, as mojo and nginx there: wrk keeps its
+		// session across reconnects, so tickets would make the handshake
+		// scenario measure resumptions)
+		srv := &http.Server{Handler: mux, TLSConfig: &tls.Config{SessionTicketsDisabled: true}}
+		err = srv.ServeTLS(ln, cert, os.Getenv("TLS_KEY"))
 	} else {
 		err = http.Serve(ln, mux)
 	}

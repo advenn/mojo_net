@@ -10,6 +10,8 @@ git clone https://github.com/advenn/mojo_net && cd mojo_net
 pixi run -e bench bench-server build    # the servers, into bench/server/out/
 pixi run -e bench bench-server check    # each answers one request, and 16 pipelined, on 1 and 4 CPUs
 pixi run -e bench bench-server run      # 5 scenarios x 5 servers, 60 s each, one at a time: ~35 min
+pixi run -e bench bench-server check --https   # the same over TLS: each server's head and the negotiated version and cipher
+pixi run -e bench bench-server run --https     # 4 HTTPS scenarios x 4 servers (hyper's build has no TLS): ~25 min
 pixi run -e bench bench-server summary bench/server/out/<time>.json
 pixi run -e bench bench-profile         # mojo and hyper under callgrind: instructions per request (~3 min)
 pixi run -e bench bench-profile --analyze bench/server/out/callgrind.mojo.<time>.1 --requests <n>   # its report again
@@ -159,6 +161,61 @@ What it shows:
 
 **Latency.** wrk is closed-loop: every connection always has exactly one request (or one batch of 16) in flight. By Little's law, the mean latency is then exactly connections × requests per write / requests per second. With keep-alive it is close to wrk's medians: within 5% on one CPU, and up to 20% above them on four CPUs, where the tail is longer (a long tail puts the mean above the median). Pipelined, wrk's percentiles are left out, because they are wrong there. Its coordinated-omission correction (`stats_correct`) adds samples spaced by the time between responses rather than batches. It can put them below the histogram's minimum, where the percentile scan never looks: one run printed a p99 of 0.
 
+## HTTPS
+The same test over TLS (`--https`), measured since the 2026-11 analysis found HTTPS never benchmarked: its data path had gone unmeasured since S7.
+
+- **The certificate:** a throwaway ECDSA P-256 chain for `localhost`, made by `tests/tls/tls_pki.py` into `out/tls/` once a day. wrk connects to `https://localhost:<port>`, since an IP address is not sent as SNI (RFC 6066), and verifies nothing.
+- **The servers:** mojo (`serve_tls` with its defaults; `tls_handshake_rate`, a flood guard of 1,000 handshakes a second, raised so that the handshake scenario measures the server), nginx (`ssl_protocols TLSv1.2 TLSv1.3`, no session tickets and no session cache, as mojo), and Go's net/http and fasthttp (`ServeTLS`, Go's own crypto/tls with its defaults, except session tickets, which are turned off). hyper is left out: its build has no TLS.
+- **No resumption anywhere:** wrk keeps its TLS object across reconnects (`SSL_clear`), so it offers the last session again, and Go, which sends tickets by default, resumed it: the handshake scenario would have measured resumptions for Go and full handshakes for the others. `check --https` connects twice to each server with Python's `ssl`, the second time with the first's session after a request (a TLS 1.3 ticket comes after the handshake), and fails a server that resumes it.
+- **The same OpenSSL:** mojo, nginx and wrk load one library file, conda-forge's OpenSSL 3.5 in the bench environment (`openssl` in the results file's versions; `ldd` of nginx shows it, and the two environments' `libssl.so.3` are one file). So mojo against nginx compares what each does around OpenSSL, not two TLS libraries.
+- **What is negotiated** (`check --https` prints it, from `openssl s_client`, which offers what wrk offers): TLS 1.3 and the X25519MLKEM768 key exchange (the hybrid with ML-KEM, OpenSSL 3.5's first choice and Go's) with every server. The cipher differs: the two OpenSSL servers take the client's first choice, AES-256-GCM, and Go its own, AES-128-GCM (10 AES rounds against 14: little, on 13-byte bodies).
+
+| Scenario | Server CPUs | Connections | Requests a write | Handshakes |
+|---|---|---|---|---|
+| `https-1cpu-keepalive` | 1 | 64 | 1 | one a connection, kept for the whole run |
+| `https-1cpu-pipelined` | 1 | 256 | 16 | one a connection, kept for the whole run |
+| `https-4cpu-keepalive` | 4 | 256 | 1 | one a connection, kept for the whole run |
+| `https-1cpu-handshakes` | 1 | 64 | 1 | one a request: `Connection: close`, so a new connection and a full handshake each time |
+
+Everything else is the plaintext method above: the same CPUs, warm-up, cool-down, quiet check and alternated reps.
+
+**Results.** Measured on 2026-11-02, 02:08 to 03:06 (`out/20261102-020836.json`), on the machine and versions of the plaintext results above, with OpenSSL 3.5.9. 2 reps of 60 s, the second in the reverse order. Other work used 0.1 to 0.8 CPUs during most runs, but 1.3 to 2.6 CPUs during three: nginx's and mojo-b's first one-CPU keep-alive runs, and Go's second four-CPU run. Those runs were slower, and the ranges show it; four runs waited for a quieter machine first, 265 s in all. `mojo-b` is the same server built from the commit before the 2026-11 data-path change (cbeb2f7), alternated with the current one in the same runs.
+
+| Scenario | Server | req/s (both runs) | Mean latency | p50 | p99 | Server CPU | wrk CPU |
+|---|---|---|---|---|---|---|---|
+| **1 CPU, 64 keep-alive connections** | fasthttp | **143k** (136k, 149k) | 449 µs | 448 µs | 1.59 ms | 6.98 µs | 43% |
+| | nginx | 108k (96k, 119k) | 600 µs | 564 µs | 1.17 ms | 9.35 µs | 32% |
+| | mojo | 101k (95k, 106k) | 638 µs | 617 µs | 1.23 ms | 9.96 µs | 27% |
+| | mojo-b | 89k (77k, 101k) | 733 µs | 662 µs | 2.78 ms | 11.33 µs | 25% |
+| | go (net/http) | 78k (74k, 82k) | 823 µs | 832 µs | 2.27 ms | 12.80 µs | 20% |
+| **1 CPU, 256 connections, 16 pipelined** | fasthttp | **994k** (991k, 996k) | 4.12 ms | | | 1.00 µs | 29% |
+| | mojo | 771k (748k, 795k) | 5.32 ms | | | 1.30 µs | 21% |
+| | mojo-b | 757k (753k, 760k) | 5.41 ms | | | 1.32 µs | 21% |
+| | nginx | 150k (148k, 151k) | 27.38 ms | | | 6.67 µs | 28% |
+| | go (net/http) | 97k (96k, 98k) | 42.25 ms | | | 10.30 µs | 15% |
+| **4 CPUs, 256 keep-alive connections** | fasthttp | **260k** (259k, 261k) | 984 µs | 469 µs | 4.67 ms | 14.17 µs | 97% |
+| | nginx | 218k (216k, 219k) | 1.18 ms | 1.07 ms | 4.86 ms | 17.87 µs | 89% |
+| | mojo | 181k (181k, 181k) | 1.42 ms | 1.32 ms | 3.65 ms | 21.93 µs | 72% |
+| | mojo-b | 168k (165k, 171k) | 1.52 ms | 1.43 ms | 3.25 ms | 23.56 µs | 66% |
+| | go (net/http) | 126k (150k, 102k) | 2.10 ms | 1.81 ms | 12.48 ms | 26.88 µs | 50% |
+| **1 CPU, a handshake a request** | fasthttp | **2,759** (2,860, 2,657) | | 10.20 ms | 23.95 ms | 362 µs | 99% |
+| | go (net/http) | 2,665 (2,748, 2,582) | | 10.57 ms | 24.65 ms | 375 µs | 99% |
+| | mojo | 2,644 (2,654, 2,633) | | 5.45 ms | 13.30 ms | 378 µs | 100% |
+| | mojo-b | 2,608 (2,636, 2,580) | | 5.52 ms | 16.85 ms | 383 µs | 100% |
+| | nginx | 2,383 (2,522, 2,244) | | 838 µs | 2.56 ms | 421 µs | 100% |
+
+What it shows:
+- **Against nginx on the same OpenSSL, mojo takes more CPU a request with keep-alive:**
+  - on one CPU, 7% more: 9.96 µs against 9.35. The first reps were noisy; in the quiet second reps it was 13% more, 9.43 against 8.36;
+  - on four CPUs, 23% more: 21.93 against 17.87.
+
+  Both encrypt the same records with the same library, so the gap is what each does around it. mojo drives OpenSSL through memory BIOs: each record's ciphertext is copied into OpenSSL's read buffer and out of its write buffer, two copies a direction that nginx's socket BIOs do not make. On top of that come the engine's checks after each record. A profile has not been taken yet.
+- **Pipelined, mojo takes a fifth of nginx's CPU a request** (1.30 µs against 6.67), as in plaintext: nginx writes each response on its own.
+- **fasthttp is ahead everywhere.** It takes 6.98 µs a request with keep-alive on one CPU and 1.00 pipelined, on Go's own crypto/tls with AES-128-GCM, where the OpenSSL servers negotiate AES-256-GCM. On four CPUs wrk was its limit (97%). Go's net/http is last, as in plaintext.
+- **Handshakes cost the same everywhere:** 362 to 421 µs of server CPU each (X25519MLKEM768 and an ECDSA P-256 signature, plus a TCP connection). The server was saturated: requests a second times CPU a request is about one CPU. wrk, which does the client's half on 4 threads, was also at its limit (99–100%). mojo's p50 and p99 are half Go's, and nginx's lower still: wrk's latencies there say how each server queues new connections rather than what a handshake costs.
+- **The data-path change.** Against mojo-b, the current server took 7% less CPU a request on four CPUs with keep-alive (21.93 µs against 23.56, the same in both reps) and 4% less on one (9.43 against 9.86 in the quiet second reps). Pipelined it took 1.30 against 1.32 µs, within noise, and handshakes were the same. It also bounds memory: a connection's output buffer peaks at 64 KB where it reached 256 KB (`tests/server/test_server_tls_analysis_regressions.mojo`).
+
+
 ## Why mojo was slower (2026-10-27)
 This is what the profile showed before the http and server reviews (HR3, SR2), which closed the gap (Results, above). It is kept for what it found and how; `why_mojo_is_slower.note` has what changed.
 
@@ -230,4 +287,4 @@ The profile is pipelined. With keep-alive, the same code ran once per request, p
 - **The kernel dominates keep-alive:** about 5 µs of loopback TCP a request (a recv and a send), the same for all three.
 - **The gap to hyper is user time:** 0.4 µs a request pipelined, 0.7 µs without. That is about what docs/server.md (S5) measured `server` adding over the bare codec (`Request` and `Response`, header scans, the hooks). The profile above (2026-10-27) places most of it in the codec's handling of header fields instead, called from both layers.
 - **mojo rarely waits:** 60 `epoll_pwait2` calls for 113k requests, since it reads a connection again after answering it. Pipelined, that costs a little: 37% of its receives find nothing yet (0.6 a batch, where hyper reads once), about 0.03 µs a request.
-- **S7 (HTTPS) costs plain HTTP nothing measurable** (2026-10-26). An A/B of the server built from the commit before S7 and from S7 was alternated 8 times on the pipelined scenario: 1.88 µs a request at best before, 1.82 with S7. HTTPS itself is not benchmarked yet.
+- **S7 (HTTPS) costs plain HTTP nothing measurable** (2026-10-26). An A/B of the server built from the commit before S7 and from S7 was alternated 8 times on the pipelined scenario: 1.88 µs a request at best before, 1.82 with S7. HTTPS itself was first benchmarked on 2026-11-02 (HTTPS, above).

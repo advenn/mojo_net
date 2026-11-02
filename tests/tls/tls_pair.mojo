@@ -1,7 +1,7 @@
 """A TLS client and server of this package joined in memory (not a test
 file itself): `Pair` moves every byte by hand, so a test decides what each
 side is fed and when. The client may call libssl directly for what `tls`
-never does (`key_update`: a test may bind what `tls` does not)."""
+never does (`key_update`, `pad`: a test may bind what `tls` does not)."""
 
 from std.ffi import OwnedDLHandle, c_int
 from std.testing import assert_equal, assert_true
@@ -21,6 +21,21 @@ def key_update_fn(path: String) raises -> KeyUpdate:
         raise Error("no SSL_key_update")
     var addr = Int(p.value())
     return Pointer(to=addr).unsafe_bitcast[KeyUpdate]()[]
+
+
+comptime BlockPadding = def(Int, Int, Int) thin abi("C") -> c_int
+
+
+def block_padding_fn(path: String) raises -> BlockPadding:
+    """libssl's `SSL_set_block_padding_ex` (3.4+): TLS 1.3 records padded
+    to a multiple of a block, application data and handshake records
+    (key updates) each (16384 pads every record to the limit)."""
+    var h = OwnedDLHandle(path)
+    var p = h.get_symbol[NoneType]("SSL_set_block_padding_ex")
+    if not p:
+        raise Error("no SSL_set_block_padding_ex")
+    var addr = Int(p.value())
+    return Pointer(to=addr).unsafe_bitcast[BlockPadding]()[]
 
 
 def drop(mut src: ByteBuffer, n: Int):
@@ -84,6 +99,15 @@ struct Pair(Movable):
         flow(self.a, self.s, self.got)
         _ = self.s.poll_transmit(self.b)
         self.b.clear()  # (the server's replies: the client would read them)
+
+    def pad(mut self, data: Int, handshake: Int) raises:
+        """Pad the client's TLS 1.3 records to a multiple of `data` bytes
+        (application data) and `handshake` bytes (its Finished, key
+        updates); 0 for none. Before `handshake()`: OpenSSL's record layer
+        takes the setting when its keys are set."""
+        ref L = self.c._e._lib[]
+        var f = block_padding_fn(L.path)
+        assert_equal(f(self.c._e._ssl, data, handshake), 1)
 
     def key_update(mut self, requested: Bool) raises:
         ref L = self.c._e._lib[]

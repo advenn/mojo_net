@@ -6,9 +6,14 @@
 #   cipher suites, curves, signature algorithms, the certificate's type);
 # - testssl.sh, every check, failing on a finding rated HIGH or CRITICAL
 #   (the test root is added as trusted, so the throwaway chain is not one;
-#   IGNORED below lists what the throwaway certificate itself draws).
-# Both come pinned: sslyze from PyPI ($SSLYZE), testssl.sh by tag and
-# commit ($TESTSSL_TAG, $TESTSSL_COMMIT). Weekly in
+#   IGNORED below lists what the throwaway certificate itself draws);
+# - tlsfuzzer, the scripts that fit this server, each with its known
+#   deviations marked (tools/tlsfuzzer_run.py says which and why), against
+#   a second server on an all-RSA chain: most scripts offer only RSA
+#   signature schemes.
+# All come pinned: sslyze from PyPI ($SSLYZE), testssl.sh by tag and
+# commit ($TESTSSL_TAG, $TESTSSL_COMMIT), tlsfuzzer by commit with its
+# libraries from PyPI ($TLSFUZZER_COMMIT, $TLSFUZZER_LIBS). Weekly in
 # .github/workflows/tls-weekly.yml, on x86_64.
 #
 #   bash tools/check_tls_interop.sh              # needs network the first time
@@ -17,6 +22,8 @@ cd "$(dirname "$0")/.."
 SSLYZE="${SSLYZE:-sslyze==6.3.1}"
 TESTSSL_TAG="${TESTSSL_TAG:-v3.2.4}"
 TESTSSL_COMMIT="${TESTSSL_COMMIT:-97763a411c525720a5f9bd9d2cded416b10f210a}"
+TLSFUZZER_COMMIT="${TLSFUZZER_COMMIT:-5eebc4464e5197a7f7392fb9acda99cfc32441f7}"
+TLSFUZZER_LIBS="${TLSFUZZER_LIBS:-tlslite-ng==0.9.0b2 ecdsa==0.19.2 kyber-py==1.2.0}"
 out=build/tls_interop
 mkdir -p "$out"
 fail=0
@@ -34,6 +41,13 @@ fi
 if [[ "$(git -C "$out/testssl.sh" rev-parse HEAD)" != "$TESTSSL_COMMIT" ]]; then
   echo "FAIL testssl.sh $TESTSSL_TAG is not commit $TESTSSL_COMMIT (a moved tag?)"; exit 1
 fi
+if [[ "$(git -C "$out/tlsfuzzer" rev-parse HEAD 2>/dev/null)" != "$TLSFUZZER_COMMIT" ]]; then
+  rm -rf "$out/tlsfuzzer"
+  git init -q "$out/tlsfuzzer" && git -C "$out/tlsfuzzer" fetch -q --depth 1 https://github.com/tlsfuzzer/tlsfuzzer "$TLSFUZZER_COMMIT" \
+    && git -C "$out/tlsfuzzer" checkout -q FETCH_HEAD || { echo "FAIL fetching tlsfuzzer $TLSFUZZER_COMMIT"; exit 1; }
+fi
+# shellcheck disable=SC2086
+"$out/venv/bin/python" -m pip install -q $TLSFUZZER_LIBS || { echo "FAIL installing $TLSFUZZER_LIBS"; exit 1; }
 
 # The server, on a throwaway PKI.
 pki="$out/pki"
@@ -44,10 +58,27 @@ mojo build -I src examples/server/https.mojo -o "$out/https" >"$out/https.build"
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 "$out/https" "$pki/good.chain.pem" "$pki/good.key" localhost "127.0.0.1:$port" >"$out/server.log" 2>&1 &
 server=$!
-trap 'kill $server 2>/dev/null; wait $server 2>/dev/null' EXIT
-for _ in $(seq 100); do
-  python3 -c "import socket; socket.create_connection(('127.0.0.1', $port), 1).close()" 2>/dev/null && break
-  sleep 0.1
+# The same server on an all-RSA chain, for tlsfuzzer (tls_pki.py's RSA
+# leaf is signed by its ECDSA root, which scripts that accept only
+# RSA-signed certificates refuse).
+rsa="$out/pki_rsa"
+rm -rf "$rsa" && mkdir -p "$rsa"
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$rsa/root.key" -out "$rsa/root.pem" -days 2 -subj "/CN=tlsfuzzer test root" \
+  -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null \
+  && openssl req -newkey rsa:2048 -nodes -keyout "$rsa/leaf.key" -out "$rsa/leaf.csr" -subj "/CN=localhost" 2>/dev/null \
+  && printf "subjectAltName=DNS:localhost\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n" >"$rsa/leaf.ext" \
+  && openssl x509 -req -in "$rsa/leaf.csr" -CA "$rsa/root.pem" -CAkey "$rsa/root.key" -CAcreateserial -days 2 -sha256 \
+       -extfile "$rsa/leaf.ext" -out "$rsa/leaf.pem" 2>/dev/null \
+  && chmod 600 "$rsa/leaf.key" || { echo "FAIL making the RSA chain"; exit 1; }
+port2=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+"$out/https" "$rsa/leaf.pem" "$rsa/leaf.key" localhost "127.0.0.1:$port2" >"$out/server_rsa.log" 2>&1 &
+server2=$!
+trap 'kill $server $server2 2>/dev/null; wait $server $server2 2>/dev/null' EXIT
+for p in $port $port2; do
+  for _ in $(seq 100); do
+    python3 -c "import socket; socket.create_connection(('127.0.0.1', $p), 1).close()" 2>/dev/null && break
+    sleep 0.1
+  done
 done
 
 # sslyze: Mozilla's intermediate configuration.
@@ -88,4 +119,7 @@ if not bad:
 sys.exit(1 if bad else 0)
 EOF
 [[ $? -eq 0 ]] || fail=1
+
+# tlsfuzzer: one script at a time against the RSA server.
+"$out/venv/bin/python" tools/tlsfuzzer_run.py "$out/tlsfuzzer" "$port2" || fail=1
 exit $fail

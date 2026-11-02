@@ -59,7 +59,7 @@ nav { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 0.95rem; margin:
 table { border-collapse: collapse; width: 100%; font-size: 0.92rem; font-variant-numeric: tabular-nums; margin: 6px 0 12px; }
 th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 th { color: var(--dim); font-weight: 600; }
-tr.me td { background: var(--accent-soft); }
+tr.me td, td.me { background: var(--accent-soft); }
 .dim { color: var(--dim); }
 .steps li { margin: 6px 0; }
 footer { margin-top: 64px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--dim); font-size: 0.9rem; }
@@ -170,6 +170,21 @@ footer { margin-top: 64px; padding-top: 16px; border-top: 1px solid var(--line);
   <li><b>On four CPUs without pipelining</b>, wrk itself used 87–92% of its CPU, so those numbers mostly measure the client.</li>
   <li><b>Go's net/http</b> takes about twice the CPU per request of the others, and gains little from pipelining: it writes each response separately. fasthttp, in the same language, is in the top group.</li>
 </ul>
+
+<h3>Over HTTPS</h3>
+<p>Measured on 2 November: the same test over TLS 1.3 with the X25519MLKEM768 key exchange. mojo and nginx use the same OpenSSL 3.5 library file, and Go's servers use Go's crypto/tls. hyper is left out, because its build has no TLS. No server resumes sessions, so the handshake row is a full handshake per request. Requests per second are the mean of two 60-second runs; CPU is the server's, per request:</p>
+<div class="scroll"><table><thead><tr><th>Scenario</th><th>mojo</th><th>nginx</th><th>fasthttp</th><th>go net/http</th></tr></thead><tbody>
+<tr><td>1 CPU, 64 keep-alive connections</td><td class="me">101k <span class="dim">· 9.96 µs</span></td><td>108k <span class="dim">· 9.35 µs</span></td><td><b>143k</b> <span class="dim">· 6.98 µs</span></td><td>78k <span class="dim">· 12.80 µs</span></td></tr>
+<tr><td>1 CPU, 256 connections, 16 pipelined</td><td class="me">771k <span class="dim">· 1.30 µs</span></td><td>150k <span class="dim">· 6.67 µs</span></td><td><b>994k</b> <span class="dim">· 1.00 µs</span></td><td>97k <span class="dim">· 10.30 µs</span></td></tr>
+<tr><td>4 CPUs, 256 keep-alive connections</td><td class="me">181k <span class="dim">· 21.93 µs</span></td><td>218k <span class="dim">· 17.87 µs</span></td><td><b>260k</b> <span class="dim">· 14.17 µs</span></td><td>126k <span class="dim">· 26.88 µs</span></td></tr>
+<tr><td>1 CPU, a handshake per request</td><td class="me">2,644 <span class="dim">· 378 µs</span></td><td>2,383 <span class="dim">· 421 µs</span></td><td><b>2,759</b> <span class="dim">· 362 µs</span></td><td>2,665 <span class="dim">· 375 µs</span></td></tr>
+</tbody></table></div>
+<ul>
+  <li><b>Here mojo is not in the lead.</b> With keep-alive it takes 7% more CPU per request than nginx on one CPU, and 23% more on four, though both encrypt with the same library. mojo passes every record through OpenSSL's memory buffers, an extra copy each way that nginx does not make. Pipelined, mojo takes a fifth of nginx's CPU per request, as in plaintext.</li>
+  <li><b>fasthttp leads every row,</b> on Go's crypto/tls (which also picks AES-128-GCM where OpenSSL picks AES-256-GCM).</li>
+  <li><b>Handshakes cost about the same everywhere,</b> 362 to 421 µs of server CPU each. That is the cryptography, not the server around it.</li>
+</ul>
+<p>Every number, with both runs and the conditions, is in <a href="https://github.com/advenn/mojo_net/blob/main/bench/server/README.md#https">bench/server/README.md</a>.</p>
 
 <h3>A day earlier</h3>
 <p>On 27 October, before the HTTP and server reviews, mojo was 35% behind hyper pipelined. The reviews' profile-driven changes moved it to the numbers above. hyper's own numbers stayed the same within noise:</p>

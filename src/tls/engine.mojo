@@ -117,7 +117,9 @@ plus one record at most, so more means the peer provokes output (key
 update replies, alerts) faster than it reads it."""
 comptime QUIET_LIMIT = 256 * 1024
 """Ciphertext a server may send, once established, that carries no data
-(session tickets, key updates, padding), over the whole connection: a
+(session tickets, key updates, records without data), over the whole
+connection (a record with data is taken off whole, its padding with it:
+RFC 8446 5.4 lets a sender pad any record to the limit): a
 few tickets are normal; a flood of them would keep a reader working past
 its deadline. Data does not reset it; each `QUIET_REFILL` bytes of data
 add one byte to it."""
@@ -242,8 +244,8 @@ struct Engine(Movable):
     """Plaintext in undelivered DATA events, plus `EVENT_COST` each
     (counted against the feed room)."""
     var _quiet: Int
-    """Ciphertext taken once established, less what the data records in
-    it account for (their data and overhead): what carried no data
+    """Ciphertext taken once established, less the records in it that
+    carried data (each whole, padding included): what carried no data
     (`QUIET_LIMIT`), records still arriving included."""
     var _quiet_limit: Int
     var _plain: Int
@@ -256,6 +258,10 @@ struct Engine(Movable):
     """That header's length field, as it arrives."""
     var _body: Int
     """Bytes of the current record's body still to come."""
+    var _rec: Int
+    """The ciphertext of the record just fed whole once established
+    (header included), while it is read: what its data takes off `_quiet`
+    (0 for none)."""
     var version: String
     var cipher: String
     var group: String
@@ -297,6 +303,7 @@ struct Engine(Movable):
         self._hdr = 0
         self._len = 0
         self._body = 0
+        self._rec = 0
         self.version = String()
         self.cipher = String()
         self.group = String()
@@ -392,7 +399,11 @@ struct Engine(Movable):
                 self._quiet += k  # (a data record is taken off as it is read)
             self._write_waits = False
             self._frame(part)
+            # (a whole record, charged whole: if it carries data, reading
+            # takes all of it off, its padding too)
+            self._rec = 5 + self._len if self._state == _OPEN and self._hdr == 0 and self._body == 0 else 0
             self._pump()
+            self._rec = 0
             if self._state == _HANDSHAKE and self._received > self._limit and not self._failed:
                 _ = self.fail(tls_error("tls: the peer's handshake is too large", ErrorKind.InvalidData, Category.RESOURCE, String(self._received, " bytes")))
             self._check_quiet()
@@ -814,7 +825,10 @@ struct Engine(Movable):
                     data.extend(Span(self._rbuf)[0:got])
                     self._events.append(TlsEvent(TlsEventKind.DATA, data^))
                     self._held += got + EVENT_COST
-                    self._quiet = max(0, self._quiet - got - self._overhead)  # (one record, read whole)
+                    # (one record, read whole; padded, it takes more than its
+                    # data and overhead: all of it, `_rec`)
+                    self._quiet = max(0, self._quiet - max(got + self._overhead, self._rec))
+                    self._rec = 0
                     self._plain += got
                 continue
             var err = L.SSL_get_error(self._ssl, rc) if forced == 0 else c_int(forced)  # (TB6)

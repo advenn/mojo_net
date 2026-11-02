@@ -61,12 +61,13 @@ jobs:
 
   # Gate TG12 (docs/tls.md, "Checks"): examples/server/https.mojo scanned
   # by sslyze (Mozilla's intermediate configuration) and testssl.sh
-  # (nothing rated HIGH or CRITICAL), both pinned. x86_64: sslyze's nassl
-  # publishes wheels for it.
+  # (nothing rated HIGH or CRITICAL), and driven by tlsfuzzer's scripts
+  # that fit it (tools/tlsfuzzer_run.py), all pinned. x86_64: sslyze's
+  # nassl publishes wheels for it.
   tg12:
     name: tg12 (x86_64)
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       - uses: prefix-dev/setup-pixi@v0.11.2

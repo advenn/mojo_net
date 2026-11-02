@@ -10,6 +10,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 	"os"
@@ -38,7 +39,10 @@ func main() {
 		addr = os.Args[1]
 	}
 	workers, _ := strconv.Atoi(os.Getenv("WORKERS"))
-	s := &fasthttp.Server{Handler: handler, Name: "fasthttp"}
+	// (TLSConfig is used only by ServeTLS, for run.py's https scenarios: no
+	// session tickets, as mojo and nginx there, since wrk keeps its session
+	// across reconnects)
+	s := &fasthttp.Server{Handler: handler, Name: "fasthttp", TLSConfig: &tls.Config{SessionTicketsDisabled: true}}
 	serve := func(ln net.Listener) error {
 		fmt.Printf("LISTEN %s pid=%d\n", ln.Addr(), os.Getpid())
 		if cert := os.Getenv("TLS_CERT"); cert != "" { // (HTTPS: run.py's https scenarios)

@@ -531,8 +531,6 @@ def _exchange(port, payload, responses, tls=None):
     (over TLS with `tls`, an ssl.SSLContext)."""
     with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
         c = tls.wrap_socket(raw, server_hostname="localhost") if tls else raw
-        if tls:
-            _exchange.negotiated = "%s %s" % (c.version(), c.cipher()[0])
         c.sendall(payload)
         data = b""
         while data.count(b"Hello, World!") < responses:
@@ -541,6 +539,42 @@ def _exchange(port, payload, responses, tls=None):
                 break
             data += chunk
     return data
+
+
+def _negotiated(port):
+    """The TLS version, cipher and key exchange group a server picks for
+    `openssl s_client`, which offers what wrk offers (one library, its
+    defaults)."""
+    p = subprocess.run(["openssl", "s_client", "-connect", "127.0.0.1:%d" % port, "-servername", "localhost", "-brief"],
+                       input=b"", capture_output=True, timeout=10)
+    found = {}
+    for line in (p.stdout + p.stderr).decode(errors="replace").splitlines():
+        key, _, val = line.partition(":")
+        if key.strip() in ("Protocol version", "Ciphersuite", "Negotiated TLS1.3 group", "Peer Temp Key"):
+            found[key.strip()] = val.strip()
+    return ", ".join(found.values()) or "nothing (s_client failed)"
+
+
+def _resumes(port, tls):
+    """Whether a second connection resumes the first's TLS session. A
+    request is answered on each first, so that a TLS 1.3 ticket, which
+    comes after the handshake, has arrived (wrk keeps its session across
+    reconnects, so a server that resumes would make the handshake scenario
+    measure resumptions)."""
+    req = b"GET /plaintext HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    session, reused = None, False
+    for _ in range(2):
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+            c = tls.wrap_socket(raw, server_hostname="localhost", session=session)
+            c.sendall(req)
+            data = b""
+            while b"Hello, World!" not in data:
+                d = c.recv(65536)
+                if not d:
+                    break
+                data += d
+            reused, session = c.session_reused, c.session
+    return reused
 
 
 def check(args):
@@ -560,16 +594,18 @@ def check(args):
             try:
                 one = _exchange(s.port, req, 1, tls)
                 many = _exchange(s.port, req * 16, 16, tls)
+                resumed = tls is not None and _resumes(s.port, tls)
+                negotiated = _negotiated(s.port) if tls else ""
             finally:
                 s.stop()
             head = one.split(b"\r\n\r\n", 1)[0].decode()
-            ok = one.startswith(b"HTTP/1.1 200") and one.endswith(b"\r\n\r\nHello, World!") and many.count(b"HTTP/1.1 200") == 16
+            ok = one.startswith(b"HTTP/1.1 200") and one.endswith(b"\r\n\r\nHello, World!") and many.count(b"HTTP/1.1 200") == 16 and not resumed
             failed |= not ok
             print("%s %s on %d CPU%s: %d bytes a response" % ("ok  " if ok else "FAIL", kind, n, "s" if n > 1 else "", len(one)))
             if n == 1:
                 print("     " + head.replace("\r\n", "\n     "))
                 if tls:
-                    print("     (negotiated: %s)" % _exchange.negotiated)
+                    print("     (negotiated: %s; a session resumed: %s)" % (negotiated, "yes" if resumed else "no"))
     sys.exit(1 if failed else 0)
 
 
