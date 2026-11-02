@@ -43,7 +43,11 @@ Its first user outside Mojo is `mojson`, the Python json module's API on this pa
 - **One flat tree.** A document is a list of 12-byte nodes in pre-order. Each node holds its kind and either a string's bytes in one shared buffer or an array's or object's member count and subtree size, so that the next sibling is one jump away, as in `redis.resp.Value`. A document of a million values is a few large allocations, and `Document.parse` reuses them.
   - **The buffer has room.** It holds the input's length plus 64 bytes, since strings unescaped and numbers' text never take more bytes than the input. So the parser stores whole 32-byte vectors without checking. And every span `Document.visit` hands out can be read `SPAN_SLACK` (32) bytes past its end, which lets a visitor load whole vectors and mask what lies past it. A copy of a document keeps the room.
   - **The pass** writes nodes and text through raw pointers into that room, growing the node list once per value at most. It keeps the innermost open array or object in locals (an open object's node holds where its keys start), raises nothing (one raise outside, so no error is built on paths that succeed), and scans strings and whitespace 32 bytes at a time and digits 8 at a time.
-- **Walking a document:** `Document.visit[V: Visitor]` calls a visitor for each node in order (`begin_array(count)`, the elements, `end_array()`; `begin_object(count)`, then `key` and the value of each pair, `end_object()`), with its own stack, so any depth walks. mojson builds Python objects with one.
+- **Walking a document:** `Document.visit[V: Visitor]` calls a visitor for each node in order (`begin_array(count)`, the elements, `end_array()`; `begin_object(count)`, then `key` and the value of each pair, `end_object()`), with its own stack, so any depth walks. mojson builds Python objects with one when hooks are given.
+- **Reading without a document:** `Document.scan[H: Handler]` reads the text with `parse`'s grammar, limits and dialect, accepting and refusing the same texts with the same errors, but calls a handler for each value as it is read instead of writing nodes. A container's size comes with its end (`end_array(count)`, `end_object(count)`), since nothing is read twice. Each handler method returns False to stop the scan, which then returns False.
+  - **Memory:** no nodes. A string's unescaped text is written into the document's buffer and dropped after its call. For a dialect that refuses repeated keys, the keys of the open objects are kept, as nodes, so that `_check_keys` reads them as it reads a document's; they go when their object closes. The document is left empty.
+  - **Why:** a consumer that builds its own values (mojson's Python objects) otherwise pays for a document it reads once. For mojson that was a sixth of a load's time and, on a 1 GB file, 1.7 GB of memory.
+  - `_scan_events` is `_scan` with the node writes replaced by handler calls; `tests/json/test_scan.mojo` holds the two together.
   - **Memory:** a document takes up to about 7 times its input, since a node can be 2 input bytes (`0,`). The size limit therefore bounds memory too, and its default is 64 MiB, so a parse takes at most about 450 MB. Raise it for large payloads, such as embeddings of big batches.
   - **Navigation:** `child(n, k)`, `key(n, i)` and `val(n, i)` walk to their member, so they cost O(k). To visit every member, step with `next()`, as the module docs show. A loop over `child(n, k)` would be quadratic.
 - **Numbers keep their text.** A number is checked against the grammar while parsing and kept as written. `int()` reads it exactly or raises (RANGE outside Int's range; TYPE if it has a fraction or an exponent). Rendering a document writes numbers exactly as they came.
@@ -89,6 +93,7 @@ var request = w.take()                                  # List[UInt8]
   - the subnormal and overflow edges.
 
   The texts go through `read_float`, padded and not (with digits planted after the text), and through `Document.float` (the fallback too).
+- **`scan` against `parse`:** `tests/json/test_scan.mojo` runs the fuzz cases (4,000 texts) and hand cases (each with every prefix), wide objects with repeats and nesting past the limit, in each of the three dialects. `scan`'s calls must be `visit`'s, value for value, and its errors `parse`'s, kind, message and offset. It also checks that a handler stops it after any call, and the limits.
 - **AddressSanitizer:** `pixi run json-asan` (in `ci`) builds every `tests/json` file with ASan.
   - The parser writes through raw pointers. Each List's length covers all it may write, and `_data` keeps `_SLACK` bytes in its length after its text, so ASan's container checks see any access past a length, even inside the capacity.
   - J2's first version wrote nodes past `_nodes`' length. Its results were right and no json test ran under ASan; `tls-asan` found it through `tests/llm`.
@@ -115,6 +120,7 @@ It found no defect in those. It did find two problems:
 - **Memory:** a document takes up to about 7 times its input, so the default size limit came down from 256 MiB to 64 MiB.
 
 ## Milestones
+- **J3: `Document.scan`.** Done: the text read into a handler's calls, with no document ("Decisions"). Its first user is mojson's `loads`, 8 to 14% faster with it and, on a 1 GB file, 1.7 GB smaller at its peak (`docs/mojson.md`).
 - **J2: speed, `Dialect`, `Visitor`, `read_float`.** Done.
   - **Measured** (`pixi run bench-json`; thread CPU time, best of 7 samples of at least 0.1 s, one core of an i5-1145G7 under the machine's usual load):
 

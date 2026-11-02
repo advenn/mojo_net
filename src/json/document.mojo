@@ -307,6 +307,45 @@ trait Visitor:
         ...
 
 
+trait Handler:
+    """What `Document.scan` calls, value by value in document order, as it
+    reads: no document is built. The spans are valid during the call
+    only: strings unescaped, numbers as written (`integer`: no fraction
+    or exponent); each can be read `SPAN_SLACK` bytes past its end. An
+    array's or object's size comes at its end. Each method returns False
+    to stop the scan (a failure of the handler's own)."""
+
+    def null(mut self) -> Bool:
+        ...
+
+    def boolean(mut self, value: Bool) -> Bool:
+        ...
+
+    def number(mut self, text: Span[UInt8, ImmutAnyOrigin], integer: Bool) -> Bool:
+        ...
+
+    def string(mut self, text: Span[UInt8, ImmutAnyOrigin]) -> Bool:
+        ...
+
+    def key(mut self, text: Span[UInt8, ImmutAnyOrigin]) -> Bool:
+        """An object's key; its value follows."""
+        ...
+
+    def begin_array(mut self) -> Bool:
+        ...
+
+    def end_array(mut self, count: Int) -> Bool:
+        """The array of `count` values just read."""
+        ...
+
+    def begin_object(mut self) -> Bool:
+        ...
+
+    def end_object(mut self, count: Int) -> Bool:
+        """The object of `count` pairs just read."""
+        ...
+
+
 struct Document(Copyable, Movable, Writable):
     """Parsed JSON text (see the module docs)."""
 
@@ -376,6 +415,35 @@ struct Document(Copyable, Movable, Writable):
 
     def parse(mut self, text: StringSlice, limits: Limits = Limits(), dialect: Dialect = Dialect()) raises JsonError:
         self.parse(text.as_bytes(), limits, dialect)
+
+    def scan[H: Handler](
+        mut self, data: Span[UInt8, _], mut handler: H, limits: Limits = Limits(), dialect: Dialect = Dialect()
+    ) raises JsonError -> Bool:
+        """Read `data` as `parse` does, accepting and refusing the same
+        texts with the same errors, but call `handler` for each value as
+        it is read instead of building the document: one pass, with no
+        nodes. The document is left empty; its buffers serve as scratch
+        (a string's unescaped text, and, for a dialect that refuses
+        repeated keys, the keys of the objects open). False when a
+        handler call returned False, which ends the scan at once."""
+        self.clear()
+        self._stack.clear()
+        self._keys.clear()
+        var n = len(data)
+        if n > min(limits.max_size, MAX_SIZE):
+            raise JsonError(JsonError.LIMIT, "json: the input is over the size limit", 0)
+        var err = _Fail(dialect)
+        var r: Int
+        if dialect.repeated_keys:
+            r = self._scan_events[False](data.unsafe_ptr(), n, limits.max_depth, handler, err)
+        else:
+            r = self._scan_events[True](data.unsafe_ptr(), n, limits.max_depth, handler, err)
+        self.clear()
+        self._stack.clear()
+        self._keys.clear()
+        if r == -1:
+            raise JsonError(err.kind, err.message, err.offset)
+        return r == 0
 
     def _parse(mut self, data: Span[UInt8, _], limits: Limits, dialect: Dialect) raises JsonError:
         """One pass over `data`. Nodes and `_data` are written through raw
@@ -533,6 +601,202 @@ struct Document(Copyable, Movable, Writable):
                 np[unsafe_offset=top].b = UInt32(nn - top)
                 top, count = self._outer()
                 i += 1
+
+    @no_inline
+    def _scan_events[
+        keys: Bool, H: Handler
+    ](mut self, p: Pointer[UInt8, _], n: Int, max_depth: Int, mut h: H, mut err: _Fail) -> Int:
+        """`scan`'s pass, `_scan`'s grammar with `h` called where `_scan`
+        writes a node: 0; -1 with `err` set; -2 when `h` stopped it. The
+        innermost open array or object is `top_obj`, `count` and (`keys`)
+        `first`, its keys' start in `_keys`; the ones around it are in
+        `_stack`, as `_Open(first * 2 + is_object, count)`. With `keys`,
+        `_nodes` holds the open objects' keys (their texts at the start of
+        `_data`), so that `_check_keys` reads them as it reads a
+        document's; every other text is written at the end of those and
+        dropped after its call."""
+        self._data.reserve(n + _SLACK)
+        self._data.resize(unsafe_uninit_length=n + _SLACK)
+        var dp = self._data.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+        var dn = 0
+        comptime if keys:
+            if self._nodes.capacity() < 64:
+                self._nodes.reserve(64)
+        self._nodes.resize(unsafe_uninit_length=self._nodes.capacity())
+        var np = self._nodes.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+        var nlim = self._nodes.capacity() - 1
+        var nn = 0
+        var depth = 0
+        var top_obj = False
+        var count = 0
+        var first = 0
+        var i = _skip_ws(p, 0, n)
+        while True:
+            # A value starts at i.
+            if i >= n:
+                return err.fail(E_END, i)
+            var c = p[unsafe_offset=i]
+            if c == _QUOTE:
+                var s0 = dn
+                i = _string(p, n, i, dp, dn, err)
+                if i < 0:
+                    return -1
+                if not h.string(Span[UInt8, ImmutAnyOrigin](unsafe_ptr=dp.unsafe_offset(s0), length=dn - s0)):
+                    return -2
+                dn = s0
+            elif c == _LBRACE or c == _LBRACKET:
+                if depth >= max_depth:
+                    return err.fail("json: nested deeper than the depth limit", i, JsonError.LIMIT)
+                var obj = c == _LBRACE
+                if depth > 0:
+                    self._stack.append(_Open(first * 2 + Int(top_obj), count))
+                depth += 1
+                top_obj = obj
+                count = 0
+                comptime if keys:
+                    first = len(self._keys)
+                if not (h.begin_object() if obj else h.begin_array()):
+                    return -2
+                i = _skip_ws(p, i + 1, n)
+                if i < n and p[unsafe_offset=i] == (_RBRACE if obj else _RBRACKET):
+                    i += 1
+                    if not (h.end_object(0) if obj else h.end_array(0)):
+                        return -2
+                    depth -= 1
+                    if depth > 0:
+                        var o = self._stack.unsafe_ptr()[unsafe_offset=len(self._stack) - 1]
+                        self._stack.resize(unsafe_uninit_length=len(self._stack) - 1)
+                        top_obj = (o.node & 1) == 1
+                        first = o.node >> 1
+                        count = o.count
+                elif obj:
+                    i = self._event_key[keys](p, n, i, h, dp, dn, np, nn, nlim, err)
+                    if i < 0:
+                        return i
+                    continue
+                else:
+                    continue
+            elif c == _MINUS or _is_digit(c):
+                var s0 = dn
+                var tag = _INT
+                i = _number(p, n, i, dp, dn, tag, err)
+                if i < 0:
+                    return -1
+                if not h.number(Span[UInt8, ImmutAnyOrigin](unsafe_ptr=dp.unsafe_offset(s0), length=dn - s0), tag == _INT):
+                    return -2
+                dn = s0
+            elif c == 116:  # t
+                if i + 4 > n or _load4(p, i) != 0x65757274:  # "true"
+                    return err.fail("json: not a JSON value", i)
+                i += 4
+                if not h.boolean(True):
+                    return -2
+            elif c == 102:  # f
+                if i + 5 > n or _load4(p, i + 1) != 0x65736C61:  # "alse"
+                    return err.fail("json: not a JSON value", i)
+                i += 5
+                if not h.boolean(False):
+                    return -2
+            elif c == 110:  # n
+                if i + 4 > n or _load4(p, i) != 0x6C6C756E:  # "null"
+                    return err.fail("json: not a JSON value", i)
+                i += 4
+                if not h.null():
+                    return -2
+            else:
+                var s0 = dn
+                i = _constant(p, n, i, dp, dn, err)
+                if i < 0:
+                    return -1
+                if not h.number(Span[UInt8, ImmutAnyOrigin](unsafe_ptr=dp.unsafe_offset(s0), length=dn - s0), False):
+                    return -2
+                dn = s0
+            # A value ended before i: what may follow it.
+            while True:
+                if depth == 0:
+                    i = _skip_ws(p, i, n)
+                    if i != n:
+                        return err.fail("json: more after the value", i)
+                    return 0
+                count += 1
+                i = _skip_ws(p, i, n)
+                if i >= n:
+                    return err.fail("json: the input ends inside an array or object", i)
+                var d = p[unsafe_offset=i]
+                if d == _COMMA:
+                    i = _skip_ws(p, i + 1, n)
+                    if top_obj:
+                        i = self._event_key[keys](p, n, i, h, dp, dn, np, nn, nlim, err)
+                        if i < 0:
+                            return i
+                    break
+                if top_obj:
+                    if d != _RBRACE:
+                        return err.fail("json: expected ',' or '}'", i)
+                    comptime if keys:
+                        if count > 1:
+                            var kp = self._keys.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]().unsafe_offset(first)
+                            if self._check_keys(np, dp, kp, count, i, err) < 0:
+                                return -1
+                        # This object's keys go: their nodes and texts.
+                        nn = Int(self._keys.unsafe_ptr()[unsafe_offset=first])
+                        dn = Int(np[unsafe_offset=nn].a)
+                        self._keys.resize(unsafe_uninit_length=first)
+                    if not h.end_object(count):
+                        return -2
+                elif d != _RBRACKET:
+                    return err.fail("json: expected ',' or ']'", i)
+                elif not h.end_array(count):
+                    return -2
+                depth -= 1
+                if depth > 0:
+                    var o = self._stack.unsafe_ptr()[unsafe_offset=len(self._stack) - 1]
+                    self._stack.resize(unsafe_uninit_length=len(self._stack) - 1)
+                    top_obj = (o.node & 1) == 1
+                    first = o.node >> 1
+                    count = o.count
+                i += 1
+
+    @inline(.always)
+    def _event_key[
+        keys: Bool, H: Handler
+    ](
+        mut self,
+        p: Pointer[UInt8, _],
+        n: Int,
+        i: Int,
+        mut h: H,
+        dp: _BytePtr,
+        mut dn: Int,
+        mut np: _NodePtr,
+        mut nn: Int,
+        mut nlim: Int,
+        mut err: _Fail,
+    ) -> Int:
+        """`_key` for `scan`: the key at `i` to `h`, its text kept (as a
+        node, for `_check_keys`) with `keys`; where its value starts, -1
+        (`err`) or -2 (stopped)."""
+        if i >= n or p[unsafe_offset=i] != _QUOTE:
+            return err.fail("json: expected a key (a string)", i)
+        var s0 = dn
+        var j = _string(p, n, i, dp, dn, err)
+        if j < 0:
+            return -1
+        if not h.key(Span[UInt8, ImmutAnyOrigin](unsafe_ptr=dp.unsafe_offset(s0), length=dn - s0)):
+            return -2
+        comptime if keys:
+            if nn > nlim:
+                np = _grow(self._nodes, nn)
+                nlim = self._nodes.capacity() - 1
+            np[unsafe_offset=nn] = _Node(_STR, UInt32(s0), UInt32(dn - s0))
+            self._keys.append(UInt32(nn))
+            nn += 1
+        else:
+            dn = s0
+        j = _skip_ws(p, j, n)
+        if j >= n or p[unsafe_offset=j] != _COLON:
+            return err.fail("json: expected ':' after a key", j)
+        return _skip_ws(p, j + 1, n)
 
     @inline(.always)
     def _outer(mut self) -> Tuple[Int, Int]:

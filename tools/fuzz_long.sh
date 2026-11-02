@@ -20,6 +20,7 @@ FUZZERS=(
   tests/http/test_sse.mojo
   tests/http/test_form.mojo
   tests/json/test_json_fuzz.mojo
+  tests/json/test_scan.mojo
   tests/net/test_dns.mojo
   tests/server/test_router.mojo
 )

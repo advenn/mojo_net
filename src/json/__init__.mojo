@@ -10,7 +10,7 @@
   (Clinger's fast path, then Eisel-Lemire).
 """
 
-from .document import DEFAULT_MAX_DEPTH, DEFAULT_MAX_SIZE, MAX_SIZE, SPAN_SLACK, Dialect, Document, Kind, Limits, Visitor, parse
+from .document import DEFAULT_MAX_DEPTH, DEFAULT_MAX_SIZE, MAX_SIZE, SPAN_SLACK, Dialect, Document, Handler, Kind, Limits, Visitor, parse
 from .error import JsonError
 from .number import read_float
 from .ryu import format_float, write_float

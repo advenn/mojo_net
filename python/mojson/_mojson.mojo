@@ -19,7 +19,7 @@ from json import MAX_SIZE, Dialect, Document, JsonError, Limits
 from std.memory import unsafe_memcpy
 
 from ext.capi import Api, Obj, Addr, SURROGATEPASS, buf, cstr, load_int, out, str_data
-from ext.decode import DecState, Decoder, KeyCache, decode
+from ext.decode import Builder, DecState, Decoder, KeyCache, decode
 from ext.encode import FLUSH_AT, EncState, Encoder, KeyBytes, Options
 
 comptime _MAX_DEPTH = 512
@@ -172,27 +172,44 @@ def _parse_and_decode(
     max_depth: Int,
     mut why: _Refused,
 ) -> Obj:
-    """The fast path: `s` parsed into `doc` (strictly, by RFC 8259, with
-    `rfc8259`; else as json reads) and made into objects by `dec`, which
-    the caller has reset and given its hooks; -1 when the parse refused it
-    (`why`: 0 when it is not text the fast path reads at all) or it is the
+    """The fast path: `s` read (strictly, by RFC 8259, with `rfc8259`;
+    else as json reads) and made into objects with `dec`, which the
+    caller has reset and given its hooks: without hooks, built as it is
+    read (`Builder`, `doc` only its scratch); with them, parsed into `doc`
+    first, then built (`Decoder`). -1 when the parse refused it (`why`: 0
+    when it is not text the fast path reads at all) or it is the
     fallback's to read, 0 when Python raised."""
     var ptr: Addr = 0
     var size = 0
     if not _text(api, s, ptr, size) or size > MAX_SIZE:
         return -1
-    try:
-        doc.parse(
-            Span[UInt8, MutAnyOrigin](unsafe_ptr=buf(ptr), length=size),
-            Limits(max_depth=max_depth, max_size=MAX_SIZE),
-            Dialect() if rfc8259 else Dialect.python(control_characters=not strict),
-        )
-    except e:
-        why.kind = e.kind
-        why.message = e.message
-        why.offset = e.offset
-        return -1
-    var r = decode(Decoder(dec), doc)
+    var text = Span[UInt8, MutAnyOrigin](unsafe_ptr=buf(ptr), length=size)
+    var limits = Limits(max_depth=max_depth, max_size=MAX_SIZE)
+    var dialect = Dialect() if rfc8259 else Dialect.python(control_characters=not strict)
+    ref d = dec[]
+    var r: Obj = 0
+    if not (d.object_hook or d.object_pairs_hook or d.parse_float or d.parse_int or d.parse_constant):
+        var b = Builder(Decoder(dec))
+        try:
+            if doc.scan(text, b, limits, dialect):
+                r = b.take()
+            else:
+                b.d.release()
+        except e:
+            b.d.release()
+            why.kind = e.kind
+            why.message = e.message
+            why.offset = e.offset
+            r = -1
+    else:
+        try:
+            doc.parse(text, limits, dialect)
+        except e:
+            why.kind = e.kind
+            why.message = e.message
+            why.offset = e.offset
+            return -1
+        r = decode(Decoder(dec), doc)
     if size > (1 << 20):
         doc = Document()  # (no large buffers kept between calls)
     else:

@@ -1,6 +1,14 @@
-"""A parsed `json.Document` made into Python objects, as Python's
-json.loads makes them: dicts (or `object_hook`'s, `object_pairs_hook`'s
-results), lists, str, int (any size), float, True, False and None.
+"""JSON text made into Python objects, as Python's json.loads makes
+them: dicts (or `object_hook`'s, `object_pairs_hook`'s results), lists,
+str, int (any size), float, True, False and None. Two ways, which make
+the same values with the same functions:
+
+- `Builder`, a `Document.scan` handler, builds them as the text is read,
+  with no document (a call without hooks);
+- `Decoder`, a `Document.visit` visitor, builds them from a parsed
+  document (a call with hooks: no hook runs before the whole text is
+  known to parse, so that a text the fallback reads again calls no hook
+  twice).
 
 - **Strings:** an ASCII string is made with `PyUnicode_New` and its bytes
   copied in (`Api.fast_str`); any other through `PyUnicode_DecodeUTF8`,
@@ -16,14 +24,14 @@ results), lists, str, int (any size), float, True, False and None.
   (an overflow is an infinity, as in json). `parse_int`, `parse_float` and `parse_constant`
   get the number's text as a str.
 
-The walk keeps its own stack (`Document.visit`), so no depth overflows
-the C stack. On a failure the objects built so far are released and the
-Python exception set stays set; `decode` returns 0."""
+Neither recurses (`scan` and `visit` keep their own stacks), so no depth
+overflows the C stack. On a failure the objects built so far are
+released (`Decoder.release`) and the Python exception set stays set."""
 
 from std.bit import count_trailing_zeros
 from std.memory import bitcast, pack_bits, unsafe_memcpy
 
-from json import SPAN_SLACK, Document, Visitor, read_float
+from json import SPAN_SLACK, Document, Handler, Visitor, read_float
 
 from .capi import Api, Obj, Addr, Buf, SURROGATEPASS, buf, cstr, str_data, str_length
 
@@ -137,6 +145,9 @@ struct DecState(Movable):
     var parse_constant: Obj
     var num: List[UInt8]
     """A number's text with a NUL after it, for the C readers."""
+    var vals: List[Obj]
+    """`Builder`'s values made and not yet in an array or object: the
+    open arrays' items and the open objects' keys and values, in order."""
 
     def __init__(out self, api: ApiPtr, cache: Pointer[KeyCache, MutUntrackedOrigin], surrogates: Bool):
         """`Codec` keeps one, and `reset`s it for each call, so that its
@@ -152,12 +163,14 @@ struct DecState(Movable):
         self.parse_int = 0
         self.parse_constant = 0
         self.num = List[UInt8]()
+        self.vals = List[Obj]()
 
     def reset(mut self, api: ApiPtr, cache: Pointer[KeyCache, MutUntrackedOrigin]):
         """Ready for a new call, with no hooks."""
         self.api = api
         self.cache = cache
         self.frames.clear()
+        self.vals.clear()
         self.result = 0
         self.object_hook = 0
         self.object_pairs_hook = 0
@@ -180,9 +193,12 @@ struct Decoder(TrivialRegisterPassable, Visitor):
             api.Py_DecRef(f.obj)
             if f.key:
                 api.Py_DecRef(f.key)
+        for o in self.s[].vals:
+            api.Py_DecRef(o)
         if self.s[].result:
             api.Py_DecRef(self.s[].result)
         self.s[].frames.clear()
+        self.s[].vals.clear()
         self.s[].result = 0
 
     # ---- making values -----------------------------------------------------
@@ -319,42 +335,41 @@ struct Decoder(TrivialRegisterPassable, Visitor):
         self.put(api.new_ref(api.true if value else api.false))
 
     def number(mut self, text: Span[UInt8, ImmutAnyOrigin], integer: Bool) raises:
+        self.put(self.make_number(text, integer))
+
+    def make_number(self, text: Span[UInt8, ImmutAnyOrigin], integer: Bool) raises -> Obj:
+        """A number's text as json reads it: an int, a float (or NaN,
+        Infinity, -Infinity), or what the hook for it returns."""
         ref api = self.s[].api[]
         var n = len(text)
         var p = text.unsafe_ptr()
         if integer:
             if self.s[].parse_int:
-                self.put(self._hook(self.s[].parse_int, text))
-                return
+                return self._hook(self.s[].parse_int, text)
             if n <= 18:
                 var neg = p[unsafe_offset=0] == 45
                 var v = 0
                 for i in range(1 if neg else 0, n):
                     v = v * 10 + Int(p[unsafe_offset=i] - 48)
-                self.put(self._check(api.PyLong_FromLongLong(-v if neg else v)))
-                return
-            self.put(self._check(api.PyLong_FromString(self._cnum(text), 0, 10)))
-            return
+                return self._check(api.PyLong_FromLongLong(-v if neg else v))
+            return self._check(api.PyLong_FromString(self._cnum(text), 0, 10))
         if p[unsafe_offset=n - 1] > 57:  # NaN, Infinity, -Infinity
             if self.s[].parse_constant:
-                self.put(self._hook(self.s[].parse_constant, text))
-                return
+                return self._hook(self.s[].parse_constant, text)
             var x: Float64 = FloatLiteral.nan
             if p[unsafe_offset=0] == 73:
                 x = FloatLiteral.infinity
             elif p[unsafe_offset=0] == 45:
                 x = FloatLiteral.negative_infinity
-            self.put(self._check(api.PyFloat_FromDouble(x)))
-            return
+            return self._check(api.PyFloat_FromDouble(x))
         if self.s[].parse_float:
-            self.put(self._hook(self.s[].parse_float, text))
-            return
+            return self._hook(self.s[].parse_float, text)
         var x: Float64 = 0
         if not read_float[padded=True](text, x):  # (more than 19 digits, subnormals; SPAN_SLACK)
             x = api.PyOS_string_to_double(self._cnum(text), 0, 0)
             if x == -1.0 and api.PyErr_Occurred():
                 raise Error("mojson: Python raised")
-        self.put(self._check(api.PyFloat_FromDouble(x)))
+        return self._check(api.PyFloat_FromDouble(x))
 
     def string(mut self, text: Span[UInt8, ImmutAnyOrigin]) raises:
         self.put(self.make_str(text))
@@ -399,3 +414,104 @@ def decode(var dec: Decoder, doc: Document) -> Obj:
     var r = dec.s[].result
     dec.s[].result = 0
     return r
+
+
+@fieldwise_init
+struct Builder(Handler, TrivialRegisterPassable):
+    """`Document.scan`'s handler: the Python objects built as the text is
+    read, with no document in between, for a call without hooks (with
+    them, the text is parsed whole before any hook runs, and `Decoder`
+    builds from the document: see `_mojson._parse_and_decode`). Each value
+    made goes on `DecState.vals`; an array or object takes its items off
+    the top of it when it ends (`scan` gives their number then), and goes
+    on it in their place. A failure (a Python exception set) returns
+    False, which stops the scan; `Decoder.release` drops what is left."""
+
+    var d: Decoder
+
+    @inline(.always)
+    def _push(self, o: Obj) -> Bool:
+        if o == 0:
+            return False
+        self.d.s[].vals.append(o)
+        return True
+
+    def take(self) -> Obj:
+        """The root, after a scan that returned True."""
+        var r = self.d.s[].vals.pop()
+        if self.d.s[].vals.capacity() > (1 << 16):
+            self.d.s[].vals = List[Obj]()  # (no large stack kept between calls)
+        return r
+
+    def null(mut self) -> Bool:
+        ref api = self.d.s[].api[]
+        return self._push(api.new_ref(api.none))
+
+    def boolean(mut self, value: Bool) -> Bool:
+        ref api = self.d.s[].api[]
+        return self._push(api.new_ref(api.true if value else api.false))
+
+    def number(mut self, text: Span[UInt8, ImmutAnyOrigin], integer: Bool) -> Bool:
+        try:
+            return self._push(self.d.make_number(text, integer))
+        except:
+            return False
+
+    def string(mut self, text: Span[UInt8, ImmutAnyOrigin]) -> Bool:
+        try:
+            return self._push(self.d.make_str(text))
+        except:
+            return False
+
+    def key(mut self, text: Span[UInt8, ImmutAnyOrigin]) -> Bool:
+        try:
+            return self._push(self.d.make_key(text))
+        except:
+            return False
+
+    def begin_array(mut self) -> Bool:
+        return True
+
+    def end_array(mut self, count: Int) -> Bool:
+        ref st = self.d.s[]
+        ref api = st.api[]
+        var l = api.PyList_New(count)
+        if l == 0:
+            return False
+        var base = len(st.vals) - count
+        var vp = st.vals.unsafe_ptr()
+        if api.fast_list:
+            if count > 0:
+                unsafe_memcpy(dest=buf(api.list_items(l)), src=vp.unsafe_offset(base).unsafe_bitcast[UInt8](), count=8 * count)
+        else:
+            for i in range(count):
+                api.list_set(l, i, vp[unsafe_offset=base + i])
+        st.vals.resize(unsafe_uninit_length=base)
+        st.vals.append(l)
+        return True
+
+    def begin_object(mut self) -> Bool:
+        return True
+
+    def end_object(mut self, count: Int) -> Bool:
+        ref st = self.d.s[]
+        ref api = st.api[]
+        var o = api.new_dict(count)
+        if o == 0:
+            return False
+        var base = len(st.vals) - 2 * count
+        var vp = st.vals.unsafe_ptr()
+        var ok = True
+        for i in range(count):
+            var k = vp[unsafe_offset=base + 2 * i]
+            var v = vp[unsafe_offset=base + 2 * i + 1]
+            if ok and api.PyDict_SetItem(o, k, v) < 0:
+                ok = False
+            api.Py_DecRef(k)
+            api.Py_DecRef(v)
+        st.vals.resize(unsafe_uninit_length=base)
+        if not ok:
+            api.Py_DecRef(o)
+            return False
+        st.vals.append(o)
+        return True
