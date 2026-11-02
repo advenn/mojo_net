@@ -14,7 +14,8 @@
 #
 #   bash tools/test_mojson_wheel.sh DIST PYTHON...
 #   (locally: bash tools/test_mojson_wheel.sh build/dist "$(uv python find 3.12)" \
-#      "$(uv python find 3.13)" "$(uv python find 3.14)" "$(uv python find 3.14t)")
+#      "$(uv python find 3.13)" "$(uv python find 3.14)" "$(uv python find 3.15)" \
+#      "$(uv python find 3.15t)")
 set -euo pipefail
 cd "$(dirname "$0")/.."
 [ $# -ge 2 ] || { echo "usage: $0 DIST PYTHON..."; exit 2; }

@@ -2,7 +2,7 @@
 
 `mojson` is a Python package with the standard library json's API whose parsing and writing are done by the Mojo `json` package (`docs/json.md`). It lives in `python/mojson`: a Mojo extension module, `_mojson`, and a small Python layer over it.
 
-**Status: done through Y2**, tested against the standard library's json on CPython 3.12, 3.13 and 3.14. Its wheels are prepared for TestPyPI (the user's decision, 2026-11-02), and nothing else of the repository is published; like the rest of it, mojson is not meant for production use.
+**Status: done through Y2**, tested against the standard library's json on CPython 3.12 to 3.15. Its wheels are prepared for TestPyPI (the user's decision, 2026-11-02), and nothing else of the repository is published; like the rest of it, mojson is not meant for production use.
 
 ## Use
 ```bash
@@ -55,7 +55,7 @@ Numbers are read as json reads them. Integers are exact at any size, under Pytho
 ## How it is built
 - **`ext/capi.mojo`** is the extension's only C. It resolves the CPython C API from the interpreter that imports it (`dlopen(NULL)`) into typed function pointers, once.
   - Objects travel as their addresses, and out-parameters as typed mutable pointers. As `Int` addresses, the compiler read them back unchanged (CLAUDE.md, "FFI").
-  - A few layouts are read directly where a call would cost more than the work: an object's type, a str's header and characters, a list's item array. Each is checked at import against the C API, on objects built for the check, and used only where it agreed. These are CPython 3.12 to 3.14's layouts, with the GIL, on 64-bit platforms.
+  - A few layouts are read directly where a call would cost more than the work: an object's type, a str's header and characters, a list's item array. Each is checked at import against the C API, on objects built for the check, and used only where it agreed. These are CPython 3.12 to 3.15's layouts (3.15's headers lay them out as 3.14's), with the GIL, on 64-bit platforms.
 - **`ext/decode.mojo`** walks a parsed `json.Document` (`Document.visit`) and builds the objects:
   - an ASCII str with `PyUnicode_New` and a copy, any other through `PyUnicode_DecodeUTF8`;
   - lists filled in place, dicts presized;
@@ -142,7 +142,7 @@ What the numbers say:
 mojson's wheels go to **TestPyPI** only. They hold mojson's own files and nothing else of the repository: `mojson/__init__.py`, `mojson/_mojson.so` (about 400 KB), the metadata and the licence. `packaging/mojson` holds what PyPI needs: `pyproject.toml` (the metadata, the CPU targets) and `README.md` (the PyPI page, with the repository's warning).
 
 - **Built** by `tools/build_mojson_wheel.py` (`pixi run -e release mojson-wheel`, then `twine check --strict`):
-  - **One build per machine.** The extension links no libpython: it resolves the C API from the interpreter that loads it, so one build serves Python 3.12, 3.13 and 3.14. It is packed into one wheel per version, tagged `cp312-cp312` to `cp314-cp314`, `manylinux_2_34`. A `none` ABI tag would also match the free-threaded build (`cp314t`), where loading the extension crashes: Mojo's module setup reads the GIL build's object layout before any check of mojson's can run. So pip refuses the wheels there, and `mojson/__init__.py` raises ImportError if it is imported by path.
+  - **One build per machine.** The extension links no libpython: it resolves the C API from the interpreter that loads it, so one build serves Python 3.12 to 3.15. It is packed into one wheel per version, tagged `cp312-cp312` to `cp315-cp315`, `manylinux_2_34`. A `none` ABI tag would also match the free-threaded build (`cp314t`), where loading the extension crashes: Mojo's module setup reads the GIL build's object layout before any check of mojson's can run. So pip refuses the wheels there, and `mojson/__init__.py` raises ImportError if it is imported by path.
   - **A portable CPU.** `mojo build` targets the build host's own CPU by default, which put AVX-512 into the extension on the machine this was written on. The wheels target x86-64-v3 and neoverse-n1. Modular's runtime libraries already need those: on x86_64 they use AVX2, BMI2 and FMA with no fallback, and on aarch64 LSE, RCpc and dot-product instructions. Against x86-64-v2, v3 was 0 to 12% faster per file (about 4% on average); the build host's own target was 5 to 15% faster still, which a wheel cannot use.
   - **The Mojo runtime is not in the wheel.** The extension links `libKGENCompilerRTShared.so`, which needs two more of Modular's libraries; all three are under Modular's licence. The wheel depends on `mojo-compiler==1.2.0` from PyPI (about 80 MB), whose wheel installs them in `site-packages/modular/lib`.
     - The extension's RUNPATH is `$ORIGIN/../modular/lib`, so it finds them when both packages share a site-packages.
@@ -155,9 +155,9 @@ mojson's wheels go to **TestPyPI** only. They hold mojson's own files and nothin
   - mojson alone in another directory (`pip --target`) must load it too;
   - on a free-threaded interpreter, pip must refuse every wheel, and an import by path must raise ImportError.
 
-  Locally: x86_64, CPython 3.12, 3.13, 3.14 and 3.14t (from uv).
+  Locally: x86_64, CPython 3.12, 3.13, 3.14, 3.15, and 3.15t (from uv).
 - **Published** by `.github/workflows/mojson-wheels.yml`:
-  - It builds on both machines, then tests each wheel on Python 3.12, 3.13, 3.14 and 3.14t on GitHub's runners. It does this on every change to mojson, `json` or the packaging.
+  - It builds on both machines, then tests each wheel on Python 3.12 to 3.15 and the free-threaded 3.14t and 3.15t on GitHub's runners. It does this on every change to mojson, `json` or the packaging.
   - On a manual run with `publish` ticked, it also uploads the tested wheels to TestPyPI by trusted publishing, so no token is stored.
   - Once, before the first upload, register a "pending publisher" on test.pypi.org (Account settings → Publishing). Its fields: project `mojson`, owner `advenn`, repository `mojo_net`, workflow `mojson-wheels.yml`, environment `testpypi`.
   - TestPyPI never takes a version twice, so raise `version` in `packaging/mojson/pyproject.toml` and `__version__` in `python/mojson/__init__.py` together before each upload.

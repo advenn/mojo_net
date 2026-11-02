@@ -59,7 +59,7 @@ pixi run bench-json                # json's parse and write on the corpus and AI
 pixi run -e pyjson bench-json-compare   # mojson beside Python's json, orjson, ujson, msgspec, simdjson, rapidjson, simplejson, yyjson
 pixi run json-asan                 # every tests/json file built with AddressSanitizer (in ci)
 pixi run mojson-build              # build/python/mojson (PYTHONPATH=build/python to import it); mojson-test runs tests/mojson
-pixi run -e release mojson-wheel   # mojson's wheels, one per Python 3.12-3.14, into build/dist (packaging/mojson; twine check); mojson-wheel-test DIST PYTHON... installs and tests them
+pixi run -e release mojson-wheel   # mojson's wheels, one per Python 3.12-3.15, into build/dist (packaging/mojson; twine check); mojson-wheel-test DIST PYTHON... installs and tests them
 pixi run -e bench bench-server run  # HTTP server vs Go (net/http, fasthttp), hyper and nginx under wrk, 60 s runs (bench/server/README.md)
 pixi run -e bench bench-server run --https   # the same over TLS: mojo, nginx (same OpenSSL), Go, fasthttp; and a handshake per request (check --https first: no server may resume sessions)
 pixi run -e bench bench-profile     # mojo and hyper under callgrind: user-space instructions per request, by file and function

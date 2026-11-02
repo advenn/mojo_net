@@ -10,10 +10,10 @@
 
 [project]
 name = "mojson"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python's json module with its parsing and writing done in Mojo: json's results and errors, faster. An AI-generated experiment, not for production."
 readme = { file = "README.md", content-type = "text/markdown" }
-requires-python = ">=3.12,<3.15"
+requires-python = ">=3.12,<3.16"
 license = "Apache-2.0"
 license-files = ["LICENSE"]  # (the repository's, at its root)
 authors = [{ name = "advenn" }]
@@ -32,6 +32,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
@@ -52,4 +53,4 @@ target-cpu = { x86_64 = "x86-64-v3", aarch64 = "neoverse-n1" }
 # glibc 2.34, as Modular's own wheels: the build checks that the extension
 # needs no newer symbol.
 manylinux = "manylinux_2_34"
-python-tags = ["cp312", "cp313", "cp314"]
+python-tags = ["cp312", "cp313", "cp314", "cp315"]

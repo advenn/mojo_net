@@ -19,7 +19,7 @@ One build of the extension serves every Python the metadata lists: it
 links no libpython (it resolves the C API from the interpreter that loads
 it, and checks the object layouts it reads at import). It is packed once
 per version, tagged cpXY-cpXY-<manylinux>_<machine>: a wheel tagged
-`none` for its ABI would also install on the free-threaded build (cp314t),
+`none` for its ABI would also install on the free-threaded build (cp314t, cp315t),
 whose object headers differ and where the extension crashes at import.
 Every check failing stops the build, with nothing written.
 """

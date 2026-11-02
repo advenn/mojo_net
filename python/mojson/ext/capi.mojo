@@ -11,7 +11,8 @@ used only where the check passed (`fast_str`, `fast_list`); otherwise the
 extension goes through the C API alone. An object's type is read always,
 so an interpreter whose objects do not start with (refcount, type), as
 free-threaded CPython's do not, is refused at import. The offsets are
-those of CPython 3.12 to 3.14 with the GIL on 64-bit platforms."""
+those of CPython 3.12 to 3.15 with the GIL on 64-bit platforms (3.15's
+headers lay them out as 3.14's)."""
 
 from std.ffi import OwnedDLHandle, c_int
 
@@ -422,7 +423,7 @@ struct Api(Movable):
         return out^
 
 
-# ---- str internals (CPython 3.12-3.14, GIL builds; `Api.fast_str`) ----------
+# ---- str internals (CPython 3.12-3.15, GIL builds; `Api.fast_str`) ----------
 # PyASCIIObject: refcnt, type, length (16), hash (24), state (32), then the
 # characters of a compact ASCII str (40); PyCompactUnicodeObject adds
 # utf8_length and utf8 (characters at 56); a legacy str holds a pointer

@@ -17,7 +17,7 @@ pip install -i https://test.pypi.org/simple/ --no-deps mojson
 
 Requirements:
 - **Linux** on x86_64 with AVX2 (Haswell, 2013, or newer), or on aarch64 (Neoverse N1 / Graviton2 or newer); glibc 2.34 or newer.
-- **CPython** 3.12, 3.13 or 3.14, as normally built: pip installs no wheel on the free-threaded build, and an import there raises ImportError.
+- **CPython** 3.12, 3.13, 3.14 or 3.15, as normally built: pip installs no wheel on the free-threaded build, and an import there raises ImportError.
 - **`mojo-compiler`** from PyPI (about 80 MB), the first step above: it holds the Mojo runtime the extension links, under [Modular's licence](https://www.modular.com/legal/max). mojson ships none of it.
 
 ## Use
