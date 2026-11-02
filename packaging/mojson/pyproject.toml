@@ -1,0 +1,55 @@
+# mojson's distribution metadata (docs/mojson.md, "Release"). The package
+# itself lives in python/mojson, its parser in src/json; this directory
+# holds only what PyPI needs. tools/build_mojson_wheel.py reads this file
+# and builds the wheels (pixi run -e release mojson-wheel): the extension
+# compiled once for a portable CPU, then one wheel per Python version with
+# mojson/__init__.py, mojson/_mojson.so and the licence, nothing else of the
+# repository. No sdist: building needs the Mojo toolchain this repository
+# pins. Raise `version` and python/mojson/__init__.py's __version__ together
+# (the build checks they match): TestPyPI never takes a version twice.
+
+[project]
+name = "mojson"
+version = "0.1.0"
+description = "Python's json module with its parsing and writing done in Mojo: json's results and errors, faster. An AI-generated experiment, not for production."
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.12,<3.15"
+license = "Apache-2.0"
+license-files = ["LICENSE"]  # (the repository's, at its root)
+authors = [{ name = "advenn" }]
+keywords = ["json", "mojo", "parser", "serialization"]
+# The Mojo runtime (libKGENCompilerRTShared.so and the two it needs), which
+# the extension links: from Modular's wheel, under Modular's licence, never
+# copied into ours. Pinned to the compiler that built the extension
+# (tools/build_mojson_wheel.py checks `mojo --version` against it).
+dependencies = ["mojo-compiler==1.2.0"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/advenn/mojo_net"
+Documentation = "https://github.com/advenn/mojo_net/blob/main/docs/mojson.md"
+Source = "https://github.com/advenn/mojo_net/tree/main/python/mojson"
+Issues = "https://github.com/advenn/mojo_net/issues"
+
+[tool.mojson-wheel]
+# The CPU the extension is compiled for, per machine. Modular's runtime
+# libraries in mojo-compiler already need these (x86_64: AVX2, BMI2 and FMA
+# with no fallback; aarch64: LSE, RCpc and dot-product instructions), so
+# they narrow nothing; `mojo build`'s default, the build host's own CPU,
+# would (AVX-512 on the machine this was written on).
+target-cpu = { x86_64 = "x86-64-v3", aarch64 = "neoverse-n1" }
+# glibc 2.34, as Modular's own wheels: the build checks that the extension
+# needs no newer symbol.
+manylinux = "manylinux_2_34"
+python-tags = ["cp312", "cp313", "cp314"]

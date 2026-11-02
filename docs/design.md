@@ -79,6 +79,7 @@ So a Mojo upgrade, or a change in a shared layer, lands in every package in one 
 - **`pixi run package`** builds it with rattler-build (in a pixi environment of its own) into `output/noarch/`. Then it installs the package in a fresh environment and runs `conda.recipe/test_package.mojo` there: each library, imported from the package, does one real thing.
 - **GitHub CI** (`.github/workflows/ci.yml`) runs what `pixi run ci` runs, and `pixi run package`, on x86_64 and on a real aarch64 runner, as parallel jobs per architecture (the checks with the package, the tests in three parts, tls-asan); it keeps each package as a workflow artifact for 30 days.
 - **Not published, by decision.** The code carries no quality guarantee and is not meant for production. So the package is built and tested (`pixi run package`) but goes to no channel.
+- **The exception: `mojson` on TestPyPI** (the user's decision, 2026-11-02). Its wheels hold only `mojson/__init__.py` and the compiled extension, built from `packaging/mojson` (`docs/mojson.md`, "Release"); TestPyPI, not PyPI.
 
 ## Contracts
 Code comments cite these by number, so keep the numbering stable. Contracts 2, 3 and 6 concern event loops (`rt`, or any loop built on `linux.Epoll`).

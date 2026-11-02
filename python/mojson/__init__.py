@@ -33,7 +33,43 @@ import json as _json
 import uuid as _uuid
 from json import JSONDecodeError, JSONDecoder, JSONEncoder, decoder, detect_encoding, encoder, scanner
 
-from . import _mojson
+__version__ = "0.1.0"
+
+# The extension, and Mojo's own module setup inside it, read CPython's
+# object layout as the GIL build lays it out; the free-threaded build's
+# headers differ, and loading it there crashes before any check of its
+# own can run. (Its wheels' cpXY-cpXY tags keep pip from installing them
+# there; this is for imports by path.)
+import sysconfig as _sysconfig
+
+if _sysconfig.get_config_var("Py_GIL_DISABLED"):
+    raise ImportError("mojson does not support the free-threaded build of CPython: its extension reads the GIL build's object layout")
+
+
+def _load_mojo_runtime():
+    """Load the Mojo runtime the extension links (libKGENCompilerRTShared.so
+    and the two it needs) from the mojo-compiler distribution, wherever it
+    is installed. The wheel's extension finds them by its RUNPATH,
+    $ORIGIN/../modular/lib, when both are in one site-packages; this is for
+    the other layouts (mojson and mojo-compiler in different directories)."""
+    import ctypes
+    import importlib.metadata
+
+    try:
+        dist = importlib.metadata.distribution("mojo-compiler")
+    except importlib.metadata.PackageNotFoundError:
+        raise ImportError("mojson needs the Mojo runtime: pip install mojo-compiler (the version mojson requires)") from None
+    for name in ("libMSupportGlobals.so", "libAsyncRTRuntimeGlobals.so", "libKGENCompilerRTShared.so"):
+        ctypes.CDLL(str(dist.locate_file("modular/lib/" + name)), mode=ctypes.RTLD_GLOBAL)
+
+
+try:
+    from . import _mojson
+except ImportError as e:
+    if "libKGENCompilerRTShared" not in str(e):
+        raise
+    _load_mojo_runtime()
+    from . import _mojson
 
 __all__ = ["dump", "dumps", "load", "loads", "JSONDecoder", "JSONDecodeError", "JSONEncoder", "dumpb"]
 

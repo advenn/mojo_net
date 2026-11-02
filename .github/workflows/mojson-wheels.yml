@@ -1,0 +1,123 @@
+# mojson's wheels (docs/mojson.md, "Release"). Built on both machines from
+# packaging/mojson by tools/build_mojson_wheel.py (only mojson's own files),
+# then each installed by pip in a fresh virtualenv on Python 3.12, 3.13 and
+# 3.14, with mojo-compiler from PyPI, and tested there against the standard
+# library's json (tools/test_mojson_wheel.sh); on free-threaded 3.14, pip
+# must refuse them. On a manual run with `publish` ticked, the tested
+# wheels go to TestPyPI by trusted publishing: the `testpypi` environment,
+# no stored token. Nothing here publishes to PyPI.
+name: mojson-wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the tested wheels to TestPyPI"
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - python/mojson/**
+      - src/json/**
+      - packaging/mojson/**
+      - tests/mojson/**
+      - tools/build_mojson_wheel.py
+      - tools/test_mojson_wheel.sh
+      - .github/workflows/mojson-wheels.yml
+  push:
+    branches: [main]
+    paths:
+      - python/mojson/**
+      - src/json/**
+      - packaging/mojson/**
+      - tests/mojson/**
+      - tools/build_mojson_wheel.py
+      - tools/test_mojson_wheel.sh
+      - .github/workflows/mojson-wheels.yml
+
+concurrency:
+  group: mojson-wheels-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: prefix-dev/setup-pixi@v0.11.2
+        with:
+          pixi-version: v0.82.1
+          environments: release
+      - name: Build and check the wheels
+        run: pixi run -e release mojson-wheel
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mojson-wheels-${{ matrix.arch }}
+          path: build/dist/mojson-*.whl
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.arch }}, Python ${{ matrix.python }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        python: ["3.12", "3.13", "3.14", "3.14t"]
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        id: python
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: mojson-wheels-${{ matrix.arch }}
+          path: build/dist
+      - name: The corpus (pinned by hash)
+        run: |
+          python bench/json/payloads.py write build/bench_json
+          python bench/json/corpus.py build/bench_json
+      - name: Install and test
+        run: bash tools/test_mojson_wheel.sh build/dist "${{ steps.python.outputs.python-path }}"
+
+  publish:
+    name: publish to TestPyPI
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: test
+    runs-on: ubuntu-24.04
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/mojson
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: mojson-wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@v1.14.3
+        with:
+          repository-url: https://test.pypi.org/legacy/

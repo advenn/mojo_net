@@ -149,8 +149,24 @@ yyjson = "*"
 [feature.pyjson.tasks]
 bench-json-compare = "python3 bench/json/payloads.py write build/bench_json && python3 bench/json/corpus.py build/bench_json && bash tools/build_mojson.sh && python3 bench/json/compare.py build/bench_json"
 
+# Releasing mojson (docs/mojson.md, "Release"): its wheel, built from
+# packaging/mojson by tools/build_mojson_wheel.py and checked by twine;
+# `mojson-wheel-test` installs it in a fresh virtualenv per interpreter.
+# .github/workflows/mojson-wheels.yml builds both machines' wheels, tests
+# them on Python 3.12 to 3.14, and publishes to TestPyPI when asked.
+[feature.release.dependencies]
+patchelf = "*"
+
+[feature.release.pypi-dependencies]
+twine = "*"
+
+[feature.release.tasks]
+mojson-wheel = "rm -f build/dist/mojson-*.whl && python3 tools/build_mojson_wheel.py && twine check --strict build/dist/mojson-*.whl"
+mojson-wheel-test = "bash tools/test_mojson_wheel.sh build/dist"
+
 [environments]
 package = { features = ["package"], no-default-feature = true }
 bench = { features = ["bench"] }
 perf = { features = ["perf"] }
 pyjson = { features = ["pyjson"] }
+release = { features = ["release"] }

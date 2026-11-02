@@ -32,6 +32,13 @@ import mojson  # noqa: E402
 
 SCALE = int(os.environ.get("MOJSON_FUZZ_SCALE", "1"))
 CORPUS = os.environ.get("MOJSON_CORPUS", os.path.join(HERE, "..", "..", "build", "bench_json"))
+# The files of that corpus (bench/json/corpus.py and payloads.py), by name:
+# never whatever else lies in the directory (a 1 GB file once did).
+CORPUS_NAMES = ["chunk", "chat_completion", "tools_request", "embeddings", "github", "twitter", "citm_catalog", "canada", "recipe_book"]
+
+
+def corpus_files():
+    return [n + ".json" for n in CORPUS_NAMES if os.path.isfile(os.path.join(CORPUS, n + ".json"))]
 
 
 def outcome(fn, *args, **kw):
@@ -79,7 +86,7 @@ class Loads(unittest.TestCase):
             self.assertEqual(got[3], want[3], (s, kw))
 
     def test_corpus(self):
-        names = [n for n in sorted(os.listdir(CORPUS)) if n.endswith(".json")] if os.path.isdir(CORPUS) else []
+        names = corpus_files()
         if not names:
             self.skipTest("no corpus in %s (pixi run bench-json writes it)" % CORPUS)
         for name in names:
@@ -304,7 +311,7 @@ class Dumps(unittest.TestCase):
             self.assertEqual(outcome(mojson.dumpb, o, **kw), ("ok", want[1].encode("utf-8")), (o, kw))
 
     def test_corpus(self):
-        names = [n for n in sorted(os.listdir(CORPUS)) if n.endswith(".json")] if os.path.isdir(CORPUS) else []
+        names = corpus_files()
         if not names:
             self.skipTest("no corpus in %s" % CORPUS)
         for name in names:
