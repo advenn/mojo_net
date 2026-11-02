@@ -10,7 +10,7 @@
 
 [project]
 name = "mojson"
-version = "0.1.1"
+version = "0.1.2"
 description = "Python's json module with its parsing and writing done in Mojo: json's results and errors, faster. An AI-generated experiment, not for production."
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.12,<3.16"

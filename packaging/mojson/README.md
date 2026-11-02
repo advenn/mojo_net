@@ -52,8 +52,10 @@ Measured on one core of an Intel i5-1145G7, CPython 3.14, against json and orjso
 
 | | mojson against json | mojson against orjson |
 |---|---|---|
-| `loads` | 1.0 to 5.2 times as fast | 0.62 to 0.89 of its speed |
-| `dumps` | 2.0 to 7.5 times as fast | 0.26 to 0.49 of its speed |
+| `loads` | 1.7 to 4.1 times as fast | 0.61 to 0.91 of its speed |
+| `dumps` | 3.3 to 7.0 times as fast | 0.35 to 0.69 of its speed |
+
+On a 1 GB document, `loads` takes 4.7 s (json 8.3 s, orjson 3.7 s), and `dumps` 1.4 s (json 4.2 s, orjson 0.76 s).
 
 The tables, and how they were taken, are in [docs/mojson.md](https://github.com/advenn/mojo_net/blob/main/docs/mojson.md#measured).
 

@@ -57,6 +57,10 @@ comptime _F_i_onnn = def(Obj, IntOut, IntOut, IntOut) thin abi("C") -> c_int
 comptime _F_d_aao = def(Addr, Addr, Obj) thin abi("C") -> Float64
 comptime _F_i_a = def(Addr) thin abi("C") -> c_int
 comptime _F_i = def() thin abi("C") -> c_int
+comptime _F_a_l = def(Int) thin abi("C") -> Addr
+comptime _F_a_al = def(Addr, Int) thin abi("C") -> Addr
+comptime _F_v_a = def(Addr) thin abi("C") -> None
+comptime _F_i_nl = def(IntOut, Int) thin abi("C") -> c_int
 comptime _F_i_ooi = def(Obj, Obj, c_int) thin abi("C") -> c_int
 comptime _F_o_ol = def(Obj, Int) thin abi("C") -> Obj
 
@@ -144,6 +148,11 @@ struct Api(Movable):
     var PyFloat_AsDouble: _F_d_o
     var PyOS_string_to_double: _F_d_aao
     var PyUnicode_New: _F_o_lu
+    var PyUnicode_Resize: _F_i_nl
+    var _PyBytes_Resize: _F_i_nl
+    var PyMem_RawMalloc: _F_a_l
+    var PyMem_RawRealloc: _F_a_al
+    var PyMem_RawFree: _F_v_a
     var PyUnicode_DecodeUTF8: _F_o_ala
     var PyUnicode_AsUTF8AndSize: _F_a_on
     var PyUnicode_AsEncodedString: _F_o_oaa
@@ -225,6 +234,11 @@ struct Api(Movable):
         self.PyFloat_AsDouble = _sym[_F_d_o](h, "PyFloat_AsDouble")
         self.PyOS_string_to_double = _sym[_F_d_aao](h, "PyOS_string_to_double")
         self.PyUnicode_New = _sym[_F_o_lu](h, "PyUnicode_New")
+        self.PyUnicode_Resize = _sym[_F_i_nl](h, "PyUnicode_Resize")
+        self._PyBytes_Resize = _sym[_F_i_nl](h, "_PyBytes_Resize")
+        self.PyMem_RawMalloc = _sym[_F_a_l](h, "PyMem_RawMalloc")
+        self.PyMem_RawRealloc = _sym[_F_a_al](h, "PyMem_RawRealloc")
+        self.PyMem_RawFree = _sym[_F_v_a](h, "PyMem_RawFree")
         self.PyUnicode_DecodeUTF8 = _sym[_F_o_ala](h, "PyUnicode_DecodeUTF8")
         self.PyUnicode_AsUTF8AndSize = _sym[_F_a_on](h, "PyUnicode_AsUTF8AndSize")
         self.PyUnicode_AsEncodedString = _sym[_F_o_oaa](h, "PyUnicode_AsEncodedString")

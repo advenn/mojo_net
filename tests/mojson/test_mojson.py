@@ -320,6 +320,82 @@ class Dumps(unittest.TestCase):
             for kw in self.OPTIONS:
                 self.check(o, **kw)
 
+    def test_key_cache(self):
+        """Keys come from a cache of encoded keys shared by every call
+        (python/mojson/ext/encode.mojo, KeyBytes): it must never change an
+        output, whatever the mode, the keys or their objects' lives."""
+        rng = random.Random(11)
+        wide = {"\u00e9t\u00e9": 1, "\u4e2d": [2], "\U0001f600": {"\u00e9t\u00e9": None}, "plain": "x"}
+        # The same key objects, in both modes, alternately: the cache must
+        # start over when the mode changes.
+        for ensure_ascii in [True, False, True, False, True]:
+            for kw in ({"ensure_ascii": ensure_ascii}, {"ensure_ascii": ensure_ascii, "indent": 1}):
+                self.check(wide, **kw)
+        # A lone surrogate in a key: its text (WTF-8 without ensure_ascii)
+        # is never kept, and dumpb raises as str.encode does, every time.
+        for _ in range(3):
+            self.check({"\ud800": 1, "a": 2})
+            self.check({"\ud800": 1, "a": 2}, ensure_ascii=False)
+            self.assertEqual(outcome(mojson.dumpb, {"\ud800": 1}, ensure_ascii=False)[:2], outcome(lambda o: json.dumps(o, ensure_ascii=False).encode(), {"\ud800": 1})[:2])
+        # Many more keys than slots, and more text than the arena holds:
+        # entries replaced, the arena started over, all through one call.
+        many = {"key-%05d-%s" % (i, "x" * rng.randrange(0, 70)): i for i in range(5000)}
+        for _ in range(2):
+            self.check(many)
+            self.check(many, ensure_ascii=False, sort_keys=True)
+        # Key objects that die and are made again: their addresses come
+        # back for other strings, which must never get the old text.
+        for round in range(300):
+            keys = ["".join(rng.choice("ab\u00e9") for _ in range(rng.randrange(1, 6))) for _ in range(rng.randrange(1, 8))]
+            d = {k + str(round): i for i, k in enumerate(keys)}
+            self.check(d)
+            self.check(d, ensure_ascii=False)
+            del d, keys
+        # str subclasses as keys are written as json writes them, not kept.
+        class S(str):
+            def __str__(self):
+                return "other"
+        self.check({S("k"): 1, "k": 2})
+        # A `default` that changes the dict being written: no reference is
+        # held on scalar values, so this must not crash, and must give
+        # json's result.
+        d = {}
+        def default(o):
+            d.clear()
+            d.update({"z%d" % i: "v" * i for i in range(50)})
+            return "replaced"
+        for _ in range(3):
+            d.clear()
+            d.update({"a": 1, "b": object(), "c": "three", "d": 4.5})
+            want = outcome(json.dumps, d, default=default)
+            d.clear()
+            d.update({"a": 1, "b": object(), "c": "three", "d": 4.5})
+            got = outcome(mojson.dumps, d, default=default)
+            self.assertEqual(got[:3], want[:3])
+
+    def test_output_sizes(self):
+        """Outputs written into the result str itself (ensure_ascii) or
+        into raw memory (the rest), across every size where either grows
+        (from 256 characters and 4096 bytes, doubling), equal json's."""
+        sizes = sorted({n + d for n in (0, 1, 2, 64, 256, 512, 4096, 8192, 65536, 1 << 20) for d in (-40, -3, -2, -1, 0, 1, 2, 40) if n + d >= 0})
+        for n in sizes:
+            for o in ("x" * n, ["\u00e9" * (n // 8), "y" * n], {"k" * min(n, 50): "z" * n}):
+                for kw in ({}, {"ensure_ascii": False}, {"indent": 2}):
+                    self.check(o, **kw)
+
+    def test_raw_text(self):
+        """A `_Raw` str (Decimal's digits, under extended) is written as it
+        is; text past ASCII in one must not land in an ASCII str (0.1.0
+        returned a str that said it was ASCII and held UTF-8 bytes)."""
+        for kw in ({}, {"ensure_ascii": False}):
+            r = mojson.dumps([mojson._Raw("\u00e9t\u00e9"), 1], **kw)
+            self.assertEqual(r, "[\u00e9t\u00e9, 1]")
+            self.assertFalse(r.isascii())
+            self.assertEqual(r.encode("utf-8"), "[\u00e9t\u00e9, 1]".encode("utf-8"))
+            self.assertEqual(mojson.dumpb([mojson._Raw("\u00e9")], **kw), "[\u00e9]".encode("utf-8"))
+        self.assertEqual(mojson.dumps([mojson._Raw("12.50")]), "[12.50]")
+        self.assertTrue(mojson.dumps([mojson._Raw("12.50")]).isascii())
+
     def test_floats(self):
         rng = random.Random(7)
         xs = [random_float(rng) for _ in range(20000 * SCALE)]

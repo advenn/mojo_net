@@ -25,7 +25,8 @@ an integer. Text is built as UTF-8 in one buffer (lone surrogates as
 WTF-8, which the str is decoded from with "surrogatepass")."""
 
 from std.bit import count_leading_zeros, count_trailing_zeros
-from std.memory import pack_bits, unsafe_memcpy
+from std.memory import bitcast, pack_bits, unsafe_memcpy
+from std.os import abort
 
 from json.ryu import shortest
 
@@ -123,6 +124,39 @@ def _copy_small(dst: Pointer[UInt8, MutUntrackedOrigin], src: Pointer[UInt8, _],
 
 
 @inline(.always)
+def _copy_scan(dst: Pointer[UInt8, MutUntrackedOrigin], src: Pointer[UInt8, _], n: Int, high: Bool) -> Int:
+    """Copy `src`'s `n` bytes to `dst` a 32-byte vector at a time, up to
+    the first byte that must be escaped (`_plain_ascii_run`'s set); its
+    index, or `n`. One pass, where a copy and then a scan made two. `dst`
+    has room to 32 bytes past `n`. A vector that would read past the end
+    of `src` is loaded whole only when it stays inside one 4 KiB page
+    (which a read past a str's characters cannot fault on); else its bytes
+    are gathered one by one."""
+    var i = 0
+    while i < n:
+        var v: SIMD[DType.uint8, 32]
+        if n - i >= 32 or ((Int(src) + i) & 4095) <= 4096 - 32:
+            v = src.unsafe_load[width=32](i)
+        else:
+            v = SIMD[DType.uint8, 32](0)
+            for k in range(n - i):
+                v[k] = src[unsafe_offset=i + k]
+        dst.unsafe_store(i, v)
+        var special = (
+            v.lt(SIMD[DType.uint8, 32](0x20)) | v.eq(SIMD[DType.uint8, 32](34)) | v.eq(SIMD[DType.uint8, 32](92))
+        )
+        if high:
+            special = special | v.ge(SIMD[DType.uint8, 32](0x7F))
+        var bits = pack_bits[DType.uint32](special)
+        if n - i < 32:
+            bits &= (UInt32(1) << UInt32(n - i)) - 1
+        if bits != 0:
+            return i + Int(count_trailing_zeros(bits))
+        i += 32
+    return n
+
+
+@inline(.always)
 def _first_special(q: Pointer[UInt8, MutUntrackedOrigin], n: Int, high: Bool) -> Int:
     """`_plain_ascii_run` over our own buffer, which has 32 bytes to read
     past `n`: vectors only, the bytes past `n` masked off."""
@@ -143,28 +177,102 @@ def _first_special(q: Pointer[UInt8, MutUntrackedOrigin], n: Int, high: Bool) ->
     return n
 
 
+comptime _STR_START = 256
+"""Characters a str written into starts with (`Out.into_str`)."""
+
+
 struct Out(Movable):
-    """The text being written: a list's buffer, written through a pointer.
+    """The text being written, through a pointer, into one of two stores:
+
+    - raw memory (`PyMem_RawMalloc`, kept by the `Codec` between calls),
+      grown by `PyMem_RawRealloc`: realloc moves a large block's pages
+      rather than copying them, where a new block and a copy (as a `List`
+      grows) wrote and faulted in every page again;
+    - the characters of a new ASCII str (`into_str`, for ensure_ascii
+      output) or bytes object (`into_bytes`, for dumpb), grown by
+      `PyUnicode_Resize` or `_PyBytes_Resize`, which realloc too: the
+      object is the result, with no copy at the end.
+
+    On a 1 GB document, the List and the final copy cost 1.2 million page
+    faults and 1.2 s in the kernel per dumps.
+
     `reserve` makes room once (per string, per number); `put` and `copy`
     then write without checks, and `byte` and `bytes` check for
-    themselves. While it is written, the list's length is its capacity,
-    so that AddressSanitizer's container checks see no write past it;
-    `finish` sets the length to the text's."""
+    themselves. Writes may reach 32 bytes past what they count, within
+    what was reserved."""
 
-    var list: List[UInt8]
+    var api: ApiPtr
     var p: Pointer[UInt8, MutUntrackedOrigin]
     var n: Int
     var cap: Int
+    var raw: Int
+    """The raw block (0 for none yet), and its size."""
+    var raw_cap: Int
+    var obj: Obj
+    """The str or bytes object written into (0: the raw block)."""
+    var bytes_obj: Bool
 
-    def __init__(out self, var list: List[UInt8]):
-        self.list = list^
-        self.list.clear()
-        if self.list.capacity() < 256:
-            self.list.reserve(256)
-        self.list.resize(unsafe_uninit_length=self.list.capacity())
-        self.p = self.list.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
+    def __init__(out self, api: ApiPtr, raw: Int, raw_cap: Int):
+        """Raw memory: `raw` (`raw_cap` bytes, from PyMem_RawMalloc), or
+        a new block when 0."""
+        self.api = api
+        self.raw = raw
+        self.raw_cap = raw_cap
+        if self.raw == 0:
+            self.raw_cap = 4096
+            self.raw = api[].PyMem_RawMalloc(self.raw_cap)
+            if self.raw == 0:
+                abort("mojson: out of memory")
+        self.p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=self.raw)
         self.n = 0
-        self.cap = self.list.capacity()
+        self.cap = self.raw_cap
+        self.obj = 0
+        self.bytes_obj = False
+
+    def into_bytes(mut self):
+        """Write into a new bytes object from here on (before anything is
+        written); the raw block stays where it was if it cannot be made."""
+        ref api = self.api[]
+        var b = api.PyBytes_FromStringAndSize(0, _STR_START)
+        if not b:
+            api.PyErr_Clear()
+            return
+        self.obj = b
+        self.bytes_obj = True
+        self.p = buf(api.PyBytes_AsString(b)).unsafe_origin_cast[MutUntrackedOrigin]()
+        self.cap = _STR_START
+
+    def into_str(mut self):
+        """Write into a new ASCII str from here on (before anything is
+        written); the raw block stays where it was if it cannot be made."""
+        ref api = self.api[]
+        var s = api.PyUnicode_New(_STR_START, 127)
+        if not s:
+            api.PyErr_Clear()
+            return
+        self.obj = s
+        self.p = buf(str_data(s)).unsafe_origin_cast[MutUntrackedOrigin]()
+        self.cap = _STR_START
+
+    def take(mut self) -> Obj:
+        """The str or bytes written into, cut to the text: its owner's now
+        (0 on a failure, Python's error set)."""
+        var s = self.obj
+        self.obj = 0
+        if self.bytes_obj:
+            # (_PyBytes_Resize releases the object when it fails.)
+            return s if self.api[]._PyBytes_Resize(out(s), self.n) == 0 else 0
+        if self.api[].PyUnicode_Resize(out(s), self.n) != 0:
+            self.api[].Py_DecRef(s)
+            return 0
+        return s
+
+    def drop(mut self):
+        """Release the str or bytes written into, if any (after a
+        failure, or when the text must be decoded instead)."""
+        if self.obj != 0:
+            self.api[].Py_DecRef(self.obj)
+            self.obj = 0
 
     @inline(.always)
     def reserve(mut self, k: Int):
@@ -173,11 +281,27 @@ struct Out(Movable):
 
     @no_inline
     def _grow(mut self, k: Int):
-        self.list.resize(unsafe_uninit_length=self.n)
-        self.list.reserve(max(2 * self.cap, self.n + k))
-        self.list.resize(unsafe_uninit_length=self.list.capacity())
-        self.p = self.list.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
-        self.cap = self.list.capacity()
+        ref api = self.api[]
+        var want = max(2 * self.cap, self.n + k)
+        if self.obj != 0:
+            var s = self.obj
+            if self.bytes_obj:
+                if api._PyBytes_Resize(out(s), want) != 0:
+                    abort("mojson: out of memory")
+                self.p = buf(api.PyBytes_AsString(s)).unsafe_origin_cast[MutUntrackedOrigin]()
+            else:
+                if api.PyUnicode_Resize(out(s), want) != 0:
+                    abort("mojson: out of memory")
+                self.p = buf(str_data(s)).unsafe_origin_cast[MutUntrackedOrigin]()
+            self.obj = s
+        else:
+            var b = api.PyMem_RawRealloc(self.raw, want)
+            if b == 0:
+                abort("mojson: out of memory")
+            self.raw = b
+            self.raw_cap = want
+            self.p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=b)
+        self.cap = want
 
     @inline(.always)
     def put(mut self, b: UInt8):
@@ -192,6 +316,15 @@ struct Out(Movable):
         self.n += count
 
     @inline(.always)
+    def word(mut self, w: UInt64, k: Int):
+        """The `k` (at most 8) low bytes of `w`, in memory order (little
+        endian, as x86_64 and aarch64 Linux are): one 8-byte store, room
+        for all 8 reserved."""
+        self.reserve(8)
+        self.p.unsafe_store(self.n, bitcast[DType.uint8, 8](w))
+        self.n += k
+
+    @inline(.always)
     def byte(mut self, b: UInt8):
         self.reserve(1)
         self.put(b)
@@ -201,8 +334,84 @@ struct Out(Movable):
         self.reserve(len(s))
         self.copy(s.unsafe_ptr(), len(s))
 
-    def finish(mut self):
-        self.list.resize(unsafe_uninit_length=self.n)
+
+
+def _packed(s: List[UInt8]) -> Tuple[UInt64, Int]:
+    """`s` as one little-endian word and its length, or (0, -1) past 8
+    bytes."""
+    if len(s) > 8:
+        return (UInt64(0), -1)
+    var w: UInt64 = 0
+    for i in range(len(s)):
+        w |= UInt64(s[i]) << UInt64(8 * i)
+    return (w, len(s))
+
+
+comptime _KEYS = 4096
+"""Slots in `KeyBytes` (a power of two). Direct-mapped: the keys of a dict
+of 159 (a BestBuy product) collided in a quarter of 512 slots, and
+colliding keys pushed each other out on every product."""
+comptime _KEY_TEXT = 6 * 64 + 2
+"""The longest quoted key kept: 64 characters at their longest escape."""
+comptime _KEY_ARENA = 1 << 18
+"""Bytes of quoted keys kept before `KeyBytes` starts over."""
+
+
+struct KeyBytes(Movable):
+    """Dict keys already written, by object, as the decoder's `KeyCache`
+    keeps keys read: exact str objects with their quoted text, in the
+    `ensure_ascii` mode they were written in. Each object is held by a
+    reference while it is here, so that no other object can take its
+    address. Shared by every dumps call; a key is looked up by its
+    address, and its text copied, in place of writing it again."""
+
+    var objs: List[Obj]
+    var off: List[Int32]
+    var size: List[Int32]
+    var text: List[UInt8]
+    var used: List[Int32]
+    """The slots filled since the last `clear` (each once)."""
+    var ascii: Int
+    """The mode the texts are in: 1 for ensure_ascii, 0 not, -1 none yet."""
+
+    def __init__(out self):
+        self.objs = List[Obj](length=_KEYS, fill=0)
+        self.off = List[Int32](length=_KEYS, fill=0)
+        self.size = List[Int32](length=_KEYS, fill=0)
+        self.text = List[UInt8](capacity=_KEY_ARENA + 32)
+        self.used = List[Int32]()
+        self.ascii = -1
+
+    def clear(mut self, ref api: Api):
+        """Forget every key, releasing its object."""
+        for i in self.used:
+            var slot = Int(i)
+            if self.objs[slot] != 0:
+                api.Py_DecRef(self.objs[slot])
+                self.objs[slot] = 0
+        self.used.clear()
+        self.text.clear()
+
+    def mode(mut self, ref api: Api, ensure_ascii: Bool):
+        """Start over unless the texts are in this call's mode."""
+        if self.ascii != Int(ensure_ascii):
+            self.clear(api)
+            self.ascii = Int(ensure_ascii)
+
+
+@inline(.always)
+def _copy_blocks(dst: Pointer[UInt8, MutUntrackedOrigin], src: Pointer[UInt8, _], n: Int):
+    """`n` bytes a 32-byte block at a time: both `dst` and `src` must have
+    room to 32 bytes past `n` (the arena of `KeyBytes`, a reserved `Out`)."""
+    var i = 0
+    while i < n:
+        dst.unsafe_store(i, src.unsafe_load[width=32](i))
+        i += 32
+
+
+@inline(.always)
+def _key_slot(k: Obj) -> Int:
+    return Int((UInt64(k) * 0x9E3779B97F4A7C15) >> UInt64(52))
 
 
 struct EncState(Movable):
@@ -216,19 +425,41 @@ struct EncState(Movable):
     var level: Int
     var wtf8: Bool
     """A lone surrogate was written (the text is WTF-8, not UTF-8)."""
+    var nonascii: Bool
+    """Bytes past ASCII were written as they are (a `raw_type` text), even
+    under ensure_ascii."""
     var int_repr: Obj
     """`int.__repr__`, for int subclasses."""
     var raw_type: Obj
     """A str subclass whose text is written as it is (0: none)."""
     var opts: Options
+    var keys: Pointer[KeyBytes, MutUntrackedOrigin]
+    var item_word: UInt64
+    var item_len: Int
+    """`opts.item_sep` as one word, or -1 when longer than 8 bytes."""
+    var key_word: UInt64
+    var key_len: Int
 
-    def __init__(out self, api: ApiPtr, int_repr: Obj, raw_type: Obj, var buffer: List[UInt8], var opts: Options):
+    def __init__(
+        out self,
+        api: ApiPtr,
+        int_repr: Obj,
+        raw_type: Obj,
+        raw: Int,
+        raw_cap: Int,
+        var opts: Options,
+        keys: Pointer[KeyBytes, MutUntrackedOrigin],
+    ):
         self.api = api
+        self.item_word, self.item_len = _packed(opts.item_sep)
+        self.key_word, self.key_len = _packed(opts.key_sep)
         self.opts = opts^
-        self.o = Out(buffer^)
+        self.keys = keys
+        self.o = Out(api, raw, raw_cap)
         self.path = List[Obj]()
         self.level = 0
         self.wtf8 = False
+        self.nonascii = False
         self.int_repr = int_repr
         self.raw_type = raw_type
 
@@ -249,6 +480,34 @@ struct Encoder(TrivialRegisterPassable):
     @inline(.always)
     def _put(self, s: StaticString):
         self.s[].o.bytes(s.as_bytes())
+
+    @inline(.always)
+    def _null(self):
+        self.s[].o.word(0x6C6C756E, 4)  # null
+
+    @inline(.always)
+    def _true(self):
+        self.s[].o.word(0x65757274, 4)  # true
+
+    @inline(.always)
+    def _false(self):
+        self.s[].o.word(0x65736C6166, 5)  # false
+
+    @inline(.always)
+    def _item_sep(self):
+        ref st = self.s[]
+        if st.item_len >= 0:
+            st.o.word(st.item_word, st.item_len)
+        else:
+            st.o.bytes(Span(st.opts.item_sep))
+
+    @inline(.always)
+    def _key_sep(self):
+        ref st = self.s[]
+        if st.key_len >= 0:
+            st.o.word(st.key_word, st.key_len)
+        else:
+            st.o.bytes(Span(st.opts.key_sep))
 
     # ---- scalars -------------------------------------------------------------
 
@@ -393,18 +652,25 @@ struct Encoder(TrivialRegisterPassable):
             var n = str_length(s)
             var kind = str_kind(s)
             var d = str_data(s)
-            self.s[].o.reserve((12 if kind == 4 else 6) * n + 34)
-            self.s[].o.put(34)
+            ref o = self.s[].o
+            o.reserve((12 if kind == 4 else 6) * n + 34)
             if kind == 1:
                 # Copied whole, then scanned where it landed (32 bytes of
                 # room past it); written again from the first character
-                # that needs more than itself.
+                # that needs more than itself. The buffer's pointer and
+                # length are read once (stores through the pointer would
+                # otherwise make the compiler read them again).
                 var p = buf(d)
                 var high = ensure_ascii or not str_is_ascii(s)
-                var start = self.s[].o.n
-                _copy_small(self.s[].o.p.unsafe_offset(start), p, n)
-                var i = _first_special(self.s[].o.p.unsafe_offset(start), n, high)
-                self.s[].o.n = start + i
+                var q = o.p
+                var start = o.n + 1
+                q[unsafe_offset=start - 1] = 34
+                var i = _copy_scan(q.unsafe_offset(start), p, n, high)
+                if i == n:  # (nothing to escape: the common case)
+                    q[unsafe_offset=start + n] = 34
+                    o.n = start + n + 1
+                    return
+                o.n = start + i
                 while i < n:
                     self._char(UInt32(p[unsafe_offset=i]), ensure_ascii)
                     i += 1
@@ -413,10 +679,12 @@ struct Encoder(TrivialRegisterPassable):
                         self.s[].o.copy(p.unsafe_offset(i), j - i)
                     i = j
             elif kind == 2:
+                o.put(34)
                 var p = Pointer[UInt16, MutAnyOrigin](unsafe_from_address=d)
                 for i in range(n):
                     self._char(UInt32(p[unsafe_offset=i]), ensure_ascii)
             else:
+                o.put(34)
                 var p = Pointer[UInt32, MutAnyOrigin](unsafe_from_address=d)
                 for i in range(n):
                     self._char(p[unsafe_offset=i], ensure_ascii)
@@ -492,13 +760,13 @@ struct Encoder(TrivialRegisterPassable):
         ref opts = self.s[].opts
         ref api = self.s[].api[]
         if o == api.none:
-            self._put("null")
+            self._null()
             return
         if o == api.true:
-            self._put("true")
+            self._true()
             return
         if o == api.false:
-            self._put("false")
+            self._false()
             return
         var t = api.type_of(o)
         if t == api.str_type:
@@ -520,7 +788,12 @@ struct Encoder(TrivialRegisterPassable):
             self.write_list(o)
             return
         if t == self.s[].raw_type and t != 0:
+            var start = self.s[].o.n
             self._utf8_of(o)
+            for i in range(start, self.s[].o.n):
+                if self.s[].o.p[unsafe_offset=i] >= 0x80:
+                    self.s[].nonascii = True
+                    break
             return
         var f = api.PyType_GetFlags(t)
         if f & TPFLAGS_UNICODE:
@@ -584,7 +857,7 @@ struct Encoder(TrivialRegisterPassable):
         var i = 0
         while i < load_int(seq + 16):
             if i > 0:
-                self.s[].o.bytes(Span(opts.item_sep))
+                self._item_sep()
                 if opts.has_indent:
                     self._newline()
             var item = api.PyList_GetItem(seq, i) if is_list else api.PyTuple_GetItem(seq, i)
@@ -610,7 +883,10 @@ struct Encoder(TrivialRegisterPassable):
         ref opts = self.s[].opts
         ref api = self.s[].api[]
         var t = api.type_of(k)
-        if t == api.str_type or (api.PyType_GetFlags(t) & TPFLAGS_UNICODE) != 0:
+        if t == api.str_type:
+            self._str_key(k)
+            return True
+        if (api.PyType_GetFlags(t) & TPFLAGS_UNICODE) != 0:
             self.write_str(k, opts.ensure_ascii)
             return True
         var mark = self.s[].o.n
@@ -637,20 +913,71 @@ struct Encoder(TrivialRegisterPassable):
         self.s[].o.byte(34)
         return True
 
+    @inline(.always)
+    def _str_key(self, k: Obj) raises:
+        """An exact str key: its text from `KeyBytes` when it is there,
+        else written, then kept (unless long, or holding a lone surrogate,
+        whose WTF-8 the caller must know of)."""
+        ref st = self.s[]
+        ref keys = st.keys[]
+        var slot = _key_slot(k)
+        if keys.objs.unsafe_ptr()[unsafe_offset=slot] == k:
+            var size = Int(keys.size.unsafe_ptr()[unsafe_offset=slot])
+            st.o.reserve(size + 32)
+            _copy_blocks(
+                st.o.p.unsafe_offset(st.o.n),
+                keys.text.unsafe_ptr().unsafe_offset(Int(keys.off.unsafe_ptr()[unsafe_offset=slot])),
+                size,
+            )
+            st.o.n += size
+            return
+        var start = st.o.n
+        var wtf8 = st.wtf8
+        st.wtf8 = False
+        self.write_str(k, st.opts.ensure_ascii)
+        var surrogate = st.wtf8
+        st.wtf8 = wtf8 or surrogate
+        var size = st.o.n - start
+        if surrogate or size > _KEY_TEXT:
+            return
+        ref api = st.api[]
+        if len(keys.text) + size > _KEY_ARENA:
+            keys.clear(api)
+        var old = keys.objs[slot]
+        if old != 0:
+            api.Py_DecRef(old)
+        else:
+            keys.used.append(Int32(slot))
+        api.Py_IncRef(k)
+        keys.objs[slot] = k
+        keys.off[slot] = Int32(len(keys.text))
+        keys.size[slot] = Int32(size)
+        keys.text.extend(Span[UInt8, MutUntrackedOrigin](unsafe_ptr=st.o.p.unsafe_offset(start), length=size))
+
+    @inline(.always)
+    def _scalar(self, v: Obj) -> Bool:
+        """Whether writing `v` can run no Python code (None, a bool, or an
+        exact str, int or float), so that it needs no reference held."""
+        ref api = self.s[].api[]
+        if v == api.none or v == api.true or v == api.false:
+            return True
+        var t = api.type_of(v)
+        return t == api.str_type or t == api.int_type or t == api.float_type
+
     def _pair(self, k: Obj, v: Obj, mut first: Bool) raises:
         """One pair: the separator (with the indent's line) unless first,
         then the key (or nothing at all, the key skipped) and the value."""
         ref opts = self.s[].opts
         var mark = self.s[].o.n
         if not first:
-            self.s[].o.bytes(Span(opts.item_sep))
+            self._item_sep()
             if opts.has_indent:
                 self._newline()
         if not self._key(k):
             self.s[].o.n = mark
             return
         first = False
-        self.s[].o.bytes(Span(opts.key_sep))
+        self._key_sep()
         self.write(v)
 
     def write_dict(self, o: Obj) raises:
@@ -673,16 +1000,69 @@ struct Encoder(TrivialRegisterPassable):
                 var pos = 0
                 var k: Obj = 0
                 var v: Obj = 0
+                ref st = self.s[]
+                ref keys = st.keys[]
+                var fast = not opts.has_indent and st.item_len >= 0 and st.key_len >= 0
                 while api.PyDict_Next(o, out(pos), out(k), out(v)) != 0:
-                    api.Py_IncRef(k)
+                    # A str key already in `KeyBytes`: the separator, its
+                    # text and the key separator stored at once, room
+                    # reserved once, and a null or bool value with them.
+                    if fast and api.type_of(k) == api.str_type:
+                        var slot = _key_slot(k)
+                        if keys.objs.unsafe_ptr()[unsafe_offset=slot] == k:
+                            var size = Int(keys.size.unsafe_ptr()[unsafe_offset=slot])
+                            st.o.reserve(size + 56)
+                            var q = st.o.p
+                            var n = st.o.n
+                            if not first:
+                                q.unsafe_store(n, bitcast[DType.uint8, 8](st.item_word))
+                                n += st.item_len
+                            first = False
+                            _copy_blocks(
+                                q.unsafe_offset(n),
+                                keys.text.unsafe_ptr().unsafe_offset(Int(keys.off.unsafe_ptr()[unsafe_offset=slot])),
+                                size,
+                            )
+                            n += size
+                            q.unsafe_store(n, bitcast[DType.uint8, 8](st.key_word))
+                            n += st.key_len
+                            if v == api.none:
+                                q.unsafe_store(n, bitcast[DType.uint8, 8](UInt64(0x6C6C756E)))
+                                st.o.n = n + 4
+                                continue
+                            if v == api.true:
+                                q.unsafe_store(n, bitcast[DType.uint8, 8](UInt64(0x65757274)))
+                                st.o.n = n + 4
+                                continue
+                            if v == api.false:
+                                q.unsafe_store(n, bitcast[DType.uint8, 8](UInt64(0x65736C6166)))
+                                st.o.n = n + 5
+                                continue
+                            st.o.n = n
+                            if self._scalar(v):
+                                self.write(v)
+                                continue
+                            api.Py_IncRef(v)
+                            try:
+                                self.write(v)
+                            except e:
+                                api.Py_DecRef(v)
+                                raise e^
+                            api.Py_DecRef(v)
+                            continue
+                    # The key is written before any Python code can run
+                    # (only a value's `default`, or a container's, can),
+                    # so it needs no reference held; nor does a value
+                    # whose writing runs none.
+                    if self._scalar(v):
+                        self._pair(k, v, first)
+                        continue
                     api.Py_IncRef(v)
                     try:
                         self._pair(k, v, first)
                     except e:
-                        api.Py_DecRef(k)
                         api.Py_DecRef(v)
                         raise e^
-                    api.Py_DecRef(k)
                     api.Py_DecRef(v)
             else:
                 var items = api.PyMapping_Items(o)

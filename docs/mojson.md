@@ -2,7 +2,7 @@
 
 `mojson` is a Python package with the standard library json's API whose parsing and writing are done by the Mojo `json` package (`docs/json.md`). It lives in `python/mojson`: a Mojo extension module, `_mojson`, and a small Python layer over it.
 
-**Status: done through Y2**, tested against the standard library's json on CPython 3.12 to 3.15. Its wheels are prepared for TestPyPI (the user's decision, 2026-11-02), and nothing else of the repository is published; like the rest of it, mojson is not meant for production use.
+**Status: done through Y3**, tested against the standard library's json on CPython 3.12 to 3.15. Its wheels are prepared for TestPyPI (the user's decision, 2026-11-02), and nothing else of the repository is published; like the rest of it, mojson is not meant for production use.
 
 ## Use
 ```bash
@@ -60,7 +60,7 @@ Numbers are read as json reads them. Integers are exact at any size, under Pytho
   - an ASCII str with `PyUnicode_New` and a copy, any other through `PyUnicode_DecodeUTF8`;
   - lists filled in place, dicts presized;
   - ASCII keys of up to 64 bytes from a cache of 1,024 str objects shared by every call, each with its hash computed once, as json's per-call memo shares them.
-- **`ext/encode.mojo`** writes into one reused buffer, reserving room once per string, and reads str characters in their own width (1, 2 or 4 bytes).
+- **`ext/encode.mojo`** writes into the result str or bytes itself, or into raw memory (`Out`), reserving room once per string and once per dict pair. It reads str characters in their own width (1, 2 or 4 bytes), and keeps dict keys encoded in `KeyBytes` across calls ("Measured").
 - **`_mojson.mojo`** holds one `Codec` per process: the C API, a reused `Document` and decoder, the key cache, and the text buffer. A call allocates only the objects it returns, and buffers past 1 MiB (a document) or 4 MiB (text) are not kept between calls.
 - **State behind one pointer.** The decoder and the encoder keep their state in a struct and pass a pointer to it. In Mojo 1.2 a struct passed as `mut`, or as `ref` to a mutable value, to a function not inlined was copied in and out of every call; for the encoder's state and options that was half its time (CLAUDE.md, "Mojo 1.2 pitfalls").
 
@@ -94,10 +94,10 @@ Numbers are read as json reads them. Integers are exact at any size, under Pytho
 - **Beyond json:** `rfc8259` refusals and their positions in characters, `max_depth`, `dumpb` (including a lone surrogate's UnicodeEncodeError), and every `extended` type.
 
 ## Measured
-`pixi run -e pyjson bench-json-compare`: each library's best of 7 samples of at least 0.1 s of thread CPU time, pinned to one core of an i5-1145G7 (Tiger Lake), CPython 3.14.
+`pixi run -e pyjson bench-json-compare`: each library's best of 7 samples of at least 0.1 s of thread CPU time, pinned to one core of an i5-1145G7 (Tiger Lake), CPython 3.14, mojson 0.1.2 built as its wheels are (x86-64-v3).
 
 Every library got the same bytes, and its result was checked against json's.
-- The run took four minutes, pinned to one core, under a load average of 7.6 to 9.0: the machine is shared, and other people's Go test suites were running.
+- The run took three minutes, under a load average of 1.3 to 1.4.
 - yyjson's `loads` (its Python binding, 4.x) differs from json's on the five files with text beyond ASCII. Given bytes, it decodes their strings as Latin-1: "Été" comes back as "Ã\x89tÃ©". Its times stand, but its results are wrong. The other libraries match json.
 - simdjson's `loads` builds every object at once, as json does. Its lazy `Parser` is in `docs/json.md`, beside the Mojo parser.
 
@@ -105,38 +105,59 @@ Every library got the same bytes, and its result was checked against json's.
 
 |file|size|json|ujson|simdjson|yyjson|msgspec|orjson|mojson|json / mojson|orjson / mojson|
 |---|---|---|---|---|---|---|---|---|---|---|
-|chunk|220 B|3.64 µs|1.34 µs|1.63 µs|1.07 µs|0.68 µs|0.78 µs|1.09 µs|3.3x|0.72|
-|chat_completion|557 B|5.50 µs|2.45 µs|2.55 µs|1.88 µs|1.45 µs|1.75 µs|2.39 µs|2.3x|0.73|
-|tools_request|3.4 KB|24.4 µs|17.1 µs|16.2 µs|14.4 µs|10.9 µs|12.5 µs|19.8 µs|1.2x|0.63|
-|embeddings|511 KB|12.4 ms|5.23 ms|2.22 ms|1.61 ms|2.37 ms|1.96 ms|2.39 ms|5.2x|0.82|
-|github|55.8 KB|212 µs|186 µs|268 µs|211 µs|191 µs|182 µs|206 µs|1.0x|0.89|
-|twitter|632 KB|4.29 ms|2.38 ms|2.50 ms|1.99 ms|1.82 ms|1.49 ms|2.28 ms|1.9x|0.66|
-|citm_catalog|1.7 MB|10.6 ms|5.95 ms|5.69 ms|5.00 ms|4.86 ms|3.96 ms|4.96 ms|2.1x|0.80|
-|canada|2.3 MB|64.7 ms|19.5 ms|13.2 ms|10.0 ms|12.6 ms|11.3 ms|18.3 ms|3.5x|0.62|
-|recipe_book|30.0 KB|169 µs|99.4 µs|72.8 µs|59.6 µs|70.3 µs|48.5 µs|70.7 µs|2.4x|0.69|
+|chunk|220 B|2.26 µs|0.83 µs|1.15 µs|0.72 µs|0.47 µs|0.58 µs|0.74 µs|3.1x|0.78|
+|chat_completion|557 B|3.61 µs|1.67 µs|1.76 µs|1.27 µs|0.93 µs|1.08 µs|1.30 µs|2.8x|0.83|
+|tools_request|3.4 KB|17.8 µs|12.2 µs|11.8 µs|9.70 µs|7.39 µs|8.22 µs|10.2 µs|1.7x|0.81|
+|embeddings|511 KB|4.94 ms|1.97 ms|859 µs|779 µs|955 µs|728 µs|1.20 ms|4.1x|0.61|
+|github|55.8 KB|151 µs|128 µs|102 µs|84.5 µs|69.6 µs|71.6 µs|81.0 µs|1.9x|0.88|
+|twitter|632 KB|2.86 ms|1.71 ms|1.61 ms|1.11 ms|1.21 ms|1.01 ms|1.36 ms|2.1x|0.74|
+|citm_catalog|1.7 MB|7.23 ms|3.75 ms|4.23 ms|3.08 ms|3.45 ms|2.77 ms|3.04 ms|2.4x|0.91|
+|canada|2.3 MB|29.4 ms|12.1 ms|8.31 ms|5.53 ms|8.49 ms|7.27 ms|9.92 ms|3.0x|0.73|
+|recipe_book|30.0 KB|98.3 µs|61.6 µs|51.6 µs|44.5 µs|45.2 µs|36.6 µs|53.0 µs|1.9x|0.69|
 
 **dumps** (Python objects in, a str out; msgspec and orjson return bytes):
 
 |file|size|json|ujson|yyjson|msgspec|orjson|mojson|json / mojson|orjson / mojson|
 |---|---|---|---|---|---|---|---|---|---|
-|chunk|220 B|3.15 µs|1.07 µs|1.05 µs|0.42 µs|0.28 µs|0.81 µs|3.9x|0.35|
-|chat_completion|557 B|5.44 µs|2.22 µs|1.70 µs|0.70 µs|0.46 µs|1.48 µs|3.7x|0.31|
-|tools_request|3.4 KB|68.2 µs|19.7 µs|11.2 µs|6.95 µs|4.30 µs|11.5 µs|5.9x|0.37|
-|embeddings|511 KB|12.2 ms|3.11 ms|957 µs|1.27 ms|790 µs|1.62 ms|7.5x|0.49|
-|github|55.8 KB|436 µs|140 µs|86.5 µs|48.9 µs|26.4 µs|60.2 µs|7.2x|0.44|
-|twitter|632 KB|1.98 ms|1.49 ms|1.03 ms|407 µs|251 µs|984 µs|2.0x|0.26|
-|citm_catalog|1.7 MB|7.41 ms|4.36 ms|1.99 ms|840 µs|742 µs|2.37 ms|3.1x|0.31|
-|canada|2.3 MB|54.4 ms|17.0 ms|5.57 ms|6.49 ms|4.33 ms|9.53 ms|5.7x|0.45|
-|recipe_book|30.0 KB|121 µs|67.4 µs|30.6 µs|32.9 µs|16.0 µs|39.8 µs|3.0x|0.40|
+|chunk|220 B|2.13 µs|0.73 µs|0.70 µs|0.26 µs|0.19 µs|0.54 µs|3.9x|0.35|
+|chat_completion|557 B|3.18 µs|1.41 µs|1.12 µs|0.47 µs|0.29 µs|0.82 µs|3.9x|0.35|
+|tools_request|3.4 KB|20.3 µs|10.0 µs|5.67 µs|3.54 µs|2.17 µs|4.63 µs|4.4x|0.47|
+|embeddings|511 KB|7.89 ms|2.22 ms|703 µs|886 µs|575 µs|1.13 ms|7.0x|0.51|
+|github|55.8 KB|155 µs|92.8 µs|45.1 µs|29.0 µs|17.1 µs|24.9 µs|6.2x|0.69|
+|twitter|632 KB|1.43 ms|1.04 ms|677 µs|303 µs|187 µs|438 µs|3.3x|0.43|
+|citm_catalog|1.7 MB|3.28 ms|1.98 ms|1.17 ms|604 µs|495 µs|942 µs|3.5x|0.53|
+|canada|2.3 MB|38.5 ms|12.4 ms|4.22 ms|4.26 ms|2.85 ms|6.94 ms|5.5x|0.41|
+|recipe_book|30.0 KB|86.8 µs|50.3 µs|22.6 µs|21.9 µs|12.2 µs|20.4 µs|4.3x|0.60|
 
 What the numbers say:
-- **loads** is 1.0 to 5.2 times as fast as json, and 0.62 to 0.89 of orjson's speed.
+- **loads** is 1.7 to 4.1 times as fast as json, and 0.61 to 0.91 of orjson's speed.
   - The Mojo parse is under a third of a load: about 37,000 of a tools_request load's 158,000 instructions (callgrind).
-  - CPython's own dicts and strs take most of the rest. json pays for those too. github is mostly strs and dicts, and there every library is within 1.3x of json, either way.
-  - canada is 111,080 floats in nested lists. There mojson is 3.5x json, but orjson and yyjson are faster still.
-- **dumps** is 2.0 to 7.5 times as fast as json, and 0.26 to 0.49 of orjson's speed.
+  - CPython's own dicts and strs take most of the rest. json pays for those too.
+- **dumps** is 3.3 to 7.0 times as fast as json, and 0.35 to 0.69 of orjson's speed.
   - It keeps json's exact output, and so its rules: every str is checked for what needs escaping, every key for its type, and the options are honoured. orjson has fewer options.
-  - It writes UTF-8 into one buffer, then copies it into the result. For a str with `ensure_ascii=False`, that copy decodes the UTF-8.
+  - The floats in canada and the embeddings go through Ryū, and then `float.__repr__`'s layout: about 500 instructions a float.
+
+**A 1 GB document** (BestBuy products, Zenodo record 7582191; `loads` from bytes, `dumps` with json's defaults; best of 2 on one core, each library in a process of its own):
+
+| | loads | dumps | peak memory |
+|---|---|---|---|
+| json | 8.3 s | 4.2 s | 5.2 GB |
+| orjson | 3.7 s | 0.76 s (compact bytes) | 5.8 GB |
+| mojson 0.1.0 | 4.7 s | 3.0 s | 5.9 to 6.6 GB |
+| mojson 0.1.2 | 4.7 s | 1.4 s | 5.6 GB |
+
+All four parse it to the same objects, and mojson's text is json's, byte for byte.
+
+**What made dumps faster in 0.1.2** (the BestBuy file: 700,000 dicts of about 160 keys, mostly null):
+- **Memory, at 1 GB.** The output grew as a `List`, which a larger block and a copy replace each time, and the text was then copied once more into the str. That came to 1.2 million page faults and 1.2 s in the kernel per dumps.
+  - The text now goes straight into the str (ensure_ascii) or bytes (dumpb) that is the result. It grows by `PyUnicode_Resize` or `_PyBytes_Resize`, which realloc: a large block's pages move, they are not copied.
+  - The other output goes into raw memory (`PyMem_RawRealloc`).
+  - Down to 250,000 page faults and 0.3 s.
+- **Instructions**, on a 45 MB sample of it under callgrind: 871 million per dumps, down to 434 million.
+  - **Keys.** A dict's keys repeat from dict to dict. `KeyBytes` keeps each exact str key's quoted text, by object, and the dict loop copies it in 32-byte blocks, with the separators and a null or bool value, into room reserved once.
+  - **Separators** are one 8-byte store, not a byte loop.
+  - **References.** None is held on a key, nor on a scalar value: writing those runs no Python code.
+  - **Strings** are copied and scanned in one pass.
 
 ## Release
 mojson's wheels go to **TestPyPI** only. They hold mojson's own files and nothing else of the repository: `mojson/__init__.py`, `mojson/_mojson.so` (about 400 KB), the metadata and the licence. `packaging/mojson` holds what PyPI needs: `pyproject.toml` (the metadata, the CPU targets) and `README.md` (the PyPI page, with the repository's warning).
@@ -166,7 +187,8 @@ mojson's wheels go to **TestPyPI** only. They hold mojson's own files and nothin
 
 ## Milestones
 - **Y1: the json module's API, with its fallbacks; rfc8259, max_depth, dumpb, extended.** Done.
-- **Y2: wheels for TestPyPI**, holding only mojson's files ("Release"). Done; the first upload waits for the pending publisher.
+- **Y2: wheels for TestPyPI**, holding only mojson's files ("Release"). Done: 0.1.0 published 2026-11-02; 0.1.1 adds Python 3.15.
+- **Y3: dumps 1.3 to 2.2 times faster (0.1.2)**: the output written into the result object, keys kept encoded, separators as words ("Measured"). Done. It also fixes 0.1.0's output for a `_Raw` text past ASCII, which went into an ASCII str as UTF-8 bytes.
 - Ideas, not plans:
   - a lazy document for Python (fields read without building the whole tree, as simdjson's `Parser` does);
   - JSON Lines;

@@ -20,7 +20,7 @@ from std.memory import unsafe_memcpy
 
 from ext.capi import Api, Obj, Addr, SURROGATEPASS, buf, cstr, load_int, out, str_data
 from ext.decode import DecState, Decoder, KeyCache, decode
-from ext.encode import EncState, Encoder, Options
+from ext.encode import EncState, Encoder, KeyBytes, Options
 
 comptime _MAX_DEPTH = 512
 """Nesting the fast path parses; deeper text goes to json, which allows
@@ -46,8 +46,12 @@ struct Codec(Movable, Writable):
     var raw_type: Obj
     """The `_Raw` of python/mojson: text written as it is (a Decimal's
     digits)."""
-    var out: List[UInt8]
-    """The text `dumps` builds, reused."""
+    var out_raw: Int
+    """The raw memory `dumps` writes into when not into the str itself
+    (`Out`), kept between calls up to 4 MiB; 0 for none."""
+    var out_cap: Int
+    var keys: KeyBytes
+    """Dict keys `dumps` has written, kept encoded."""
 
     def __init__(out self) raises:
         self.api = Api()
@@ -66,7 +70,9 @@ struct Codec(Movable, Writable):
         self.int_repr = self.api.PyObject_GetAttrString(self.api.int_type, cstr("__repr__"))
         if not self.int_repr:
             raise Error("mojson: int.__repr__ is missing")
-        self.out = List[UInt8]()
+        self.out_raw = 0
+        self.out_cap = 0
+        self.keys = KeyBytes()
 
     @staticmethod
     def py_init(out self: Codec, args: PythonObject, kwargs: PythonObject) raises:
@@ -286,14 +292,26 @@ def _set_fallbacks(py_self: PyObjectPtr, args: PyObjectPtr, kwargs: PyObjectPtr)
 
 
 def _dump(mut codec: Codec, o: Obj, var opts: Options, as_bytes: Bool) -> Obj:
-    """`o` as JSON text: a str, or (`as_bytes`) its UTF-8 bytes."""
+    """`o` as JSON text: a str, or (`as_bytes`) its UTF-8 bytes. ensure_ascii
+    text for a str is written into the str itself (`Out.into_str`); any
+    other into raw memory, then copied (or decoded) into the result."""
     ref api = codec.api
-    var buffer = List[UInt8]()
-    swap(buffer, codec.out)
     var ensure_ascii = opts.ensure_ascii
+    codec.keys.mode(api, ensure_ascii)
     var state = EncState(
-        Pointer(to=codec.api).unsafe_origin_cast[MutUntrackedOrigin](), codec.int_repr, codec.raw_type, buffer^, opts^
+        Pointer(to=codec.api).unsafe_origin_cast[MutUntrackedOrigin](),
+        codec.int_repr,
+        codec.raw_type,
+        codec.out_raw,
+        codec.out_cap,
+        opts^,
+        Pointer(to=codec.keys).unsafe_origin_cast[MutUntrackedOrigin](),
     )
+    codec.out_raw = 0
+    if as_bytes:
+        state.o.into_bytes()
+    elif ensure_ascii and api.fast_str:
+        state.o.into_str()
     var enc = Encoder(Pointer(to=state).unsafe_origin_cast[MutUntrackedOrigin]())
     var ok = True
     try:
@@ -301,14 +319,15 @@ def _dump(mut codec: Codec, o: Obj, var opts: Options, as_bytes: Bool) -> Obj:
     except:
         ok = False
     ref st = state
-    st.o.finish()
     var r: Obj = 0
     if ok:
         var n = st.o.n
-        var p = st.o.list.unsafe_ptr()
-        if as_bytes and not st.wtf8:
+        var p = st.o.p
+        if st.o.obj != 0 and (st.o.bytes_obj and not st.wtf8 or not st.o.bytes_obj and not st.nonascii):
+            r = st.o.take()
+        elif as_bytes and not st.wtf8:
             r = api.PyBytes_FromStringAndSize(Int(p), n)
-        elif ensure_ascii and not st.wtf8 and api.fast_str:
+        elif ensure_ascii and not st.wtf8 and not st.nonascii and api.fast_str:
             r = api.PyUnicode_New(n, 127)
             if r and n > 0:
                 unsafe_memcpy(dest=buf(str_data(r)), src=p, count=n)
@@ -318,10 +337,14 @@ def _dump(mut codec: Codec, o: Obj, var opts: Options, as_bytes: Bool) -> Obj:
                 var b = api.PyUnicode_AsEncodedString(r, cstr("utf-8"), cstr("strict"))
                 api.Py_DecRef(r)
                 r = b
-    swap(st.o.list, codec.out)
+    st.o.drop()
+    # The raw block back to the codec, unless it grew past 4 MiB.
+    if st.o.raw_cap > (1 << 22):
+        api.PyMem_RawFree(st.o.raw)
+    else:
+        codec.out_raw = st.o.raw
+        codec.out_cap = st.o.raw_cap
     _ = state^
-    if codec.out.capacity() > (1 << 22):
-        codec.out = List[UInt8]()
     return r
 
 
