@@ -41,6 +41,9 @@ func main() {
 	s := &fasthttp.Server{Handler: handler, Name: "fasthttp"}
 	serve := func(ln net.Listener) error {
 		fmt.Printf("LISTEN %s pid=%d\n", ln.Addr(), os.Getpid())
+		if cert := os.Getenv("TLS_CERT"); cert != "" { // (HTTPS: run.py's https scenarios)
+			return s.ServeTLS(ln, cert, os.Getenv("TLS_KEY"))
+		}
 		return s.Serve(ln)
 	}
 	var err error

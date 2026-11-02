@@ -7,7 +7,7 @@ with wrk. README.md has the method, the results and how to reproduce them.
     pixi run -e bench bench-server build     # the servers, into bench/server/out/
     pixi run -e bench bench-server check     # each answers, one request and 16 pipelined
     pixi run -e bench bench-server run [--reps 1] [--duration 60] [--warmup 5] [--cooldown 15]
-                                       [--scenarios a,b] [--servers mojo,go]
+                                       [--scenarios a,b] [--servers mojo,go] [--https]
                                        [--server-cpus 2,3,6,7 --wrk-cpus 0,1,4,5]
     pixi run -e bench bench-server pgo       # refresh the Go servers' PGO profiles (default.pgo)
     pixi run -e bench bench-server summary bench/server/out/<time>.json
@@ -25,6 +25,14 @@ reverse order. Each run records requests/s and latency percentiles (wrk
 process in its group, from /proc), wrk's own CPU (near 100% the client, not
 the server, is the limit), and the server CPUs' clock and the package
 temperature, sampled each second. Results go to bench/server/out/<time>.json.
+
+HTTPS (--https, or --scenarios naming https-* ones): the same test over
+TLS, with a throwaway ECDSA P-256 certificate for localhost
+(tests/tls/tls_pki.py), against mojo, nginx (the same OpenSSL 3.5 library
+as mojo), Go's net/http and fasthttp (Go's crypto/tls); hyper is left out,
+since its build has no TLS. https-1cpu-handshakes sends `Connection:
+close`, so every request is a new connection and a full handshake (wrk
+resumes no sessions).
 """
 
 import argparse
@@ -50,15 +58,25 @@ CLK_TCK = os.sysconf("SC_CLK_TCK")
 PIPELINE_LUA = os.path.join(HERE, "pipeline.lua")
 HYPER_BIN = os.path.join(OUT, "hyper-target", "release", "hyper_plaintext")
 
-# (name, server CPUs, connections, requests per write)
+# (name, server CPUs, connections, requests per write, mode): mode is
+# "http", "https", or "handshake" (https with a new connection a request)
 SCENARIOS = [
-    ("1cpu-keepalive", 1, 64, 1),
-    ("1cpu-pipelined", 1, 256, 16),
-    ("1cpu-1024conns", 1, 1024, 1),
-    ("4cpu-keepalive", 4, 256, 1),
-    ("4cpu-pipelined", 4, 256, 16),
+    ("1cpu-keepalive", 1, 64, 1, "http"),
+    ("1cpu-pipelined", 1, 256, 16, "http"),
+    ("1cpu-1024conns", 1, 1024, 1, "http"),
+    ("4cpu-keepalive", 4, 256, 1, "http"),
+    ("4cpu-pipelined", 4, 256, 16, "http"),
 ]
+HTTPS_SCENARIOS = [
+    ("https-1cpu-keepalive", 1, 64, 1, "https"),
+    ("https-1cpu-pipelined", 1, 256, 16, "https"),
+    ("https-4cpu-keepalive", 4, 256, 1, "https"),
+    ("https-1cpu-handshakes", 1, 64, 1, "handshake"),
+]
+ALL_SCENARIOS = SCENARIOS + HTTPS_SCENARIOS
 SERVERS = ("mojo", "go", "fasthttp", "hyper", "nginx")
+NO_TLS = ("hyper",)  # (its build has no TLS)
+TLS_DIR = os.path.join(OUT, "tls")
 GO_SERVERS = {"go": "go", "fasthttp": "fasthttp"}  # (kind: directory under bench/server)
 
 NGINX_CONF = """\
@@ -81,8 +99,8 @@ http {{
     uwsgi_temp_path {dir}/uwsgi;
     scgi_temp_path {dir}/scgi;
     server {{
-        listen 127.0.0.1:{port} reuseport backlog=4096;
-        location = /plaintext {{
+        listen 127.0.0.1:{port} {ssl}reuseport backlog=4096;
+{ssl_conf}        location = /plaintext {{
             default_type text/plain;
             return 200 "Hello, World!";
         }}
@@ -141,14 +159,34 @@ def _mask(cpus):
     return "".join("1" if i in cpus else "0" for i in range(max(cpus), -1, -1))
 
 
-def server_command(kind, port, cpus):
+def scenario_named(name):
+    return [s for s in ALL_SCENARIOS if s[0] == name][0]
+
+
+def tls_files():
+    """(chain, key) of a throwaway certificate for localhost, made once a
+    day (its PKI is valid for two)."""
+    chain, key = os.path.join(TLS_DIR, "good.chain.pem"), os.path.join(TLS_DIR, "good.key")
+    if not os.path.exists(key) or time.time() - os.path.getmtime(key) > 86400:
+        shutil.rmtree(TLS_DIR, ignore_errors=True)
+        subprocess.run([sys.executable, os.path.join(ROOT, "tests", "tls", "tls_pki.py"), TLS_DIR],
+                       check=True, capture_output=True)
+        os.chmod(key, 0o600)  # (the mojo server refuses a key others can read)
+    return chain, key
+
+
+def server_command(kind, port, cpus, tls=False):
     """The argv, environment and number of "LISTEN" lines of one server."""
     workers = len(cpus)
     addr = "127.0.0.1:%d" % port
     env = dict(os.environ)
-    if kind == "mojo":
+    if tls:
+        env["TLS_CERT"], env["TLS_KEY"] = tls_files()
+    if kind == "mojo" or kind == "mojo-b":
+        # (mojo-b: a second mojo build, bench/server/out/plaintext_b, for an
+        # A/B of two versions in one run, alternated like any two servers)
         env["WORKERS"] = "0" if workers == 1 else str(workers)  # (one process, no supervisor)
-        return [os.path.join(OUT, "plaintext"), addr], env, workers
+        return [os.path.join(OUT, "plaintext" if kind == "mojo" else "plaintext_b"), addr], env, workers
     if kind == "go":
         env["GOMAXPROCS"] = str(workers)
         return [os.path.join(OUT, "go_plaintext"), addr], env, 1
@@ -162,8 +200,16 @@ def server_command(kind, port, cpus):
         d = os.path.join(OUT, "nginx")
         os.makedirs(d, exist_ok=True)
         conf = os.path.join(d, "nginx.conf")
+        ssl, ssl_conf = "", ""
+        if tls:
+            chain, key = tls_files()
+            ssl = "ssl "
+            # (as mojo's: no tickets, no session cache, so no resumption)
+            ssl_conf = ("        ssl_certificate %s;\n        ssl_certificate_key %s;\n"
+                        "        ssl_protocols TLSv1.2 TLSv1.3;\n        ssl_session_tickets off;\n"
+                        "        ssl_session_cache off;\n" % (chain, key))
         with open(conf, "w") as f:
-            f.write(NGINX_CONF.format(workers=workers, dir=d, port=port, mask=_mask(cpus)))
+            f.write(NGINX_CONF.format(workers=workers, dir=d, port=port, mask=_mask(cpus), ssl=ssl, ssl_conf=ssl_conf))
         return [shutil.which("nginx"), "-p", d, "-c", conf], env, 0
     raise ValueError(kind)
 
@@ -171,10 +217,10 @@ def server_command(kind, port, cpus):
 class Server:
     """A server in a process group of its own, pinned to `cpus`."""
 
-    def __init__(self, kind, cpus, env=None):
+    def __init__(self, kind, cpus, env=None, tls=False):
         self.kind = kind
         self.port = free_port()
-        argv, base, lines = server_command(kind, self.port, cpus)
+        argv, base, lines = server_command(kind, self.port, cpus, tls)
         base.update(env or {})
         self.p = subprocess.Popen(
             ["taskset", "-c", _cpulist(cpus)] + argv,
@@ -330,11 +376,15 @@ def quiet(args, first):
         window = 5
 
 
-def wrk(port, cpus, conns, pipelined, seconds):
-    url = "http://127.0.0.1:%d/plaintext" % port
+def wrk(port, cpus, conns, pipelined, seconds, mode="http"):
+    # (https by name: the certificate is for localhost, and an address in
+    # SNI is refused, as RFC 6066 says)
+    url = ("http://127.0.0.1:%d/plaintext" if mode == "http" else "https://localhost:%d/plaintext") % port
     threads = min(len(cpus), conns)
     cmd = ["taskset", "-c", _cpulist(cpus), shutil.which("wrk"), "-t%d" % threads, "-c%d" % conns,
            "-d%ds" % seconds, "--timeout", "10s", "--latency"]
+    if mode == "handshake":
+        cmd += ["-H", "Connection: close"]
     if pipelined > 1:
         cmd += ["-s", PIPELINE_LUA, url, "--", str(pipelined)]
     else:
@@ -377,17 +427,17 @@ def parse_wrk(text):
 
 
 def run_one(kind, scenario, cpus, wrk_cpus, args):
-    name, n, conns, pipelined = scenario
+    name, n, conns, pipelined, mode = scenario
     load = os.getloadavg()[0]
-    s = Server(kind, cpus[:n])
+    s = Server(kind, cpus[:n], tls=mode != "http")
     try:
         if args.warmup > 0:
-            wrk(s.port, wrk_cpus, conns, pipelined, args.warmup)
+            wrk(s.port, wrk_cpus, conns, pipelined, args.warmup, mode)
         t0 = s.cpu_ticks()
         b0 = busy_ticks()
         sampler = Sampler(cpus[:n])
         sampler.start()
-        r = wrk(s.port, wrk_cpus, conns, pipelined, args.duration)
+        r = wrk(s.port, wrk_cpus, conns, pipelined, args.duration, mode)
         r.update(sampler.result())
         t1 = s.cpu_ticks()
         b1 = busy_ticks()
@@ -459,7 +509,7 @@ def pgo(args):
         exe = os.path.join(OUT, "%s_plaintext" % kind)
         subprocess.run(["go", "build", "-trimpath", "-pgo=off", "-o", exe, "."], cwd=d, env=env, check=True)
         profiles = []
-        for scenario in SCENARIOS:
+        for scenario in SCENARIOS:  # (plaintext only)
             path = os.path.join(OUT, "%s-%s.pprof" % (kind, scenario[0]))
             s = Server(kind, server_cpus[: scenario[1]], env={"CPUPROFILE": path})
             try:
@@ -476,9 +526,13 @@ def pgo(args):
     build(args)
 
 
-def _exchange(port, payload, responses):
-    """Send `payload`, read until `responses` responses with their bodies."""
-    with socket.create_connection(("127.0.0.1", port), timeout=5) as c:
+def _exchange(port, payload, responses, tls=None):
+    """Send `payload`, read until `responses` responses with their bodies
+    (over TLS with `tls`, an ssl.SSLContext)."""
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+        c = tls.wrap_socket(raw, server_hostname="localhost") if tls else raw
+        if tls:
+            _exchange.negotiated = "%s %s" % (c.version(), c.cipher()[0])
         c.sendall(payload)
         data = b""
         while data.count(b"Hello, World!") < responses:
@@ -490,15 +544,22 @@ def _exchange(port, payload, responses):
 
 
 def check(args):
-    req = b"GET /plaintext HTTP/1.1\r\nHost: bench\r\n\r\n"
     server_cpus, _ = layout(args.server_cpus, args.wrk_cpus)
     failed = False
+    tls = None
+    if args.https:
+        import ssl
+        tls_files()
+        tls = ssl.create_default_context(cafile=os.path.join(TLS_DIR, "root.pem"))
+    req = b"GET /plaintext HTTP/1.1\r\nHost: %s\r\n\r\n" % (b"localhost" if tls else b"bench")
     for kind in args.servers:
+        if tls and kind in NO_TLS:
+            continue
         for n in (1, 4):
-            s = Server(kind, server_cpus[:n])
+            s = Server(kind, server_cpus[:n], tls=tls is not None)
             try:
-                one = _exchange(s.port, req, 1)
-                many = _exchange(s.port, req * 16, 16)
+                one = _exchange(s.port, req, 1, tls)
+                many = _exchange(s.port, req * 16, 16, tls)
             finally:
                 s.stop()
             head = one.split(b"\r\n\r\n", 1)[0].decode()
@@ -507,6 +568,8 @@ def check(args):
             print("%s %s on %d CPU%s: %d bytes a response" % ("ok  " if ok else "FAIL", kind, n, "s" if n > 1 else "", len(one)))
             if n == 1:
                 print("     " + head.replace("\r\n", "\n     "))
+                if tls:
+                    print("     (negotiated: %s)" % _exchange.negotiated)
     sys.exit(1 if failed else 0)
 
 
@@ -549,12 +612,16 @@ def versions(server_cpus, wrk_cpus):
         "rustc": _first_line(["rustc", "--version"]),
         "hyper": _locked(os.path.join(HERE, "hyper", "Cargo.lock"), ["hyper", "tokio", "mimalloc"]),
         "wrk": _first_line(["wrk", "--version"]),
+        "openssl": _first_line(["openssl", "version"]),  # (the library mojo, nginx and wrk load)
     }
 
 
 def run(args):
     server_cpus, wrk_cpus = layout(args.server_cpus, args.wrk_cpus)
-    scenarios = [s for s in SCENARIOS if not args.scenarios or s[0] in args.scenarios]
+    if args.scenarios:
+        scenarios = [s for s in ALL_SCENARIOS if s[0] in args.scenarios]
+    else:
+        scenarios = HTTPS_SCENARIOS if args.https else SCENARIOS
     results = {
         "versions": versions(server_cpus, wrk_cpus),
         "duration_s": args.duration,
@@ -569,6 +636,8 @@ def run(args):
         order = list(args.servers) if rep % 2 == 0 else list(reversed(args.servers))
         for scenario in scenarios:
             for kind in order:
+                if scenario[4] != "http" and kind in NO_TLS:
+                    continue
                 background, waited = quiet(args, first)
                 first = False
                 start = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -595,7 +664,7 @@ def mean_latency_us(r):
     law: wrk is closed-loop, with one request or batch in flight on every
     connection, so it is connections x requests per write / requests per
     second."""
-    _, _, conns, pipelined = [s for s in SCENARIOS if s[0] == r["scenario"]][0]
+    _, _, conns, pipelined, _ = scenario_named(r["scenario"])
     return conns * pipelined / r["rps"] * 1e6
 
 
@@ -617,7 +686,7 @@ def summary(results):
         rps = [r["rps"] for r in rs]
         mhz = [r["server_mhz"]["mean"] for r in rs if "server_mhz" in r]
         others = [r["others_cpus"] for r in rs if "others_cpus" in r]
-        pipelined = [s for s in SCENARIOS if s[0] == scenario][0][3] > 1
+        pipelined = scenario_named(scenario)[3] > 1
         pct = lambda p: "–" if pipelined else _t(med([r["latency_us"][p] for r in rs]))
         print("| %s | %s | %s | %s | %s | %s | %.2f µs | %.0f%% | %s | %s |" % (
             scenario, kind, _k(med(rps)) + ("; %s–%s" % (_k(min(rps)), _k(max(rps))) if len(rps) > 1 else ""),
@@ -644,6 +713,7 @@ def main():
     cpus.add_argument("--wrk-cpus", type=lambda s: [int(c) for c in s.split(",")], default=None)
     c = sub.add_parser("check", parents=[cpus])
     c.add_argument("--servers", type=lambda s: s.split(","), default=list(SERVERS))
+    c.add_argument("--https", action="store_true", help="check the servers over TLS")
     p = sub.add_parser("pgo", parents=[cpus])
     p.add_argument("--servers", type=lambda s: s.split(","), default=list(GO_SERVERS))
     p.add_argument("--seconds", type=int, default=10, help="profiled seconds per scenario")
@@ -657,6 +727,7 @@ def main():
     r.add_argument("--quiet-wait", type=int, default=1800, help="the longest wait, in seconds, before running anyway")
     r.add_argument("--scenarios", type=lambda s: s.split(","), default=[])
     r.add_argument("--servers", type=lambda s: s.split(","), default=list(SERVERS))
+    r.add_argument("--https", action="store_true", help="the https-* scenarios instead of the plaintext ones")
     s = sub.add_parser("summary")
     s.add_argument("file")
     args = ap.parse_args()

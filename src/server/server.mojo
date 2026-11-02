@@ -140,6 +140,8 @@ comptime _SLICE_BYTES = 64 * 1024
 comptime _SLICE_REQUESTS = 128
 """A connection's slice of one turn: bytes read and written, or requests
 answered. Then it waits for the next turn (fairness)."""
+comptime _RECORD = 16 * 1024
+"""The most plaintext one TLS record carries (RFC 8446 5.1)."""
 comptime _KEEP = 16 * 1024
 """Capacity each buffer of an idle connection may keep; larger ones are
 given back when it goes idle (so an idle connection holds about 100 KiB
@@ -835,8 +837,6 @@ struct _Conn(Movable):
     var tls: List[TlsServer]
     """TLS between the socket and the codec: one element, or none (boxed:
     an `Optional` of it would cost a copy per use, CLAUDE.md)."""
-    var tls_plain: ByteBuffer
-    """The codec's output that TLS has not taken yet."""
     var tls_in: List[UInt8]
     """Plaintext TLS delivered that the codec has not taken yet."""
     var tls_in_off: Int
@@ -927,7 +927,6 @@ struct _Conn(Movable):
         self.write_window = 0
         self.handshaking = False
         self.tls = List[TlsServer]()
-        self.tls_plain = ByteBuffer()
         self.tls_in = List[UInt8]()
         self.tls_in_off = 0
         self.established_now = False
@@ -1021,8 +1020,7 @@ struct _Conn(Movable):
                 unsafe_memcpy(dest=chunk.unsafe_ptr(), src=self.tls_in.unsafe_ptr().unsafe_offset(self.tls_in_off), count=n)
                 self.tls_in_off += n
                 if self.tls_in_off == len(self.tls_in):
-                    self.tls[0].wipe(self.tls_in)  # (TB18: plaintext the codec has taken)
-                    self.tls_in.clear()
+                    self.tls[0].recycle(self.tls_in)  # (TB18: wiped; the next record goes in it)
                     self.tls_in_off = 0
                 return n
             var ev: Optional[TlsEvent]
@@ -1064,16 +1062,20 @@ struct _Conn(Movable):
             self.tls[0].feed(Span(chunk)[0 : got.value()])
 
     def _fill(mut self) raises -> Int:
-        """Move output into `out`: the codec's, or with TLS its ciphertext
-        (the codec's output goes into TLS while less than `_HIGH_WATER` of
-        ciphertext waits)."""
+        """Move output into `out`: the codec's, or with TLS its ciphertext.
+        The codec's output goes into TLS straight from the codec's buffer,
+        a record at a time while less than `_HIGH_WATER` of ciphertext
+        waits, so OpenSSL's write buffer, which never shrinks, stays near
+        that (it grew to `TRANSMIT_LIMIT` and stayed, when a large response
+        went in whole)."""
         if len(self.tls) == 0:
             return self.http.poll_transmit(self.out)
         while self.tls[0].pending_transmit() < _HIGH_WATER:
-            if len(self.tls_plain) == 0 and self.http.poll_transmit(self.tls_plain) == 0:
+            var take = min(self.http.pending_transmit(), _RECORD)
+            if take == 0:
                 break
-            var n = self.tls[0].write(self.tls_plain.readable_span())
-            self.tls_plain.consume(n)
+            var n = self.tls[0].write(self.http.transmit_view()[0:take])
+            self.http.consume_transmit(n)
             if n == 0:
                 break
         return self.tls[0].poll_transmit(self.out)
@@ -1082,7 +1084,7 @@ struct _Conn(Movable):
         """Output produced and not yet taken by the socket."""
         var n = len(self.out) + self.http.pending_transmit()
         if len(self.tls) > 0:
-            n += len(self.tls_plain) + self.tls[0].pending_transmit()
+            n += self.tls[0].pending_transmit()
         return n
 
     def flush_alert(mut self):
@@ -1267,8 +1269,6 @@ struct _Conn(Movable):
         if self.out.capacity() > _KEEP:
             self.out = ByteBuffer()
         self.http.trim(_KEEP)
-        if self.tls_plain.capacity() > _KEEP:
-            self.tls_plain = ByteBuffer()
         if self.tls_in.capacity() > _KEEP:
             self.tls_in = List[UInt8]()
 

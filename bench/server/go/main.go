@@ -34,7 +34,12 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("LISTEN %s pid=%d\n", ln.Addr(), os.Getpid())
-	if err := http.Serve(ln, mux); err != nil {
+	if cert := os.Getenv("TLS_CERT"); cert != "" { // (HTTPS: run.py's https scenarios)
+		err = http.ServeTLS(ln, mux, cert, os.Getenv("TLS_KEY"))
+	} else {
+		err = http.Serve(ln, mux)
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

@@ -217,6 +217,12 @@ struct TlsClient(Movable):
 
     # ---- the application's side -----------------------------------------
 
+    def recycle(mut self, mut data: List[UInt8]):
+        """Give back a DATA event's buffer once its plaintext was read: it
+        is wiped, and the next record goes into it (no allocation per
+        record). `data` is left empty."""
+        self._e.recycle(data)
+
     def write(mut self, data: Span[UInt8, _]) raises TlsError -> Int:
         """Encrypt plaintext into records; returns how much was taken, less
         than `len(data)` only while `TRANSMIT_LIMIT` bytes wait to be sent

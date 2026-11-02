@@ -229,6 +229,13 @@ struct Engine(Movable):
     var _early_off: Int
     var _rbuf: List[UInt8]
     """Where records are decrypted (one record)."""
+    var _spare: List[UInt8]
+    """An empty buffer for the next DATA event, given back by its owner
+    once read and wiped (`recycle`): no allocation per record."""
+    var _n: List[Int]
+    """The out-parameter box of the hot calls (BIO_write_ex, BIO_read_ex,
+    SSL_read_ex, SSL_write_ex), one per engine rather than one per call;
+    each call site reads it right after its call, before any other."""
     var _received: Int
     """Ciphertext fed before the handshake ended."""
     var _held: Int
@@ -279,6 +286,8 @@ struct Engine(Movable):
         self._early = List[UInt8]()
         self._early_off = 0
         self._rbuf = List[UInt8](length=MAX_RECORD, fill=0)
+        self._spare = List[UInt8]()
+        self._n = List[Int](length=1, fill=0)
         self._received = 0
         self._held = 0
         self._quiet = 0
@@ -363,7 +372,6 @@ struct Engine(Movable):
         failure, or the peer's close_notify, drops the rest. Raises only
         if the read BIO refuses the bytes (the failure latched too)."""
         ref L = self._lib[]
-        var written = List[Int](length=1, fill=0)
         var off = 0
         while off < len(data):
             if self._failed or self._state == _DONE:
@@ -377,8 +385,8 @@ struct Engine(Movable):
             if self._state == _HANDSHAKE:
                 self._received += k
             L.ERR_clear_error()
-            var rc = L.BIO_write_ex(self._rbio, in_buf(part), k, size_out(written))
-            if rc != 1 or written[0] != k or seam(SEAM_BIO_WRITE) != 0:
+            var rc = L.BIO_write_ex(self._rbio, in_buf(part), k, size_out(self._n))
+            if rc != 1 or self._n[0] != k or seam(SEAM_BIO_WRITE) != 0:
                 raise self.fail(tls_error("tls: BIO_write_ex failed", ErrorKind.OutOfMemory, Category.RESOURCE, L.drain_errors()))
             if self._state == _OPEN:
                 self._quiet += k  # (a data record is taken off as it is read)
@@ -477,10 +485,10 @@ struct Engine(Movable):
             if m <= 0:
                 return total
             out.ensure_writable(m)
-            var got = List[Int](length=1, fill=0)
-            if L.BIO_read_ex(self._wbio, out_buf(out.writable_span()), m, size_out(got)) == 1 and got[0] > 0:
-                out.commit(got[0])
-                total += got[0]
+            if L.BIO_read_ex(self._wbio, out_buf(out.writable_span()), m, size_out(self._n)) == 1 and self._n[0] > 0:
+                var got = self._n[0]
+                out.commit(got)
+                total += got
         except e:
             raise TlsError(e, Category.RESOURCE)
         return total
@@ -512,6 +520,16 @@ struct Engine(Movable):
             _ = seam(SEAM_WIPE)  # (counted by tests)
             self._lib[].OPENSSL_cleanse(buf(data), len(data))
             _ = len(data)  # (the buffer outlives the call)
+
+    def recycle(mut self, mut data: List[UInt8]):
+        """Give back the buffer of a DATA event whose plaintext was read:
+        it is wiped (`wipe`), and the next record's plaintext goes into it,
+        so a connection allocates nothing per record. `data` is left empty
+        (with the smaller of the two buffers)."""
+        self.wipe(data)
+        data.clear()
+        if data.capacity() > self._spare.capacity():
+            swap(data, self._spare)
 
     def wants_input(self) -> Bool:
         """The last `write` took nothing because OpenSSL is in the middle of
@@ -782,17 +800,22 @@ struct Engine(Movable):
         tickets and key updates carry no data, and a key update queues a
         reply in the write BIO."""
         ref L = self._lib[]
-        var got = List[Int](length=1, fill=0)
         while True:
             L.ERR_clear_error()
             var forced = seam(SEAM_READ)
-            var rc = L.SSL_read_ex(self._ssl, buf(self._rbuf), len(self._rbuf), size_out(got)) if forced == 0 else c_int(0)
+            var rc = L.SSL_read_ex(self._ssl, buf(self._rbuf), len(self._rbuf), size_out(self._n)) if forced == 0 else c_int(0)
             if rc == 1:
-                if got[0] > 0:
-                    self._events.append(TlsEvent(TlsEventKind.DATA, List[UInt8](Span(self._rbuf)[0 : got[0]])))
-                    self._held += got[0] + EVENT_COST
-                    self._quiet = max(0, self._quiet - got[0] - self._overhead)  # (one record, read whole)
-                    self._plain += got[0]
+                var got = self._n[0]
+                if got > 0:
+                    # (into the recycled buffer, if its owner gave one back:
+                    # its capacity holds a record, so no allocation)
+                    var data = List[UInt8]()
+                    swap(data, self._spare)
+                    data.extend(Span(self._rbuf)[0:got])
+                    self._events.append(TlsEvent(TlsEventKind.DATA, data^))
+                    self._held += got + EVENT_COST
+                    self._quiet = max(0, self._quiet - got - self._overhead)  # (one record, read whole)
+                    self._plain += got
                 continue
             var err = L.SSL_get_error(self._ssl, rc) if forced == 0 else c_int(forced)  # (TB6)
             if err == SSL_ERROR_WANT_READ and not self._ended:
@@ -828,13 +851,12 @@ struct Engine(Movable):
         which OpenSSL reports before it starts a record: nothing more is
         taken until input comes (`wants_input`)."""
         ref L = self._lib[]
-        var done = List[Int](length=1, fill=0)
         var taken = 0
         while taken < len(data) and Int(L.BIO_ctrl_pending(self._wbio)) < TRANSMIT_LIMIT and seam(SEAM_TRANSMIT_FULL) == 0:
             var n = min(MAX_RECORD, len(data) - taken)
             L.ERR_clear_error()
             var forced = seam(SEAM_WRITE)
-            var rc = L.SSL_write_ex(self._ssl, in_buf(data[taken : taken + n]), n, size_out(done)) if forced == 0 else c_int(0)
+            var rc = L.SSL_write_ex(self._ssl, in_buf(data[taken : taken + n]), n, size_out(self._n)) if forced == 0 else c_int(0)
             if rc != 1:
                 var err = L.SSL_get_error(self._ssl, rc) if forced == 0 else c_int(forced)  # (TB6)
                 if err == SSL_ERROR_WANT_READ and L.SSL_in_init(self._ssl) != 0:
@@ -842,7 +864,7 @@ struct Engine(Movable):
                     self._write_waits = True
                     return taken
                 raise tls_error("tls: encrypting a record failed", ErrorKind.Other, Category.PROTOCOL, String("SSL_get_error ", err, " ", L.drain_errors()))
-            taken += done[0]
+            taken += self._n[0]
         return taken
 
 

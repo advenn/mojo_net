@@ -1175,6 +1175,17 @@ struct ServerConnection(Codec, Copyable):
         """Bytes queued for sending."""
         return len(self._tx)
 
+    def transmit_view(self) -> Span[UInt8, origin_of(self._tx._buf)]:
+        """The bytes queued for sending, in place: for a driver that hands
+        them to something that copies them anyway (TLS encrypts them), with
+        `consume_transmit` for what it took, instead of `poll_transmit`'s
+        copy."""
+        return self._tx.readable_span()
+
+    def consume_transmit(mut self, n: Int) raises IoError:
+        """Drop the first `n` bytes of `transmit_view()`, sent."""
+        self._tx.consume(min(n, len(self._tx)))
+
     def buffered(self) -> Int:
         """Received bytes held and not yet consumed: a partial head, say
         (a driver's timeout tells an idle connection from a slow request

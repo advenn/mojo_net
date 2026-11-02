@@ -9,6 +9,11 @@ With WORKERS > 0 a supervisor runs that many worker processes on one port
 (SO_REUSEPORT), each kept on one CPU of the supervisor's affinity mask.
 Each serving process prints "LISTEN <addr> pid=<pid>" once it is bound.
 SIGTERM stops it gracefully.
+
+With TLS_CERT and TLS_KEY set (a chain and its key, for "localhost"), it
+serves HTTPS instead. The handshake rate limit (`tls_handshake_rate`, a
+protection against handshake floods, 1,000 a second by default) is raised
+so that the handshake scenario measures the server, not the limit.
 """
 
 from std.os import getenv
@@ -18,6 +23,7 @@ from linux.nr import SYS_getpid
 from linux.syscall import syscall0
 from net.addr import SocketAddr
 from server import Handler, Request, Response, Server, ServerConfig, Stop, WorkerConfig, run_workers
+from tls import ServerConfig as TlsConfig
 
 
 struct App(Handler):
@@ -42,8 +48,11 @@ def main() raises:
             return  # the supervisor: its workers have ended
         stop = w.take()
     var addr = String(argv()[1]) if len(argv()) > 1 else String("127.0.0.1:8080")
-    var server = Server(App(), ServerConfig(reuseport=n > 0, server_name="mojo-net"))
+    var cert = getenv("TLS_CERT")
+    var server = Server(App(), ServerConfig(reuseport=n > 0, server_name="mojo-net", tls_handshake_rate=1_000_000))
     server.bind(SocketAddr.parse(addr))
+    if cert.byte_length() > 0:
+        server.serve_tls(TlsConfig(certificate=cert, key=getenv("TLS_KEY"), names=[String("localhost")]))
     server.stop_on(stop^)
     print("LISTEN", server.local_addr(), String("pid=", syscall0(SYS_getpid)), flush=True)
     server.run()

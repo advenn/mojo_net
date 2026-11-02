@@ -20,6 +20,8 @@ decides for itself whether to treat that end as clean, and only after a
 complete message.
 """
 
+from std.memory import unsafe_memcpy
+
 from bytes.buffer import ByteBuffer
 from linux import ErrorKind, IoError
 from linux.time import Deadline, Duration
@@ -380,8 +382,8 @@ struct TlsStream(Movable, Writable):
     def _take(mut self, buf: MutSpan[UInt8, _]) -> Int:
         """Copy plaintext already decrypted into `buf`."""
         var n = min(len(self._data) - self._data_off, len(buf))
-        for i in range(n):
-            buf[i] = self._data[self._data_off + i]
+        if n > 0:
+            unsafe_memcpy(dest=buf.unsafe_ptr(), src=self._data.unsafe_ptr().unsafe_offset(self._data_off), count=n)
         self._data_off += n
         return n
 
@@ -392,8 +394,8 @@ struct TlsStream(Movable, Writable):
         if not ev:
             return False
         if ev.value().kind == TlsEventKind.DATA:
-            self._tls.wipe(self._data)  # (the last record's plaintext, dropped with the event)
             swap(self._data, ev.value().data)
+            self._tls.recycle(ev.value().data)  # (the last record's: wiped, and the next goes in it)
             self._data_off = 0
         elif ev.value().kind == TlsEventKind.CLOSED:
             try:
