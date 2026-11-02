@@ -161,8 +161,7 @@ mojson's wheels go to **TestPyPI** only. They hold mojson's own files and nothin
   - On a manual run with `publish` ticked, it also uploads the tested wheels to TestPyPI by trusted publishing, so no token is stored.
   - Once, before the first upload, register a "pending publisher" on test.pypi.org (Account settings → Publishing). Its fields: project `mojson`, owner `advenn`, repository `mojo_net`, workflow `mojson-wheels.yml`, environment `testpypi`.
   - TestPyPI never takes a version twice, so raise `version` in `packaging/mojson/pyproject.toml` and `__version__` in `python/mojson/__init__.py` together before each upload.
-- **Installed** from TestPyPI with PyPI as a second index, since `mojo-compiler` is only there:
-  `pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ mojson`.
+- **Installed** in two steps: `pip install mojo-compiler==1.2.0` from PyPI, then `pip install -i https://test.pypi.org/simple/ --no-deps mojson`. Anyone can upload to TestPyPI under any free name. A one-line install with PyPI as a second index (`--extra-index-url`) would search TestPyPI for `mojo-compiler` too, and could pick up someone else's package of that name.
 - **No sdist.** Building needs the Mojo toolchain this repository pins, and a user without a matching wheel (macOS, another Python) has no other way to build it.
 
 ## Milestones

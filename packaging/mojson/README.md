@@ -8,16 +8,17 @@ Python's `json` module with its parsing and writing done in [Mojo](https://www.m
 
 ## Install
 
-From TestPyPI, which holds no copy of its dependency, so PyPI is searched too:
+From TestPyPI, in two steps. Its dependency comes from PyPI first; then mojson alone from TestPyPI. Anyone can upload to TestPyPI under any free name, so a one-line install that also searches it for dependencies could pick up someone else's `mojo-compiler`:
 
 ```bash
-pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ mojson
+pip install mojo-compiler==1.2.0
+pip install -i https://test.pypi.org/simple/ --no-deps mojson
 ```
 
 Requirements:
 - **Linux** on x86_64 with AVX2 (Haswell, 2013, or newer), or on aarch64 (Neoverse N1 / Graviton2 or newer); glibc 2.34 or newer.
-- **CPython** 3.12, 3.13 or 3.14, as normally built: the free-threaded build is refused at import.
-- **`mojo-compiler`**, installed with it from PyPI (about 80 MB): it holds the Mojo runtime the extension links, under [Modular's licence](https://www.modular.com/legal/max). mojson ships none of it.
+- **CPython** 3.12, 3.13 or 3.14, as normally built: pip installs no wheel on the free-threaded build, and an import there raises ImportError.
+- **`mojo-compiler`** from PyPI (about 80 MB), the first step above: it holds the Mojo runtime the extension links, under [Modular's licence](https://www.modular.com/legal/max). mojson ships none of it.
 
 ## Use
 
