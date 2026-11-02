@@ -29,11 +29,12 @@ import dataclasses as _dataclasses
 import datetime as _datetime
 import decimal as _decimal
 import enum as _enum
+import functools as _functools
 import json as _json
 import uuid as _uuid
 from json import JSONDecodeError, JSONDecoder, JSONEncoder, decoder, detect_encoding, encoder, scanner
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 # The extension, and Mojo's own module setup inside it, read CPython's
 # object layout as the GIL build lays it out; the free-threaded build's
@@ -164,8 +165,10 @@ def _decimal_text(d):
 
 
 def _dumps_kw(obj, *, skipkeys=False, ensure_ascii=True, check_circular=True, allow_nan=True, cls=None,
-              indent=None, separators=None, default=None, sort_keys=False, extended=False, _as_bytes=False, **kw):
-    """dumps with keyword arguments (the extension calls it)."""
+              indent=None, separators=None, default=None, sort_keys=False, extended=False, _as_bytes=False,
+              _fp=None, **kw):
+    """dumps with keyword arguments (the extension calls it); with `_fp`,
+    dump: the text written to it, as json.dump writes it, None returned."""
     if cls is not None and cls is not JSONEncoder:
         enc = cls(skipkeys=skipkeys, ensure_ascii=ensure_ascii, check_circular=check_circular,
                   allow_nan=allow_nan, indent=indent, separators=separators, default=default,
@@ -173,6 +176,10 @@ def _dumps_kw(obj, *, skipkeys=False, ensure_ascii=True, check_circular=True, al
         if type(enc).encode is not JSONEncoder.encode or type(enc).iterencode is not JSONEncoder.iterencode:
             if extended:
                 enc.default = _extend(enc.default)
+            if _fp is not None:
+                for chunk in enc.iterencode(obj):  # (json.dump's own loop)
+                    _fp.write(chunk)
+                return None
             text = enc.encode(obj)
             return text.encode("utf-8") if _as_bytes else text
         # A subclass that only changes default (or the options): its
@@ -183,9 +190,10 @@ def _dumps_kw(obj, *, skipkeys=False, ensure_ascii=True, check_circular=True, al
         default = enc.default if type(enc).default is not JSONEncoder.default else default
     else:
         if kw:
-            return _json.dumps(obj, skipkeys=skipkeys, ensure_ascii=ensure_ascii, check_circular=check_circular,
-                               allow_nan=allow_nan, indent=indent, separators=separators, default=default,
-                               sort_keys=sort_keys, **kw)
+            write = _json.dumps if _fp is None else _functools.partial(_json.dump, fp=_fp)
+            return write(obj, skipkeys=skipkeys, ensure_ascii=ensure_ascii, check_circular=check_circular,
+                         allow_nan=allow_nan, indent=indent, separators=separators, default=default,
+                         sort_keys=sort_keys, **kw)
         if separators is not None:
             item_sep, key_sep = separators
         elif indent is not None:
@@ -196,14 +204,15 @@ def _dumps_kw(obj, *, skipkeys=False, ensure_ascii=True, check_circular=True, al
         indent = " " * indent
     if type(item_sep) is not str or type(key_sep) is not str or (indent is not None and type(indent) is not str):
         # (json's own TypeError for separators that are not str)
-        text = _json.dumps(obj, skipkeys=skipkeys, ensure_ascii=ensure_ascii, check_circular=check_circular,
-                           allow_nan=allow_nan, indent=indent, separators=(item_sep, key_sep), default=default,
-                           sort_keys=sort_keys)
-        return text.encode("utf-8") if _as_bytes else text
+        write = _json.dumps if _fp is None else _functools.partial(_json.dump, fp=_fp)
+        text = write(obj, skipkeys=skipkeys, ensure_ascii=ensure_ascii, check_circular=check_circular,
+                     allow_nan=allow_nan, indent=indent, separators=(item_sep, key_sep), default=default,
+                     sort_keys=sort_keys)
+        return text.encode("utf-8") if _as_bytes and text is not None else text
     if extended:
         default = _extend(default)
     return _codec.dumps_with(obj, bool(skipkeys), bool(ensure_ascii), bool(check_circular), bool(allow_nan),
-                             indent, item_sep, key_sep, default, bool(sort_keys), _as_bytes)
+                             indent, item_sep, key_sep, default, bool(sort_keys), _as_bytes, _fp)
 
 
 _codec.set_fallbacks(_json.loads, _loads_kw, _dumps_kw, _Refused, _Raw)
@@ -218,8 +227,10 @@ def load(fp, **kw):
 
 
 def dump(obj, fp, **kw):
-    """Write `obj` to `fp` as dumps writes it, in one `fp.write`."""
-    fp.write(dumps(obj, **kw))
+    """Write `obj` to `fp` as json.dump does: `fp.write` takes str pieces,
+    here of about 64 KiB each, so that the whole text is never held at
+    once."""
+    _dumps_kw(obj, _fp=fp, **kw)
 
 
 def dumpb(obj, **kw):

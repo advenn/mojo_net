@@ -486,6 +486,132 @@ class Dumps(unittest.TestCase):
         self.assertEqual(f.getvalue(), json.dumps({"a": [1, "é"]}, ensure_ascii=False))
 
 
+class Reentry(unittest.TestCase):
+    """loads and dumps run Python code (hooks, default, fp.write), which
+    may call them again: a call inside another must not touch the state
+    the outer call is in the middle of (0.1.0 crashed on loads from an
+    object_hook)."""
+
+    def test_loads_inside_hooks(self):
+        inner = json.dumps({"x": [1, 2.5, {"y": "z\u00e9"}], "big": list(range(300))})
+        doc = json.dumps([{"payload": inner, "n": i, "f": i / 3} for i in range(50)])
+        def hook(loads):
+            return lambda d: dict(d, payload=loads(d["payload"])) if "payload" in d else d
+        self.assertEqual(mojson.loads(doc, object_hook=hook(mojson.loads)), json.loads(doc, object_hook=hook(json.loads)))
+        pairs = lambda loads: (lambda ps: [(k, loads(v) if k == "payload" else v) for k, v in ps])
+        self.assertEqual(mojson.loads(doc, object_pairs_hook=pairs(mojson.loads)), json.loads(doc, object_pairs_hook=pairs(json.loads)))
+        num = lambda loads: (lambda t: loads("[%s]" % t)[0] * 2)
+        self.assertEqual(mojson.loads(doc, parse_float=num(mojson.loads), parse_int=num(mojson.loads)),
+                         json.loads(doc, parse_float=num(json.loads), parse_int=num(json.loads)))
+        # Three deep, and a refused text inside (the fallback, from inside).
+        deep = json.dumps({"payload": json.dumps({"payload": json.dumps([1, 2])})})
+        self.assertEqual(mojson.loads(deep, object_hook=hook(mojson.loads)), json.loads(deep, object_hook=hook(json.loads)))
+        bad = json.dumps({"payload": "[1, 2"})
+        self.assertEqual(outcome(mojson.loads, bad, object_hook=hook(mojson.loads))[:3], outcome(json.loads, bad, object_hook=hook(json.loads))[:3])
+
+    def test_dumps_inside_default(self):
+        obj = {"a\u00e9": [1, {"b": object()}], "k": "v", "\u4e2d": object()}
+        for outer, inner in ((True, False), (False, True), (True, True), (False, False)):
+            def default(o, dumps):
+                return dumps({"nested\u00e9": [1, 2], "a\u00e9": "x"}, ensure_ascii=inner)
+            got = mojson.dumps(obj, ensure_ascii=outer, default=lambda o: default(o, mojson.dumps))
+            want = json.dumps(obj, ensure_ascii=outer, default=lambda o: default(o, json.dumps))
+            self.assertEqual(got, want)
+            if outer:
+                self.assertTrue(got.isascii())
+            # And loads inside default, of what dumps wrote.
+            got = mojson.dumps(obj, ensure_ascii=outer, default=lambda o: mojson.loads(mojson.dumps([o.__class__.__name__])))
+            self.assertEqual(got, json.dumps(obj, ensure_ascii=outer, default=lambda o: [o.__class__.__name__]))
+
+
+class DumpStream(unittest.TestCase):
+    """dump writes str pieces of about 64 KiB to fp.write, as the text
+    goes: never a sequence split, every piece a str, json.dump's text."""
+
+    class Pieces(io.StringIO):
+        def __init__(self):
+            super().__init__()
+            self.pieces = []
+
+        def write(self, s):
+            self.pieces.append((type(s), len(s) if isinstance(s, str) else 0))
+            return super().write(s)
+
+    def check(self, o, **kw):
+        f, g = self.Pieces(), self.Pieces()
+        want = outcome(json.dump, o, g, **kw)
+        got = outcome(mojson.dump, o, f, **kw)
+        self.assertEqual(got[:3], want[:3], kw)
+        if want[0] == "ok":
+            self.assertEqual(f.getvalue(), g.getvalue(), kw)
+            self.assertTrue(all(t is str for t, _ in f.pieces), kw)
+        f.pieces = [n for _, n in f.pieces]
+        return f
+
+    def test_corpus(self):
+        for name in corpus_files():
+            with open(os.path.join(CORPUS, name), "rb") as fh:
+                o = json.loads(fh.read())
+            for kw in ({}, {"ensure_ascii": False}, {"indent": 2, "sort_keys": True}):
+                self.check(o, **kw)
+
+    def test_pieces(self):
+        """Characters of 1 to 4 UTF-8 bytes, and lone surrogates, in
+        strings of every length, so that 64 KiB boundaries fall inside
+        sequences."""
+        rng = random.Random(5)
+        alphabet = ["a", "\u00e9", "\u4e2d", "\U0001f600", "\ud800", "\udfff", "\n", '"']
+        items = ["".join(rng.choice(alphabet) for _ in range(rng.randrange(0, 200))) for _ in range(6000)]
+        for kw in ({}, {"ensure_ascii": False}, {"indent": 1, "ensure_ascii": False}):
+            f = self.check({"items": items, "more": [{"k%d" % i: s} for i, s in enumerate(items)]}, **kw)
+            self.assertGreater(len(f.pieces), 3)
+            # Each piece is about 64 KiB, plus at most one item past it.
+            self.assertLess(max(f.pieces), 70000)
+        self.check([], indent=2)
+        self.check("x" * 200000)
+        self.check(["y" * 100000] * 3, ensure_ascii=False)
+
+    def test_files(self):
+        """What fp is: binary, without write, failing, or changing the
+        object being written; each as json.dump treats it."""
+        big = [{"k": "v" * 50, "n": i} for i in range(5000)]
+        for o in ([1, 2], big):
+            self.assertEqual(outcome(mojson.dump, o, io.BytesIO())[:3], outcome(json.dump, o, io.BytesIO())[:3])
+            self.assertEqual(outcome(mojson.dump, o, 42)[:3], outcome(json.dump, o, 42)[:3])
+
+        class Failing(io.StringIO):
+            def write(self, s):
+                if self.tell() > 100000:
+                    raise OSError("disk full")
+                return super().write(s)
+        self.assertEqual(outcome(mojson.dump, big * 5, Failing())[:3], outcome(json.dump, big * 5, Failing())[:3])
+
+        class Changing(io.StringIO):
+            """Empties the object it is given while it is being written."""
+            def __init__(self, target):
+                super().__init__()
+                self.target = target
+
+            def write(self, s):
+                self.target.clear()
+                return super().write(s)
+        d = {"k%d" % i: {"v": "x" * 100, "n": [i] * 10} for i in range(3000)}
+        mojson.dump(d, Changing(d))  # (no crash; the text is whatever is left)
+        l = [{"v": "x" * 100} for i in range(3000)]
+        mojson.dump(l, Changing(l))
+
+    def test_options(self):
+        o = {"b": [1, 2.5, None], "a": "\u00e9", "c": {"d": True}}
+        class Mine(json.JSONEncoder):
+            def iterencode(self, o, _one_shot=False):
+                yield from ("<", *super().iterencode(o), ">")
+        for kw in ({"sort_keys": True}, {"separators": (",", ":")}, {"indent": "\t"}, {"cls": Mine},
+                   {"default": str}, {"skipkeys": True}, {"separators": (1, 2)}, {"bogus": 1}):
+            self.check(o, **kw)
+        self.check({1: 2, (1, 2): 3}, skipkeys=True)
+        self.check({"t": object()})
+
+
 class Extensions(unittest.TestCase):
     def test_rfc8259(self):
         for s, ok in [("[1]", True), ('{"a": 1, "a": 2}', False), ('{"a": 1, "\\u0061": 2}', False), ("NaN", False),

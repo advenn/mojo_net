@@ -25,7 +25,7 @@ an integer. Text is built as UTF-8 in one buffer (lone surrogates as
 WTF-8, which the str is decoded from with "surrogatepass")."""
 
 from std.bit import count_leading_zeros, count_trailing_zeros
-from std.memory import bitcast, pack_bits, unsafe_memcpy
+from std.memory import bitcast, pack_bits, unsafe_memcpy, unsafe_memmove
 from std.os import abort
 
 from json.ryu import shortest
@@ -33,6 +33,7 @@ from json.ryu import shortest
 from .capi import (
     Api,
     Obj,
+    SURROGATEPASS,
     TPFLAGS_DICT,
     TPFLAGS_LIST,
     TPFLAGS_LONG,
@@ -211,6 +212,9 @@ struct Out(Movable):
     var obj: Obj
     """The str or bytes object written into (0: the raw block)."""
     var bytes_obj: Bool
+    var flush_at: Int
+    """Text past this many bytes goes to the sink (`Encoder._flush`), at
+    the next item boundary: `Int.MAX` but for `dump`."""
 
     def __init__(out self, api: ApiPtr, raw: Int, raw_cap: Int):
         """Raw memory: `raw` (`raw_cap` bytes, from PyMem_RawMalloc), or
@@ -228,6 +232,7 @@ struct Out(Movable):
         self.cap = self.raw_cap
         self.obj = 0
         self.bytes_obj = False
+        self.flush_at = Int.MAX
 
     def into_bytes(mut self):
         """Write into a new bytes object from here on (before anything is
@@ -414,6 +419,24 @@ def _key_slot(k: Obj) -> Int:
     return Int((UInt64(k) * 0x9E3779B97F4A7C15) >> UInt64(52))
 
 
+comptime FLUSH_AT = 1 << 16
+"""`dump` hands its text to `fp.write` in pieces of about this many bytes."""
+
+
+@inline(.always)
+def _utf8_cut(p: Pointer[UInt8, MutUntrackedOrigin], n: Int) -> Int:
+    """Where `n` bytes of (W)UTF-8 can be cut so that no sequence is split:
+    `n`, or the start of a last sequence not yet whole."""
+    var j = n - 1
+    while j > 0 and n - j < 4 and (p[unsafe_offset=j] & 0xC0) == 0x80:
+        j -= 1
+    var b = p[unsafe_offset=j]
+    if b < 0x80:
+        return n
+    var need = 2 if b < 0xE0 else (3 if b < 0xF0 else 4)
+    return n if n - j >= need else j
+
+
 struct EncState(Movable):
     """What an `Encoder` writes into and keeps track of."""
 
@@ -428,6 +451,11 @@ struct EncState(Movable):
     var nonascii: Bool
     """Bytes past ASCII were written as they are (a `raw_type` text), even
     under ensure_ascii."""
+    var sink: Obj
+    """`fp.write` for `dump` (0 for none)."""
+    var use_keys: Bool
+    """Keys through `KeyBytes` (not inside another call: its keys may be
+    in another `ensure_ascii` mode)."""
     var int_repr: Obj
     """`int.__repr__`, for int subclasses."""
     var raw_type: Obj
@@ -460,6 +488,8 @@ struct EncState(Movable):
         self.level = 0
         self.wtf8 = False
         self.nonascii = False
+        self.sink = 0
+        self.use_keys = True
         self.int_repr = int_repr
         self.raw_type = raw_type
 
@@ -480,6 +510,37 @@ struct Encoder(TrivialRegisterPassable):
     @inline(.always)
     def _put(self, s: StaticString):
         self.s[].o.bytes(s.as_bytes())
+
+    def _flush(self, final: Bool) raises:
+        """The text written so far to the sink, as a str (`dump`): all of
+        it when `final`, else up to the last whole UTF-8 sequence. Called
+        at item boundaries only, never while a key or value that no
+        reference holds is being written: `fp.write` is Python code, and
+        may change the object being dumped."""
+        ref st = self.s[]
+        ref api = st.api[]
+        var n = st.o.n
+        var cut = n if final else _utf8_cut(st.o.p, n)
+        if cut == 0:
+            return
+        var chunk: Obj
+        if st.opts.ensure_ascii and not st.nonascii and api.fast_str:
+            chunk = api.PyUnicode_New(cut, 127)
+            if chunk:
+                unsafe_memcpy(dest=buf(str_data(chunk)), src=st.o.p, count=cut)
+        else:
+            chunk = api.PyUnicode_DecodeUTF8(Int(st.o.p), cut, cstr(SURROGATEPASS))
+        if not chunk:
+            self._raised()
+        var r = api.PyObject_CallOneArg(st.sink, chunk)
+        api.Py_DecRef(chunk)
+        if not r:
+            self._raised()
+        api.Py_DecRef(r)
+        var rest = n - cut
+        if rest > 0:
+            unsafe_memmove(dest=st.o.p, src=st.o.p.unsafe_offset(cut), count=rest)
+        st.o.n = rest
 
     @inline(.always)
     def _null(self):
@@ -856,6 +917,17 @@ struct Encoder(TrivialRegisterPassable):
             self._newline()
         var i = 0
         while i < load_int(seq + 16):
+            if self.s[].o.n >= self.s[].o.flush_at:
+                # (Before an item is taken: `fp.write` may change the
+                # list, so its length is read again after.)
+                try:
+                    self._flush(False)
+                except e:
+                    api.Py_DecRef(seq)
+                    self._leave()
+                    raise e^
+                if i >= load_int(seq + 16):
+                    break
             if i > 0:
                 self._item_sep()
                 if opts.has_indent:
@@ -883,8 +955,11 @@ struct Encoder(TrivialRegisterPassable):
         ref opts = self.s[].opts
         ref api = self.s[].api[]
         var t = api.type_of(k)
-        if t == api.str_type:
+        if t == api.str_type and self.s[].use_keys:
             self._str_key(k)
+            return True
+        if t == api.str_type:
+            self.write_str(k, opts.ensure_ascii)
             return True
         if (api.PyType_GetFlags(t) & TPFLAGS_UNICODE) != 0:
             self.write_str(k, opts.ensure_ascii)
@@ -1002,8 +1077,14 @@ struct Encoder(TrivialRegisterPassable):
                 var v: Obj = 0
                 ref st = self.s[]
                 ref keys = st.keys[]
-                var fast = not opts.has_indent and st.item_len >= 0 and st.key_len >= 0
-                while api.PyDict_Next(o, out(pos), out(k), out(v)) != 0:
+                var fast = not opts.has_indent and st.item_len >= 0 and st.key_len >= 0 and st.use_keys
+                while True:
+                    # The sink is written to before the next pair is
+                    # taken (borrowed): `fp.write` may change the dict.
+                    if st.o.n >= st.o.flush_at:
+                        self._flush(False)
+                    if api.PyDict_Next(o, out(pos), out(k), out(v)) == 0:
+                        break
                     # A str key already in `KeyBytes`: the separator, its
                     # text and the key separator stored at once, room
                     # reserved once, and a null or bool value with them.
@@ -1073,6 +1154,12 @@ struct Encoder(TrivialRegisterPassable):
                     self._raised()
                 var i = 0
                 while i < load_int(items + 16):
+                    if self.s[].o.n >= self.s[].o.flush_at:
+                        try:
+                            self._flush(False)
+                        except e:
+                            api.Py_DecRef(items)
+                            raise e^
                     var item = api.PyList_GetItem(items, i)
                     var k = api.PyTuple_GetItem(item, 0)
                     var v = api.PyTuple_GetItem(item, 1)

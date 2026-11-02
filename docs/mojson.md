@@ -2,7 +2,7 @@
 
 `mojson` is a Python package with the standard library json's API whose parsing and writing are done by the Mojo `json` package (`docs/json.md`). It lives in `python/mojson`: a Mojo extension module, `_mojson`, and a small Python layer over it.
 
-**Status: done through Y3**, tested against the standard library's json on CPython 3.12 to 3.15. Its wheels are prepared for TestPyPI (the user's decision, 2026-11-02), and nothing else of the repository is published; like the rest of it, mojson is not meant for production use.
+**Status: done through Y4**, tested against the standard library's json on CPython 3.12 to 3.15. Its wheels are prepared for TestPyPI (the user's decision, 2026-11-02), and nothing else of the repository is published; like the rest of it, mojson is not meant for production use.
 
 ## Use
 ```bash
@@ -15,6 +15,7 @@ pixi run -e pyjson bench-json-compare  # mojson beside json, orjson, ujson, msgs
 `import mojson as json` changes nothing but the speed:
 
 - `loads`, `load`, `dumps` and `dump` take json's arguments (`cls`, the hooks, `strict`, `indent`, `separators`, `default`, `sort_keys`, ...) and give json's results, byte for byte.
+- `dump` writes as json.dump does, in str pieces to `fp.write`: of about 64 KiB, as the text goes, so the whole text is never held. Writing a 1 GB document took no memory past the objects, where `fp.write(dumps(obj))` took 2.1 GB more (the str, and its encoding into the file).
 - They raise json's exceptions: `JSONDecodeError` is json's own class, with json's messages and positions.
 - `JSONDecoder`, `JSONEncoder`, `detect_encoding` and the `decoder`, `encoder` and `scanner` modules are json's, re-exported.
 
@@ -188,6 +189,9 @@ mojson's wheels go to **TestPyPI** only. They hold mojson's own files and nothin
 ## Milestones
 - **Y1: the json module's API, with its fallbacks; rfc8259, max_depth, dumpb, extended.** Done.
 - **Y2: wheels for TestPyPI**, holding only mojson's files ("Release"). Done: 0.1.0 published 2026-11-02; 0.1.1 adds Python 3.15.
+- **Y4: a streaming dump, and calls inside calls (0.1.3).** Done.
+  - `dump` hands str pieces of about 64 KiB to `fp.write`, between items only: never while a key or value is being written, since `fp.write` may change the object being dumped, and the dict loop holds no reference on its keys and scalars. A piece never splits a UTF-8 sequence.
+  - loads and dumps run Python code (hooks, `default`, `fp.write`), which may call them again. 0.1.0 to 0.1.2 crashed on a `loads` inside an `object_hook`: the inner call parsed into the document the outer one was walking. A call inside another now gets a `Document`, `DecState` and raw memory of its own, and no `KeyBytes`, whose texts may be in the other `ensure_ascii` mode (`Codec.busy`).
 - **Y3: dumps 1.3 to 2.2 times faster (0.1.2)**: the output written into the result object, keys kept encoded, separators as words ("Measured"). Done. It also fixes 0.1.0's output for a `_Raw` text past ASCII, which went into an ASCII str as UTF-8 bytes.
 - Ideas, not plans:
   - a lazy document for Python (fields read without building the whole tree, as simdjson's `Parser` does);

@@ -20,7 +20,7 @@ from std.memory import unsafe_memcpy
 
 from ext.capi import Api, Obj, Addr, SURROGATEPASS, buf, cstr, load_int, out, str_data
 from ext.decode import DecState, Decoder, KeyCache, decode
-from ext.encode import EncState, Encoder, KeyBytes, Options
+from ext.encode import FLUSH_AT, EncState, Encoder, KeyBytes, Options
 
 comptime _MAX_DEPTH = 512
 """Nesting the fast path parses; deeper text goes to json, which allows
@@ -46,6 +46,12 @@ struct Codec(Movable, Writable):
     var raw_type: Obj
     """The `_Raw` of python/mojson: text written as it is (a Decimal's
     digits)."""
+    var busy: Int
+    """Calls running: loads and dumps run Python code (hooks, `default`,
+    `fp.write`), which may call them again. A call that starts while
+    another runs uses state of its own (a `Document` and `DecState`; no
+    `KeyBytes`, its own raw memory), never the shared state the outer
+    call is in the middle of (0.1.0 crashed on loads from object_hook)."""
     var out_raw: Int
     """The raw memory `dumps` writes into when not into the str itself
     (`Out`), kept between calls up to 4 MiB; 0 for none."""
@@ -72,6 +78,7 @@ struct Codec(Movable, Writable):
             raise Error("mojson: int.__repr__ is missing")
         self.out_raw = 0
         self.out_cap = 0
+        self.busy = 0
         self.keys = KeyBytes()
 
     @staticmethod
@@ -155,19 +162,27 @@ struct _Refused(Movable):
         self.offset = -1
 
 
-def _parse_and_decode(mut codec: Codec, s: Obj, strict: Bool, rfc8259: Bool, max_depth: Int, mut why: _Refused) -> Obj:
-    """The fast path: `s` parsed (strictly, by RFC 8259, with `rfc8259`;
-    else as json reads) and made into objects by `codec.dec`, which the
-    caller has reset (`Codec.decoder`) and given its hooks; -1 when the
-    parse refused it (`why`: 0 when it is not text the fast path reads at
-    all) or it is the fallback's to read, 0 when Python raised."""
-    ref api = codec.api
+def _parse_and_decode(
+    ref api: Api,
+    mut doc: Document,
+    dec: Pointer[DecState, MutUntrackedOrigin],
+    s: Obj,
+    strict: Bool,
+    rfc8259: Bool,
+    max_depth: Int,
+    mut why: _Refused,
+) -> Obj:
+    """The fast path: `s` parsed into `doc` (strictly, by RFC 8259, with
+    `rfc8259`; else as json reads) and made into objects by `dec`, which
+    the caller has reset and given its hooks; -1 when the parse refused it
+    (`why`: 0 when it is not text the fast path reads at all) or it is the
+    fallback's to read, 0 when Python raised."""
     var ptr: Addr = 0
     var size = 0
     if not _text(api, s, ptr, size) or size > MAX_SIZE:
         return -1
     try:
-        codec.doc.parse(
+        doc.parse(
             Span[UInt8, MutAnyOrigin](unsafe_ptr=buf(ptr), length=size),
             Limits(max_depth=max_depth, max_size=MAX_SIZE),
             Dialect() if rfc8259 else Dialect.python(control_characters=not strict),
@@ -177,12 +192,59 @@ def _parse_and_decode(mut codec: Codec, s: Obj, strict: Bool, rfc8259: Bool, max
         why.message = e.message
         why.offset = e.offset
         return -1
-    var r = decode(Decoder(Pointer(to=codec.dec).unsafe_origin_cast[MutUntrackedOrigin]()), codec.doc)
+    var r = decode(Decoder(dec), doc)
     if size > (1 << 20):
-        codec.doc = Document()  # (no large buffers kept between calls)
+        doc = Document()  # (no large buffers kept between calls)
     else:
-        codec.doc.clear()
+        doc.clear()
     return r
+
+
+def _loads_call(
+    mut codec: Codec,
+    a: Obj,
+    hooks: Bool,
+    strict: Bool,
+    rfc8259: Bool,
+    max_depth: Int,
+    mut why: _Refused,
+) -> Obj:
+    """`_parse_and_decode` of argument 0, with the hooks of arguments 1 to
+    5 when `hooks`: on the codec's own document and decoder, or, inside
+    another call (`Codec.busy`), on ones of its own."""
+    ref api = codec.api
+    var api_ptr = Pointer(to=codec.api).unsafe_origin_cast[MutUntrackedOrigin]()
+    var cache_ptr = Pointer(to=codec.cache).unsafe_origin_cast[MutUntrackedOrigin]()
+    var r: Obj
+    if codec.busy == 0:
+        codec.busy += 1
+        ref dec = codec.decoder().s[]
+        if hooks:
+            _set_hooks(api, dec, a)
+        r = _parse_and_decode(
+            codec.api, codec.doc, Pointer(to=codec.dec).unsafe_origin_cast[MutUntrackedOrigin](), api.PyTuple_GetItem(a, 0), strict, rfc8259, max_depth, why
+        )
+        codec.busy -= 1
+    else:
+        codec.busy += 1
+        var doc = Document()
+        var dec = DecState(api_ptr, cache_ptr, True)
+        if hooks:
+            _set_hooks(api, dec, a)
+        r = _parse_and_decode(
+            codec.api, doc, Pointer(to=dec).unsafe_origin_cast[MutUntrackedOrigin](), api.PyTuple_GetItem(a, 0), strict, rfc8259, max_depth, why
+        )
+        _ = dec^
+        codec.busy -= 1
+    return r
+
+
+def _set_hooks(ref api: Api, mut dec: DecState, a: Obj):
+    dec.object_hook = _hook(api, a, 1)
+    dec.object_pairs_hook = _hook(api, a, 2)
+    dec.parse_float = _hook(api, a, 3)
+    dec.parse_int = _hook(api, a, 4)
+    dec.parse_constant = _hook(api, a, 5)
 
 
 def _refuse(ref codec: Codec, ref why: _Refused) -> Obj:
@@ -211,9 +273,8 @@ def _loads(py_self: PyObjectPtr, args: PyObjectPtr, kwargs: PyObjectPtr) abi("C"
     var kw = _obj(kwargs)
     if (kw != 0 and api.PyDict_Size(kw) > 0) or api.PyTuple_Size(a) != 1:
         return _ptr(api.PyObject_Call(codec.kw_fallback, a, kw))
-    _ = codec.decoder()
     var why = _Refused()
-    var r = _parse_and_decode(codec, api.PyTuple_GetItem(a, 0), True, False, _MAX_DEPTH, why)
+    var r = _loads_call(codec, a, False, True, False, _MAX_DEPTH, why)
     if r == -1:
         return _ptr(api.PyObject_Call(codec.fallback, a, 0))
     return _ptr(r)
@@ -240,12 +301,6 @@ def _loads_with(py_self: PyObjectPtr, args: PyObjectPtr, kwargs: PyObjectPtr) ab
     if api.PyTuple_Size(a) != 9:
         api.fail(api.TypeError, "loads_with takes 9 arguments")
         return _ptr(0)
-    ref hooks = codec.decoder().s[]
-    hooks.object_hook = _hook(api, a, 1)
-    hooks.object_pairs_hook = _hook(api, a, 2)
-    hooks.parse_float = _hook(api, a, 3)
-    hooks.parse_int = _hook(api, a, 4)
-    hooks.parse_constant = _hook(api, a, 5)
     var strict = api.PyTuple_GetItem(a, 6) != api.false
     var rfc8259 = api.PyTuple_GetItem(a, 7) == api.true
     var depth_arg = api.PyTuple_GetItem(a, 8)
@@ -260,7 +315,7 @@ def _loads_with(py_self: PyObjectPtr, args: PyObjectPtr, kwargs: PyObjectPtr) ab
             api.fail(api.ValueError, "max_depth must be a non-negative int")
             return _ptr(0)
     var why = _Refused()
-    var r = _parse_and_decode(codec, api.PyTuple_GetItem(a, 0), strict, rfc8259, max_depth, why)
+    var r = _loads_call(codec, a, True, strict, rfc8259, max_depth, why)
     if r == -1:
         if why.kind != 0 and (rfc8259 or (own_depth and why.kind == JsonError.LIMIT)):
             return _ptr(_refuse(codec, why))
@@ -291,36 +346,54 @@ def _set_fallbacks(py_self: PyObjectPtr, args: PyObjectPtr, kwargs: PyObjectPtr)
     return _ptr(api.new_ref(api.none))
 
 
-def _dump(mut codec: Codec, o: Obj, var opts: Options, as_bytes: Bool) -> Obj:
+def _dump(mut codec: Codec, o: Obj, var opts: Options, as_bytes: Bool, fp: Obj = 0) -> Obj:
     """`o` as JSON text: a str, or (`as_bytes`) its UTF-8 bytes. ensure_ascii
     text for a str is written into the str itself (`Out.into_str`); any
-    other into raw memory, then copied (or decoded) into the result."""
+    other into raw memory, then copied (or decoded) into the result. With
+    `fp`, the text goes to `fp.write` instead, as str pieces of about 64
+    KiB (`Encoder._flush`), and the result is None."""
     ref api = codec.api
     var ensure_ascii = opts.ensure_ascii
-    codec.keys.mode(api, ensure_ascii)
+    var nested = codec.busy > 0
+    codec.busy += 1
+    if not nested:
+        codec.keys.mode(api, ensure_ascii)
     var state = EncState(
         Pointer(to=codec.api).unsafe_origin_cast[MutUntrackedOrigin](),
         codec.int_repr,
         codec.raw_type,
-        codec.out_raw,
-        codec.out_cap,
+        0 if nested else codec.out_raw,
+        0 if nested else codec.out_cap,
         opts^,
         Pointer(to=codec.keys).unsafe_origin_cast[MutUntrackedOrigin](),
     )
-    codec.out_raw = 0
-    if as_bytes:
+    state.use_keys = not nested
+    if not nested:
+        codec.out_raw = 0
+    if fp != 0:
+        state.sink = api.PyObject_GetAttrString(fp, cstr("write"))
+        state.o.flush_at = FLUSH_AT
+    elif as_bytes:
         state.o.into_bytes()
     elif ensure_ascii and api.fast_str:
         state.o.into_str()
     var enc = Encoder(Pointer(to=state).unsafe_origin_cast[MutUntrackedOrigin]())
-    var ok = True
-    try:
-        enc.write(o)
-    except:
-        ok = False
+    var ok = fp == 0 or state.sink != 0
+    if ok:
+        try:
+            enc.write(o)
+            if fp != 0:
+                enc._flush(True)
+        except:
+            ok = False
     ref st = state
     var r: Obj = 0
-    if ok:
+    if fp != 0:
+        if st.sink != 0:
+            api.Py_DecRef(st.sink)
+        if ok:
+            r = api.new_ref(api.none)
+    elif ok:
         var n = st.o.n
         var p = st.o.p
         if st.o.obj != 0 and (st.o.bytes_obj and not st.wtf8 or not st.o.bytes_obj and not st.nonascii):
@@ -338,13 +411,15 @@ def _dump(mut codec: Codec, o: Obj, var opts: Options, as_bytes: Bool) -> Obj:
                 api.Py_DecRef(r)
                 r = b
     st.o.drop()
-    # The raw block back to the codec, unless it grew past 4 MiB.
-    if st.o.raw_cap > (1 << 22):
+    # The raw block back to the codec, unless it grew past 4 MiB, or this
+    # call was inside another.
+    if nested or st.o.raw_cap > (1 << 22):
         api.PyMem_RawFree(st.o.raw)
     else:
         codec.out_raw = st.o.raw
         codec.out_cap = st.o.raw_cap
     _ = state^
+    codec.busy -= 1
     return r
 
 
@@ -374,12 +449,14 @@ def _dumps_with(py_self: PyObjectPtr, args: PyObjectPtr, kwargs: PyObjectPtr) ab
     """`dumps_with(obj, skipkeys, ensure_ascii, check_circular, allow_nan,
     indent, item_separator, key_separator, default, sort_keys, as_bytes)`:
     `indent` None or a str, the separators str, `default` None or a
-    callable; python/mojson checks them as json does."""
+    callable; python/mojson checks them as json does. A twelfth argument,
+    a file (or None), makes it `dump`: the text goes to its `write`."""
     ref codec = _codec(py_self)[]
     ref api = codec.api
     var a = _obj(args)
-    if api.PyTuple_Size(a) != 11:
-        api.fail(api.TypeError, "dumps_with takes 11 arguments")
+    var nargs = api.PyTuple_Size(a)
+    if nargs != 11 and nargs != 12:
+        api.fail(api.TypeError, "dumps_with takes 11 or 12 arguments")
         return _ptr(0)
     var opts = Options()
     opts.skipkeys = api.PyTuple_GetItem(a, 1) == api.true
@@ -398,7 +475,8 @@ def _dumps_with(py_self: PyObjectPtr, args: PyObjectPtr, kwargs: PyObjectPtr) ab
     opts.default = _hook(api, a, 8)
     opts.sort_keys = api.PyTuple_GetItem(a, 9) == api.true
     var as_bytes = api.PyTuple_GetItem(a, 10) == api.true
-    return _ptr(_dump(codec, api.PyTuple_GetItem(a, 0), opts^, as_bytes))
+    var fp = _hook(api, a, 11) if nargs == 12 else 0
+    return _ptr(_dump(codec, api.PyTuple_GetItem(a, 0), opts^, as_bytes, fp))
 
 
 @export

@@ -29,7 +29,7 @@ data = json.loads(body)            # str, bytes or bytearray: json's results and
 text = json.dumps(obj, indent=2)   # json's output, byte for byte
 ```
 
-`load`, `dump`, `JSONDecodeError`, `JSONDecoder` and `JSONEncoder` are there too: the last three are json's own.
+`load`, `dump`, `JSONDecodeError`, `JSONDecoder` and `JSONEncoder` are there too: the last three are json's own. `dump` writes as it goes, in pieces of about 64 KiB, so a large document never takes its whole text in memory.
 
 Beyond json:
 
