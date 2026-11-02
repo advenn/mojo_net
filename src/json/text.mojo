@@ -23,8 +23,12 @@ def utf8_length(s: Span[UInt8, _], i: Int) -> Int:
     byte >= 0x80; 0 when there is none: a stray continuation byte, an
     overlong form, a surrogate (U+D800-U+DFFF), past U+10FFFF, or cut off
     by the end of `s`."""
-    var p = s.unsafe_ptr()
-    var n = len(s)
+    return utf8_length_at(s.unsafe_ptr(), len(s), i)
+
+
+@inline(.always)
+def utf8_length_at(p: Pointer[UInt8, _], n: Int, i: Int) -> Int:
+    """`utf8_length` of the `n` bytes at `p`."""
     var c = p[unsafe_offset=i]
     if c < 0xC2:
         return 0

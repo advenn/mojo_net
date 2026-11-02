@@ -37,12 +37,15 @@ To walk an array: `var c = doc.child(n, 0)`, then `c = doc.next(c)`; an
 object: key `c = n + 1`, its value `c + 1`, the next key `doc.next(c + 1)`.
 """
 
+from std.bit import count_leading_zeros, count_trailing_zeros
 from std.collections import Optional
+from std.memory import bitcast, pack_bits
 from std.sys import get_defined_bool
 
 from .error import JsonError
+from .number import read_float
 from .siphash import siphash13
-from .text import plain_run, utf8_length, write_quoted
+from .text import is_plain, utf8_length_at, write_quoted
 
 comptime DEFAULT_MAX_DEPTH = 128
 comptime DEFAULT_MAX_SIZE = 64 * 1024 * 1024
@@ -157,18 +160,169 @@ struct Limits(TrivialRegisterPassable):
         self.max_size = max_size
 
 
+struct Dialect(TrivialRegisterPassable):
+    """What `parse` accepts beyond RFC 8259, strictly read; nothing by
+    default. `Dialect.python()` accepts what Python's json module reads,
+    for the Python binding (python/mojson) and for text Python wrote."""
+
+    var repeated_keys: Bool
+    """A key twice in one object (both pairs are kept, in order)."""
+    var constants: Bool
+    """`NaN`, `Infinity` and `-Infinity`: numbers (not integers) whose
+    text is the word; `float()` reads them as NaN and the infinities."""
+    var lone_surrogates: Bool
+    """A `\\uD800`-`\\uDFFF` escape outside a pair, and a surrogate
+    encoded in the input as UTF-8 would encode it (ED A0 80 to ED BF BF):
+    kept in the string as those three bytes (WTF-8), which is then not
+    UTF-8. Python decodes them with "surrogatepass"."""
+    var control_characters: Bool
+    """Control characters in strings, unescaped (Python's strict=False)."""
+
+    def __init__(
+        out self,
+        *,
+        repeated_keys: Bool = False,
+        constants: Bool = False,
+        lone_surrogates: Bool = False,
+        control_characters: Bool = False,
+    ):
+        self.repeated_keys = repeated_keys
+        self.constants = constants
+        self.lone_surrogates = lone_surrogates
+        self.control_characters = control_characters
+
+    @staticmethod
+    def python(control_characters: Bool = False) -> Self:
+        """Python's json.loads: repeated keys, the constants and lone
+        surrogates; control characters with `strict=False`."""
+        return Self(repeated_keys=True, constants=True, lone_surrogates=True, control_characters=control_characters)
+
+
+comptime _V = 32
+"""Input bytes a scan for a string's end, or past whitespace, looks at
+at once."""
+comptime _VBits = DType.uint32
+"""`_V` comparisons packed into one integer."""
+
+comptime _SLACK = 64
+"""Bytes `_data` holds past the input's length while parsing, and past its
+text after: strings unescaped and numbers' text never take more bytes than
+the input, so with this slack a scan can store whole vectors, and read 8
+bytes past any key, unchecked. They count in the list's length, so that
+AddressSanitizer's container checks see no access past it."""
+
+comptime _PROBES = 16
+"""Slots a key may probe in `_check_keys`'s table before the object is
+checked by sorting instead (keys chosen to share the public hash)."""
+
+comptime _PARTITIONED = 4096
+"""Objects with more pairs split their keys into 256 buckets by hash
+before the table, so that each bucket's table stays in cache."""
+
+comptime _RUN = 8
+"""Keys of one large object that share a cheap hash are compared pair by
+pair up to this many; a longer run goes through SipHash (`_check_run`)."""
+
+comptime _BytePtr = Pointer[UInt8, MutAnyOrigin]
+comptime _NodePtr = Pointer[_Node, MutAnyOrigin]
+
+
+struct _Fail(Movable):
+    """Where a parse failed, and why: what `Document.parse` raises. It
+    carries the dialect's switches too, since every check that can fail
+    has it at hand, and the switches are read only where a strict parse
+    would fail."""
+
+    var kind: Int
+    var message: StaticString
+    var offset: Int
+    var constants: Bool
+    var surrogates: Bool
+    var controls: Bool
+
+    def __init__(out self, dialect: Dialect):
+        self.kind = 0
+        self.message = ""
+        self.offset = -1
+        self.constants = dialect.constants
+        self.surrogates = dialect.lone_surrogates
+        self.controls = dialect.control_characters
+
+    @no_inline
+    def fail(mut self, message: StaticString, offset: Int, kind: Int = JsonError.SYNTAX) -> Int:
+        """Record the failure; -1, for the caller to return."""
+        self.kind = kind
+        self.message = message
+        self.offset = offset
+        return -1
+
+
+@fieldwise_init
+struct _Open(Copyable, TrivialRegisterPassable):
+    """An array or object open around the one being parsed: its node and
+    its members so far."""
+
+    var node: Int
+    var count: Int
+
+
+comptime SPAN_SLACK = 32
+"""Bytes that can be read past the end of any span `Document.visit` hands
+a `Visitor` (the document's buffer has room after its text), so that a
+visitor can load whole vectors and mask off what lies past the span."""
+
+
+trait Visitor:
+    """What `Document.visit` calls, node by node in document order. The
+    spans are the document's own bytes, valid while it is unchanged:
+    strings unescaped, numbers as written (`integer`: no fraction or
+    exponent); each can be read `SPAN_SLACK` bytes past its end."""
+
+    def null(mut self) raises:
+        ...
+
+    def boolean(mut self, value: Bool) raises:
+        ...
+
+    def number(mut self, text: Span[UInt8, ImmutAnyOrigin], integer: Bool) raises:
+        ...
+
+    def string(mut self, text: Span[UInt8, ImmutAnyOrigin]) raises:
+        ...
+
+    def key(mut self, text: Span[UInt8, ImmutAnyOrigin]) raises:
+        ...
+
+    def begin_array(mut self, count: Int) raises:
+        ...
+
+    def end_array(mut self) raises:
+        ...
+
+    def begin_object(mut self, count: Int) raises:
+        """An object of `count` pairs: `key` then the value, each pair."""
+        ...
+
+    def end_object(mut self) raises:
+        ...
+
+
 struct Document(Copyable, Movable, Writable):
     """Parsed JSON text (see the module docs)."""
 
     var _nodes: List[_Node]
     var _data: List[UInt8]
     """Strings, unescaped, and numbers' text, back to back."""
-    var _stack: List[UInt32]
-    """While parsing: the arrays and objects open."""
+    var _stack: List[_Open]
+    """While parsing: the arrays and objects open around the innermost."""
     var _keys: List[UInt32]
+    """While parsing: the key nodes of the objects open, outermost first."""
+    var _table: List[UInt64]
     var _hashed: List[UInt128]
-    """While parsing: an object's key nodes, and their hashes (high 64
-    bits) with their places in `_keys`, for the repeated-key check."""
+    var _run: List[UInt128]
+    """While checking an object for a repeated key: its keys' hashes (high
+    64 bits) with their places among its keys (`_check_keys`): a table,
+    and, when its keys collide there, sorted lists."""
     var _spare: List[UInt128]
     var _counts: List[UInt32]
 
@@ -176,9 +330,24 @@ struct Document(Copyable, Movable, Writable):
         """An empty document (no nodes); `parse` fills it."""
         self._nodes = List[_Node]()
         self._data = List[UInt8]()
-        self._stack = List[UInt32]()
+        self._stack = List[_Open]()
         self._keys = List[UInt32]()
+        self._table = List[UInt64]()
         self._hashed = List[UInt128]()
+        self._run = List[UInt128]()
+        self._spare = List[UInt128]()
+        self._counts = List[UInt32]()
+
+    def __init__(out self, *, copy: Self):
+        """A copy, with the room past its text that `SPAN_SLACK` promises
+        (`_data` holds it)."""
+        self._nodes = copy._nodes.copy()
+        self._data = copy._data.copy()
+        self._stack = List[_Open]()
+        self._keys = List[UInt32]()
+        self._table = List[UInt64]()
+        self._hashed = List[UInt128]()
+        self._run = List[UInt128]()
         self._spare = List[UInt128]()
         self._counts = List[UInt32]()
 
@@ -193,304 +362,368 @@ struct Document(Copyable, Movable, Writable):
 
     # ---- parsing -----------------------------------------------------------
 
-    def parse(mut self, data: Span[UInt8, _], limits: Limits = Limits()) raises JsonError:
+    def parse(mut self, data: Span[UInt8, _], limits: Limits = Limits(), dialect: Dialect = Dialect()) raises JsonError:
         """Replace the contents with `data` parsed, reusing the buffers.
         On an error the document is left empty."""
         self.clear()
         self._stack.clear()
+        self._keys.clear()
         try:
-            self._parse(data, limits)
+            self._parse(data, limits, dialect)
         except e:
             self.clear()
             raise e^
 
-    def parse(mut self, text: StringSlice, limits: Limits = Limits()) raises JsonError:
-        self.parse(text.as_bytes(), limits)
+    def parse(mut self, text: StringSlice, limits: Limits = Limits(), dialect: Dialect = Dialect()) raises JsonError:
+        self.parse(text.as_bytes(), limits, dialect)
 
-    def _parse(mut self, data: Span[UInt8, _], limits: Limits) raises JsonError:
+    def _parse(mut self, data: Span[UInt8, _], limits: Limits, dialect: Dialect) raises JsonError:
+        """One pass over `data`. Nodes and `_data` are written through raw
+        pointers: `_data` gets the input's length first (strings unescaped
+        and numbers' text never take more), plus `_SLACK` so that scans
+        store whole vectors; `_nodes` grows on demand, checked once per
+        value for the two nodes (a key and a value) written before the
+        next check. The innermost open array or object is kept in `top`,
+        the ones around it in `_stack`. While the scan runs, each list's
+        length covers all it may write (`_nodes` its capacity, `_data` the
+        input plus `_SLACK`); their lengths are set once, at the end, and
+        `_data` keeps its `_SLACK` (`SPAN_SLACK`)."""
         var n = len(data)
         if n > min(limits.max_size, MAX_SIZE):
             raise JsonError(JsonError.LIMIT, "json: the input is over the size limit", 0)
-        var p = data.unsafe_ptr()
-        var i = _ws(data, 0)
+        var err = _Fail(dialect)
+        var r: Int
+        if dialect.repeated_keys:
+            r = self._scan[False](data.unsafe_ptr(), n, limits.max_depth, err)
+        else:
+            r = self._scan[True](data.unsafe_ptr(), n, limits.max_depth, err)
+        if r < 0:
+            raise JsonError(err.kind, err.message, err.offset)
+
+    @no_inline
+    def _scan[keys: Bool](mut self, p: Pointer[UInt8, _], n: Int, max_depth: Int, mut err: _Fail) -> Int:
+        """`_parse`'s pass: 0, or -1 with `err` set. It raises nothing, so
+        that no error is built on the paths that succeed; each check that
+        fails returns `err.fail(...)`. Few values stay live across it (the
+        innermost open array or object is `top` and `count`; while open,
+        an object's node holds where its keys start in `_keys`), so that
+        they fit in registers."""
+        self._data.reserve(n + _SLACK)
+        self._data.resize(unsafe_uninit_length=n + _SLACK)
+        var dp = self._data.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+        var dn = 0
+        if self._nodes.capacity() < n // 16 + 16:
+            self._nodes.reserve(n // 16 + 16)
+        self._nodes.resize(unsafe_uninit_length=self._nodes.capacity())
+        var np = self._nodes.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+        var nlim = self._nodes.capacity() - 2
+        var nn = 0
+        var top = -1  # (none open)
+        var count = 0
+        var i = _skip_ws(p, 0, n)
         while True:
             # A value starts at i.
+            if nn > nlim:
+                np = _grow(self._nodes, nn)
+                nlim = self._nodes.capacity() - 2
             if i >= n:
-                raise JsonError(JsonError.SYNTAX, E_END, i)
+                return err.fail(E_END, i)
             var c = p[unsafe_offset=i]
-            if c == _LBRACE or c == _LBRACKET:
-                if len(self._stack) >= limits.max_depth:
-                    raise JsonError(JsonError.LIMIT, "json: nested deeper than the depth limit", i)
+            if c == _QUOTE:
+                var s0 = dn
+                i = _string(p, n, i, dp, dn, err)
+                if i < 0:
+                    return -1
+                np[unsafe_offset=nn] = _Node(_STR, UInt32(s0), UInt32(dn - s0))
+                nn += 1
+            elif c == _LBRACE or c == _LBRACKET:
+                if (len(self._stack) + 1 if top >= 0 else 0) >= max_depth:
+                    return err.fail("json: nested deeper than the depth limit", i, JsonError.LIMIT)
                 var obj = c == _LBRACE
-                self._stack.append(UInt32(len(self._nodes)))
-                self._nodes.append(_Node(_OBJ if obj else _ARR, 0, 0))
-                i = _ws(data, i + 1)
+                if top >= 0:
+                    self._stack.append(_Open(top, count))
+                top = nn
+                count = 0
+                np[unsafe_offset=nn] = _Node(_OBJ if obj else _ARR, UInt32(len(self._keys)), 1)
+                nn += 1
+                i = _skip_ws(p, i + 1, n)
                 if i < n and p[unsafe_offset=i] == (_RBRACE if obj else _RBRACKET):
                     i += 1
-                    self._close()
+                    np[unsafe_offset=top].a = 0
+                    top, count = self._outer()
                 elif obj:
-                    i = self._key(data, i)
+                    comptime if keys:
+                        self._keys.append(UInt32(nn))
+                    i = _key(p, n, i, np, nn, dp, dn, err)
+                    if i < 0:
+                        return -1
                     continue
                 else:
                     continue
-            elif c == _QUOTE:
-                i = self._string(data, i)
-            elif c == 116:  # t
-                i = _literal(data, i, "true")
-                self._nodes.append(_Node(_TRUE, 0, 0))
-            elif c == 102:  # f
-                i = _literal(data, i, "false")
-                self._nodes.append(_Node(_FALSE, 0, 0))
-            elif c == 110:  # n
-                i = _literal(data, i, "null")
-                self._nodes.append(_Node(_NULL, 0, 0))
             elif c == _MINUS or _is_digit(c):
-                i = self._number(data, i)
+                var s0 = dn
+                var tag = _INT
+                i = _number(p, n, i, dp, dn, tag, err)
+                if i < 0:
+                    return -1
+                np[unsafe_offset=nn] = _Node(tag, UInt32(s0), UInt32(dn - s0))
+                nn += 1
+            elif c == 116:  # t
+                if i + 4 > n or _load4(p, i) != 0x65757274:  # "true"
+                    return err.fail("json: not a JSON value", i)
+                i += 4
+                np[unsafe_offset=nn] = _Node(_TRUE, 0, 0)
+                nn += 1
+            elif c == 102:  # f
+                if i + 5 > n or _load4(p, i + 1) != 0x65736C61:  # "alse"
+                    return err.fail("json: not a JSON value", i)
+                i += 5
+                np[unsafe_offset=nn] = _Node(_FALSE, 0, 0)
+                nn += 1
+            elif c == 110:  # n
+                if i + 4 > n or _load4(p, i) != 0x6C6C756E:  # "null"
+                    return err.fail("json: not a JSON value", i)
+                i += 4
+                np[unsafe_offset=nn] = _Node(_NULL, 0, 0)
+                nn += 1
             else:
-                raise JsonError(JsonError.SYNTAX, "json: not a JSON value", i)
+                var s0 = dn
+                i = _constant(p, n, i, dp, dn, err)
+                if i < 0:
+                    return -1
+                np[unsafe_offset=nn] = _Node(_NUM, UInt32(s0), UInt32(dn - s0))
+                nn += 1
             # A value ended before i: what may follow it.
             while True:
-                i = _ws(data, i)
-                var depth = len(self._stack)
-                if depth == 0:
+                if top < 0:
+                    i = _skip_ws(p, i, n)
                     if i != n:
-                        raise JsonError(JsonError.SYNTAX, "json: more after the value", i)
-                    return
-                var top = Int(self._stack[depth - 1])
-                self._nodes[top].a += 1
+                        return err.fail("json: more after the value", i)
+                    self._nodes.resize(unsafe_uninit_length=nn)
+                    self._data.resize(unsafe_uninit_length=dn + _SLACK)
+                    return 0
+                count += 1
+                i = _skip_ws(p, i, n)
                 if i >= n:
-                    raise JsonError(JsonError.SYNTAX, "json: the input ends inside an array or object", i)
+                    return err.fail("json: the input ends inside an array or object", i)
                 var d = p[unsafe_offset=i]
-                if self._nodes[top].tag == _ARR:
-                    if d == _COMMA:
-                        i = _ws(data, i + 1)
-                        break
-                    if d != _RBRACKET:
-                        raise JsonError(JsonError.SYNTAX, "json: expected ',' or ']'", i)
-                    self._close()
-                else:
-                    if d == _COMMA:
-                        i = self._key(data, _ws(data, i + 1))
-                        break
+                var obj = np[unsafe_offset=top].tag == _OBJ
+                if d == _COMMA:
+                    i = _skip_ws(p, i + 1, n)
+                    if obj:
+                        comptime if keys:
+                            self._keys.append(UInt32(nn))
+                        i = _key(p, n, i, np, nn, dp, dn, err)
+                        if i < 0:
+                            return -1
+                    break
+                if obj:
                     if d != _RBRACE:
-                        raise JsonError(JsonError.SYNTAX, "json: expected ',' or '}'", i)
-                    self._check_keys(top, i)
-                    self._close()
+                        return err.fail("json: expected ',' or '}'", i)
+                    comptime if keys:
+                        var first = Int(np[unsafe_offset=top].a)
+                        if count > 1:
+                            var kp = self._keys.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]().unsafe_offset(first)
+                            if self._check_keys(np, dp, kp, count, i, err) < 0:
+                                return -1
+                        self._keys.resize(unsafe_uninit_length=first)
+                elif d != _RBRACKET:
+                    return err.fail("json: expected ',' or ']'", i)
+                np[unsafe_offset=top].a = UInt32(count)
+                np[unsafe_offset=top].b = UInt32(nn - top)
+                top, count = self._outer()
                 i += 1
 
     @inline(.always)
-    def _close(mut self):
-        var top = Int(self._stack.pop())
-        self._nodes[top].b = UInt32(len(self._nodes) - top)
-
-    def _key(mut self, data: Span[UInt8, _], i: Int) raises JsonError -> Int:
-        """An object's key and its ':' at `i`; returns where the value is."""
-        var n = len(data)
-        if i >= n or data[i] != _QUOTE:
-            raise JsonError(JsonError.SYNTAX, "json: expected a key (a string)", i)
-        var j = _ws(data, self._string(data, i))
-        if j >= n or data[j] != _COLON:
-            raise JsonError(JsonError.SYNTAX, "json: expected ':' after a key", j)
-        return _ws(data, j + 1)
-
-    def _string(mut self, data: Span[UInt8, _], i: Int) raises JsonError -> Int:
-        """The string whose '"' is at `i`, unescaped into `_data`; returns
-        the index after its closing '"'."""
-        var n = len(data)
-        var p = data.unsafe_ptr()
-        var start = len(self._data)
-        var j = i + 1
-        while True:
-            var k = plain_run(data, j)
-            if k > j:
-                self._data.extend(data[j:k])
-            if k >= n:
-                raise JsonError(JsonError.SYNTAX, "json: the input ends inside a string", n)
-            var b = p[unsafe_offset=k]
-            if b == _QUOTE:
-                var size = len(self._data) - start
-                self._nodes.append(_Node(_STR, UInt32(start), UInt32(size)))
-                return k + 1
-            if b == _BACKSLASH:
-                j = self._escape(data, k)
-            elif b >= 0x80:
-                var m = k
-                while m < n and p[unsafe_offset=m] >= 0x80:
-                    var length = utf8_length(data, m)
-                    if length == 0:
-                        raise JsonError(JsonError.SYNTAX, "json: a string is not UTF-8", m)
-                    m += length
-                self._data.extend(data[k:m])
-                j = m
-            else:
-                raise JsonError(JsonError.SYNTAX, "json: a control character in a string", k)
-
-    def _escape(mut self, data: Span[UInt8, _], k: Int) raises JsonError -> Int:
-        """The escape whose '\\' is at `k`; returns the index after it."""
-        var n = len(data)
-        if k + 1 >= n:
-            raise JsonError(JsonError.SYNTAX, "json: the input ends inside a string", n)
-        var e = data[k + 1]
-        var b: UInt8
-        if e == _QUOTE or e == _BACKSLASH or e == 47:  # '/'
-            b = e
-        elif e == 98:  # b
-            b = 0x08
-        elif e == 102:  # f
-            b = 0x0C
-        elif e == 110:  # n
-            b = 0x0A
-        elif e == 114:  # r
-            b = 0x0D
-        elif e == 116:  # t
-            b = 0x09
-        elif e == 117:  # u
-            var u = _hex4(data, k + 2)
-            var j = k + 6
-            if u >= 0xDC00 and u <= 0xDFFF:
-                raise JsonError(JsonError.SYNTAX, "json: a lone surrogate in a string", k)
-            if u >= 0xD800 and u <= 0xDBFF:
-                if j + 1 >= n or data[j] != _BACKSLASH or data[j + 1] != 117:
-                    raise JsonError(JsonError.SYNTAX, "json: a lone surrogate in a string", k)
-                var lo = _hex4(data, j + 2)
-                if lo < 0xDC00 or lo > 0xDFFF:
-                    raise JsonError(JsonError.SYNTAX, "json: a lone surrogate in a string", k)
-                u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00)
-                j += 6
-            _put_utf8(self._data, u)
-            return j
-        else:
-            raise JsonError(JsonError.SYNTAX, "json: an invalid escape in a string", k)
-        self._data.append(b)
-        return k + 2
-
-    def _number(mut self, data: Span[UInt8, _], start: Int) raises JsonError -> Int:
-        """The number at `start`, checked against the grammar and kept as
-        text; returns the index after it."""
-        var n = len(data)
-        var p = data.unsafe_ptr()
-        var i = start
-        if p[unsafe_offset=i] == _MINUS:
-            i += 1
-        if i >= n or not _is_digit(p[unsafe_offset=i]):
-            raise JsonError(JsonError.SYNTAX, "json: a number needs digits", i)
-        if p[unsafe_offset=i] == 48:
-            i += 1
-        else:
-            while i < n and _is_digit(p[unsafe_offset=i]):
-                i += 1
-        var tag = _INT
-        if i < n and p[unsafe_offset=i] == 46:  # '.'
-            i += 1
-            if i >= n or not _is_digit(p[unsafe_offset=i]):
-                raise JsonError(JsonError.SYNTAX, "json: a fraction needs digits", i)
-            while i < n and _is_digit(p[unsafe_offset=i]):
-                i += 1
-            tag = _NUM
-        if i < n and (p[unsafe_offset=i] == 101 or p[unsafe_offset=i] == 69):  # e E
-            i += 1
-            if i < n and (p[unsafe_offset=i] == 43 or p[unsafe_offset=i] == _MINUS):
-                i += 1
-            if i >= n or not _is_digit(p[unsafe_offset=i]):
-                raise JsonError(JsonError.SYNTAX, "json: an exponent needs digits", i)
-            while i < n and _is_digit(p[unsafe_offset=i]):
-                i += 1
-            tag = _NUM
-        self._nodes.append(_Node(tag, UInt32(len(self._data)), UInt32(i - start)))
-        self._data.extend(data[start:i])
-        return i
+    def _outer(mut self) -> Tuple[Int, Int]:
+        """The array or object around the one just closed, and its count
+        (-1 for none)."""
+        var depth = len(self._stack)
+        if depth == 0:
+            return (-1, 0)
+        var o = self._stack.unsafe_ptr()[unsafe_offset=depth - 1]
+        self._stack.resize(unsafe_uninit_length=depth - 1)
+        return (o.node, o.count)
 
     # ---- repeated keys -----------------------------------------------------
 
-    def _check_keys(mut self, obj: Int, at: Int) raises JsonError:
-        """Refuse a key that object `obj` (closing at `at`) has twice.
+    def _check_keys(
+        mut self, np: _NodePtr, dp: _BytePtr, kp: Pointer[UInt32, MutAnyOrigin], pairs: Int, at: Int, mut err: _Fail
+    ) -> Int:
+        """Refuse (-1: `err`) a key that the object whose `pairs` key nodes
+        are at `kp` (closing at `at`) has twice.
 
-        Up to `_PAIRWISE` pairs, every two keys are compared (lengths
-        first, then 16 bytes at a time), at most 15 comparisons per key.
-        Beyond, each key is hashed once (`siphash13`, in input order), the
-        (hash, key) values are sorted, and only keys with the same hash are
-        compared: the time is bounded by the keys' bytes plus a sort of
-        16-byte values, whatever the keys are."""
-        var pairs = Int(self._nodes[obj].a)
-        if pairs < 2:
-            return
-        self._keys.clear()
-        var c = obj + 1
-        for _ in range(pairs):
-            self._keys.append(UInt32(c))
-            c = c + 1 + self._size(c + 1)
+        Each key gets a cheap hash of its length and its first and last 8
+        bytes (`_fingerprint`), which equal keys share. Up to `_PAIRWISE`
+        pairs, every two hashes are compared, and the keys' bytes where the
+        hashes are equal: at most 15 comparisons per key. Beyond, the keys
+        go into an open-addressing table of at least twice their number,
+        probed linearly and compared only where the hashes are equal. The
+        hash is public, so keys can be chosen to collide; a key that probes
+        more than `_PROBES` slots ends the table, and the object goes
+        through `_check_sorted` instead. So the time is bounded by the
+        keys' bytes (each compared with at most `_PROBES` others) plus,
+        for such keys only, a sort of 16-byte values."""
         if pairs <= _PAIRWISE:
-            for x in range(pairs):
-                for y in range(x + 1, pairs):
-                    if self._same_key(Int(self._keys[x]), Int(self._keys[y])):
-                        raise JsonError(JsonError.SYNTAX, "json: an object has a key twice", at)
-            return
+            var h = Array[UInt64, _PAIRWISE](uninitialized=True)
+            var hp = h.unsafe_ptr()
+            var x = 0
+            while x < pairs:
+                var k = np[unsafe_offset=Int(kp[unsafe_offset=x])]
+                var f = _fingerprint(dp, Int(k.a), Int(k.b))
+                var y = 0
+                while y < x:
+                    if hp[unsafe_offset=y] == f and _same_key(np, dp, Int(kp[unsafe_offset=x]), Int(kp[unsafe_offset=y])):
+                        return err.fail("json: an object has a key twice", at)
+                    y += 1
+                hp[unsafe_offset=x] = f
+                x += 1
+            return 0
         self._hashed.clear()
-        for i in range(pairs):
-            var h = _key_hash(self._span(Int(self._keys[i])))
-            self._hashed.append((UInt128(h) << 64) | UInt128(i))
-        self._sort_hashed()
+        for x in range(pairs):
+            var k = np[unsafe_offset=Int(kp[unsafe_offset=x])]
+            self._hashed.append((UInt128(_fingerprint(dp, Int(k.a), Int(k.b))) << 64) | UInt128(x))
+        var hp = self._hashed.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+        if pairs <= _PARTITIONED:
+            var r = self._table_check(np, dp, kp, hp, pairs, at, err)
+            if r != 1:
+                return r
+            return self._check_sorted(np, dp, kp, pairs, at, err)
+        # Into 256 buckets by the hashes' top 8 bits first, so that each
+        # bucket's table stays in cache.
+        self._counts.resize(257, 0)
+        for b in range(257):
+            self._counts[b] = 0
+        for x in range(pairs):
+            self._counts[Int(hp[unsafe_offset=x] >> 120) + 1] += 1
+        for b in range(256):
+            self._counts[b + 1] += self._counts[b]
+        self._spare.resize(pairs, 0)
+        for x in range(pairs):
+            var r = hp[unsafe_offset=x]
+            var b = Int(r >> 120)
+            self._spare[Int(self._counts[b])] = r
+            self._counts[b] += 1
+        var sp = self._spare.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+        var start = 0  # (each count is now its bucket's end)
+        for b in range(256):
+            var end = Int(self._counts[b])
+            var r = self._table_check(np, dp, kp, sp.unsafe_offset(start), end - start, at, err)
+            if r == 1:
+                return self._check_sorted(np, dp, kp, pairs, at, err)
+            if r < 0:
+                return -1
+            start = end
+        return 0
+
+    def _table_check(
+        mut self,
+        np: _NodePtr,
+        dp: _BytePtr,
+        kp: Pointer[UInt32, MutAnyOrigin],
+        hp: Pointer[UInt128, MutAnyOrigin],
+        count: Int,
+        at: Int,
+        mut err: _Fail,
+    ) -> Int:
+        """The `count` keys whose (hash, place) values are at `hp`, through
+        the table: 0, -1 for a repeated key (`err`), or 1 when a key probed
+        more than `_PROBES` slots (the caller sorts instead)."""
+        if count < 2:
+            return 0
+        var size = 1 << (64 - Int(count_leading_zeros(UInt64(2 * count - 1))))
+        self._table.clear()
+        self._table.resize(size, 0)
+        var tp = self._table.unsafe_ptr()
+        var mask = size - 1
+        for i in range(count):
+            var r = hp[unsafe_offset=i]
+            var h = UInt64(r >> 64)
+            var x = Int(r & 0xFFFFFFFF)
+            var kx = Int(kp[unsafe_offset=x])
+            var tag = h & 0xFFFFFFFF00000000
+            var slot = Int(h) & mask
+            var probes = 0
+            while True:
+                var e = tp[unsafe_offset=slot]
+                if e == 0:
+                    tp[unsafe_offset=slot] = tag | UInt64(x + 1)
+                    break
+                if (e & 0xFFFFFFFF00000000) == tag:
+                    var ky = Int(kp[unsafe_offset=Int(e & 0xFFFFFFFF) - 1])
+                    if _same_key(np, dp, kx, ky):
+                        return err.fail("json: an object has a key twice", at)
+                probes += 1
+                if probes > _PROBES:
+                    return 1
+                slot = (slot + 1) & mask
+        return 0
+
+    def _check_sorted(
+        mut self, np: _NodePtr, dp: _BytePtr, kp: Pointer[UInt32, MutAnyOrigin], pairs: Int, at: Int, mut err: _Fail
+    ) -> Int:
+        """`_check_keys` for keys that collide in the table: the (cheap
+        hash, key) values sorted, and keys compared only within a run of
+        one hash: pair by pair in a run of up to `_RUN`; a longer run goes
+        through `_check_run` and SipHash. The time is bounded by the keys'
+        bytes plus sorts of 16-byte values, whatever the keys are."""
+        self._hashed.clear()
+        for x in range(pairs):
+            var k = np[unsafe_offset=Int(kp[unsafe_offset=x])]
+            self._hashed.append((UInt128(_fingerprint(dp, Int(k.a), Int(k.b))) << 64) | UInt128(x))
+        _sort_hashed(self._hashed, self._spare, self._counts)
         var start = 0
         for x in range(1, pairs + 1):
             if x < pairs and (self._hashed[x] >> 64) == (self._hashed[start] >> 64):
                 continue
-            # [start, x) share one hash: compare their keys.
-            for u in range(start, x):
-                for v in range(u + 1, x):
-                    var ku = Int(self._keys[Int(self._hashed[u] & 0xFFFFFFFF)])
-                    var kv = Int(self._keys[Int(self._hashed[v] & 0xFFFFFFFF)])
-                    if self._same_key(ku, kv):
-                        raise JsonError(JsonError.SYNTAX, "json: an object has a key twice", at)
+            # [start, x) share one cheap hash.
+            if x - start > _RUN:
+                if self._check_run(np, dp, kp, start, x, at, err) < 0:
+                    return -1
+            else:
+                for u in range(start, x):
+                    for v in range(u + 1, x):
+                        var ku = Int(kp[unsafe_offset=Int(self._hashed[u] & 0xFFFFFFFF)])
+                        var kv = Int(kp[unsafe_offset=Int(self._hashed[v] & 0xFFFFFFFF)])
+                        if _same_key(np, dp, ku, kv):
+                            return err.fail("json: an object has a key twice", at)
             start = x
+        return 0
 
-    def _sort_hashed(mut self):
-        """Sort `_hashed`: into buckets by the hashes' top 16 bits (one
-        pass), then each bucket by `sort`. Never slower than `sort` alone,
-        whatever the hashes; 300,000 keys parse in 31 ms instead of 79."""
-        var n = len(self._hashed)
-        if n < _BUCKETED:
-            sort(self._hashed)
-            return
-        self._counts.resize(65537, 0)
-        for b in range(65537):
-            self._counts[b] = 0
-        for r in self._hashed:
-            self._counts[Int(r >> 112) + 1] += 1
-        for b in range(65536):
-            self._counts[b + 1] += self._counts[b]
-        self._spare.resize(n, 0)
-        for r in self._hashed:
-            var b = Int(r >> 112)
-            self._spare[Int(self._counts[b])] = r
-            self._counts[b] += 1
-        swap(self._hashed, self._spare)
-        var start = 0  # (each count is now its bucket's end)
-        for b in range(65536):
-            var end = Int(self._counts[b])
-            if end - start > 1:
-                sort(Span(self._hashed)[start:end])
-            start = end
-
-    def _same_key(self, x: Int, y: Int) -> Bool:
-        """Whether string nodes `x` and `y` hold the same bytes."""
-        var a = self._nodes[x]
-        var b = self._nodes[y]
-        if a.b != b.b:
-            return False
-        var p = self._data.unsafe_ptr()
-        var i = Int(a.a)
-        var j = Int(b.a)
-        var n = Int(a.b)
-        var k = 0
-        while k + 16 <= n:
-            if not (p.unsafe_load[width=16](i + k) == p.unsafe_load[width=16](j + k)):
-                return False
-            k += 16
-        while k < n:
-            if p[unsafe_offset=i + k] != p[unsafe_offset=j + k]:
-                return False
-            k += 1
-        return True
+    def _check_run(
+        mut self,
+        np: _NodePtr,
+        dp: _BytePtr,
+        kp: Pointer[UInt32, MutAnyOrigin],
+        start: Int,
+        end: Int,
+        at: Int,
+        mut err: _Fail,
+    ) -> Int:
+        """The keys `_hashed[start:end]`, which share one cheap hash: each
+        hashed once with SipHash (`_key_hash`), sorted, and compared only
+        within one SipHash, where a group of k keys costs whoever builds
+        it about 2^(64(k-1)/k) evaluations."""
+        self._run.clear()
+        for r in range(start, end):
+            var x = self._hashed[r] & 0xFFFFFFFF
+            var k = np[unsafe_offset=Int(kp[unsafe_offset=Int(x)])]
+            var key = Span[UInt8, MutAnyOrigin](unsafe_ptr=dp.unsafe_offset(Int(k.a)), length=Int(k.b))
+            self._run.append((UInt128(_key_hash(key)) << 64) | x)
+        _sort_hashed(self._run, self._spare, self._counts)
+        var count = end - start
+        var s = 0
+        for x in range(1, count + 1):
+            if x < count and (self._run[x] >> 64) == (self._run[s] >> 64):
+                continue
+            for u in range(s, x):
+                for v in range(u + 1, x):
+                    var ku = Int(kp[unsafe_offset=Int(self._run[u] & 0xFFFFFFFF)])
+                    var kv = Int(kp[unsafe_offset=Int(self._run[v] & 0xFFFFFFFF)])
+                    if _same_key(np, dp, ku, kv):
+                        return err.fail("json: an object has a key twice", at)
+            s = x
+        return 0
 
     # ---- reading -----------------------------------------------------------
 
@@ -625,14 +858,25 @@ struct Document(Copyable, Movable, Writable):
     def float(self, n: Int = 0) raises JsonError -> Float64:
         """Any number, correctly rounded to the nearest Float64 (one too
         small for a Float64 reads as 0 or a subnormal); RANGE past
-        Float64's range, where it would be an infinity."""
+        Float64's range, where it would be an infinity. Read by
+        `json.number.read_float`, else (more than 19 digits, subnormals)
+        by Mojo's `atof`."""
         self._check(n)
         var tag = self._nodes[n].tag
         if tag != _INT and tag != _NUM:
             raise JsonError(JsonError.TYPE, "json: not a number")
-        var x: Float64
+        var t = self._span(n)
+        if tag == _NUM and t[len(t) - 1] > 57:  # (NaN, Infinity: Dialect.constants)
+            if t[0] == 78:
+                return FloatLiteral.nan
+            return FloatLiteral.negative_infinity if t[0] == _MINUS else FloatLiteral.infinity
+        var x: Float64 = 0
+        if read_float[padded=True](t, x):  # (`_data` has room past every span)
+            if x - x != 0:
+                raise JsonError(JsonError.RANGE, "json: the number is out of Float64's range")
+            return x
         try:
-            x = atof(StringSlice(unsafe_from_utf8=self._span(n)))
+            x = atof(StringSlice(unsafe_from_utf8=t))
         except:
             raise JsonError(JsonError.RANGE, "json: the number does not read as a Float64")
         if x - x != 0:
@@ -693,6 +937,78 @@ struct Document(Copyable, Movable, Writable):
                 _ = first.pop()
                 out.append(_RBRACE if objects.pop() else _RBRACKET)
 
+    def visit[V: Visitor](self, mut v: V, n: Int = 0) raises:
+        """Call `v` for node `n` and everything in it, in document order:
+        `begin_array(count)`, the elements, `end_array()`;
+        `begin_object(count)`, then `key` and the value of each pair,
+        `end_object()`. MISSING for no such node; `v`'s errors pass
+        through, and the walk stops there. Its stack is inline up to 64
+        levels, so a walk allocates nothing below that."""
+        self._check(n)
+        var end = n + self._size(n)
+        var np = self._nodes.unsafe_ptr()
+        var dp = self._data.unsafe_ptr().unsafe_origin_cast[ImmutAnyOrigin]()
+        # Per open array or object: its nodes still to visit (an object's
+        # keys and values both count) times 2, plus 1 for an object.
+        var inline = Array[Int, 64](uninitialized=True)
+        var ip = inline.unsafe_ptr()
+        var spill = List[Int]()
+        var depth = 0
+        for i in range(n, end):
+            var is_key = False
+            if depth > 0:
+                var t = ip[unsafe_offset=depth - 1] if depth <= 64 else spill[depth - 65]
+                is_key = (t & 1) == 1 and (t >> 1) % 2 == 0
+                t -= 2
+                if depth <= 64:
+                    ip[unsafe_offset=depth - 1] = t
+                else:
+                    spill[depth - 65] = t
+            var node = np[unsafe_offset=i]
+            var tag = node.tag
+            if is_key:
+                v.key(Span[UInt8, ImmutAnyOrigin](unsafe_ptr=dp.unsafe_offset(Int(node.a)), length=Int(node.b)))
+            elif tag >= _ARR:
+                var obj = tag == _OBJ
+                if obj:
+                    v.begin_object(Int(node.a))
+                else:
+                    v.begin_array(Int(node.a))
+                if node.a > 0:
+                    var t = (Int(node.a) * (2 if obj else 1)) * 2 + (1 if obj else 0)
+                    if depth < 64:
+                        ip[unsafe_offset=depth] = t
+                    else:
+                        spill.append(t)
+                    depth += 1
+                    continue
+                if obj:
+                    v.end_object()
+                else:
+                    v.end_array()
+            elif tag == _STR:
+                v.string(Span[UInt8, ImmutAnyOrigin](unsafe_ptr=dp.unsafe_offset(Int(node.a)), length=Int(node.b)))
+            elif tag == _INT or tag == _NUM:
+                v.number(
+                    Span[UInt8, ImmutAnyOrigin](unsafe_ptr=dp.unsafe_offset(Int(node.a)), length=Int(node.b)),
+                    tag == _INT,
+                )
+            elif tag == _NULL:
+                v.null()
+            else:
+                v.boolean(tag == _TRUE)
+            while depth > 0:
+                var t = ip[unsafe_offset=depth - 1] if depth <= 64 else spill[depth - 65]
+                if (t >> 1) != 0:
+                    break
+                if depth > 64:
+                    _ = spill.pop()
+                depth -= 1
+                if (t & 1) == 1:
+                    v.end_object()
+                else:
+                    v.end_array()
+
     def json(self, n: Int = 0) raises JsonError -> String:
         """Node `n` as compact JSON text."""
         var out = List[UInt8]()
@@ -709,15 +1025,15 @@ struct Document(Copyable, Movable, Writable):
             pass
 
 
-def parse(data: Span[UInt8, _], limits: Limits = Limits()) raises JsonError -> Document:
+def parse(data: Span[UInt8, _], limits: Limits = Limits(), dialect: Dialect = Dialect()) raises JsonError -> Document:
     """`data` parsed into a new `Document` (see the module docs)."""
     var doc = Document()
-    doc.parse(data, limits)
+    doc.parse(data, limits, dialect)
     return doc^
 
 
-def parse(text: StringSlice, limits: Limits = Limits()) raises JsonError -> Document:
-    return parse(text.as_bytes(), limits)
+def parse(text: StringSlice, limits: Limits = Limits(), dialect: Dialect = Dialect()) raises JsonError -> Document:
+    return parse(text.as_bytes(), limits, dialect)
 
 
 @inline(.always)
@@ -726,12 +1042,40 @@ def _is_digit(c: UInt8) -> Bool:
 
 
 @inline(.always)
-def _ws(data: Span[UInt8, _], start: Int) -> Int:
-    """The index of the first byte at or after `start` that is not JSON
-    whitespace (space, tab, LF, CR)."""
-    var p = data.unsafe_ptr()
-    var n = len(data)
+def _load4(p: Pointer[UInt8, _], i: Int) -> UInt32:
+    """The four bytes at `p + i`, little-endian."""
+    return bitcast[DType.uint32, 1](p.unsafe_load[width=4](i))
+
+
+@inline(.always)
+def _skip_ws(p: Pointer[UInt8, _], i: Int, n: Int) -> Int:
+    """The index of the first byte at or after `i` that is not JSON
+    whitespace (space, tab, LF, CR): at once for no whitespace or one
+    space, the common cases, else `_skip_ws_run`."""
+    if i < n:
+        var c = p[unsafe_offset=i]
+        if c > 32:
+            return i
+        if c == 32 and i + 1 < n and p[unsafe_offset=i + 1] > 32:
+            return i + 1
+    return _skip_ws_run(p, i, n)
+
+
+def _skip_ws_run(p: Pointer[UInt8, _], start: Int, n: Int) -> Int:
+    """`_skip_ws`, `_V` bytes compared at once (indentation)."""
     var i = start
+    while i + _V <= n:
+        var v = p.unsafe_load[width=_V](i)
+        var ws = (
+            v.eq(SIMD[DType.uint8, _V](32))
+            | v.eq(SIMD[DType.uint8, _V](10))
+            | v.eq(SIMD[DType.uint8, _V](13))
+            | v.eq(SIMD[DType.uint8, _V](9))
+        )
+        var other = ~pack_bits[_VBits](ws)
+        if other != 0:
+            return i + Int(count_trailing_zeros(other))
+        i += _V
     while i < n:
         var c = p[unsafe_offset=i]
         if c > 32 or (c != 32 and c != 10 and c != 13 and c != 9):
@@ -740,23 +1084,271 @@ def _ws(data: Span[UInt8, _], start: Int) -> Int:
     return i
 
 
-def _literal(data: Span[UInt8, _], i: Int, word: StaticString) raises JsonError -> Int:
-    var w = word.as_bytes()
-    if i + len(w) > len(data):
-        raise JsonError(JsonError.SYNTAX, "json: not a JSON value", i)
-    for k in range(len(w)):
-        if data[i + k] != w[k]:
-            raise JsonError(JsonError.SYNTAX, "json: not a JSON value", i)
-    return i + len(w)
+@inline(.always)
+def _copy(dp: _BytePtr, o: Int, p: Pointer[UInt8, _], j: Int, count: Int, n: Int):
+    """`count` bytes from `p + j` (input of length `n`) to `dp + o`, a
+    vector at a time while the input has one to read (`dp` has `_SLACK`
+    bytes past them)."""
+    var k = 0
+    while k < count:
+        if j + k + _V <= n:
+            dp.unsafe_store(o + k, p.unsafe_load[width=_V](j + k))
+            k += _V
+        else:
+            dp[unsafe_offset=o + k] = p[unsafe_offset=j + k]
+            k += 1
 
 
-def _hex4(data: Span[UInt8, _], i: Int) raises JsonError -> Int:
-    """The four hex digits at `i` (a \\u escape's)."""
-    if i + 4 > len(data):
-        raise JsonError(JsonError.SYNTAX, "json: a \\u escape needs four hex digits", i)
+@inline(.always)
+def _key(
+    p: Pointer[UInt8, _], n: Int, i: Int, np: _NodePtr, mut nn: Int, dp: _BytePtr, mut dn: Int, mut err: _Fail
+) -> Int:
+    """An object's key and its ':' at `i`; returns where the value is
+    (-1: `err`)."""
+    if i >= n or p[unsafe_offset=i] != _QUOTE:
+        return err.fail("json: expected a key (a string)", i)
+    var s0 = dn
+    var j = _string(p, n, i, dp, dn, err)
+    if j < 0:
+        return -1
+    j = _skip_ws(p, j, n)
+    np[unsafe_offset=nn] = _Node(_STR, UInt32(s0), UInt32(dn - s0))
+    nn += 1
+    if j >= n or p[unsafe_offset=j] != _COLON:
+        return err.fail("json: expected ':' after a key", j)
+    return _skip_ws(p, j + 1, n)
+
+
+@no_inline
+def _grow[T: Copyable & Deinitable](mut list: List[T], length: Int) -> Pointer[T, MutAnyOrigin]:
+    """Twice the room in `list`, its first `length` items kept, and its
+    length its new capacity (the parser writes through the pointer
+    returned, and sets the length at the end)."""
+    list.resize(unsafe_uninit_length=length)
+    list.reserve(max(2 * list.capacity(), 16))
+    list.resize(unsafe_uninit_length=list.capacity())
+    return list.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+
+
+@inline(.always)
+def _string(p: Pointer[UInt8, _], n: Int, i: Int, dp: _BytePtr, mut dn: Int, mut err: _Fail) -> Int:
+    """The string whose '"' is at `i`, unescaped into `dp + dn` (`dn`
+    advanced past it); returns the index after its closing '"' (-1:
+    `err`).
+
+    Plain bytes (printable ASCII but '"' and '\\') go a vector at a time:
+    each vector is stored whole, then the count advances to its first
+    other byte, which `_SLACK` makes safe."""
+    var j = i + 1
+    var o = dn
+    while True:
+        if j + _V <= n:
+            var v = p.unsafe_load[width=_V](j)
+            dp.unsafe_store(o, v)
+            var special = (
+                (v - SIMD[DType.uint8, _V](0x20)).ge(SIMD[DType.uint8, _V](0x60))
+                | v.eq(SIMD[DType.uint8, _V](_QUOTE))
+                | v.eq(SIMD[DType.uint8, _V](_BACKSLASH))
+            )
+            var bits = pack_bits[_VBits](special)
+            if bits == 0:
+                j += _V
+                o += _V
+                continue
+            var k = Int(count_trailing_zeros(bits))
+            j += k
+            o += k
+        else:
+            while j < n and is_plain(p[unsafe_offset=j]):
+                dp[unsafe_offset=o] = p[unsafe_offset=j]
+                j += 1
+                o += 1
+            if j >= n:
+                return err.fail("json: the input ends inside a string", n)
+        var b = p[unsafe_offset=j]
+        if b == _QUOTE:
+            dn = o
+            return j + 1
+        if b == _BACKSLASH:
+            j = _escape(p, n, j, dp, o, err)
+            if j < 0:
+                return -1
+        elif b >= 0x80:
+            var m = _utf8_run(p, n, j, err.surrogates)
+            if m < 0:
+                return err.fail("json: a string is not UTF-8", -m - 1)
+            _copy(dp, o, p, j, m - j, n)
+            o += m - j
+            j = m
+        elif err.controls:
+            dp[unsafe_offset=o] = b
+            o += 1
+            j += 1
+        else:
+            return err.fail("json: a control character in a string", j)
+
+
+@no_inline
+def _utf8_run(p: Pointer[UInt8, _], n: Int, start: Int, surrogates: Bool) -> Int:
+    """Where the run of bytes >= 0x80 at `start` ends, each sequence in it
+    valid UTF-8 (or, with `surrogates`, a surrogate in UTF-8's form, ED A0
+    80 to ED BF BF); -1 - the index of the first that is not."""
+    var m = start
+    while m < n and p[unsafe_offset=m] >= 0x80:
+        var length = utf8_length_at(p, n, m)
+        if length == 0:
+            if (
+                surrogates
+                and p[unsafe_offset=m] == 0xED
+                and m + 2 < n
+                and p[unsafe_offset=m + 1] >= 0xA0
+                and p[unsafe_offset=m + 1] <= 0xBF
+                and (p[unsafe_offset=m + 2] & 0xC0) == 0x80
+            ):
+                length = 3
+            else:
+                return -1 - m
+        m += length
+    return m
+
+
+def _escape(p: Pointer[UInt8, _], n: Int, k: Int, dp: _BytePtr, mut o: Int, mut err: _Fail) -> Int:
+    """The escape whose '\\' is at `k`, its character written at `dp + o`
+    (`o` advanced); returns the index after it (-1: `err`)."""
+    if k + 1 >= n:
+        return err.fail("json: the input ends inside a string", n)
+    var e = p[unsafe_offset=k + 1]
+    var b: UInt8
+    if e == _QUOTE or e == _BACKSLASH or e == 47:  # '/'
+        b = e
+    elif e == 98:  # b
+        b = 0x08
+    elif e == 102:  # f
+        b = 0x0C
+    elif e == 110:  # n
+        b = 0x0A
+    elif e == 114:  # r
+        b = 0x0D
+    elif e == 116:  # t
+        b = 0x09
+    elif e == 117:  # u
+        var u = _hex4(p, n, k + 2, err)
+        if u < 0:
+            return -1
+        var j = k + 6
+        if u >= 0xDC00 and u <= 0xDFFF:
+            if not err.surrogates:
+                return err.fail("json: a lone surrogate in a string", k)
+        elif u >= 0xD800 and u <= 0xDBFF:
+            # A pair, or (Dialect.lone_surrogates) the high one alone, the
+            # escape after it read on its own.
+            if j + 1 >= n or p[unsafe_offset=j] != _BACKSLASH or p[unsafe_offset=j + 1] != 117:
+                if not err.surrogates:
+                    return err.fail("json: a lone surrogate in a string", k)
+            else:
+                var lo = _hex4(p, n, j + 2, err)
+                if lo < 0:
+                    return -1
+                if lo >= 0xDC00 and lo <= 0xDFFF:
+                    u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00)
+                    j += 6
+                elif not err.surrogates:
+                    return err.fail("json: a lone surrogate in a string", k)
+        _put_utf8(dp, o, u)
+        return j
+    else:
+        return err.fail("json: an invalid escape in a string", k)
+    dp[unsafe_offset=o] = b
+    o += 1
+    return k + 2
+
+
+@inline(.always)
+def _digits(p: Pointer[UInt8, _], n: Int, start: Int) -> Int:
+    """The index of the first byte at or after `start` that is not a
+    digit: eight bytes tested at once (a byte b is a digit when b ^ '0'
+    is at most 9; adding 0x76 sets the top bit of any larger one, and the
+    carries it makes only reach bytes above the first non-digit)."""
+    var i = start
+    while i + 8 <= n:
+        var t = bitcast[DType.uint64, 1](p.unsafe_load[width=8](i)) ^ 0x3030303030303030
+        var m = ((t + 0x7676767676767676) | t) & 0x8080808080808080
+        if m != 0:
+            return i + (Int(count_trailing_zeros(m)) >> 3)
+        i += 8
+    while i < n and _is_digit(p[unsafe_offset=i]):
+        i += 1
+    return i
+
+
+@inline(.always)
+def _number(
+    p: Pointer[UInt8, _], n: Int, start: Int, dp: _BytePtr, mut dn: Int, mut tag: UInt8, mut err: _Fail
+) -> Int:
+    """The number at `start`, checked against the grammar and copied to
+    `dp + dn` as text (`dn` advanced, `tag` _INT or _NUM); returns the
+    index after it (-1: `err`)."""
+    var i = start
+    if p[unsafe_offset=i] == _MINUS:
+        i += 1
+    if i >= n or not _is_digit(p[unsafe_offset=i]):
+        if err.constants and i < n and p[unsafe_offset=i] == 73:  # -Infinity
+            tag = _NUM
+            return _constant(p, n, start, dp, dn, err)
+        return err.fail("json: a number needs digits", i)
+    if p[unsafe_offset=i] == 48:
+        i += 1
+    else:
+        i = _digits(p, n, i + 1)
+    if i < n and p[unsafe_offset=i] == 46:  # '.'
+        i += 1
+        if i >= n or not _is_digit(p[unsafe_offset=i]):
+            return err.fail("json: a fraction needs digits", i)
+        i = _digits(p, n, i + 1)
+        tag = _NUM
+    if i < n and (p[unsafe_offset=i] | 0x20) == 101:  # e E
+        i += 1
+        if i < n and (p[unsafe_offset=i] == 43 or p[unsafe_offset=i] == _MINUS):
+            i += 1
+        if i >= n or not _is_digit(p[unsafe_offset=i]):
+            return err.fail("json: an exponent needs digits", i)
+        i = _digits(p, n, i + 1)
+        tag = _NUM
+    _copy(dp, dn, p, start, i - start, n)
+    dn += i - start
+    return i
+
+
+@no_inline
+def _constant(p: Pointer[UInt8, _], n: Int, i: Int, dp: _BytePtr, mut dn: Int, mut err: _Fail) -> Int:
+    """`NaN`, `Infinity` or `-Infinity` at `i` (`Dialect.constants`),
+    copied to `dp + dn`; returns the index after it. Anything else is not
+    a JSON value."""
+    if err.constants:
+        var words: List[StaticString] = ["NaN", "Infinity", "-Infinity"]
+        for w in words:
+            var b = w.as_bytes()
+            if i + len(b) <= n:
+                var same = True
+                for k in range(len(b)):
+                    if p[unsafe_offset=i + k] != b[k]:
+                        same = False
+                        break
+                if same:
+                    for k in range(len(b)):
+                        dp[unsafe_offset=dn + k] = b[k]
+                    dn += len(b)
+                    return i + len(b)
+    return err.fail("json: not a JSON value", i)
+
+
+def _hex4(p: Pointer[UInt8, _], n: Int, i: Int, mut err: _Fail) -> Int:
+    """The four hex digits at `i` (a \\u escape's), or -1 (`err`)."""
+    if i + 4 > n:
+        return err.fail("json: a \\u escape needs four hex digits", i)
     var v = 0
     for k in range(4):
-        var c = data[i + k]
+        var c = p[unsafe_offset=i + k]
         var d: Int
         if c >= 48 and c <= 57:
             d = Int(c) - 48
@@ -765,24 +1357,99 @@ def _hex4(data: Span[UInt8, _], i: Int) raises JsonError -> Int:
         elif c >= 65 and c <= 70:
             d = Int(c) - 55
         else:
-            raise JsonError(JsonError.SYNTAX, "json: a \\u escape needs four hex digits", i)
+            return err.fail("json: a \\u escape needs four hex digits", i)
         v = v * 16 + d
     return v
 
 
-def _put_utf8(mut out: List[UInt8], u: Int):
-    """Append code point `u` (not a surrogate) as UTF-8."""
+@inline(.always)
+def _put_utf8(dp: _BytePtr, mut o: Int, u: Int):
+    """Write code point `u` (not a surrogate) as UTF-8 at `dp + o`."""
     if u < 0x80:
-        out.append(UInt8(u))
+        dp[unsafe_offset=o] = UInt8(u)
+        o += 1
     elif u < 0x800:
-        out.append(UInt8(0xC0 | (u >> 6)))
-        out.append(UInt8(0x80 | (u & 0x3F)))
+        dp[unsafe_offset=o] = UInt8(0xC0 | (u >> 6))
+        dp[unsafe_offset=o + 1] = UInt8(0x80 | (u & 0x3F))
+        o += 2
     elif u < 0x10000:
-        out.append(UInt8(0xE0 | (u >> 12)))
-        out.append(UInt8(0x80 | ((u >> 6) & 0x3F)))
-        out.append(UInt8(0x80 | (u & 0x3F)))
+        dp[unsafe_offset=o] = UInt8(0xE0 | (u >> 12))
+        dp[unsafe_offset=o + 1] = UInt8(0x80 | ((u >> 6) & 0x3F))
+        dp[unsafe_offset=o + 2] = UInt8(0x80 | (u & 0x3F))
+        o += 3
     else:
-        out.append(UInt8(0xF0 | (u >> 18)))
-        out.append(UInt8(0x80 | ((u >> 12) & 0x3F)))
-        out.append(UInt8(0x80 | ((u >> 6) & 0x3F)))
-        out.append(UInt8(0x80 | (u & 0x3F)))
+        dp[unsafe_offset=o] = UInt8(0xF0 | (u >> 18))
+        dp[unsafe_offset=o + 1] = UInt8(0x80 | ((u >> 12) & 0x3F))
+        dp[unsafe_offset=o + 2] = UInt8(0x80 | ((u >> 6) & 0x3F))
+        dp[unsafe_offset=o + 3] = UInt8(0x80 | (u & 0x3F))
+        o += 4
+
+
+@inline(.always)
+def _fingerprint(dp: _BytePtr, start: Int, size: Int) -> UInt64:
+    """A cheap hash of the key of `size` bytes at `dp + start`, of its
+    length and its first and last 8 bytes, so that equal keys have equal
+    ones (`dp` has 8 bytes to read past any key: `_SLACK`)."""
+    var a = bitcast[DType.uint64, 1](dp.unsafe_load[width=8](start))
+    var b: UInt64 = 0
+    if size >= 8:
+        b = bitcast[DType.uint64, 1](dp.unsafe_load[width=8](start + size - 8))
+    else:
+        a &= (UInt64(1) << UInt64(8 * size)) - 1
+    var h = (a ^ UInt64(size)) * 0x9E3779B97F4A7C15
+    h = (h ^ (h >> 29) ^ b) * 0xBF58476D1CE4E5B9
+    h ^= h >> 32
+    comptime if _FAULTS:
+        var t = h >> 56
+        return (t << 56) | t  # (256 hashes, as `_key_hash`)
+    return h
+
+
+def _same_key(np: _NodePtr, dp: _BytePtr, x: Int, y: Int) -> Bool:
+    """Whether string nodes `x` and `y` hold the same bytes."""
+    var a = np[unsafe_offset=x]
+    var b = np[unsafe_offset=y]
+    if a.b != b.b:
+        return False
+    var i = Int(a.a)
+    var j = Int(b.a)
+    var n = Int(a.b)
+    var k = 0
+    while k + 16 <= n:
+        if not (dp.unsafe_load[width=16](i + k) == dp.unsafe_load[width=16](j + k)):
+            return False
+        k += 16
+    while k < n:
+        if dp[unsafe_offset=i + k] != dp[unsafe_offset=j + k]:
+            return False
+        k += 1
+    return True
+
+
+def _sort_hashed(mut v: List[UInt128], mut spare: List[UInt128], mut counts: List[UInt32]):
+    """Sort `v`: into buckets by the values' top 16 bits (one pass), then
+    each bucket by `sort`. Never slower than `sort` alone, whatever the
+    values; 300,000 keys parse in 31 ms instead of 79."""
+    var n = len(v)
+    if n < _BUCKETED:
+        sort(v)
+        return
+    counts.resize(65537, 0)
+    for b in range(65537):
+        counts[b] = 0
+    for r in v:
+        counts[Int(r >> 112) + 1] += 1
+    for b in range(65536):
+        counts[b + 1] += counts[b]
+    spare.resize(n, 0)
+    for r in v:
+        var b = Int(r >> 112)
+        spare[Int(counts[b])] = r
+        counts[b] += 1
+    swap(v, spare)
+    var start = 0  # (each count is now its bucket's end)
+    for b in range(65536):
+        var end = Int(counts[b])
+        if end - start > 1:
+            sort(Span(v)[start:end])
+        start = end
