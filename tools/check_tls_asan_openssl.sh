@@ -19,7 +19,9 @@
 #
 # The OpenSSL source is downloaded once (the version pinned below, checked
 # against its SHA-256) and built under build/openssl-asan/ (about 1.5 min
-# with 6 cores). The version must be the environment's: update the pin
+# with 6 cores), with the environment's OPENSSLDIR, so that its default CA
+# file is conda-forge's, as the environment's library has it (`make
+# install_sw` writes nothing there). The version must be the environment's: update the pin
 # when pixi.lock moves.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -37,7 +39,7 @@ fi
 
 top=build/openssl-asan
 src="$top/openssl-$VERSION"
-prefix="$top/prefix-$VERSION"
+prefix="$top/prefix-$VERSION-envssl"  # (-envssl: built with the environment's OPENSSLDIR, below)
 rt="$top/rt-$VERSION"
 mkdir -p "$top"
 
@@ -52,7 +54,7 @@ if [[ ! -f "$prefix/lib/libssl.so.3" ]]; then
   tar xzf "$tarball" -C "$top"
   abs_prefix="$(pwd)/$prefix"
   (cd "$src" && ./Configure linux-$(uname -m) enable-asan shared no-tests no-docs -g -O1 -fno-omit-frame-pointer \
-      --prefix="$abs_prefix" --libdir=lib --openssldir="$abs_prefix/ssl" >"../configure.log" 2>&1 \
+      --prefix="$abs_prefix" --libdir=lib --openssldir="$CONDA_PREFIX/ssl" >"../configure.log" 2>&1 \
     && make -j"$(nproc)" >"../make.log" 2>&1 && make install_sw >"../install.log" 2>&1) \
     || { echo "FAIL building OpenSSL $VERSION with ASan (logs in $top)"; exit 1; }
 fi
@@ -84,11 +86,11 @@ if [[ "${1:-}" == "--self-test" ]]; then
 import sys
 p = sys.argv[1]
 t = open(p).read()
-old = "            var rc = L.SSL_write_ex(self._ssl, in_buf(data[taken : taken + n]), n, size_out(done)) if forced == 0 else c_int(0)"
+old = "            var rc = L.SSL_write_ex(self._ssl, in_buf(data[taken : taken + n]), n, size_out(self._n)) if forced == 0 else c_int(0)"
 new = """            var w = unsafe_alloc[Int](1)
             w.unsafe_free()  # (planted)
             var rc = L.SSL_write_ex(self._ssl, in_buf(data[taken : taken + n]), n, w.unsafe_origin_cast[MutAnyOrigin]()) if forced == 0 else c_int(0)
-            done[0] = n"""
+            self._n[0] = n"""
 assert t.count(old) == 1, "the planted bug's anchor moved: update the self-test"
 t = t.replace(old, new).replace("from bytes.buffer import ByteBuffer\n", "from bytes.buffer import ByteBuffer\nfrom std.memory.alloc import unsafe_alloc\n", 1)
 open(p, "w").write(t)

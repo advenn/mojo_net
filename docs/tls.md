@@ -186,7 +186,7 @@ What runs, in `pixi run ci` on x86_64 and aarch64 unless said. Gates are the res
     - **Left out:** scripts that do not fit this server (an echo server, servers without TLS 1.3, FFDHE, TLS 1.2 scripts whose suites are all CBC), listed in the runner.
 
     No crash, hang or growth in memory came up.
-- **Static** (`pixi run tls-check`): FFI in one module, and in it C reached only through the allowlisted bindings; forbidden names; one callback, wherever it is defined; no handle handed out, as `Obj` or as `Int`; symbol versions; constants against the headers. Its self-test plants a violation of each. Also `import-check`: only `tls.stream` and `tls.target` import `net`.
+- **Static** (`pixi run tls-check`): FFI in one module, and in it C reached only through the allowlisted bindings; forbidden names; one callback, wherever it is defined; no handle handed out, as `Obj` or as `Int`; symbol versions; constants against the headers; and the line of `engine.mojo` that TG8's self-test plants its bug in still there (a change to it once showed only in the weekly run, 2026-11). Its self-test plants a violation of each. Also `import-check`: only `tls.stream` and `tls.target` import `net`.
 - **TG14, freshness** (`pixi run tls-freshness`, daily in `.github/workflows/freshness.yml`): fails when conda-forge has had a newer `openssl` 3.5 or `ca-certificates` than `pixi.lock` for more than two days. Its first run found `ca-certificates` three days stale.
 - **By hand, 2026-10-26: badssl.com and real APIs.**
   - Refused: expired, wrong host, self-signed, untrusted root, incomplete chain, SHA-1 intermediate, RSA 1024 behind an untrusted root, Superfish and the other bad roots, RC4, 3DES, NULL, DHE of 480 to 1024 bits, static RSA, CBC, TLS 1.0 and 1.1.

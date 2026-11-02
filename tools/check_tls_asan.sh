@@ -46,10 +46,14 @@ run() {  # run NAME DEFINES... -- FILE
 declare -A SKIP=(
   [tests/tls/test_hostile_config.mojo]="imports Python's ssl into the process on purpose (a hostile OpenSSL config), and Python never frees OpenSSL's objects: LeakSanitizer reports them, with stacks too short (no frame pointers in libcrypto) for tools/lsan_tls.supp's libpython rule"
 )
+# Skipped against the instrumented OpenSSL only (TG8, TLS_ASAN_LIBDIR):
+declare -A SKIP_OPENSSL=(
+  [tests/tls/test_tls_regressions_hostile.mojo]="imports Python's ssl into the process on purpose, which maps the environment's libcrypto before tls opens the instrumented libssl: tls refuses that mix by design (a libssl must use the libcrypto beside it)"
+)
 uses_tls() {
   grep -qE '^(from|import) (tls|tls_util)\b|https://(127\.0\.0\.1|localhost|\[::1\])' "$1"
 }
-for f in "${!SKIP[@]}"; do
+for f in "${!SKIP[@]}" "${!SKIP_OPENSSL[@]}"; do
   if [[ ! -f "$f" ]] || ! uses_tls "$f"; then
     echo "FAIL SKIP names $f, which is not a test that uses TLS (stale entry)"; fail=1
   fi
@@ -59,6 +63,9 @@ while IFS= read -r f; do
   uses_tls "$f" || continue
   if [[ -n "${SKIP[$f]:-}" ]]; then
     echo "skip $f: ${SKIP[$f]}"; continue
+  fi
+  if [[ -n "${TLS_ASAN_LIBDIR:-}" && -n "${SKIP_OPENSSL[$f]:-}" ]]; then
+    echo "skip $f$against: ${SKIP_OPENSSL[$f]}"; continue
   fi
   name=${f#tests/}; name=${name%.mojo}; name=${name//\//_}
   defines=()

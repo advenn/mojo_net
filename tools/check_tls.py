@@ -27,6 +27,10 @@ rules TL2, TL5, TL7 and TB14 of docs/research/tls_with_openssl.md).
 8. One callback (TS5): the only function in src/tls/ffi.mojo libssl may
    call (`def ... abi("C")`) is `alpn_select`, and the only binding that
    installs a callback is `SSL_CTX_set_alpn_select_cb`.
+9. The weekly gate's planted bug still has its place: TG8's self-test
+   (tools/check_tls_asan_openssl.sh --self-test) rewrites one line of
+   src/tls/engine.mojo, which must be there exactly once. A change to that
+   line used to show only in the weekly run (2026-11).
 
     python3 tools/check_tls.py [--root DIR]
 
@@ -338,11 +342,34 @@ def _self_test():
             errors.append(f"prose or a comment was reported: {bad}")
         if bound != ["SSL_CTX_set_keylog_x", "SSL_CTX_set_verify_cb", "SSL_new"]:
             errors.append(f"bound names misread: {bound}")
+        os.makedirs(os.path.join(root, "tools"), exist_ok=True)
+        with open(os.path.join(root, "tools", "check_tls_asan_openssl.sh"), "w") as f:
+            f.write('old = "            var rc = gone(x)"\n')
+        with open(os.path.join(root, "src", "tls", "engine.mojo"), "w") as f:
+            f.write("            var rc = moved(x)\n")
+        if not any("anchor occurs 0 times" in b for b in check_anchor(root)):
+            errors.append("a moved TG8 anchor went unreported")
+        with open(os.path.join(root, "src", "tls", "engine.mojo"), "w") as f:
+            f.write("            var rc = gone(x)\n")
+        if check_anchor(root):
+            errors.append(f"an anchor in place was reported: {check_anchor(root)}")
         if os.environ.get("CONDA_PREFIX"):
             if check_versions(["SSL_new"]) or not check_versions(["SSL_no_such_function"]):
                 errors.append("the version-node check misjudged SSL_new or a missing function")
         if errors:
             sys.exit("check_tls self-test failed:\n" + "\n".join(errors) + "\nreported:\n" + "\n".join(bad))
+
+
+def check_anchor(root):
+    """Check 9: the line TG8's self-test plants its bug in."""
+    script = open(os.path.join(root, "tools", "check_tls_asan_openssl.sh")).read()
+    m = re.search(r'^old = "(.*)"$', script, re.M)
+    if not m:
+        return ["tools/check_tls_asan_openssl.sh: no `old = \"...\"` anchor found for the self-test"]
+    n = open(os.path.join(root, "src", "tls", "engine.mojo")).read().count(m.group(1))
+    if n != 1:
+        return [f"src/tls/engine.mojo: TG8's self-test anchor occurs {n} times, not once; update tools/check_tls_asan_openssl.sh:\n  {m.group(1).strip()}"]
+    return []
 
 
 def main():
@@ -354,6 +381,7 @@ def main():
     if len(bound) < 50:
         bad.append(f"{FFI_MODULE}: only {len(bound)} bindings found; the pattern no longer matches the module")
     bad += check_versions(bound)
+    bad += check_anchor(args.root)
     consts = subprocess.run([sys.executable, os.path.join(args.root, "tools", "gen_tls_consts.py"), "--check"], capture_output=True, text=True)
     if consts.returncode != 0:
         bad.append("src/tls/consts.mojo differs from the headers (TB14):\n" + consts.stdout + consts.stderr)
