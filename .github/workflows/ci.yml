@@ -2,10 +2,11 @@
 # into parallel jobs per architecture: the checks (with the TLS spike and
 # the conda package, built and tested: docs/design.md, "Packaging"), the
 # tests in three parts (tools/run_tests.sh, MOJO_NET_TEST_SHARD), and
-# tls-asan. Almost all of the time is compiling, one file at a time, so
-# the parts run side by side. tools/check_ci.py (pixi run ci-check) fails
-# when a task of `ci` is missing here. The package is kept as a workflow
-# artifact only: nothing is published.
+# the AddressSanitizer runs (tls-asan, then json-asan). Almost all of the
+# time is compiling, one file at a time, so the parts run side by side.
+# tools/check_ci.py (pixi run ci-check) fails when a task of `ci` is
+# missing here. The package is kept as a workflow artifact only: nothing
+# is published.
 name: ci
 
 on:
@@ -65,6 +66,7 @@ jobs:
           pixi run api-check
           pixi run nolibc-check
           pixi run examples-check
+          pixi run mojson-test
       - name: TLS spike (T0, docs/spikes.md)
         if: matrix.part == 'checks'
         run: pixi run spike-tls
@@ -88,3 +90,6 @@ jobs:
       - name: tls-asan
         if: matrix.part == 'tls-asan'
         run: pixi run tls-asan
+      - name: json-asan
+        if: matrix.part == 'tls-asan' && !cancelled()
+        run: pixi run json-asan

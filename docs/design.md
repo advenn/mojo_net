@@ -22,7 +22,8 @@ So a Mojo upgrade, or a change in a shared layer, lands in every package in one 
 | `linux` | raw syscalls, ABI mirrors, errno, `IoError`, fds, clock, poll/epoll/eventfd wrappers, probing (including fd-table pre-growth) | stable (M1) | `std` only |
 | `bytes` | `ByteBuffer`, base64, and the sans-I/O `Codec` contract (contract 1) with the reference `LineCodec` | stable (M1) | `linux` |
 | `crypto` | hashes and MACs for authentication protocols: SHA-256, MD5, HMAC-SHA-256, PBKDF2, constant-time comparison (no ciphers) | done for `pg` (P1) | `std` only |
-| `json` | strict JSON (`docs/json.md`): a parser into a flat document, a writer that checks structure, shortest round-trip floats (Ryū) | J1 done | `std` only |
+| `json` | strict JSON (`docs/json.md`): a parser into a flat document, a writer that checks structure, shortest round-trip floats (Ryū), float reading (Eisel-Lemire); strict by default, `Dialect.python()` for what Python's json reads | J2 done | `std` only |
+| `mojson` | not a library: the Python package `python/mojson` (`docs/mojson.md`), json's API for Python on `json`; its Mojo side calls the CPython C API in one module (`ext/capi.mojo`); not in the conda package | Y1 done | `json` |
 | `llm` | clients for model APIs (`docs/llm.md`): OpenAI-compatible chat and embeddings, Anthropic's Messages, streamed, with tool calls and retries | L1 done | `linux`, `bytes`, `json`, `http`; `net` and `tls` only in `llm.client` |
 | `net` | the TCP/UDP library (`docs/net.md`): addresses, socket options (L1), blocking TCP/Unix with deadlines and nonblocking `try_*` calls (L2), buffered frame reads (`BufReader`), DNS and connect-by-name (Happy Eyeballs), UDP | TCP client (M2) and UDP (M3) done; API stable (see "Stability") | `linux`, `bytes` |
 | `tls` | TLS through OpenSSL 3.5 (`docs/tls.md`): a verifying client as a sans-I/O state machine over memory BIOs, and a blocking stream; and a server context and connection; OpenSSL loaded at run time, the only C the libraries call | T1 and T2 done (client and server) | `linux`, `bytes`; `net` only in `tls.stream` and `tls.target` |
@@ -33,7 +34,7 @@ So a Mojo upgrade, or a change in a shared layer, lands in every package in one 
 | `rt` | experimental completion-based event loop (`docs/rt.md`): epoll and simulator backends, timers, slab, mailbox, `rt.evented` connections | **frozen** until Mojo's async/await stabilizes | `linux`, `bytes`, `net` |
 
 - **Nothing outside `rt` imports `rt`.** `rt` builds on `net`, never the reverse.
-- **The same rules cover all code.** They apply to `tests/<pkg>`, `examples/<pkg>` and `bench/<pkg>`. `spikes/` (M1 evidence) follows `net`'s rules.
+- **The same rules cover all code.** They apply to `tests/<pkg>`, `examples/<pkg>`, `bench/<pkg>` and `python/<pkg>` (a Python extension's Mojo side). `spikes/` (M1 evidence) follows `net`'s rules.
 - **Protocol libraries** (`http`, `pg`, and later database drivers) each get `src/<pkg>`, `tests/<pkg>`, `examples/<pkg>`, `docs/<pkg>.md`, and an entry in `ALLOWED` in `tools/check_imports.py`.
   - Their protocol logic is a sans-I/O codec built on `bytes` (contract 1).
   - Their transport uses `net`, from named modules only: `SANS_IO` in `tools/check_imports.py` lists the `src/<pkg>` modules that may import `net` (for `http`: `client.mojo`).
@@ -135,5 +136,7 @@ Code comments cite these by number, so keep the numbering stable. Contracts 2, 3
 - `docs/server.md`: the HTTP server. Covers its model (one loop per process), behaviour and milestones.
 - `docs/pg.md`: the PostgreSQL driver. Covers its scope, decisions (authentication, no TLS yet, errors) and milestones.
 - `docs/redis.md`: the Redis client. Covers its scope, decisions (the flat reply tree, the resumable parser, RESP3 first, pub/sub on its own connection, deadlines) and milestones.
+- `docs/json.md`: JSON. Covers its scope, decisions (strictness, the dialect, repeated keys, the flat tree, numbers), testing and milestones.
+- `docs/mojson.md`: the Python package. Covers how it stays json (its fallbacks), what it adds, how it is built, testing and measurements.
 - `docs/rt.md`: the frozen runtime. Covers how contracts 2–7 are realised, the simulator, and the M2 gate.
 - `docs/spikes.md`: measured facts. Covers threads, the Mojo runtime, callbacks, and the 10k-connection epoll spike.

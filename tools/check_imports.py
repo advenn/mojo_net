@@ -4,6 +4,7 @@
 Every Mojo file belongs to one package by its path:
 
     src/<pkg>/  tests/<pkg>/  examples/<pkg>/  bench/<pkg>/   -> <pkg>
+    python/<pkg>/ (a Python extension's Mojo side)            -> <pkg>
     spikes/                                                   -> net (M1 evidence)
 
 and may import only the packages listed for <pkg> in ALLOWED below (std is
@@ -43,6 +44,9 @@ ALLOWED = {
     "pg": {"linux", "bytes", "net", "crypto", "pg"},
     "redis": {"linux", "bytes", "net", "redis"},
     "tls": {"linux", "bytes", "net", "tls"},
+    # The Python extension (python/mojson): json, and the C API through
+    # std.python and its own ext/capi.mojo.
+    "mojson": {"json", "mojson"},
 }
 # Packages whose protocol logic is sans-I/O: in src/, only the listed
 # modules may import `net`, or `tls` (whose stream does I/O); the rest only
@@ -55,7 +59,7 @@ SANS_IO = {
     # (tls.target parses addresses with net.addr, which does no I/O.)
     "tls": {"stream.mojo", "target.mojo"},
 }
-AREAS = ("src", "tests", "examples", "bench")
+AREAS = ("src", "tests", "examples", "bench", "python")
 FIXED = {"spikes": "net"}
 
 _TRIPLE = re.compile(r'("""|\'\'\')(?:.|\n)*?\1')

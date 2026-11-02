@@ -39,6 +39,8 @@ tls-freshness = "python3 tools/check_freshness.py"
 # `gen-json` regenerates them.
 json-check = "python3 tools/gen_ryu_tables.py --check"
 gen-json = "python3 tools/gen_ryu_tables.py --write"
+# The json tests built with AddressSanitizer (the parser is raw-pointer code).
+json-asan = "bash tools/check_json_asan.sh"
 # Verify the stable packages' public API (linux, bytes, net) against api/*.txt
 # (docs/design.md, "Stability"); `api-update` accepts a deliberate change.
 api-check = "python3 tools/check_api.py"
@@ -61,7 +63,7 @@ fuzz-long = "bash tools/fuzz_long.sh"
 # GitHub CI runs the same tasks as parallel jobs; ci-check fails when one of
 # them is missing from .github/workflows/ci.yml.
 ci-check = "python3 tools/check_ci.py"
-ci = { depends-on = ["ci-check", "import-check", "tls-check", "json-check", "api-check", "test", "tls-asan", "nolibc-check", "examples-check"] }
+ci = { depends-on = ["ci-check", "import-check", "tls-check", "json-check", "api-check", "test", "tls-asan", "json-asan", "nolibc-check", "examples-check", "mojson-test"] }
 # Re-run the M1 threading/runtime/callback spikes (see docs/spikes.md).
 spikes = "bash spikes/run_spikes.sh"
 # The TLS-through-OpenSSL spike (T0): checks every recorded fact.
@@ -70,7 +72,12 @@ spike-tls = "bash spikes/tls/run.sh"
 # `pixi run bench build`, then `pixi run bench gate`.
 bench = "bash bench/rt/run.sh"
 # json on AI-shaped payloads, against Python's json (bench/json/payloads.py).
-bench-json = "python3 bench/json/payloads.py write build/bench_json && python3 bench/json/payloads.py python build/bench_json && mojo build -I src -o build/bench_json/bench bench/json/bench_json.mojo && build/bench_json/bench build/bench_json"
+bench-json = "python3 bench/json/payloads.py write build/bench_json && python3 bench/json/corpus.py build/bench_json && mojo build -I src -o build/bench_json/bench bench/json/bench_json.mojo && build/bench_json/bench build/bench_json"
+# mojson, json's API for Python on the json package (python/mojson):
+# `mojson-build` builds it into build/python, `mojson-test` tests it against
+# the standard library's json (tests/mojson).
+mojson-build = "bash tools/build_mojson.sh"
+mojson-test = "bash tools/run_mojson_tests.sh"
 format = "mojo format src tests"
 
 [dependencies]
@@ -127,7 +134,23 @@ valgrind = ">=3.27"
 [feature.perf.tasks]
 perf-check = "python3 tools/check_perf.py"
 
+# Python's JSON libraries beside mojson (bench/json/compare.py): json,
+# simplejson, ujson, rapidjson, orjson, msgspec, simdjson, cysimdjson, yyjson.
+[feature.pyjson.pypi-dependencies]
+orjson = "*"
+ujson = "*"
+simplejson = "*"
+python-rapidjson = "*"
+msgspec = "*"
+pysimdjson = "*"
+cysimdjson = "*"
+yyjson = "*"
+
+[feature.pyjson.tasks]
+bench-json-compare = "python3 bench/json/payloads.py write build/bench_json && python3 bench/json/corpus.py build/bench_json && bash tools/build_mojson.sh && python3 bench/json/compare.py build/bench_json"
+
 [environments]
 package = { features = ["package"], no-default-feature = true }
 bench = { features = ["bench"] }
 perf = { features = ["perf"] }
+pyjson = { features = ["pyjson"] }
