@@ -5,16 +5,18 @@ typed function pointer; objects travel as `Obj`, their addresses (0 for
 NULL), since Mojo's pointers cannot be null.
 
 A few object layouts are read directly where a call would cost more than
-the work (a type, a str's characters, a list's items). `Api.__init__`
-checks each against the C API on objects it builds, and the reads are
-used only where the check passed (`fast_str`, `fast_list`); otherwise the
-extension goes through the C API alone. An object's type is read always,
+the work (a type, a str's characters, a list's items, a compact int's
+digit, a float's value, a dict's entries). `Api.__init__` checks each
+against the C API on objects it builds, and the reads are used only where
+the check passed (`fast_str`, `fast_list`, `fast_int`, `fast_float`,
+`fast_dict`); otherwise the extension goes through the C API alone. An object's type is read always,
 so an interpreter whose objects do not start with (refcount, type), as
 free-threaded CPython's do not, is refused at import. The offsets are
 those of CPython 3.12 to 3.15 with the GIL on 64-bit platforms (3.15's
 headers lay them out as 3.14's)."""
 
 from std.ffi import OwnedDLHandle, c_int
+from std.memory import bitcast
 
 comptime Obj = Int
 """A `PyObject*`, as its address; 0 is NULL."""
@@ -176,6 +178,7 @@ struct Api(Movable):
     var _PyDict_NewPresized: _F_o_l
     var has_presized: Bool
     var PyDict_SetItem: _F_i_ooo
+    var PyDict_DelItem: _F_i_oo
     var PyDict_Next: _F_i_onnn
     var PyDict_Size: _F_l_o
     var PyMapping_Items: _F_o_o
@@ -207,6 +210,14 @@ struct Api(Movable):
     """A str's header and characters are read directly (checked at load)."""
     var fast_list: Bool
     """A list's item array is written directly (checked at load)."""
+    var fast_float: Bool
+    """A float's value is read directly (checked at load)."""
+    var fast_int: Bool
+    """A compact int's value (one 30-bit digit at most) is read directly
+    (checked at load)."""
+    var fast_dict: Bool
+    """A combined dict's entries are read directly (`dict_next`, checked
+    at load against PyDict_Next)."""
 
     def __init__(out self) raises:
         var h = OwnedDLHandle()
@@ -266,6 +277,7 @@ struct Api(Movable):
         else:
             self._PyDict_NewPresized = _sym[_F_o_l](h, "PyList_New")  # (never called)
         self.PyDict_SetItem = _sym[_F_i_ooo](h, "PyDict_SetItem")
+        self.PyDict_DelItem = _sym[_F_i_oo](h, "PyDict_DelItem")
         self.PyDict_Next = _sym[_F_i_onnn](h, "PyDict_Next")
         self.PyDict_Size = _sym[_F_l_o](h, "PyDict_Size")
         self.PyMapping_Items = _sym[_F_o_o](h, "PyMapping_Items")
@@ -294,6 +306,9 @@ struct Api(Movable):
         self.UnicodeError = load_int(_data(h, "PyExc_UnicodeError"))
         self.fast_str = False
         self.fast_list = False
+        self.fast_float = False
+        self.fast_int = False
+        self.fast_dict = False
         self._handle = h^
         # Every path reads an object's type directly: refuse an interpreter
         # whose objects do not start with (refcount, type), as free-threaded
@@ -367,7 +382,91 @@ struct Api(Movable):
                 )
                 self.Py_DecRef(rendered)
             self.Py_DecRef(list)
+        # A float's value is its third word; an int of at most one digit
+        # is compact, its sign and size in the tag (third word), its digit
+        # in the fourth (3.12 to 3.15's layout).
+        var ok = True
+        for x in [Float64(1.5), Float64(-0.0), Float64(1e300), Float64(-3.25e-310)]:
+            var f = self.PyFloat_FromDouble(x)
+            if not f:
+                ok = False
+                break
+            var bits = UInt64(load_int(f + 16))
+            ok = ok and self.type_of(f) == self.float_type and bits == bitcast[DType.uint64, 1](SIMD[DType.float64, 1](x))
+            self.Py_DecRef(f)
+        self.fast_float = ok
+        ok = True
+        for v in [0, 1, -1, 7, -12345, (1 << 30) - 1, -((1 << 30) - 1)]:
+            var o = self.PyLong_FromLongLong(v)
+            if not o:
+                ok = False
+                break
+            ok = ok and self.type_of(o) == self.int_type and compact_int(o) and compact_value(o) == v
+            self.Py_DecRef(o)
+        for v in [1 << 30, -(1 << 30), 1 << 62]:
+            var o = self.PyLong_FromLongLong(v)
+            if not o:
+                ok = False
+                break
+            ok = ok and not compact_int(o)
+            self.Py_DecRef(o)
+        self.fast_int = ok
+        self.fast_dict = self._check_dicts()
         self.PyErr_Clear()
+
+    def _check_dicts(self) -> Bool:
+        """`dict_next` against PyDict_Next on dicts built here: str keys,
+        a deleted entry, other keys (the general table), and a dict past
+        256 slots (2-byte indices)."""
+        var d = self.PyDict_New()
+        var g = self.PyDict_New()
+        var big = self.PyDict_New()
+        if not d or not g or not big:
+            return False
+        var ok = True
+        var made = List[Obj]()
+        for i in range(400):
+            var k = self.PyLong_FromLongLong(i * 7919)
+            var ks = self.PyObject_Repr(k)
+            if not k or not ks:
+                ok = False
+                break
+            made.append(k)
+            made.append(ks)
+            if i < 5:
+                ok = ok and self.PyDict_SetItem(d, ks, k) == 0
+            if i < 3:
+                ok = ok and self.PyDict_SetItem(g, k, ks) == 0 and self.PyDict_SetItem(g, ks, k) == 0
+            ok = ok and self.PyDict_SetItem(big, ks, k) == 0
+        if ok:
+            ok = self.PyDict_DelItem(d, made[3]) == 0  # (the second key)
+        for o in [d, g, big]:
+            ok = ok and load_int(o + 40) == 0 and self._same_iteration(o)
+        for o in made:
+            self.Py_DecRef(o)
+        for o in [d, g, big]:
+            self.Py_DecRef(o)
+        self.PyErr_Clear()
+        return ok
+
+    def _same_iteration(self, o: Obj) -> Bool:
+        var pos = 0
+        var mine = 0
+        var k: Obj = 0
+        var v: Obj = 0
+        var k2: Obj = 0
+        var v2: Obj = 0
+        var count = 0
+        while True:
+            var a = self.PyDict_Next(o, out(pos), out(k), out(v)) != 0
+            var b = dict_next(o, mine, k2, v2)
+            if a != b:
+                return False
+            if not a:
+                return count == self.PyDict_Size(o)
+            if k != k2 or v != v2 or pos != mine:
+                return False
+            count += 1
 
     # ---- helpers -----------------------------------------------------------
 
@@ -435,6 +534,63 @@ struct Api(Movable):
             self.PyErr_Clear()
         self.Py_DecRef(name)
         return out^
+
+
+# ---- int and float internals (CPython 3.12-3.15, GIL builds) ----------------
+# PyLongObject: refcnt, type, lv_tag (16), then 30-bit digits (24). The tag
+# holds the number of digits above its 3 low bits, and the sign in its 2
+# lowest (0 positive, 1 zero, 2 negative); an int of 0 or 1 digits is
+# compact. PyFloatObject: refcnt, type, ob_fval (16).
+
+
+@inline(.always)
+def compact_int(o: Obj) -> Bool:
+    """Whether an exact int has at most one digit (`Api.fast_int`)."""
+    return load_int(o + 16) < (2 << 3)
+
+
+@inline(.always)
+def compact_value(o: Obj) -> Int:
+    """A compact int's value (`compact_int`)."""
+    var tag = load_int(o + 16)
+    var digit = Int(Pointer[UInt32, MutAnyOrigin](unsafe_from_address=o + 24)[])
+    return (1 - (tag & 3)) * digit
+
+
+@inline(.always)
+def dict_next(o: Obj, mut pos: Int, mut k: Obj, mut v: Obj) -> Bool:
+    """PyDict_Next for a dict with a combined table (`ma_values` NULL; its
+    keys object read again on each call, as PyDict_Next reads it): the
+    next live entry at or after `pos`. PyDictObject: refcnt, type, ma_used
+    (16), a tag (24), ma_keys (32), ma_values (40). The keys object:
+    dk_refcnt, dk_log2_size (8), dk_log2_index_bytes (9), dk_kind (10),
+    dk_version, dk_usable, dk_nentries (24), the indices (32), then the
+    entries: (key, value) for str keys (kind 1), (hash, key, value) for
+    others (`Api.fast_dict`)."""
+    var keys = load_int(o + 32)
+    var b = buf(keys)
+    var unicode = b[unsafe_offset=10] == 1
+    var step = 16 if unicode else 24
+    var e = keys + 32 + (1 << Int(b[unsafe_offset=9])) + (0 if unicode else 8)
+    var n = load_int(keys + 24)
+    var i = pos
+    while i < n:
+        var at = e + i * step
+        var value = load_int(at + 8)
+        i += 1
+        if value != 0:
+            k = load_int(at)
+            v = value
+            pos = i
+            return True
+    pos = i
+    return False
+
+
+@inline(.always)
+def float_value(o: Obj) -> Float64:
+    """An exact float's value (`Api.fast_float`)."""
+    return Pointer[Float64, MutAnyOrigin](unsafe_from_address=o + 16)[]
 
 
 # ---- str internals (CPython 3.12-3.15, GIL builds; `Api.fast_str`) ----------

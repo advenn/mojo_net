@@ -40,7 +40,11 @@ from .capi import (
     TPFLAGS_TUPLE,
     TPFLAGS_UNICODE,
     buf,
+    compact_int,
+    compact_value,
     cstr,
+    dict_next,
+    float_value,
     out,
     load_int,
     str_data,
@@ -176,6 +180,95 @@ def _first_special(q: Pointer[UInt8, MutUntrackedOrigin], n: Int, high: Bool) ->
             return i + Int(count_trailing_zeros(bits))
         i += 32
     return n
+
+
+comptime _HEX_PAIRS = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+"""Each byte's two lowercase hex digits, for `_u_escape`."""
+
+
+@inline(.always)
+def _u_escape(c: UInt32) -> UInt64:
+    """`\\uXXXX` for `c` (below U+10000), as the 6 low bytes of a word:
+    each byte's two digits one load from `_HEX_PAIRS`."""
+    var t = _HEX_PAIRS.as_bytes().unsafe_ptr()
+    var hi = bitcast[DType.uint16, 1](t.unsafe_load[width=2](Int(c >> 8) * 2))
+    var lo = bitcast[DType.uint16, 1](t.unsafe_load[width=2](Int(c & 0xFF) * 2))
+    return 0x755C | (UInt64(hi) << 16) | (UInt64(lo) << 32)
+
+
+@inline(.always)
+def _put_char(q: Pointer[UInt8, MutUntrackedOrigin], m: Int, c: UInt32, ensure_ascii: Bool, mut wtf8: Bool) -> Int:
+    """One character of a str at `q[m]`, as json writes it; where the next
+    goes. Each escape or UTF-8 sequence is built in a word and stored once
+    (8 bytes, room reserved: 12 a character, and 32 past the end). A lone
+    surrogate written as it is (not ensure_ascii) sets `wtf8`."""
+    if c < 0x80:
+        if c >= 0x20 and c != 34 and c != 92 and not (ensure_ascii and c == 0x7F):
+            q[unsafe_offset=m] = UInt8(c)
+            return m + 1
+        var two: UInt64 = 0
+        if c == 34 or c == 92:
+            two = UInt64(c)
+        elif c == 10:
+            two = 110
+        elif c == 13:
+            two = 114
+        elif c == 9:
+            two = 116
+        elif c == 8:
+            two = 98
+        elif c == 12:
+            two = 102
+        if two != 0:
+            q.unsafe_store(m, bitcast[DType.uint8, 8](0x5C | (two << 8)))
+            return m + 2
+        q.unsafe_store(m, bitcast[DType.uint8, 8](_u_escape(c)))
+        return m + 6
+    if ensure_ascii:
+        if c >= 0x10000:
+            var v = c - 0x10000
+            q.unsafe_store(m, bitcast[DType.uint8, 8](_u_escape(0xD800 | (v >> 10))))
+            q.unsafe_store(m + 6, bitcast[DType.uint8, 8](_u_escape(0xDC00 | (v & 0x3FF))))
+            return m + 12
+        q.unsafe_store(m, bitcast[DType.uint8, 8](_u_escape(c)))
+        return m + 6
+    var w: UInt64
+    var k: Int
+    if c < 0x800:
+        w = UInt64(0xC0 | (c >> 6)) | (UInt64(0x80 | (c & 0x3F)) << 8)
+        k = 2
+    elif c < 0x10000:
+        if c >= 0xD800 and c <= 0xDFFF:
+            wtf8 = True
+        w = UInt64(0xE0 | (c >> 12)) | (UInt64(0x80 | ((c >> 6) & 0x3F)) << 8) | (UInt64(0x80 | (c & 0x3F)) << 16)
+        k = 3
+    else:
+        w = (
+            UInt64(0xF0 | (c >> 18))
+            | (UInt64(0x80 | ((c >> 12) & 0x3F)) << 8)
+            | (UInt64(0x80 | ((c >> 6) & 0x3F)) << 16)
+            | (UInt64(0x80 | (c & 0x3F)) << 24)
+        )
+        k = 4
+    q.unsafe_store(m, bitcast[DType.uint8, 8](w))
+    return m + k
+
+
+@inline(.always)
+def _plain_str(q: Pointer[UInt8, MutUntrackedOrigin], n: Int, s: Obj, high: Bool) -> Int:
+    """An exact compact ASCII str of at most 64 characters, with nothing to
+    escape, quoted at `q[n]` (room: 130 bytes); the length after it, or -1
+    (`q` past `n` garbage, nothing counted) for any other str (`fast_str`)."""
+    if not str_is_ascii(s):
+        return -1
+    var size = str_length(s)
+    if size > 64:
+        return -1
+    q[unsafe_offset=n] = 34
+    if _copy_scan(q.unsafe_offset(n + 1), buf(str_data(s)), size, high) != size:
+        return -1
+    q[unsafe_offset=n + 1 + size] = 34
+    return n + size + 2
 
 
 comptime _STR_START = 256
@@ -575,6 +668,9 @@ struct Encoder(TrivialRegisterPassable):
     def write_int(self, o: Obj) raises:
         """An exact int."""
         ref api = self.s[].api[]
+        if api.fast_int and compact_int(o):
+            self._digits(compact_value(o))
+            return
         var overflow: Int32 = 0
         var v = api.PyLong_AsLongLongAndOverflow(o, out(overflow))
         if overflow == 0:
@@ -607,20 +703,20 @@ struct Encoder(TrivialRegisterPassable):
 
     @inline(.always)
     def _digits(self, v: Int):
-        self.s[].o.reserve(21)
+        """`v` in decimal: its digits counted, then written in pairs where
+        they go (the buffer's pointer and length read once)."""
+        ref o = self.s[].o
+        o.reserve(21)
+        var q = o.p
+        var m = o.n
+        var u = UInt64(v)
         if v < 0:
-            self.s[].o.put(45)
-        var u = UInt64(v) if v >= 0 else UInt64(0) - UInt64(v)
-        var digits = Array[UInt8, 20](fill=0)
-        var k = 20
-        while True:
-            k -= 1
-            var q = u // 10
-            digits[k] = UInt8(48) + UInt8(u - 10 * q)
-            u = q
-            if u == 0:
-                break
-        self.s[].o.copy(Span(digits).unsafe_ptr().unsafe_offset(k), 20 - k)
+            q[unsafe_offset=m] = 45
+            m += 1
+            u = UInt64(0) - UInt64(v)
+        var nd = _ndigits(u)
+        _digits_into(q.unsafe_offset(m), u, nd)
+        o.n = m + nd
 
     def write_float(self, o: Obj, x: Float64, allow_nan: Bool) raises:
         """`x` (the value of float `o`) as `float.__repr__` writes it."""
@@ -731,25 +827,78 @@ struct Encoder(TrivialRegisterPassable):
                     q[unsafe_offset=start + n] = 34
                     o.n = start + n + 1
                     return
-                o.n = start + i
+                # Then each character to write otherwise, and the run of
+                # plain ones after it copied and scanned in one pass again
+                # (which writes at most 32 bytes past the run: within the
+                # room, since each character before took at least one).
+                var m = start + i
+                var wtf8 = False
                 while i < n:
-                    self._char(UInt32(p[unsafe_offset=i]), ensure_ascii)
+                    m = _put_char(q, m, UInt32(p[unsafe_offset=i]), ensure_ascii, wtf8)
                     i += 1
-                    var j = _plain_ascii_run(p, i, n, high)
-                    if j > i:
-                        self.s[].o.copy(p.unsafe_offset(i), j - i)
-                    i = j
-            elif kind == 2:
-                o.put(34)
+                    if i < n:
+                        var k = _copy_scan(q.unsafe_offset(m), p.unsafe_offset(i), n - i, high)
+                        m += k
+                        i += k
+                q[unsafe_offset=m] = 34
+                o.n = m + 1
+                return
+            var q = o.p
+            var m = o.n
+            q[unsafe_offset=m] = 34
+            m += 1
+            var wtf8 = False
+            # Characters 16 (or 8) at a time while they are plain ASCII,
+            # narrowed to bytes and stored at once; the others one by one.
+            var i = 0
+            if kind == 2:
                 var p = Pointer[UInt16, MutAnyOrigin](unsafe_from_address=d)
-                for i in range(n):
-                    self._char(UInt32(p[unsafe_offset=i]), ensure_ascii)
+                while i < n:
+                    if i + 16 <= n:
+                        var v = p.unsafe_load[width=16](i)
+                        var special = (
+                            v.ge(SIMD[DType.uint16, 16](0x7F if ensure_ascii else 0x80))
+                            | v.lt(SIMD[DType.uint16, 16](0x20))
+                            | v.eq(SIMD[DType.uint16, 16](34))
+                            | v.eq(SIMD[DType.uint16, 16](92))
+                        )
+                        var bits = pack_bits[DType.uint16](special)
+                        q.unsafe_store(m, v.cast[DType.uint8]())
+                        if bits == 0:
+                            m += 16
+                            i += 16
+                            continue
+                        var k = Int(count_trailing_zeros(bits))
+                        m += k
+                        i += k
+                    m = _put_char(q, m, UInt32(p[unsafe_offset=i]), ensure_ascii, wtf8)
+                    i += 1
             else:
-                o.put(34)
                 var p = Pointer[UInt32, MutAnyOrigin](unsafe_from_address=d)
-                for i in range(n):
-                    self._char(p[unsafe_offset=i], ensure_ascii)
-            self.s[].o.put(34)
+                while i < n:
+                    if i + 8 <= n:
+                        var v = p.unsafe_load[width=8](i)
+                        var special = (
+                            v.ge(SIMD[DType.uint32, 8](0x7F if ensure_ascii else 0x80))
+                            | v.lt(SIMD[DType.uint32, 8](0x20))
+                            | v.eq(SIMD[DType.uint32, 8](34))
+                            | v.eq(SIMD[DType.uint32, 8](92))
+                        )
+                        var bits = pack_bits[DType.uint8](special)
+                        q.unsafe_store(m, v.cast[DType.uint8]())
+                        if bits == 0:
+                            m += 8
+                            i += 8
+                            continue
+                        var k = Int(count_trailing_zeros(bits))
+                        m += k
+                        i += k
+                    m = _put_char(q, m, p[unsafe_offset=i], ensure_ascii, wtf8)
+                    i += 1
+            q[unsafe_offset=m] = 34
+            o.n = m + 1
+            if wtf8:
+                self.s[].wtf8 = True
             return
         # Through the C API: the text as UTF-8 (WTF-8 for lone surrogates).
         var size = 0
@@ -816,29 +965,47 @@ struct Encoder(TrivialRegisterPassable):
             _ = self.s[].path.pop()
         self.s[].api[].Py_LeaveRecursiveCall()
 
+    @inline(.always)
+    def _write_scalar(self, v: Obj) raises -> Bool:
+        """`v` written if it is None, a bool, or an exact str, int or float,
+        whose writing runs no Python code (so that a borrowed `v` needs no
+        reference held); False, nothing written, for anything else."""
+        ref st = self.s[]
+        ref api = st.api[]
+        if v == api.none:
+            self._null()
+            return True
+        if v == api.true:
+            self._true()
+            return True
+        if v == api.false:
+            self._false()
+            return True
+        var t = api.type_of(v)
+        if t == api.str_type:
+            self.write_str(v, st.opts.ensure_ascii)
+            return True
+        if t == api.int_type:
+            if api.fast_int and compact_int(v):
+                self._digits(compact_value(v))
+            else:
+                self.write_int(v)
+            return True
+        if t == api.float_type:
+            self.write_float(v, float_value(v) if api.fast_float else api.PyFloat_AsDouble(v), st.opts.allow_nan)
+            return True
+        if t == api.list_type and api.fast_list and load_int(v + 16) == 0:
+            self._put("[]")
+            return True
+        return False
+
     def write(self, o: Obj) raises:
         """Any value."""
         ref opts = self.s[].opts
         ref api = self.s[].api[]
-        if o == api.none:
-            self._null()
-            return
-        if o == api.true:
-            self._true()
-            return
-        if o == api.false:
-            self._false()
+        if self._write_scalar(o):
             return
         var t = api.type_of(o)
-        if t == api.str_type:
-            self.write_str(o, opts.ensure_ascii)
-            return
-        if t == api.int_type:
-            self.write_int(o)
-            return
-        if t == api.float_type:
-            self.write_float(o, api.PyFloat_AsDouble(o), opts.allow_nan)
-            return
         if t == api.list_type:
             self.write_list(o)
             return
@@ -893,10 +1060,129 @@ struct Encoder(TrivialRegisterPassable):
         api.Py_DecRef(r)
         self._leave()
 
+    def _write_exact_list(self, o: Obj) raises:
+        """An exact list, its items read from its array (`fast_list`): a
+        scalar borrowed (`_write_scalar`), anything else held by a
+        reference while it is written. The length and the array are read
+        again for each item, since Python code (a `default`, `fp.write`)
+        may change the list between them."""
+        ref opts = self.s[].opts
+        ref api = self.s[].api[]
+        if load_int(o + 16) == 0:  # (ob_size)
+            self._put("[]")
+            return
+        self._enter(o)
+        self.s[].o.byte(91)
+        if opts.has_indent:
+            self.s[].level += 1
+            self._newline()
+        var i = 0
+        # Without an indent, the separator and the items that are None, a
+        # bool or a compact int are written with the buffer's pointer,
+        # length and capacity in locals, kept from item to item: through
+        # `Out`, each write loaded the length its last one stored, a chain
+        # through memory that bounded the loop. They go back to `Out`
+        # before anything else is written, and are read again after.
+        var fast = not opts.has_indent and self.s[].item_len >= 0 and api.fast_int
+        var item_word = self.s[].item_word
+        var item_len = self.s[].item_len
+        ref ob = self.s[].o
+        var q = ob.p
+        var n = ob.n
+        var cap = ob.cap
+        while i < load_int(o + 16):
+            try:
+                if fast:
+                    if n >= ob.flush_at:
+                        ob.n = n
+                        self._flush(False)
+                        q = ob.p
+                        n = ob.n
+                        cap = ob.cap
+                        if i >= load_int(o + 16):
+                            break
+                    if n + 40 > cap:
+                        ob.n = n
+                        ob._grow(40)
+                        q = ob.p
+                        cap = ob.cap
+                    if i > 0:
+                        q.unsafe_store(n, bitcast[DType.uint8, 8](item_word))
+                        n += item_len
+                    var item = load_int(api.list_items(o) + 8 * i)
+                    i += 1
+                    if item == api.none:
+                        q.unsafe_store(n, bitcast[DType.uint8, 8](UInt64(0x6C6C756E)))
+                        n += 4
+                        continue
+                    if item == api.true:
+                        q.unsafe_store(n, bitcast[DType.uint8, 8](UInt64(0x65757274)))
+                        n += 4
+                        continue
+                    if item == api.false:
+                        q.unsafe_store(n, bitcast[DType.uint8, 8](UInt64(0x65736C6166)))
+                        n += 5
+                        continue
+                    if api.type_of(item) == api.int_type and compact_int(item):
+                        var v = compact_value(item)
+                        var u = UInt64(v)
+                        if v < 0:
+                            q[unsafe_offset=n] = 45
+                            n += 1
+                            u = UInt64(0) - UInt64(v)
+                        var nd = _ndigits(u)
+                        _digits_into(q.unsafe_offset(n), u, nd)
+                        n += nd
+                        continue
+                    ob.n = n
+                    if not self._write_scalar(item):
+                        api.Py_IncRef(item)
+                        try:
+                            self.write(item)
+                        except e:
+                            api.Py_DecRef(item)
+                            raise e^
+                        api.Py_DecRef(item)
+                    q = ob.p
+                    n = ob.n
+                    cap = ob.cap
+                    continue
+                if self.s[].o.n >= self.s[].o.flush_at:
+                    self._flush(False)
+                    if i >= load_int(o + 16):
+                        break
+                if i > 0:
+                    self._item_sep()
+                    if opts.has_indent:
+                        self._newline()
+                var item = load_int(api.list_items(o) + 8 * i)
+                if not self._write_scalar(item):
+                    api.Py_IncRef(item)
+                    try:
+                        self.write(item)
+                    except e:
+                        api.Py_DecRef(item)
+                        raise e^
+                    api.Py_DecRef(item)
+            except e:
+                self._leave()
+                raise e^
+            i += 1
+        if fast:
+            ob.n = n
+        if opts.has_indent:
+            self.s[].level -= 1
+            self._newline()
+        self.s[].o.byte(93)
+        self._leave()
+
     def write_list(self, o: Obj) raises:
         """A list or tuple (or subclass), by its items."""
         ref opts = self.s[].opts
         ref api = self.s[].api[]
+        if api.fast_list and api.type_of(o) == api.list_type:
+            self._write_exact_list(o)
+            return
         var seq = api.PySequence_Fast(o, cstr(""))
         if not seq:
             self._raised()
@@ -1015,6 +1301,11 @@ struct Encoder(TrivialRegisterPassable):
         var size = st.o.n - start
         if surrogate or size > _KEY_TEXT:
             return
+        if load_int(k) <= 1:
+            # (Its dict holds the only reference, `ob_refcnt`: no other
+            # dict can share it, and keeping it would push out a key that
+            # comes again.)
+            return
         ref api = st.api[]
         if len(keys.text) + size > _KEY_ARENA:
             keys.clear(api)
@@ -1078,26 +1369,56 @@ struct Encoder(TrivialRegisterPassable):
                 ref st = self.s[]
                 ref keys = st.keys[]
                 var fast = not opts.has_indent and st.item_len >= 0 and st.key_len >= 0 and st.use_keys
+                var fast_values = fast and api.fast_str and api.fast_int
+                # A combined table's entries are read as PyDict_Next reads
+                # them, without the call (`capi.dict_next`); a split one
+                # (an instance's `__dict__`) stays split, and goes through
+                # PyDict_Next.
+                var direct = api.fast_dict and load_int(o + 40) == 0
+                var item_word = st.item_word
+                var item_len = st.item_len
+                var key_word = st.key_word
+                var key_len = st.key_len
+                var high = opts.ensure_ascii
+                # The buffer's pointer, length and capacity in locals, kept
+                # from pair to pair (see `_write_exact_list`): they go back
+                # to `Out` before anything else writes, and are read again
+                # after.
+                ref ob = st.o
+                var q = ob.p
+                var n = ob.n
+                var cap = ob.cap
                 while True:
                     # The sink is written to before the next pair is
                     # taken (borrowed): `fp.write` may change the dict.
-                    if st.o.n >= st.o.flush_at:
+                    if n >= ob.flush_at:
+                        ob.n = n
                         self._flush(False)
-                    if api.PyDict_Next(o, out(pos), out(k), out(v)) == 0:
+                        q = ob.p
+                        n = ob.n
+                        cap = ob.cap
+                    if direct:
+                        if not dict_next(o, pos, k, v):
+                            break
+                    elif api.PyDict_Next(o, out(pos), out(k), out(v)) == 0:
                         break
                     # A str key already in `KeyBytes`: the separator, its
                     # text and the key separator stored at once, room
-                    # reserved once, and a null or bool value with them.
+                    # reserved once, and a value that is None, a bool, a
+                    # compact int or a short ASCII str with nothing to
+                    # escape with them.
                     if fast and api.type_of(k) == api.str_type:
                         var slot = _key_slot(k)
                         if keys.objs.unsafe_ptr()[unsafe_offset=slot] == k:
                             var size = Int(keys.size.unsafe_ptr()[unsafe_offset=slot])
-                            st.o.reserve(size + 56)
-                            var q = st.o.p
-                            var n = st.o.n
+                            if n + size + 160 > cap:
+                                ob.n = n
+                                ob._grow(size + 160)
+                                q = ob.p
+                                cap = ob.cap
                             if not first:
-                                q.unsafe_store(n, bitcast[DType.uint8, 8](st.item_word))
-                                n += st.item_len
+                                q.unsafe_store(n, bitcast[DType.uint8, 8](item_word))
+                                n += item_len
                             first = False
                             _copy_blocks(
                                 q.unsafe_offset(n),
@@ -1105,46 +1426,70 @@ struct Encoder(TrivialRegisterPassable):
                                 size,
                             )
                             n += size
-                            q.unsafe_store(n, bitcast[DType.uint8, 8](st.key_word))
-                            n += st.key_len
+                            q.unsafe_store(n, bitcast[DType.uint8, 8](key_word))
+                            n += key_len
                             if v == api.none:
                                 q.unsafe_store(n, bitcast[DType.uint8, 8](UInt64(0x6C6C756E)))
-                                st.o.n = n + 4
+                                n += 4
                                 continue
                             if v == api.true:
                                 q.unsafe_store(n, bitcast[DType.uint8, 8](UInt64(0x65757274)))
-                                st.o.n = n + 4
+                                n += 4
                                 continue
                             if v == api.false:
                                 q.unsafe_store(n, bitcast[DType.uint8, 8](UInt64(0x65736C6166)))
-                                st.o.n = n + 5
+                                n += 5
                                 continue
-                            st.o.n = n
-                            if self._scalar(v):
-                                self.write(v)
-                                continue
-                            api.Py_IncRef(v)
-                            try:
-                                self.write(v)
-                            except e:
+                            if fast_values:
+                                var t = api.type_of(v)
+                                if t == api.str_type:
+                                    var m = _plain_str(q, n, v, high)
+                                    if m >= 0:
+                                        n = m
+                                        continue
+                                elif t == api.int_type and compact_int(v):
+                                    var iv = compact_value(v)
+                                    var u = UInt64(iv)
+                                    if iv < 0:
+                                        q[unsafe_offset=n] = 45
+                                        n += 1
+                                        u = UInt64(0) - UInt64(iv)
+                                    var nd = _ndigits(u)
+                                    _digits_into(q.unsafe_offset(n), u, nd)
+                                    n += nd
+                                    continue
+                            ob.n = n
+                            if not self._write_scalar(v):
+                                api.Py_IncRef(v)
+                                try:
+                                    self.write(v)
+                                except e:
+                                    api.Py_DecRef(v)
+                                    raise e^
                                 api.Py_DecRef(v)
-                                raise e^
-                            api.Py_DecRef(v)
+                            q = ob.p
+                            n = ob.n
+                            cap = ob.cap
                             continue
                     # The key is written before any Python code can run
                     # (only a value's `default`, or a container's, can),
                     # so it needs no reference held; nor does a value
                     # whose writing runs none.
+                    ob.n = n
                     if self._scalar(v):
                         self._pair(k, v, first)
-                        continue
-                    api.Py_IncRef(v)
-                    try:
-                        self._pair(k, v, first)
-                    except e:
+                    else:
+                        api.Py_IncRef(v)
+                        try:
+                            self._pair(k, v, first)
+                        except e:
+                            api.Py_DecRef(v)
+                            raise e^
                         api.Py_DecRef(v)
-                        raise e^
-                    api.Py_DecRef(v)
+                    q = ob.p
+                    n = ob.n
+                    cap = ob.cap
+                ob.n = n
             else:
                 var items = api.PyMapping_Items(o)
                 if not items:
@@ -1191,6 +1536,19 @@ comptime _POW10: Array[UInt64, 20] = [
     1000000000000, 10000000000000, 100000000000000, 1000000000000000, 10000000000000000,
     100000000000000000, 1000000000000000000, 10000000000000000000,
 ]
+
+
+@inline(.always)
+def _ndigits(u: UInt64) -> Int:
+    """How many decimal digits `u` has (1 for 0): from its bit length
+    (log10(2) ~ 1233 / 4096), then one comparison with the power of ten
+    that may have been missed."""
+    if u < 10:
+        return 1
+    var n = ((64 - Int(count_leading_zeros(u))) * 1233) >> 12
+    if u >= materialize[_POW10]().unsafe_get(n):
+        n += 1
+    return n
 
 
 @inline(.always)

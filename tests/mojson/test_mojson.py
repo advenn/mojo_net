@@ -501,6 +501,40 @@ class Dumps(unittest.TestCase):
                 o = [o, 1] if i % 2 else {"k": o, "n": None}
             self.check(o)
 
+    def test_list_changed_while_written(self):
+        """A `default` that changes the list being written. An exact
+        list's scalars are written borrowed from its item array
+        (python/mojson/ext/encode.mojo, `_write_exact_list`); its length
+        and array are read again for each item, as json reads them, and
+        an item the change drops is never read after."""
+
+        def run(lib, change, items):
+            seq = list(items)
+
+            def default(o):
+                if change == "clear":
+                    seq.clear()
+                elif change == "grow":
+                    if len(seq) < 40:
+                        seq.extend(["more", 1.5, None] * 4)  # (the array moves)
+                elif change == "shrink":
+                    del seq[len(seq) // 2:]
+                else:
+                    seq[:] = ["replaced", 2, [3]]
+                return "d"
+
+            return outcome(lib.dumps, seq, default=default)
+
+        shapes = [
+            [1, object(), "x", 2.5, None, [3], "tail", True],
+            [object(), object(), 7],
+            ["a", "b", object()],
+            [object()],
+        ]
+        for change in ("clear", "grow", "shrink", "replace"):
+            for items in shapes:
+                self.assertEqual(run(mojson, change, items)[:3], run(json, change, items)[:3], (change, items))
+
     def test_dump_writes_a_file(self):
         f = io.StringIO()
         mojson.dump({"a": [1, "é"]}, f, ensure_ascii=False)
