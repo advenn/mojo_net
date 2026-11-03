@@ -215,9 +215,14 @@ struct Api(Movable):
     var fast_int: Bool
     """A compact int's value (one 30-bit digit at most) is read directly
     (checked at load)."""
+    var counted_recursion: Bool
+    """Py_EnterRecursiveCall counts calls (Python 3.12 and 3.13), where
+    3.14 and later compare the C stack's depth with a limit instead: a
+    loop that takes no stack per level need not call it per level."""
     var fast_dict: Bool
     """A combined dict's entries are read directly (`dict_next`, checked
-    at load against PyDict_Next)."""
+    at load against PyDict_Next), and an exact dict's size (`ma_used`, the
+    third word)."""
 
     def __init__(out self) raises:
         var h = OwnedDLHandle()
@@ -309,6 +314,7 @@ struct Api(Movable):
         self.fast_float = False
         self.fast_int = False
         self.fast_dict = False
+        self.counted_recursion = (load_int(_data(h, "Py_Version")) & 0xFFFFFFFF) < 0x030E0000
         self._handle = h^
         # Every path reads an object's type directly: refuse an interpreter
         # whose objects do not start with (refcount, type), as free-threaded
@@ -463,7 +469,7 @@ struct Api(Movable):
             if a != b:
                 return False
             if not a:
-                return count == self.PyDict_Size(o)
+                return count == self.PyDict_Size(o) and load_int(o + 16) == count  # (ma_used)
             if k != k2 or v != v2 or pos != mine:
                 return False
             count += 1
@@ -585,6 +591,21 @@ def dict_next(o: Obj, mut pos: Int, mut k: Obj, mut v: Obj) -> Bool:
             return True
     pos = i
     return False
+
+
+@inline(.always)
+def dict_table(o: Obj) -> Tuple[Int, Int, Int]:
+    """A combined dict's entries as `dict_next` reads them: the address of
+    the first one's key, the size of an entry, and the entries used
+    (`dk_nentries`, deleted ones included: a NULL value)."""
+    var keys = load_int(o + 32)
+    var b = buf(keys)
+    var unicode = b[unsafe_offset=10] == 1
+    return (
+        keys + 32 + (1 << Int(b[unsafe_offset=9])) + (0 if unicode else 8),
+        16 if unicode else 24,
+        load_int(keys + 24),
+    )
 
 
 @inline(.always)

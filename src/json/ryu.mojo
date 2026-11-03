@@ -195,8 +195,25 @@ def _d2d(ieee_mantissa: UInt64, ieee_exponent: Int) -> Shortest:
         var up = (vr == vm and (not accept_bounds or not vm_trailing_zeros)) or last_removed >= 5
         output = vr + (UInt64(1) if up else UInt64(0))
     else:
-        # The common case: no exact bounds, round half up.
+        # The common case: no exact bounds, round half up. Four digits at a
+        # time while the interval still holds a number with four fewer
+        # (floor(vp / 10^4) > floor(vm / 10^4) implies the same for each
+        # smaller power, so it is four single steps), the last digit
+        # removed, the one that rounds, being the group's first; then two,
+        # then one at a time. Short decimals (prices, coordinates) shed a
+        # dozen digits here.
         var round_up = False
+        while True:
+            var vp4 = vp // 10000
+            var vm4 = vm // 10000
+            if vp4 <= vm4:
+                break
+            var vr4 = vr // 10000
+            round_up = vr - 10000 * vr4 >= 5000
+            vr = vr4
+            vp = vp4
+            vm = vm4
+            removed += 4
         var vp100 = vp // 100
         var vm100 = vm // 100
         if vp100 > vm100:

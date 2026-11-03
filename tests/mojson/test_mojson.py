@@ -433,6 +433,15 @@ class Dumps(unittest.TestCase):
             self.check(s)
             self.check(s, ensure_ascii=False)
             self.check({s: s}, sort_keys=True)
+        # Runs of characters past ASCII, written one after another
+        # (python/mojson/ext/encode.mojo, `write_str`), and short ASCII
+        # strings in one or two 32-byte blocks (`_plain_str`).
+        pools = ["ab z", "ÄÖüß é", "Дуглас Адамс", "日本語の文章", "\ud800\udfff\udbff", "😀🎉", "\"\\\n\x01\x7f/", "\u0080\u07ff\u0800\uffff"]
+        for _ in range(2000 * SCALE):
+            s = "".join("".join(rng.choice(pool) for _ in range(rng.randint(0, 40))) for pool in rng.sample(pools, 3))
+            for o in ([s, s[:31], s[:32], s[:33], s[:64], s[:65]], {"k": s, s[:5]: [s]}):
+                self.check(o)
+                self.check(o, ensure_ascii=False)
 
     def test_random_objects(self):
         rng = random.Random(9)
@@ -495,11 +504,70 @@ class Dumps(unittest.TestCase):
             self.check(object(), cls=Dates, **kw)
 
     def test_deep(self):
-        for d in [10, 100, 500]:
+        """Past `_TREE_DEPTH` (128) levels a container goes into a loop of
+        its own (python/mojson/ext/encode.mojo, `_write_tree`); 10,000
+        levels, which json writes, overflowed the stack in 0.1.7."""
+        for d in [10, 100, 127, 128, 129, 500, 10000]:
             o = []
             for i in range(d):
                 o = [o, 1] if i % 2 else {"k": o, "n": None}
             self.check(o)
+            self.check(o, separators=(",", ":"))
+        for kind in ("list", "dict"):
+            a = [] if kind == "list" else {}
+            b = [{"x": a}]
+            if kind == "list":
+                a.append(b)
+            else:
+                a["b"] = b
+            for kw in [{}, {"separators": (",", ":")}]:
+                self.check(a, **kw)
+                # (Without the check, a cycle runs out of stack: the error's
+                # text names the stack's use, so only its type is compared.)
+                self.assertEqual(outcome(mojson.dumps, a, check_circular=False, **kw)[1], RecursionError)
+
+    def test_changed_while_written(self):
+        """A `default` that changes containers above the value it is
+        given, and drops ones being written (their only reference in the
+        object). `_write_tree` borrows the containers on its stack, and
+        takes a reference to each before Python code runs; a dict's table
+        is read again after (python/mojson/ext/encode.mojo)."""
+
+        def run(lib, change, kw):
+            root = {
+                "a": 1,
+                "x": {"y": [{"z": object(), "w": "after"}, "tail", {"q": [1, 2]}], "v": 2.5},
+                "b": [3, {"c": object()}, "end"],
+                "e": None,
+            }
+
+            def default(o):
+                x = root.get("x")
+                if change == "clear":
+                    root.clear()
+                elif change == "drop":
+                    root["x"] = None
+                    root["b"] = None
+                elif change == "grow":
+                    for i in range(30):
+                        root["k%d" % i] = {"i": i}
+                elif change == "inner" and isinstance(x, dict):
+                    x["y"].clear()
+                    x["new"] = [4]
+                elif change == "replace" and isinstance(x, dict):
+                    x["y"][:] = ["r", {"s": 1}]
+                return "D"
+
+            return outcome(lib.dumps, root, default=default, **kw)
+
+        options = [{}, {"separators": (",", ":")}, {"check_circular": False}]
+        if sys.version_info >= (3, 13):
+            # (3.12's json writes an indent in Python, whose dict views
+            # raise RuntimeError on a change of size.)
+            options.append({"indent": 1})
+        for change in ("clear", "drop", "grow", "inner", "replace"):
+            for kw in options:
+                self.assertEqual(run(mojson, change, kw)[:3], run(json, change, kw)[:3], (change, kw))
 
     def test_list_changed_while_written(self):
         """A `default` that changes the list being written. An exact

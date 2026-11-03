@@ -44,6 +44,7 @@ from .capi import (
     compact_value,
     cstr,
     dict_next,
+    dict_table,
     float_value,
     out,
     load_int,
@@ -255,17 +256,50 @@ def _put_char(q: Pointer[UInt8, MutUntrackedOrigin], m: Int, c: UInt32, ensure_a
 
 
 @inline(.always)
+def _plain_block(dst: Pointer[UInt8, MutUntrackedOrigin], src: Pointer[UInt8, _], m: Int, high: Bool) -> UInt32:
+    """`_plain_str`'s 32-byte step: the block at `src` copied to `dst`, and
+    a bit for each of its first `m` (at most 32) bytes that must be
+    escaped. The bytes are ASCII, so one signed compare finds the control
+    characters; a read past `src`'s `m` bytes stays inside its page (else
+    they are gathered one by one), as `_copy_scan`'s does."""
+    var v: SIMD[DType.uint8, 32]
+    if m >= 32 or (Int(src) & 4095) <= 4096 - 32:
+        v = src.unsafe_load[width=32](0)
+    else:
+        v = SIMD[DType.uint8, 32](0x41)
+        for k in range(m):
+            v[k] = src[unsafe_offset=k]
+    dst.unsafe_store(0, v)
+    var special = (
+        v.cast[DType.int8]().lt(SIMD[DType.int8, 32](0x20))
+        | v.eq(SIMD[DType.uint8, 32](34))
+        | v.eq(SIMD[DType.uint8, 32](92))
+    )
+    if high:
+        special = special | v.eq(SIMD[DType.uint8, 32](0x7F))
+    var bits = pack_bits[DType.uint32](special)
+    if m < 32:
+        bits &= (UInt32(1) << UInt32(m)) - 1
+    return bits
+
+
+@inline(.always)
 def _plain_str(q: Pointer[UInt8, MutUntrackedOrigin], n: Int, s: Obj, high: Bool) -> Int:
     """An exact compact ASCII str of at most 64 characters, with nothing to
     escape, quoted at `q[n]` (room: 130 bytes); the length after it, or -1
-    (`q` past `n` garbage, nothing counted) for any other str (`fast_str`)."""
-    if not str_is_ascii(s):
+    (`q` past `n` garbage, nothing counted) for any other str (`fast_str`):
+    its state's compact and ASCII bits read at once, its characters at 40,
+    one or two 32-byte blocks."""
+    if (Pointer[UInt32, MutAnyOrigin](unsafe_from_address=s + 32)[] & 0x60) != 0x60:  # (compact, ascii)
         return -1
     var size = str_length(s)
     if size > 64:
         return -1
+    var src = buf(s + 40)
     q[unsafe_offset=n] = 34
-    if _copy_scan(q.unsafe_offset(n + 1), buf(str_data(s)), size, high) != size:
+    if _plain_block(q.unsafe_offset(n + 1), src, size, high) != 0:
+        return -1
+    if size > 32 and _plain_block(q.unsafe_offset(n + 33), src.unsafe_offset(32), size - 32, high) != 0:
         return -1
     q[unsafe_offset=n + 1 + size] = 34
     return n + size + 2
@@ -445,6 +479,29 @@ def _packed(s: List[UInt8]) -> Tuple[UInt64, Int]:
     return (w, len(s))
 
 
+comptime _TREE_DEPTH = 128
+"""The levels one `_write_tree` loop goes down; a deeper container goes
+through `write`, into a loop of its own."""
+comptime _FRAME = 4
+"""Words per level in `EncState.frames`: container, position, 1 for a
+dict, `mask` (`_write_tree`)."""
+
+
+@inline(.always)
+def _path_bit(o: Obj) -> Int:
+    """A container's bit in `_write_tree`'s `mask`: from a multiplicative
+    hash of its address (dicts and lists sit 64 bytes apart in their
+    pools, so their low bits repeat)."""
+    return 1 << Int((UInt64(o) * 0x9E3779B97F4A7C15) >> UInt64(58))
+
+
+@inline(.always)
+def _nested(ref api: Api, v: Obj) -> Bool:
+    """An exact list, or an exact dict with a combined table: what
+    `_write_tree` goes into (`fast_list`, `fast_dict`)."""
+    var t = api.type_of(v)
+    return t == api.list_type or (t == api.dict_type and load_int(v + 40) == 0)  # (ma_values)
+
 comptime _KEYS = 4096
 """Slots in `KeyBytes` (a power of two). Direct-mapped: the keys of a dict
 of 159 (a BestBuy product) collided in a quarter of 512 slots, and
@@ -560,6 +617,15 @@ struct EncState(Movable):
     """`opts.item_sep` as one word, or -1 when longer than 8 bytes."""
     var key_word: UInt64
     var key_len: Int
+    var tree_ok: Bool
+    """Lists and dicts can go through `_write_tree`: no indent, both
+    separators a word long, and the layouts it reads checked."""
+    var frames: List[Int]
+    """`_write_tree`'s stacks, one above another (a loop inside `write`
+    inside another): container, position, kind and mask of each
+    level above the current one (`_FRAME`). Its length is its room."""
+    var tree_top: Int
+    """Where the next loop's stack starts in `frames`."""
 
     def __init__(
         out self,
@@ -574,6 +640,18 @@ struct EncState(Movable):
         self.api = api
         self.item_word, self.item_len = _packed(opts.item_sep)
         self.key_word, self.key_len = _packed(opts.key_sep)
+        self.tree_ok = (
+            not opts.has_indent
+            and not opts.sort_keys
+            and self.item_len >= 0
+            and self.key_len >= 0
+            and api[].fast_str
+            and api[].fast_int
+            and api[].fast_dict
+            and api[].fast_list
+        )
+        self.frames = List[Int]()
+        self.tree_top = 0
         self.opts = opts^
         self.keys = keys
         self.o = Out(api, raw, raw_cap)
@@ -837,6 +915,12 @@ struct Encoder(TrivialRegisterPassable):
                 while i < n:
                     m = _put_char(q, m, UInt32(p[unsafe_offset=i]), ensure_ascii, wtf8)
                     i += 1
+                    if ensure_ascii:
+                        # (A run past ASCII, as in kind 2's loop.)
+                        while i < n and p[unsafe_offset=i] >= 0x80:
+                            q.unsafe_store(m, bitcast[DType.uint8, 8](_u_escape(UInt32(p[unsafe_offset=i]))))
+                            m += 6
+                            i += 1
                     if i < n:
                         var k = _copy_scan(q.unsafe_offset(m), p.unsafe_offset(i), n - i, high)
                         m += k
@@ -874,6 +958,32 @@ struct Encoder(TrivialRegisterPassable):
                         i += k
                     m = _put_char(q, m, UInt32(p[unsafe_offset=i]), ensure_ascii, wtf8)
                     i += 1
+                    # A run past ASCII (a word in Cyrillic, CJK text) one
+                    # character after another, without the vector check
+                    # that would find each the first to write otherwise.
+                    if ensure_ascii:
+                        while i < n and p[unsafe_offset=i] >= 0x80:
+                            q.unsafe_store(m, bitcast[DType.uint8, 8](_u_escape(UInt32(p[unsafe_offset=i]))))
+                            m += 6
+                            i += 1
+                    else:
+                        while i < n:
+                            var c = UInt32(p[unsafe_offset=i])
+                            if c < 0x80 or (c & 0xF800) == 0xD800:  # (a surrogate: `_put_char`)
+                                break
+                            var w: UInt64
+                            if c < 0x800:
+                                w = UInt64(0xC0 | (c >> 6)) | (UInt64(0x80 | (c & 0x3F)) << 8)
+                                m += 2
+                            else:
+                                w = (
+                                    UInt64(0xE0 | (c >> 12))
+                                    | (UInt64(0x80 | ((c >> 6) & 0x3F)) << 8)
+                                    | (UInt64(0x80 | (c & 0x3F)) << 16)
+                                )
+                                m += 3
+                            q.unsafe_store(m - (2 if c < 0x800 else 3), bitcast[DType.uint8, 8](w))
+                            i += 1
             else:
                 var p = Pointer[UInt32, MutAnyOrigin](unsafe_from_address=d)
                 while i < n:
@@ -1072,6 +1182,9 @@ struct Encoder(TrivialRegisterPassable):
         if load_int(o + 16) == 0:  # (ob_size)
             self._put("[]")
             return
+        if self.s[].tree_ok and self.s[].use_keys:
+            self._write_tree(o, False)
+            return
         self._enter(o)
         self.s[].o.byte(91)
         if opts.has_indent:
@@ -1084,7 +1197,8 @@ struct Encoder(TrivialRegisterPassable):
         # `Out`, each write loaded the length its last one stored, a chain
         # through memory that bounded the loop. They go back to `Out`
         # before anything else is written, and are read again after.
-        var fast = not opts.has_indent and self.s[].item_len >= 0 and api.fast_int
+        var fast = not opts.has_indent and self.s[].item_len >= 0 and api.fast_int and api.fast_str
+        var high = opts.ensure_ascii
         var item_word = self.s[].item_word
         var item_len = self.s[].item_len
         ref ob = self.s[].o
@@ -1102,9 +1216,9 @@ struct Encoder(TrivialRegisterPassable):
                         cap = ob.cap
                         if i >= load_int(o + 16):
                             break
-                    if n + 72 > cap:
+                    if n + 144 > cap:
                         ob.n = n
-                        ob._grow(72)
+                        ob._grow(144)
                         q = ob.p
                         cap = ob.cap
                     if i > 0:
@@ -1125,7 +1239,12 @@ struct Encoder(TrivialRegisterPassable):
                         n += 5
                         continue
                     var t = api.type_of(item)
-                    if t == api.float_type and api.fast_float:
+                    if t == api.str_type:
+                        var m = _plain_str(q, n, item, high)
+                        if m >= 0:
+                            n = m
+                            continue
+                    elif t == api.float_type and api.fast_float:
                         var x = float_value(item)
                         if x - x == 0:  # (finite)
                             n = _py_float_into(q, n, x)
@@ -1182,6 +1301,404 @@ struct Encoder(TrivialRegisterPassable):
             self._newline()
         self.s[].o.byte(93)
         self._leave()
+
+    @inline(.always)
+    def _leaf(
+        self,
+        mut q: Pointer[UInt8, MutUntrackedOrigin],
+        mut n: Int,
+        mut cap: Int,
+        v: Obj,
+        high: Bool,
+    ) raises -> Bool:
+        """For `_write_tree`: `v` written at `q[n]` (room: 160 bytes), and
+        True, if it is None, a bool, or an exact str, int or float, whose
+        writing runs no Python code; False, nothing written, for anything
+        else. `q`, `n` and `cap` are the loop's (`Out`'s when synced)."""
+        ref st = self.s[]
+        ref api = st.api[]
+        if v == api.none:
+            q.unsafe_store(n, bitcast[DType.uint8, 8](UInt64(0x6C6C756E)))
+            n += 4
+            return True
+        if v == api.true:
+            q.unsafe_store(n, bitcast[DType.uint8, 8](UInt64(0x65757274)))
+            n += 4
+            return True
+        if v == api.false:
+            q.unsafe_store(n, bitcast[DType.uint8, 8](UInt64(0x65736C6166)))
+            n += 5
+            return True
+        var t = api.type_of(v)
+        if t == api.str_type:
+            var m = _plain_str(q, n, v, high)
+            if m >= 0:
+                n = m
+                return True
+            st.o.n = n
+            self.write_str(v, high)
+        elif t == api.int_type:
+            if compact_int(v):
+                var iv = compact_value(v)
+                var u = UInt64(iv)
+                if iv < 0:
+                    q[unsafe_offset=n] = 45
+                    n += 1
+                    u = UInt64(0) - UInt64(iv)
+                var nd = _ndigits(u)
+                _digits_fast(q.unsafe_offset(n), u, nd)
+                n += nd
+                return True
+            st.o.n = n
+            self.write_int(v)
+        elif t == api.float_type and api.fast_float:
+            var x = float_value(v)
+            if x - x == 0:  # (finite)
+                n = _py_float_into(q, n, x)
+                return True
+            st.o.n = n
+            self.write_float(v, x, st.opts.allow_nan)
+        else:
+            return False
+        q = st.o.p
+        n = st.o.n
+        cap = st.o.cap
+        return True
+
+    def _write_tree(self, root: Obj, root_dict: Bool) raises:
+        """A non-empty exact list, or a non-empty exact dict with a
+        combined table, and the lists and dicts like them inside it down
+        to `_TREE_DEPTH` levels, in one loop with a stack of its own
+        (`EncState.frames`), the buffer's pointer, length and capacity in
+        locals throughout (see `_write_exact_list`): a recursive call per
+        container cost ~450 instructions on small ones. A loop for a
+        dict's pairs and one for a list's items, inside a loop that goes
+        from one container to another, keep what each needs in registers.
+        Everything else goes to `write`, recursively as before, and so
+        does a container `_TREE_DEPTH` levels down (into a loop of its
+        own: a C frame per 128 levels, where json's C encoder takes one
+        per level, and ours took two, which ran out of stack short of
+        json's depth).
+
+        Values, and the containers below the root, are borrowed: none of
+        the loop's own writing runs Python code. Before anything that can
+        (`write`, `fp.write`, a key that is not an exact str), `_hold`
+        takes a reference to each container on the stack not yet held
+        (levels 1 to `held` are; the root is the caller's), and puts it
+        on `path` for the circular check of what `write` writes; each is
+        given back as it is left. A dict's table is read again whenever
+        its loop starts and after any of those, as PyDict_Next reads it
+        on each call, and a list's length and array at every item.
+
+        Each level is entered as `_enter` enters one: the circular check
+        (against `path` and the levels not on it, after a bit for each
+        container on either, `mask`, says it may be there), then, where
+        Python counts them (`Api.counted_recursion`),
+        Py_EnterRecursiveCall, as json counts; Python 3.14 and later check
+        the stack instead, which stays where it was at the root, checked
+        by `_enter`."""
+        ref st = self.s[]
+        ref api = st.api[]
+        ref keys = st.keys[]
+        ref ob = st.o
+        var check = st.opts.check_circular
+        var counted = api.counted_recursion
+        var high = st.opts.ensure_ascii
+        var item_word = st.item_word
+        var item_len = st.item_len
+        var key_word = st.key_word
+        var key_len = st.key_len
+        var flush_at = ob.flush_at
+        self._enter(root)
+        var mask = 0
+        if check:
+            for p in st.path:
+                mask |= _path_bit(p)
+        var base = st.tree_top
+        if len(st.frames) < base + _FRAME * 16:
+            st.frames.resize(2 * (base + _FRAME * 16), 0)
+        var fp = st.frames.unsafe_ptr()
+        var o = root
+        var is_dict = root_dict
+        var pos = 0
+        var first = True
+        var depth = 0
+        var held = 0
+        var q = ob.p
+        var n = ob.n
+        var cap = ob.cap
+        try:
+            if n + 8 > cap:
+                ob.n = n
+                ob._grow(8)
+                q = ob.p
+                cap = ob.cap
+            q[unsafe_offset=n] = 123 if is_dict else 91
+            n += 1
+            while True:
+                # The container to go into next (0: this one is done).
+                var child: Obj = 0
+                if is_dict:
+                    var de: Int
+                    var dstep: Int
+                    var dn: Int
+                    de, dstep, dn = dict_table(o)
+                    while True:
+                        if n >= flush_at:
+                            self._hold(o, base, depth, held)
+                            held = depth
+                            ob.n = n
+                            self._flush(False)
+                            q = ob.p
+                            n = ob.n
+                            cap = ob.cap
+                            de, dstep, dn = dict_table(o)
+                        if n + 200 > cap:
+                            ob.n = n
+                            ob._grow(200)
+                            q = ob.p
+                            cap = ob.cap
+                        var k: Obj = 0
+                        var v: Obj = 0
+                        while pos < dn:
+                            var at = de + pos * dstep
+                            pos += 1
+                            v = load_int(at + 8)
+                            if v != 0:
+                                k = load_int(at)
+                                break
+                        if v == 0:
+                            break
+                        var mark = n
+                        if not first:
+                            q.unsafe_store(n, bitcast[DType.uint8, 8](item_word))
+                            n += item_len
+                        if api.type_of(k) == api.str_type:
+                            var slot = _key_slot(k)
+                            if keys.objs.unsafe_ptr()[unsafe_offset=slot] == k:
+                                var size = Int(keys.size.unsafe_ptr()[unsafe_offset=slot])
+                                if n + size + 160 > cap:
+                                    ob.n = n
+                                    ob._grow(size + 160)
+                                    q = ob.p
+                                    cap = ob.cap
+                                _copy_blocks(
+                                    q.unsafe_offset(n),
+                                    keys.text.unsafe_ptr().unsafe_offset(Int(keys.off.unsafe_ptr()[unsafe_offset=slot])),
+                                    size,
+                                )
+                                n += size
+                            else:
+                                ob.n = n
+                                self._new_key(k)
+                                ob.reserve(160)
+                                q = ob.p
+                                n = ob.n
+                                cap = ob.cap
+                        else:
+                            self._hold(o, base, depth, held)
+                            held = depth
+                            ob.n = n
+                            var kept = self._key(k)
+                            ob.reserve(160)
+                            q = ob.p
+                            n = ob.n if kept else mark
+                            cap = ob.cap
+                            de, dstep, dn = dict_table(o)
+                            if not kept:
+                                continue
+                        q.unsafe_store(n, bitcast[DType.uint8, 8](key_word))
+                        n += key_len
+                        first = False
+                        if self._leaf(q, n, cap, v, high):
+                            continue
+                        if _nested(api, v):
+                            if load_int(v + 16) == 0:  # (ma_used, ob_size)
+                                q.unsafe_store(n, bitcast[DType.uint8, 8](UInt64(0x7D7B if api.type_of(v) == api.dict_type else 0x5D5B)))
+                                n += 2
+                                continue
+                            if depth + 1 < _TREE_DEPTH:
+                                child = v
+                                break
+                        self._hold(o, base, depth, held)
+                        held = depth
+                        ob.n = n
+                        self._other(v, base + _FRAME * depth)
+                        fp = st.frames.unsafe_ptr()
+                        q = ob.p
+                        n = ob.n
+                        cap = ob.cap
+                        de, dstep, dn = dict_table(o)
+                else:
+                    while True:
+                        if n >= flush_at:
+                            self._hold(o, base, depth, held)
+                            held = depth
+                            ob.n = n
+                            self._flush(False)
+                            q = ob.p
+                            n = ob.n
+                            cap = ob.cap
+                        if n + 200 > cap:
+                            ob.n = n
+                            ob._grow(200)
+                            q = ob.p
+                            cap = ob.cap
+                        if pos >= load_int(o + 16):  # (ob_size)
+                            break
+                        var v = load_int(api.list_items(o) + 8 * pos)
+                        if pos > 0:
+                            q.unsafe_store(n, bitcast[DType.uint8, 8](item_word))
+                            n += item_len
+                        pos += 1
+                        if self._leaf(q, n, cap, v, high):
+                            continue
+                        if _nested(api, v):
+                            if load_int(v + 16) == 0:  # (ma_used, ob_size)
+                                q.unsafe_store(n, bitcast[DType.uint8, 8](UInt64(0x7D7B if api.type_of(v) == api.dict_type else 0x5D5B)))
+                                n += 2
+                                continue
+                            if depth + 1 < _TREE_DEPTH:
+                                child = v
+                                break
+                        self._hold(o, base, depth, held)
+                        held = depth
+                        ob.n = n
+                        self._other(v, base + _FRAME * depth)
+                        fp = st.frames.unsafe_ptr()
+                        q = ob.p
+                        n = ob.n
+                        cap = ob.cap
+                if child != 0:
+                    # Into `child`, a level down.
+                    var bit = _path_bit(child)
+                    if check and (mask & bit) != 0:
+                        if child == o or self._on_path(child, base, depth, held):
+                            api.fail(api.ValueError, "Circular reference detected")
+                            self._raised()
+                    if counted and api.Py_EnterRecursiveCall(cstr(" while encoding a JSON object")) != 0:
+                        self._raised()
+                    var f = base + _FRAME * depth
+                    if f + _FRAME > len(st.frames):
+                        st.frames.resize(2 * len(st.frames), 0)
+                        fp = st.frames.unsafe_ptr()
+                    fp[unsafe_offset=f] = o
+                    fp[unsafe_offset=f + 1] = pos
+                    fp[unsafe_offset=f + 2] = Int(is_dict)
+                    fp[unsafe_offset=f + 3] = mask
+                    mask |= bit
+                    depth += 1
+                    o = child
+                    pos = 0
+                    first = True
+                    is_dict = api.type_of(child) == api.dict_type
+                    q[unsafe_offset=n] = 123 if is_dict else 91
+                    n += 1
+                    continue
+                # Out of this one, a level up.
+                q[unsafe_offset=n] = 125 if is_dict else 93
+                n += 1
+                if depth == 0:
+                    break
+                if counted:
+                    api.Py_LeaveRecursiveCall()
+                if depth <= held:
+                    # (This may be its last reference: releasing it can
+                    # run Python code; the table above is read again.)
+                    held = depth - 1
+                    if check:
+                        _ = st.path.pop()
+                    ob.n = n
+                    api.Py_DecRef(o)
+                depth -= 1
+                var f = base + _FRAME * depth
+                o = fp[unsafe_offset=f]
+                pos = fp[unsafe_offset=f + 1]
+                is_dict = fp[unsafe_offset=f + 2] != 0
+                mask = fp[unsafe_offset=f + 3]
+                first = False
+        except e:
+            self._unwind(o, base, depth, held)
+            raise e^
+        ob.n = n
+        st.tree_top = base
+        self._leave()
+
+    @no_inline
+    def _other(self, v: Obj, top: Int) raises:
+        """For `_write_tree`, whose containers are held now: `v`, by
+        `write`, held too (Python code may change what holds it), with a
+        loop it starts stacked above `top`."""
+        ref st = self.s[]
+        ref api = st.api[]
+        var saved = st.tree_top
+        st.tree_top = top
+        api.Py_IncRef(v)
+        try:
+            self.write(v)
+        except e:
+            api.Py_DecRef(v)
+            st.tree_top = saved
+            raise e^
+        api.Py_DecRef(v)
+        st.tree_top = saved
+
+    @no_inline
+    def _on_path(self, v: Obj, base: Int, depth: Int, held: Int) -> Bool:
+        """Whether `v` is being written (`_write_tree`'s circular check):
+        on `path`, or one of the loop's levels not on it (`held + 1` to
+        `depth - 1`; the caller compares the one at `depth`)."""
+        ref path = self.s[].path
+        var p = path.unsafe_ptr()
+        for i in range(len(path)):
+            if p[unsafe_offset=i] == v:
+                return True
+        var f = self.s[].frames.unsafe_ptr().unsafe_offset(base)
+        for level in range(held + 1, depth):
+            if f[unsafe_offset=_FRAME * level] == v:
+                return True
+        return False
+
+    @no_inline
+    def _hold(self, cur: Obj, base: Int, depth: Int, held: Int):
+        """Before Python code can run in `_write_tree`: a reference to the
+        container at each of its levels `held + 1` to `depth` (`cur` the
+        one at `depth`, the others in `frames` from `base`), each put on
+        `path` (under check_circular) in order."""
+        ref st = self.s[]
+        ref api = st.api[]
+        var check = st.opts.check_circular
+        var level = held + 1
+        while level <= depth:
+            var c = cur if level == depth else st.frames[base + _FRAME * level]
+            api.Py_IncRef(c)
+            if check:
+                st.path.append(c)
+            level += 1
+
+    @no_inline
+    def _unwind(self, cur: Obj, base: Int, depth: Int, held: Int):
+        """After a failure in `_write_tree`: each level left as the loop
+        leaves one, held containers given back, and the root left."""
+        ref st = self.s[]
+        ref api = st.api[]
+        var level = depth
+        while level >= 1:
+            var c = cur if level == depth else st.frames[base + _FRAME * level]
+            if api.counted_recursion:
+                api.Py_LeaveRecursiveCall()
+            if level <= held:
+                if st.opts.check_circular:
+                    _ = st.path.pop()
+                api.Py_DecRef(c)
+            level -= 1
+        st.tree_top = base
+        self._leave()
+
+    @no_inline
+    def _new_key(self, k: Obj) raises:
+        """An exact str key not in `KeyBytes` (`_str_key`), out of line."""
+        self._str_key(k)
 
     def write_list(self, o: Obj) raises:
         """A list or tuple (or subclass), by its items."""
@@ -1359,8 +1876,11 @@ struct Encoder(TrivialRegisterPassable):
         ref opts = self.s[].opts
         ref api = self.s[].api[]
         var exact = api.type_of(o) == api.dict_type
-        if api.PyDict_Size(o) == 0:
+        if (load_int(o + 16) if exact and api.fast_dict else api.PyDict_Size(o)) == 0:  # (ma_used)
             self._put("{}")
+            return
+        if exact and self.s[].tree_ok and self.s[].use_keys and load_int(o + 40) == 0:
+            self._write_tree(o, True)
             return
         self._enter(o)
         self.s[].o.byte(123)
@@ -1591,6 +2111,14 @@ def _digits_fast(dst: Pointer[UInt8, MutUntrackedOrigin], v: UInt64, n: Int):
     """The `n` (`_ndigits(v)`) digits of `v` at `dst`, 8 at a time: the
     leading 1 to 8 first, as one 8-byte store, then each full group of 8
     after them. Writes up to 8 bytes from `dst`, past `n` when `n` < 8."""
+    if n <= 2:
+        if n == 1:
+            dst[unsafe_offset=0] = UInt8(48 + v)
+        else:
+            var t = v // 10
+            dst[unsafe_offset=0] = UInt8(48 + t)
+            dst[unsafe_offset=1] = UInt8(48 + v - 10 * t)
+        return
     var groups = (n - 1) >> 3
     var lead = n - 8 * groups
     var top = v
