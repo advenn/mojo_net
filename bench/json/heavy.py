@@ -446,14 +446,17 @@ def _print_row(r, rows):
     if "failed" in r:
         print("  %-9s %s" % (r["lib"], r["failed"]), flush=True)
         return
+    # The reference: json's result, else the first library's that ran
+    # (whose own `dumps` text then says nothing about json's).
     ref = next((x for x in rows if x.get("lib") == "json" and "failed" not in x), None)
-    if r["lib"] == "json":
+    by_json = ref is not None
+    if ref is None:
+        ref = next((x for x in rows if "failed" not in x), None)
+    if r is ref:
         same = "(the reference)"
-    elif ref is None:
-        same = "(no json result to compare)"
     else:
-        same = "same as json" if r["result_sha256"] == ref["result_sha256"] else "DIFFERS from json"
-        if "out_sha256" in r:
+        same = "same as %s" % ref["lib"] if r["result_sha256"] == ref["result_sha256"] else "DIFFERS from %s" % ref["lib"]
+        if "out_sha256" in r and by_json:
             same += ", json's text" if r["out_sha256"] == ref.get("out_sha256") else ", own format"
     print("  %-9s %-10s %8.2f %8s %8d %8s  %s" % (
         r["lib"], r["version"][:10], r["loads_s"], "%.2f" % r["dumps_s"] if "dumps_s" in r else "-",
