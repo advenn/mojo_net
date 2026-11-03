@@ -28,12 +28,16 @@ with `--core`):
   `--repeat` (orjson, yjson and msgspec write compact bytes, json and
   mojson json's own format, a str);
 - the process's peak memory (the input included);
-- **a check of the result by the standard library alone:** SHA-256 over
-  `json.dumps` of the result, piece by piece (each member of the root, and
-  each item of a large list, one `json.dumps` each, so that no whole text
-  is held), the same for every library. Equal hashes mean equal objects
-  (key order included). The hash of each library's own `dumps` text is
-  kept too: mojson's must be json's.
+- **a check of the result by the standard library alone:** the SHA-256
+  of the text `json.dumps` writes for the result (fed piece by piece, the
+  same bytes, so that no whole text is held), the same for every library.
+  Equal hashes mean equal objects (key order included). The hash of each
+  library's own `dumps` text is kept too: json's equals its result hash,
+  and mojson's must be json's.
+
+Each row shows both hashes' first 12 hex digits ("result", "out"; the
+full ones go to `--out`), and each dataset its input's pinned SHA-256; the
+summary ends with a table of each.
 
 Times are wall-clock seconds of the call alone. The machine's load, the
 memory it has free and the cap are printed first: on a shared machine,
@@ -252,10 +256,14 @@ def _codec(lib):
 
 
 class _Fingerprint:
-    """SHA-256 over the standard library's `json.dumps` of a value, piece
-    by piece, so that no whole text of a large value is held at once: the
+    """SHA-256 of exactly the text the standard library's `json.dumps`
+    writes for a value (its defaults: `", "` and `": "`, ensure_ascii),
+    fed piece by piece so that no whole text of a large value is held: the
     root's members, and the items of lists of more than 1,000 (records)
-    down to depth 3, one `json.dumps` call each; anything else whole."""
+    down to depth 3, one `json.dumps` call each, with the brackets and
+    separators json puts between them; anything else whole. The same
+    bytes as `json.dumps(value)`, so the same hash (bench.py takes it
+    whole)."""
 
     def __init__(self):
         self.h = hashlib.sha256()
@@ -265,18 +273,26 @@ class _Fingerprint:
         split = (t is dict or t is list) and (depth == 0 or (depth < 3 and len(o) > 1000))
         if split and t is dict:
             self.h.update(b"{")
+            first = True
             for k, v in o.items():
+                if not first:
+                    self.h.update(b", ")
+                first = False
                 self.h.update(json.dumps(k).encode("utf-8", "surrogatepass"))
+                self.h.update(b": ")
                 self.add(v, depth + 1)
             self.h.update(b"}")
         elif split:
             self.h.update(b"[")
+            first = True
             for v in o:
+                if not first:
+                    self.h.update(b", ")
+                first = False
                 self.add(v, depth + 1)
             self.h.update(b"]")
         else:
             self.h.update(json.dumps(o).encode("utf-8", "surrogatepass"))
-            self.h.update(b"\n")
 
 
 def _text_sha(out, h):
@@ -346,6 +362,7 @@ def child(lib, path, fmt, repeat, core):
     if fmt == "jsonl":
         for o in obj:
             fp.add(o)
+            fp.h.update(b"\n")
     else:
         fp.add(obj)
     r["result_sha256"] = fp.h.hexdigest()
@@ -409,12 +426,13 @@ def run(names, d, libs, repeat, cap, core, out):
         print("not installed: %s" % ", ".join(missing))
     results = []
     for name in names:
-        fname, _, _, _, _, fmt, licence, shape = DATASETS[name]
+        fname, _, _, sha, _, fmt, licence, shape = DATASETS[name]
         path = os.path.join(d, fname)
         if not os.path.exists(path):
             print("\n== %s: not fetched (heavy.py fetch %s)" % (name, name))
             continue
-        print("\n== %s: %s (%.0f MB%s)" % (name, shape, os.path.getsize(path) / 1e6, ", JSON Lines" if fmt == "jsonl" else ""), flush=True)
+        print("\n== %s: %s (%.0f MB%s)" % (name, shape, os.path.getsize(path) / 1e6, ", JSON Lines" if fmt == "jsonl" else ""))
+        print("   input sha256 %s (pinned; `fetch --verify` checks the file)" % sha, flush=True)
         rows = []
         for lib in libs:
             cmd = [sys.executable, os.path.abspath(__file__), "_child", lib, path, fmt, str(repeat), "-" if core is None else str(core)]
@@ -432,6 +450,9 @@ def run(names, d, libs, repeat, cap, core, out):
             r["dataset"] = name
         results.extend(rows)
     _summary(results, names, libs)
+    if results:
+        print("\n(out MB: json and mojson write json's format, `, ` and `: ` between items and non-ASCII as \\uXXXX;"
+              "\n orjson, yjson and msgspec write compact UTF-8, so theirs is smaller, a format of their own)")
     if out:
         os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
         with open(out, "w") as f:
@@ -440,9 +461,14 @@ def run(names, d, libs, repeat, cap, core, out):
         print("\nresults: " + out)
 
 
+def _short(h):
+    return h[:12] if h else "-"
+
+
 def _print_row(r, rows):
     if len(rows) == 1:
-        print("  %-9s %-10s %8s %8s %8s %8s  %s" % ("library", "version", "loads s", "dumps s", "peak MB", "out MB", "result (by json.dumps) / dumps text"))
+        print("  %-9s %-10s %8s %8s %8s %8s  %-12s %-12s  %s" % (
+            "library", "version", "loads s", "dumps s", "peak MB", "out MB", "result", "out", "check"))
     if "failed" in r:
         print("  %-9s %s" % (r["lib"], r["failed"]), flush=True)
         return
@@ -458,18 +484,22 @@ def _print_row(r, rows):
         same = "same as %s" % ref["lib"] if r["result_sha256"] == ref["result_sha256"] else "DIFFERS from %s" % ref["lib"]
         if "out_sha256" in r and by_json:
             same += ", json's text" if r["out_sha256"] == ref.get("out_sha256") else ", own format"
-    print("  %-9s %-10s %8.2f %8s %8d %8s  %s" % (
+    print("  %-9s %-10s %8.2f %8s %8d %8s  %-12s %-12s  %s" % (
         r["lib"], r["version"][:10], r["loads_s"], "%.2f" % r["dumps_s"] if "dumps_s" in r else "-",
-        r["peak_mb"], "%.0f" % r["out_mb"] if "out_mb" in r else "-", same), flush=True)
+        r["peak_mb"], "%.0f" % r["out_mb"] if "out_mb" in r else "-",
+        _short(r["result_sha256"]), _short(r.get("out_sha256")), same), flush=True)
 
 
 def _summary(results, names, libs):
     done = [n for n in names if any(r.get("dataset") == n for r in results)]
     if len(done) < 2:
         return
-    for title, key, fmt in (("loads, s", "loads_s", "%.2f"), ("dumps, s", "dumps_s", "%.2f"), ("peak memory, MB", "peak_mb", "%d")):
+    for title, key, fmt in (("loads, s", "loads_s", "%.2f"), ("dumps, s", "dumps_s", "%.2f"), ("peak memory, MB", "peak_mb", "%d"),
+                            ("result sha256 (json.dumps of what loads returned)", "result_sha256", "%.12s"),
+                            ("out sha256 (each library's own dumps text)", "out_sha256", "%.12s")):
         print("\n%s" % title)
-        print("  %-10s" % "" + "".join("%10s" % l for l in libs))
+        width = 14 if key.endswith("sha256") else 10
+        print("  %-10s" % "" + "".join("%*s" % (width, l) for l in libs))
         for n in done:
             row = []
             for l in libs:
@@ -480,7 +510,7 @@ def _summary(results, names, libs):
                     cell = r["failed"].split(":")[0].split(" ")[0]  # killed / failed
                 else:
                     cell = fmt % r[key] if key in r else "-"
-                row.append("%10s" % cell)
+                row.append("%*s" % (width, cell))
             print("  %-10s" % n + "".join(row))
 
 
