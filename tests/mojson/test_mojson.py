@@ -687,5 +687,39 @@ class Extensions(unittest.TestCase):
         self.assertEqual(outcome(mojson.dumps, o)[1], TypeError)  # (not without extended)
 
 
+class Environment(unittest.TestCase):
+    """Importing mojson leaves the process's environment as it was, and
+    needs no `python3` on PATH (python/mojson/__init__.py, `_MOJO_ENV`).
+    Mojo's module setup exported MOJO_PYTHON_LIBRARY, PYTHONEXECUTABLE and
+    an empty PYTHONPATH entry through the C environment, so that a child
+    started from a virtualenv's `sys.executable` lost the virtualenv (and
+    imported from its working directory); with no `python3` on PATH, it
+    aborted the process. 0.1.0 to 0.1.4 did both."""
+
+    KEYS = ("MOJO_PYTHON_LIBRARY", "PYTHONEXECUTABLE", "PYTHONPATH")
+
+    def test_children_inherit_the_environment_unchanged(self):
+        import subprocess
+
+        # (mojson is imported at the top of this file)
+        code = "import json, os, sys; print(json.dumps([{k: os.environ.get(k) for k in %r}, sys.prefix]))" % (self.KEYS,)
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
+        env, prefix = json.loads(out)
+        self.assertEqual(env, {k: os.environ.get(k) for k in self.KEYS})
+        self.assertEqual(prefix, sys.prefix)
+
+    def test_no_python3_on_path(self):
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as empty:
+            env = {k: v for k, v in os.environ.items() if k not in ("MOJO_PYTHON_LIBRARY", "PYTHONEXECUTABLE")}
+            env["PATH"] = empty
+            code = "import mojson; print(mojson.loads('[1, 2]'), mojson.dumps({'a': None}))"
+            p = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr[-2000:])
+        self.assertEqual(p.stdout.strip(), '[1, 2] {"a": null}')
+
+
 if __name__ == "__main__":
     unittest.main()

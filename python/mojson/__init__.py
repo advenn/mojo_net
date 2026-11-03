@@ -34,7 +34,7 @@ import json as _json
 import uuid as _uuid
 from json import JSONDecodeError, JSONDecoder, JSONEncoder, decoder, detect_encoding, encoder, scanner
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 # The extension, and Mojo's own module setup inside it, read CPython's
 # object layout as the GIL build lays it out; the free-threaded build's
@@ -64,13 +64,55 @@ def _load_mojo_runtime():
         ctypes.CDLL(str(dist.locate_file("modular/lib/" + name)), mode=ctypes.RTLD_GLOBAL)
 
 
+import os as _os
+import sys as _sys
+
+# Mojo's module setup (inside the extension's import) looks for a Python
+# library to link to, as a Mojo program that embeds Python does. Unless
+# MOJO_PYTHON_LIBRARY names an existing file, it runs `python3` from PATH
+# (any interpreter, of any version) to find one, and aborts the process
+# when there is none. It also exports MOJO_PYTHON_LIBRARY,
+# PYTHONEXECUTABLE (the `python3` on PATH) and an empty entry first in
+# PYTHONPATH (the current directory) through the C environment, which
+# every child process inherits: a child started from a virtualenv's
+# `sys.executable` (multiprocessing's workers, say) lost the virtualenv
+# and imported from its working directory. Inside an extension the
+# library is only checked to exist, never loaded (the C API is the
+# running interpreter's), so mojson names the interpreter's own, and puts
+# the three back as they were once the extension is loaded.
+_MOJO_ENV = ("MOJO_PYTHON_LIBRARY", "PYTHONEXECUTABLE", "PYTHONPATH")
+
+
+def _own_python_library():
+    """The running interpreter's shared library when it has one, else the
+    interpreter itself: an existing file either way."""
+    libdir = _sysconfig.get_config_var("LIBDIR") or ""
+    for name in (_sysconfig.get_config_var("INSTSONAME"), _sysconfig.get_config_var("LDLIBRARY")):
+        if name and ".so" in name and _os.path.isfile(_os.path.join(libdir, name)):
+            return _os.path.join(libdir, name)
+    if _sys.executable and _os.path.isfile(_sys.executable):
+        return _sys.executable
+    return _os.path.abspath(__file__)
+
+
+_env_before = {k: _os.environ.get(k) for k in _MOJO_ENV}
 try:
-    from . import _mojson
-except ImportError as e:
-    if "libKGENCompilerRTShared" not in str(e):
-        raise
-    _load_mojo_runtime()
-    from . import _mojson
+    if _env_before["MOJO_PYTHON_LIBRARY"] is None:
+        _os.putenv("MOJO_PYTHON_LIBRARY", _own_python_library())  # (the C environment only)
+    try:
+        from . import _mojson
+    except ImportError as e:
+        if "libKGENCompilerRTShared" not in str(e):
+            raise
+        _load_mojo_runtime()
+        from . import _mojson
+finally:
+    for _k, _v in _env_before.items():
+        if _v is None:
+            _os.unsetenv(_k)
+        else:
+            _os.putenv(_k, _v)
+    del _k, _v
 
 __all__ = ["dump", "dumps", "load", "loads", "JSONDecoder", "JSONDecodeError", "JSONEncoder", "dumpb"]
 

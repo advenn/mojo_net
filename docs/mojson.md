@@ -2,7 +2,7 @@
 
 `mojson` is a Python package with the standard library json's API whose parsing and writing are done by the Mojo `json` package (`docs/json.md`). It lives in `python/mojson`: a Mojo extension module, `_mojson`, and a small Python layer over it.
 
-**Status: done through Y4**, tested against the standard library's json on CPython 3.12 to 3.15. Its wheels are prepared for TestPyPI (the user's decision, 2026-11-02), and nothing else of the repository is published; like the rest of it, mojson is not meant for production use.
+**Status: done through Y7**, tested against the standard library's json on CPython 3.12 to 3.15. Its wheels are prepared for TestPyPI (the user's decision, 2026-11-02), and nothing else of the repository is published; like the rest of it, mojson is not meant for production use.
 
 ## Use
 ```bash
@@ -54,6 +54,7 @@ Numbers are read as json reads them. Integers are exact at any size, under Pytho
   - set and frozenset, as arrays.
 
 ## How it is built
+- **Mojo's module setup**, inside the extension's import, looks for a Python library to link to, as a Mojo program that embeds Python does. Left alone, it runs `python3` from PATH (another interpreter, of any version) to find one, aborts the process when there is none, and exports `MOJO_PYTHON_LIBRARY`, `PYTHONEXECUTABLE` and an empty first `PYTHONPATH` entry (the current directory) through the C environment. Every child process inherits those: a child started from a virtualenv's `sys.executable`, as multiprocessing starts its workers, lost the virtualenv. Inside an extension the library is only checked to exist, never loaded (the C API is the running interpreter's). So `mojson/__init__.py` sets `MOJO_PYTHON_LIBRARY` to the interpreter's own library (or the interpreter itself) for the import, unless the user set it, and puts the three variables back as they were afterwards (`_MOJO_ENV`). The import also takes about 20 ms instead of 45, with no subprocess.
 - **`ext/capi.mojo`** is the extension's only C. It resolves the CPython C API from the interpreter that imports it (`dlopen(NULL)`) into typed function pointers, once.
   - Objects travel as their addresses, and out-parameters as typed mutable pointers. As `Int` addresses, the compiler read them back unchanged (CLAUDE.md, "FFI").
   - A few layouts are read directly where a call would cost more than the work: an object's type, a str's header and characters, a list's item array. Each is checked at import against the C API, on objects built for the check, and used only where it agreed. These are CPython 3.12 to 3.15's layouts (3.15's headers lay them out as 3.14's), with the GIL, on 64-bit platforms.
@@ -161,6 +162,19 @@ What the numbers say:
 
 All five parse it to the same objects, and mojson's text is json's, byte for byte.
 
+**Heavy workloads** (`pixi run -e pyjson bench-json-heavy run`, `bench/json/heavy.py`): real documents of different shapes, each pinned by URL and checksum, each library in a process of its own on one core, memory-capped; every result checked against json's by the standard library's `json.dumps` alone. mojson 0.1.4 from TestPyPI, CPython 3.14, best of 1, load average about 1, 2026-11-03:
+
+| dataset | size | loads: json / orjson / mojson | dumps: json / orjson / mojson | peak memory: json / orjson / mojson |
+|---|---|---|---|---|
+| bestbuy (products, mostly null) | 1.05 GB | 8.74 / 4.03 / 3.26 s | 4.34 / 0.77 / 1.17 s | 5.2 / 5.8 / 3.6 GB |
+| walmart (products) | 1.00 GB | 3.05 / 1.76 / 1.25 s | 2.47 / 0.51 / 0.62 s | 3.4 / 3.6 / 2.4 GB |
+| twitter (tweets) | 0.84 GB | 5.61 / 3.36 / 3.03 s | 3.26 / 0.64 / 0.99 s | 3.6 / 4.6 / 3.0 GB |
+| sharegpt (chats, many languages) | 0.67 GB | 1.55 / 1.05 / 0.69 s | 1.55 / 0.39 / 0.57 s | 2.2 / 2.2 / 1.6 GB |
+| citylots (GeoJSON floats) | 0.19 GB | 2.28 / 0.91 / 0.95 s | 2.40 / 0.22 / 0.47 s | 1.1 / 1.4 / 1.0 GB |
+
+- On these documents mojson's loads is 0.96 to 1.5 times orjson's speed (faster on all but the floats), and its peak 28 to 38% lower. Its dumps (json's format) is 1.2 to 2.1 times orjson's time (compact bytes).
+- wiki, nspl and gmaps (1.1 to 1.2 GB) were not measured: json and orjson both went past a 6.5 GB cap on wiki, and the machine had no more to spare. gharchive (JSON Lines) is still to run.
+
 **What made dumps faster in 0.1.2** (the BestBuy file: 700,000 dicts of about 160 keys, mostly null):
 - **Memory, at 1 GB.** The output grew as a `List`, which a larger block and a copy replace each time, and the text was then copied once more into the str. That came to 1.2 million page faults and 1.2 s in the kernel per dumps.
   - The text now goes straight into the str (ensure_ascii) or bytes (dumpb) that is the result. It grows by `PyUnicode_Resize` or `_PyBytes_Resize`, which realloc: a large block's pages move, they are not copied.
@@ -201,6 +215,7 @@ mojson's wheels go to **TestPyPI** only. They hold mojson's own files and nothin
 ## Milestones
 - **Y1: the json module's API, with its fallbacks; rfc8259, max_depth, dumpb, extended.** Done.
 - **Y2: wheels for TestPyPI**, holding only mojson's files ("Release"). Done: 0.1.0 published 2026-11-02; 0.1.1 adds Python 3.15.
+- **Y7: the environment left as it was (0.1.5).** Done. Importing mojson 0.1.0 to 0.1.4 changed the C environment of the process (`MOJO_PYTHON_LIBRARY`, `PYTHONEXECUTABLE`, `PYTHONPATH`), so that children started from a virtualenv's `sys.executable` ran outside it, and aborted the process when no `python3` was on PATH ("How it is built"). Found by `bench/json/heavy.py`, whose children could not import orjson once the parent had imported mojson. `tests/mojson` (`Environment`) checks both.
 - **Y6: keys shared as json shares them (0.1.4).** Done. The decoder's key cache is open-addressed: on the 1 GB file loads takes 3.4 s and dumps 1.2 s (from 3.6 and 1.5), and the peak is 3.6 GB (from 3.9).
 - **Y5: loads without a document (0.1.3).** Done. Calls without hooks build the objects from `Document.scan`'s events (`json`'s J3), as the text is read: 8 to 14% faster, and 1.7 GB less at the peak for a 1 GB file ("Measured").
 - **Y4: a streaming dump, and calls inside calls (0.1.3).** Done.

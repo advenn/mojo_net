@@ -148,6 +148,10 @@ yyjson = "*"
 
 [feature.pyjson.tasks]
 bench-json-compare = "python3 bench/json/payloads.py write build/bench_json && python3 bench/json/corpus.py build/bench_json && bash tools/build_mojson.sh && python3 bench/json/compare.py build/bench_json"
+# Real documents of 0.2 to 1.2 GB and an hour of JSON Lines (bench/json/heavy.py):
+# `bench-json-heavy fetch` downloads them into build/big (about 2 GB, 8 GB unpacked),
+# `bench-json-heavy run [NAME...] [--libs all] [--repeat 2] [--core 3]` measures.
+bench-json-heavy = "bash tools/build_mojson.sh && PYTHONPATH=build/python python3 bench/json/heavy.py"
 
 # Releasing mojson (docs/mojson.md, "Release"): its wheel, built from
 # packaging/mojson by tools/build_mojson_wheel.py and checked by twine;
