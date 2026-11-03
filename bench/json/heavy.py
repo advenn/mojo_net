@@ -25,8 +25,8 @@ with `--core`):
 - `loads`: the file's bytes to Python objects, the best of `--repeat`
   (JSON Lines: every line, one call each);
 - `dumps`: those objects back to text with the library's defaults, best of
-  `--repeat` (orjson and msgspec write compact bytes, json and mojson
-  json's own format, a str);
+  `--repeat` (orjson, yjson and msgspec write compact bytes, json and
+  mojson json's own format, a str);
 - the process's peak memory (the input included);
 - **a check of the result by the standard library alone:** SHA-256 over
   `json.dumps` of the result, piece by piece (each member of the root, and
@@ -138,8 +138,8 @@ DATASETS = {
     ),
 }
 
-LIBS = ["json", "orjson", "mojson", "ujson", "msgspec", "simdjson"]
-DEFAULT_LIBS = ["json", "orjson", "mojson"]
+LIBS = ["json", "orjson", "yjson", "mojson", "ujson", "msgspec", "simdjson"]
+DEFAULT_LIBS = ["json", "orjson", "yjson", "mojson"]
 
 
 # ---- fetching ----------------------------------------------------------------

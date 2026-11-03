@@ -6,7 +6,10 @@ document), which is the work `json.Document.parse` does in Mojo.
     pixi run -e pyjson bench-json-compare        (all of them, mojson built)
     python3 bench/json/compare.py <dir> [name...]
 
-Each library found is measured; the missing are skipped. mojson is
+Each library found is measured; the missing are skipped. (yjson, in
+Mojo with orjson's API, is not in the pyjson environment: its wheels need
+glibc 2.35, which the environment does not declare, and its source does
+not build here. Install it beside to measure it.) mojson is
 imported from build/python (`pixi run mojson-build`) when it is there. Times are the
 thread's CPU time, the best of 7 samples of at least 0.1 s each (the
 machine is shared: pin with `taskset -c N` and watch the load). Every
@@ -37,7 +40,7 @@ def loaders():
     import json
 
     out.append(("json", json.loads))
-    for mod, fn in (("simplejson", "loads"), ("ujson", "loads"), ("rapidjson", "loads"), ("orjson", "loads")):
+    for mod, fn in (("simplejson", "loads"), ("ujson", "loads"), ("rapidjson", "loads"), ("orjson", "loads"), ("yjson", "loads")):
         m = _try(mod)
         if m:
             out.append((mod, getattr(m, fn)))
@@ -81,7 +84,7 @@ def dumpers():
     import json
 
     out.append(("json", json.dumps))
-    for mod in ("simplejson", "ujson", "rapidjson", "orjson", "yyjson", "mojson"):
+    for mod in ("simplejson", "ujson", "rapidjson", "orjson", "yjson", "yyjson", "mojson"):
         m = _try(mod)
         if m:
             out.append((mod, m.dumps))
