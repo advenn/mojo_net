@@ -129,6 +129,27 @@ class Loads(unittest.TestCase):
         self.check('{"a": 1, "\\u0061": 2}')
         self.check('{"a": 1, "a": 2}', object_pairs_hook=list)
 
+    def test_key_sharing(self):
+        """Keys repeated from object to object come back as one str object
+        each, as json's per-call memo shares them (python/mojson/ext/
+        decode.mojo, KeyCache), and the cache starting over, past half its
+        slots, changes no result."""
+        names = ["field%d%s" % (i, "_x" * (i % 7)) for i in range(300)]
+        text = json.dumps([{n: i for i, n in enumerate(names)} for _ in range(200)])
+        got = mojson.loads(text)
+        self.assertEqual(got, json.loads(text))
+        self.assertEqual(len({id(k) for d in got for k in d}), len(names))
+        # More distinct keys than the cache keeps, through one call and
+        # across calls: the same results, and the shared keys still shared.
+        # (18,000 inner keys of 66 names; the 9,000 outer keys make the
+        # cache of 2,048 start over 4 times a call: about 5 objects a name.)
+        many = json.dumps({"k%05d" % i: {"inner": i, "z" * (i % 65): i} for i in range(9000)})
+        for _ in range(2):
+            got = mojson.loads(many)
+            self.assertEqual(got, json.loads(many))
+            self.assertEqual(list(got), list(json.loads(many)))
+            self.assertLessEqual(len({id(k) for v in got.values() for k in v}), 66 * 7)
+
     def test_hooks(self):
         doc = '{"a": [1, 2.5, "x", NaN, {"b": null}], "c": 12345678901234567890}'
         self.check(doc, object_hook=lambda d: ("hook", sorted(d)))

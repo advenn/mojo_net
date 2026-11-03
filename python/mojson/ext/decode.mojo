@@ -13,10 +13,10 @@ the same values with the same functions:
 - **Strings:** an ASCII string is made with `PyUnicode_New` and its bytes
   copied in (`Api.fast_str`); any other through `PyUnicode_DecodeUTF8`,
   with "surrogatepass" for the lone surrogates `Dialect.python` keeps.
-- **Keys:** ASCII keys of up to 64 bytes are kept in a cache of 1,024
-  str objects shared by every call (`KeyCache`), each with its hash
-  computed once, so that an array of objects shares its keys, as json's
-  per-call memo makes them share.
+- **Keys:** ASCII keys of up to 64 bytes are kept as str objects in a
+  table shared by every call (`KeyCache`: open addressing, up to 2,048
+  keys), each with its hash computed once, so that an array of objects
+  shares its keys, as json's per-call memo makes them share.
 - **Numbers:** an integer of up to 18 digits is read here; a longer one
   through `PyLong_FromString` (with its digit limit); a float by
   `json.read_float` (Eisel-Lemire), or, for what that leaves (more than
@@ -35,7 +35,9 @@ from json import SPAN_SLACK, Document, Handler, Visitor, read_float
 
 from .capi import Api, Obj, Addr, Buf, SURROGATEPASS, buf, cstr, str_data, str_length
 
-comptime _CACHE = 1024
+comptime _CACHE = 4096
+"""Slots in `KeyCache` (a power of two), probed linearly; it starts over
+past half full, so that a probe stays short."""
 comptime _CACHE_MAX_KEY = 64
 
 comptime _LIST: UInt8 = 0
@@ -85,18 +87,33 @@ def _key_hash(p: Pointer[UInt8, ImmutAnyOrigin], n: Int) -> UInt64:
 
 struct KeyCache(Movable):
     """ASCII keys of up to `_CACHE_MAX_KEY` bytes made into str objects,
-    by a hash of their bytes: one object per slot, the cache holding a
-    reference to each, and the key's bytes in a slot of their own (zero
-    past the key), so that a lookup compares whole vectors."""
+    by a hash of their bytes, in an open-addressing table: one object per
+    slot, the cache holding a reference to each, and the key's bytes in a
+    slot of their own (zero past the key), so that a lookup compares whole
+    vectors. Keys never push each other out (a direct-mapped cache of
+    1,024 slots made 277,375 str objects of a BestBuy sample's 252 key
+    names, which json shares as 252); past `_CACHE / 2` keys it starts
+    over."""
 
     var hashes: List[UInt64]
     var objs: List[Int]
     var bytes: List[UInt8]
+    var used: List[Int32]
+    """The slots filled, in order (their number is the load)."""
 
     def __init__(out self):
         self.hashes = List[UInt64](length=_CACHE, fill=0)
         self.objs = List[Int](length=_CACHE, fill=0)
         self.bytes = List[UInt8](length=_CACHE * _CACHE_MAX_KEY, fill=0)
+        self.used = List[Int32]()
+
+    def clear(mut self, ref api: Api):
+        """Forget every key, releasing its object."""
+        var objs = self.objs.unsafe_ptr()
+        for i in self.used:
+            api.Py_DecRef(objs[unsafe_offset=Int(i)])
+            objs[unsafe_offset=Int(i)] = 0
+        self.used.clear()
 
 
 @fieldwise_init
@@ -232,32 +249,39 @@ struct Decoder(TrivialRegisterPassable, Visitor):
         ref cache = self.s[].cache[]
         var objs = cache.objs.unsafe_ptr()
         var hashes = cache.hashes.unsafe_ptr()
-        var kb = cache.bytes.unsafe_ptr().unsafe_offset(slot * _CACHE_MAX_KEY)
-        var o = objs[unsafe_offset=slot]
-        if o != 0 and hashes[unsafe_offset=slot] == h and str_length(o) == n:
-            var same = True
-            var i = 0
-            while i < n:
-                var v = p.unsafe_load[width=32](i)
-                var w = kb.unsafe_load[width=32](i)
-                var bits = pack_bits[DType.uint32](v.ne(w))
-                if n - i < 32:
-                    bits &= (UInt32(1) << UInt32(n - i)) - 1
-                if bits != 0:
-                    same = False
-                    break
-                i += 32
-            if same:
-                api.Py_IncRef(o)
-                return o
+        while True:
+            var o = objs[unsafe_offset=slot]
+            if o == 0:
+                break
+            if hashes[unsafe_offset=slot] == h and str_length(o) == n:
+                var kb = cache.bytes.unsafe_ptr().unsafe_offset(slot * _CACHE_MAX_KEY)
+                var same = True
+                var i = 0
+                while i < n:
+                    var v = p.unsafe_load[width=32](i)
+                    var w = kb.unsafe_load[width=32](i)
+                    var bits = pack_bits[DType.uint32](v.ne(w))
+                    if n - i < 32:
+                        bits &= (UInt32(1) << UInt32(n - i)) - 1
+                    if bits != 0:
+                        same = False
+                        break
+                    i += 32
+                if same:
+                    api.Py_IncRef(o)
+                    return o
+            slot = (slot + 1) & (_CACHE - 1)
         var made = self.make_str(text)
         if api.PyObject_Hash(made) == -1:
             api.Py_DecRef(made)
             raise Error("mojson: Python raised")
-        if o != 0:
-            api.Py_DecRef(o)
+        if len(cache.used) >= _CACHE // 2:
+            cache.clear(api)
+            slot = Int(h) & (_CACHE - 1)
         objs[unsafe_offset=slot] = made
         hashes[unsafe_offset=slot] = h
+        cache.used.append(Int32(slot))
+        var kb = cache.bytes.unsafe_ptr().unsafe_offset(slot * _CACHE_MAX_KEY)
         for k in range(_CACHE_MAX_KEY):
             kb[unsafe_offset=k] = p[unsafe_offset=k] if k < n else 0
         api.Py_IncRef(made)

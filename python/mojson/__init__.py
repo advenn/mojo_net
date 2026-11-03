@@ -34,7 +34,7 @@ import json as _json
 import uuid as _uuid
 from json import JSONDecodeError, JSONDecoder, JSONEncoder, decoder, detect_encoding, encoder, scanner
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 # The extension, and Mojo's own module setup inside it, read CPython's
 # object layout as the GIL build lays it out; the free-threaded build's

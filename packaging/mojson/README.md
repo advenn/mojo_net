@@ -55,7 +55,7 @@ Measured on one core of an Intel i5-1145G7, CPython 3.14, against json and orjso
 | `loads` | 1.9 to 4.5 times as fast | 0.66 to 0.97 of its speed |
 | `dumps` | 3.2 to 6.9 times as fast | 0.34 to 0.70 of its speed |
 
-On a 1 GB document, `loads` takes 3.6 s (json 8.2 s, orjson 3.6 s) and `dumps` 1.5 s (json 4.1 s, orjson 0.75 s). The process peaks at 3.9 GB, against 5.2 GB with json and 5.8 GB with orjson: `loads` builds the objects as it reads, with no intermediate document.
+On a 1 GB document, `loads` takes 3.4 s (json 8.4 s, orjson 3.9 s) and `dumps` 1.2 s (json 4.3 s, orjson 0.80 s). The process peaks at 3.6 GB, against 5.2 GB with json and 5.8 GB with orjson: `loads` builds the objects as it reads, with no intermediate document, and shares repeated keys as json does.
 
 The tables, and how they were taken, are in [docs/mojson.md](https://github.com/advenn/mojo_net/blob/main/docs/mojson.md#measured).
 

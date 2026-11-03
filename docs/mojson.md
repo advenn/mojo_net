@@ -62,7 +62,7 @@ Numbers are read as json reads them. Integers are exact at any size, under Pytho
   - with hooks, from a parsed `json.Document` (`Decoder`, through `Document.visit`). No hook runs before the whole text is known to parse. A text the parser refuses goes to json, which reads it again, and a hook that ran on its first part would run twice;
   - an ASCII str with `PyUnicode_New` and a copy, any other through `PyUnicode_DecodeUTF8`;
   - lists filled in place, dicts presized;
-  - ASCII keys of up to 64 bytes from a cache of 1,024 str objects shared by every call, each with its hash computed once, as json's per-call memo shares them.
+  - ASCII keys of up to 64 bytes from a table of str objects shared by every call, each with its hash computed once, as json's per-call memo shares them. The table is open-addressed, so keys never push each other out; it starts over past 2,048 keys. 0.1.0 to 0.1.3 kept them direct-mapped in 1,024 slots, where colliding keys did push each other out: a 45 MB BestBuy sample got 277,375 key objects for its 252 names, where json makes 252 ("Measured").
 - **`ext/encode.mojo`** writes into the result str or bytes itself, or into raw memory (`Out`), reserving room once per string and once per dict pair. It reads str characters in their own width (1, 2 or 4 bytes), and keeps dict keys encoded in `KeyBytes` across calls ("Measured").
 - **`_mojson.mojo`** holds one `Codec` per process: the C API, a reused `Document` (a scan's scratch) and decoder state, the key cache, and the text buffer. A call allocates only the objects it returns, and buffers past 1 MiB (a document) or 4 MiB (text) are not kept between calls.
 - **State behind one pointer.** The decoder and the encoder keep their state in a struct and pass a pointer to it. In Mojo 1.2 a struct passed as `mut`, or as `ref` to a mutable value, to a function not inlined was copied in and out of every call; for the encoder's state and options that was half its time (CLAUDE.md, "Mojo 1.2 pitfalls").
@@ -150,9 +150,13 @@ What the numbers say:
 | mojson 0.1.0 | 4.7 s | 3.0 s | 5.9 to 6.6 GB |
 | mojson 0.1.2 | 4.7 s | 1.4 s | 5.6 GB |
 | mojson 0.1.3 | 3.6 s | 1.5 s | 3.9 GB |
+| mojson 0.1.4 | 3.4 s | 1.2 s | 3.6 GB |
 
 - 0.1.3's loads builds the objects with no document in between. The document held a 12-byte node per value and the text unescaped, 1.7 GB here, which also cost 600,000 page faults and 0.7 s in the kernel.
-- The peak is now the input (1 GB) and the objects (2.8 GB). orjson's is 5.8 GB.
+- 0.1.4 shares each key name as one str object, as json does ("How it is built"). 0.1.3's key cache let colliding names push each other out, so the file's products got about 6 million extra str objects: 390 MB at the peak, and time in loads.
+  - It made `dumps` 23 to 32% faster too: the encoder keeps keys' text by object, and a fresh object for a key it has seen is a miss, written again. Callgrind counts 97 million instructions per dumps of a 10 MB sample, down from 126 million. orjson's dumps was slower on those objects too: 41 ms for the 45 MB sample's objects from 0.1.3's loads, against 32 ms for json's.
+  - A cache of one line per key in the encoder (object, size and text together; 0.1.3 keeps them in four arrays) simulated 57% fewer L1 misses but ran no faster on the 1 GB file; beside the decoder's fix it counted the same instructions (97.5 million against 97.3). It was not kept.
+- The peak is now the input (1 GB) and the objects (2.5 GB). orjson's is 5.8 GB.
 - `dump` to a file writes pieces of 64 KiB, so it adds no output to the peak; `fp.write(dumps(obj))` adds 2.1 GB (the str, and its encoding into the file).
 
 All five parse it to the same objects, and mojson's text is json's, byte for byte.
@@ -197,6 +201,7 @@ mojson's wheels go to **TestPyPI** only. They hold mojson's own files and nothin
 ## Milestones
 - **Y1: the json module's API, with its fallbacks; rfc8259, max_depth, dumpb, extended.** Done.
 - **Y2: wheels for TestPyPI**, holding only mojson's files ("Release"). Done: 0.1.0 published 2026-11-02; 0.1.1 adds Python 3.15.
+- **Y6: keys shared as json shares them (0.1.4).** Done. The decoder's key cache is open-addressed: on the 1 GB file loads takes 3.4 s and dumps 1.2 s (from 3.6 and 1.5), and the peak is 3.6 GB (from 3.9).
 - **Y5: loads without a document (0.1.3).** Done. Calls without hooks build the objects from `Document.scan`'s events (`json`'s J3), as the text is read: 8 to 14% faster, and 1.7 GB less at the peak for a 1 GB file ("Measured").
 - **Y4: a streaming dump, and calls inside calls (0.1.3).** Done.
   - `dump` hands str pieces of about 64 KiB to `fp.write`, between items only: never while a key or value is being written, since `fp.write` may change the object being dumped, and the dict loop holds no reference on its keys and scalars. A piece never splits a UTF-8 sequence.
