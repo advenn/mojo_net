@@ -715,7 +715,7 @@ struct Encoder(TrivialRegisterPassable):
             m += 1
             u = UInt64(0) - UInt64(v)
         var nd = _ndigits(u)
-        _digits_into(q.unsafe_offset(m), u, nd)
+        _digits_fast(q.unsafe_offset(m), u, nd)
         o.n = m + nd
 
     def write_float(self, o: Obj, x: Float64, allow_nan: Bool) raises:
@@ -740,8 +740,9 @@ struct Encoder(TrivialRegisterPassable):
             else:
                 self._put("-Infinity")
             return
-        self.s[].o.reserve(32)
-        write_py_float(self.s[].o, x)
+        ref out = self.s[].o
+        out.reserve(64)
+        out.n = _py_float_into(out.p, out.n, x)
 
     # ---- strings -------------------------------------------------------------
 
@@ -1101,9 +1102,9 @@ struct Encoder(TrivialRegisterPassable):
                         cap = ob.cap
                         if i >= load_int(o + 16):
                             break
-                    if n + 40 > cap:
+                    if n + 72 > cap:
                         ob.n = n
-                        ob._grow(40)
+                        ob._grow(72)
                         q = ob.p
                         cap = ob.cap
                     if i > 0:
@@ -1123,7 +1124,13 @@ struct Encoder(TrivialRegisterPassable):
                         q.unsafe_store(n, bitcast[DType.uint8, 8](UInt64(0x65736C6166)))
                         n += 5
                         continue
-                    if api.type_of(item) == api.int_type and compact_int(item):
+                    var t = api.type_of(item)
+                    if t == api.float_type and api.fast_float:
+                        var x = float_value(item)
+                        if x - x == 0:  # (finite)
+                            n = _py_float_into(q, n, x)
+                            continue
+                    elif t == api.int_type and compact_int(item):
                         var v = compact_value(item)
                         var u = UInt64(v)
                         if v < 0:
@@ -1131,7 +1138,7 @@ struct Encoder(TrivialRegisterPassable):
                             n += 1
                             u = UInt64(0) - UInt64(v)
                         var nd = _ndigits(u)
-                        _digits_into(q.unsafe_offset(n), u, nd)
+                        _digits_fast(q.unsafe_offset(n), u, nd)
                         n += nd
                         continue
                     ob.n = n
@@ -1447,6 +1454,11 @@ struct Encoder(TrivialRegisterPassable):
                                     if m >= 0:
                                         n = m
                                         continue
+                                elif t == api.float_type and api.fast_float:
+                                    var x = float_value(v)
+                                    if x - x == 0:  # (finite)
+                                        n = _py_float_into(q, n, x)
+                                        continue
                                 elif t == api.int_type and compact_int(v):
                                     var iv = compact_value(v)
                                     var u = UInt64(iv)
@@ -1455,7 +1467,7 @@ struct Encoder(TrivialRegisterPassable):
                                         n += 1
                                         u = UInt64(0) - UInt64(iv)
                                     var nd = _ndigits(u)
-                                    _digits_into(q.unsafe_offset(n), u, nd)
+                                    _digits_fast(q.unsafe_offset(n), u, nd)
                                     n += nd
                                     continue
                             ob.n = n
@@ -1552,6 +1564,54 @@ def _ndigits(u: UInt64) -> Int:
 
 
 @inline(.always)
+def _pair_at(t: Pointer[UInt8, ImmutAnyOrigin], i: UInt64) -> UInt64:
+    """The two digits of `i` (< 100) from `_DIGIT_PAIRS`, as 2 bytes."""
+    return UInt64(bitcast[DType.uint16, 1](t.unsafe_load[width=2](Int(i) * 2)))
+
+
+@inline(.always)
+def _eight_digits(v: UInt64) -> UInt64:
+    """The 8 digits of `v` (< 10^8, leading zeros kept) as 8 ASCII bytes
+    in memory order, by arithmetic within one word: the two halves of four
+    digits in 32-bit lanes, each split into its hundreds and the rest
+    (x * 10486 >> 20 is x // 100 below 43,699), giving four 16-bit lanes
+    below 100, each split into tens and ones (x * 103 >> 10 is x // 10
+    below 179). A lane's product never reaches the next lane, and the
+    masks drop what each shift brings down from the lane above."""
+    var merged = (v // 10000) | ((v % 10000) << 32)
+    var hundreds = ((merged * 10486) >> 20) & 0x0000007F0000007F
+    var lanes = hundreds | ((merged - hundreds * 100) << 16)
+    var tens = ((lanes * 103) >> 10) & 0x000F000F000F000F
+    var ones = lanes - tens * 10
+    return (tens | (ones << 8)) + 0x3030303030303030
+
+
+@inline(.always)
+def _digits_fast(dst: Pointer[UInt8, MutUntrackedOrigin], v: UInt64, n: Int):
+    """The `n` (`_ndigits(v)`) digits of `v` at `dst`, 8 at a time: the
+    leading 1 to 8 first, as one 8-byte store, then each full group of 8
+    after them. Writes up to 8 bytes from `dst`, past `n` when `n` < 8."""
+    var groups = (n - 1) >> 3
+    var lead = n - 8 * groups
+    var top = v
+    var g1: UInt64 = 0
+    var g0: UInt64 = 0
+    if groups >= 1:
+        top = v // 100000000
+        g0 = v - top * 100000000
+        if groups == 2:
+            var t2 = top // 100000000
+            g1 = top - t2 * 100000000
+            top = t2
+    dst.unsafe_store(0, bitcast[DType.uint8, 8](_eight_digits(top) >> UInt64(8 * (8 - lead))))
+    if groups == 2:
+        dst.unsafe_store(lead, bitcast[DType.uint8, 8](_eight_digits(g1)))
+        dst.unsafe_store(lead + 8, bitcast[DType.uint8, 8](_eight_digits(g0)))
+    elif groups == 1:
+        dst.unsafe_store(lead, bitcast[DType.uint8, 8](_eight_digits(g0)))
+
+
+@inline(.always)
 def _digits_into(dst: Pointer[UInt8, MutUntrackedOrigin], v0: UInt64, n: Int):
     """The `n` decimal digits of `v0` at `dst`, two at a time from the
     right."""
@@ -1569,55 +1629,58 @@ def _digits_into(dst: Pointer[UInt8, MutUntrackedOrigin], v0: UInt64, n: Int):
         dst[unsafe_offset=0] = UInt8(48) + UInt8(v)
 
 
-def write_py_float(mut out: Out, x: Float64):
-    """Finite `x` as `float.__repr__` writes it: the shortest digits
-    that read back as `x`, plain from 1e-4 up to 1e16 (with `.0` after an
-    integer), else with an exponent of at least two digits. (32 bytes of
-    room reserved: at most 17 digits, a sign, a point and an exponent.)"""
+@inline(.always)
+def _py_float_into(q: Pointer[UInt8, MutUntrackedOrigin], m0: Int, x: Float64) -> Int:
+    """Finite `x` as `float.__repr__` writes it, at `q[m0]` (64 bytes of
+    room); the length after it. The shortest digits that read back as `x`
+    (Ryū), plain from 1e-4 up to 1e16 (`.0` after an integer), else with an
+    exponent of at least two digits. The digits go to a small buffer first,
+    then into place a vector at a time, the point between them stored
+    after."""
     var s = shortest(x)
+    var m = m0
     if s.negative:
-        out.put(45)
+        q[unsafe_offset=m] = 45
+        m += 1
     if s.digits == 0:
-        out.put(48)
-        out.put(46)
-        out.put(48)
-        return
-    # Digits: from the bit length (log10(2) ~ 1233 / 4096), then one
-    # comparison with the power of ten it may have missed.
-    var bits = 64 - Int(count_leading_zeros(s.digits))
-    var n = (bits * 1233) >> 12  # (at most 19)
-    if s.digits >= materialize[_POW10]().unsafe_get(n):
-        n += 1
-    var tmp = Array[UInt8, 24](uninitialized=True)
+        q.unsafe_store(m, bitcast[DType.uint8, 4](UInt32(0x302E30)))  # 0.0
+        return m + 3
+    var n = _ndigits(s.digits)
+    var tmp = Array[UInt8, 48](uninitialized=True)
     var t = tmp.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
-    _digits_into(t, s.digits, n)
+    _digits_fast(t, s.digits, n)
     var decpt = n + s.exponent
     if decpt <= -4 or decpt > 16:
-        out.put(t[unsafe_offset=0])
+        q[unsafe_offset=m] = t[unsafe_offset=0]
         if n > 1:
-            out.put(46)
-            out.copy(t.unsafe_offset(1), n - 1)
-        out.put(101)
+            q[unsafe_offset=m + 1] = 46
+            q.unsafe_store(m + 2, t.unsafe_load[width=16](1))
+            m += n + 1
+        else:
+            m += 1
         var e = decpt - 1
-        out.put(UInt8(45) if e < 0 else UInt8(43))
-        var a = -e if e < 0 else e
-        var en = 2 if a < 100 else 3
-        _digits_into(out.p.unsafe_offset(out.n), UInt64(a), en)
-        out.n += en
-        return
+        q[unsafe_offset=m] = 101
+        q[unsafe_offset=m + 1] = UInt8(45) if e < 0 else UInt8(43)
+        var a = UInt64(-e if e < 0 else e)
+        var pairs = _DIGIT_PAIRS.as_bytes().unsafe_ptr().unsafe_origin_cast[ImmutAnyOrigin]()
+        if a < 100:
+            q.unsafe_store(m + 2, bitcast[DType.uint8, 2](UInt16(_pair_at(pairs, a))))
+            return m + 4
+        q[unsafe_offset=m + 2] = UInt8(48) + UInt8(a // 100)
+        q.unsafe_store(m + 3, bitcast[DType.uint8, 2](UInt16(_pair_at(pairs, a % 100))))
+        return m + 5
     if decpt <= 0:
-        out.put(48)
-        out.put(46)
-        for _ in range(-decpt):
-            out.put(48)
-        out.copy(t, n)
-    elif decpt >= n:
-        out.copy(t, n)
-        for _ in range(decpt - n):
-            out.put(48)
-        out.put(46)
-        out.put(48)
-    else:
-        out.copy(t, decpt)
-        out.put(46)
-        out.copy(t.unsafe_offset(decpt), n - decpt)
+        q.unsafe_store(m, bitcast[DType.uint8, 8](UInt64(0x3030303030302E30)))  # 0.000000
+        m += 2 - decpt
+        q.unsafe_store(m, t.unsafe_load[width=32](0))
+        return m + n
+    if decpt >= n:
+        q.unsafe_store(m, t.unsafe_load[width=16](0))
+        q.unsafe_store(m + n, SIMD[DType.uint8, 16](48))
+        m += decpt
+        q.unsafe_store(m, bitcast[DType.uint8, 2](UInt16(0x302E)))  # .0
+        return m + 2
+    q.unsafe_store(m, t.unsafe_load[width=16](0))
+    q[unsafe_offset=m + decpt] = 46
+    q.unsafe_store(m + decpt + 1, t.unsafe_load[width=16](decpt))
+    return m + n + 1
